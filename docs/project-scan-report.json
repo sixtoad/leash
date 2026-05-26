@@ -1,0 +1,186 @@
+{
+  "workflow_version": "1.2.0",
+  "timestamps": {
+    "started": "2026-05-25T23:01:22Z",
+    "last_updated": "2026-05-25T23:01:22Z"
+  },
+  "mode": "initial_scan",
+  "scan_level": "exhaustive",
+  "project_root": "/Volumes/sixto_dev/ai/leash",
+  "project_knowledge": "/Volumes/sixto_dev/ai/leash/docs",
+  "repository_type": "monorepo",
+  "completed_steps": [
+    {
+      "step": "step_0.5",
+      "status": "completed",
+      "timestamp": "2026-05-25T22:59:17Z",
+      "summary": "Loaded documentation-requirements.csv (12 project types) for fresh start."
+    },
+    {
+      "step": "step_0.6",
+      "status": "completed",
+      "timestamp": "2026-05-25T22:59:17Z",
+      "summary": "No docs/index.md found; scan_level=exhaustive selected by user via AskUserQuestion."
+    },
+    {
+      "step": "step_1",
+      "status": "completed",
+      "timestamp": "2026-05-25T23:01:22Z",
+      "summary": "Classified as monorepo with 3 documented parts (leash-core=backend, controlui-web=web, mac-leash=desktop) + 3 ancillary directories (npm-leash, build-scripts, e2e) folded into deployment/dev guides. Confirmed by user."
+    },
+    {
+      "step": "step_2",
+      "status": "completed",
+      "timestamp": "2026-05-26T00:00:00Z",
+      "summary": "Inventoried 18 existing docs (root, docs/, docs/design/, docs/todo/, part READMEs, CI workflows). User specified 4 focus areas and excluded BMad scaffolding directories from analysis."
+    },
+    {
+      "step": "step_3",
+      "status": "completed",
+      "timestamp": "2026-05-26T00:05:00Z",
+      "summary": "Tech stack captured: leash-core (Go 1.23+, github.com/cedar-policy/cedar-go, github.com/cilium/ebpf, gorilla/websocket, charmbracelet/bubbletea+lipgloss, OpenTelemetry SDK, pelletier/go-toml v2); controlui-web (Next.js 16, React 19, TS, Tailwind v4, shadcn/Radix, Monaco editor, xyflow/reactflow, TanStack Query, Vitest, pnpm); mac-leash (Swift + Xcode, EndpointSecurity + NetworkExtension frameworks, Sparkle updater). CLI orchestration via Makefile (precommit, lsm-generate, build-ui, docker-leash). Release via Goreleaser + Docker multi-arch + npm OIDC trusted publishing."
+    }
+  ],
+  "tech_stack": {
+    "leash-core": {
+      "language": "Go 1.23+ (CI: 1.25.x)",
+      "framework": "stdlib + bubbletea TUI for CLI",
+      "key_deps": [
+        "github.com/cedar-policy/cedar-go v1.2.6 — Cedar policy engine",
+        "github.com/cilium/ebpf v0.19.0 — eBPF/LSM bindings",
+        "github.com/gorilla/websocket v1.5.3 — WS hub for events/UI",
+        "github.com/charmbracelet/bubbletea v0.25.0 + lipgloss v0.9.1 — terminal UI",
+        "go.opentelemetry.io/otel v1.38.0 + sdk + metric + trace + stdouttrace — telemetry",
+        "github.com/pelletier/go-toml/v2 v2.2.4 — TOML config",
+        "github.com/klauspost/compress v1.17.10 — entrypoint binary packing",
+        "github.com/google/uuid v1.6.0"
+      ],
+      "build": "CGO_ENABLED=1 for leashd (eBPF), CGO_ENABLED=0 for leash-entry; cmd/leash multiplexes runner | --daemon→leashd | --darwin→darwind",
+      "entry_points": ["cmd/leash/main.go", "cmd/leash-entry/main.go (target-container bootstrap)"]
+    },
+    "controlui-web": {
+      "language": "TypeScript 5",
+      "framework": "Next.js 16 (App Router)",
+      "key_deps": [
+        "react 19, react-dom 19",
+        "tailwindcss v4 + @tailwindcss/postcss + tw-animate-css",
+        "shadcn/ui style components built on @radix-ui/* (avatar, dropdown-menu, label, navigation-menu, scroll-area, separator, slot, tabs, tooltip)",
+        "@monaco-editor/react + monaco-editor — Cedar policy editor",
+        "@tanstack/react-query 5 + @tanstack/react-virtual",
+        "@xyflow/react + reactflow — graph visualization",
+        "lucide-react — icons",
+        "framer-motion",
+        "@faker-js/faker — fixture data",
+        "class-variance-authority, clsx, tailwind-merge"
+      ],
+      "build": "pnpm + next build; assets embedded into Go binary at internal/ui/dist",
+      "test": "Vitest + Testing Library + jsdom",
+      "package_manager": "pnpm 10 (corepack-pinned in CI)"
+    },
+    "mac-leash": {
+      "language": "Swift 5 (Xcode project)",
+      "framework": "AppKit/SwiftUI status-bar app + EndpointSecurity + NetworkExtension system extensions",
+      "key_deps": [
+        "EndpointSecurity.framework — exec/file monitoring (LeashES)",
+        "NetworkExtension.framework — per-flow network filter (LeashNetworkFilter)",
+        "Sparkle — auto-update framework (SparkleUpdater.swift)"
+      ],
+      "targets": ["Leash (status-bar app)", "LeashCLI (CLI helper /Applications/Leash.app/Contents/Resources/leashcli)", "LeashES (Endpoint Security extension)", "LeashNetworkFilter (Network Filter extension)"],
+      "shared": "Swift sources in mac-leash/Shared/ (DaemonSync, NetworkRule, PolicyModels, LeashIdentifiers, LeashNotifications)",
+      "bundle_team_id": "W5HSYBBJGA",
+      "bundle_ids": ["com.strongdm.leash.LeashES", "com.strongdm.leash.LeashNetworkFilter"]
+    }
+  },
+  "build_release_summary": {
+    "make_default": "build-ui → docker-leash → build",
+    "make_release_targets": ["docker-base", "docker-leash", "docker-coder", "build", "build-ui", "lsm-generate"],
+    "container_base_images": ["leash/build-base:latest (golang:1.25.3-bookworm + Node 20 + clang/llvm/libbpf-dev)", "leash/runtime-base:latest (debian:bookworm + bash, busybox, libbpf1, iptables, tini, tcpdump)"],
+    "registry": "public.ecr.aws/s5i7k8t3/strongdm/{leash,coder}",
+    "goreleaser": "goos=[linux,darwin], goarch=[amd64,arm64], CGO_ENABLED=0 for leash binary",
+    "ci_test_workflow": ".github/workflows/tests.yml (make test-deps test-go test-web)",
+    "ci_release_workflow": ".github/workflows/release.yml (verify → release → stage-npm → publish-npm, OIDC to ECR + npm)",
+    "npm_distribution": "npm/leash + build/npm/{collect_vendor_from_dist.py, build_npm_package.py} → @strongdm/leash with provenance"
+  },
+  "user_context": {
+    "focus_areas": [
+      "cross-reference existing design docs (link, don't duplicate)",
+      "deep map of internal/ packages and call graph",
+      "daemon-side HTTP/WS API surface from controlui-web perspective",
+      "macOS native architecture (XPC, ES, NE) + Go daemon sync surface"
+    ],
+    "excluded_paths": [
+      ".agents/",
+      "_bmad/",
+      "_bmad-output/",
+      ".github/agents/",
+      ".claude/"
+    ]
+  },
+  "existing_documentation": {
+    "root": ["README.md", "CONTRIBUTORS.md", "LICENSE", "DISCLAIMER.txt"],
+    "docs": ["CONFIG.md", "CUSTOM-DOCKER-IMAGES.md", "DEVELOPMENT.md", "MACOS.md", "RELEASE.md", "TELEMETRY.md"],
+    "docs_design": ["ARCHITECTURE.md", "AUTOCOMPLETE.md", "BOOT.md", "CEDAR.md", "PROXY.md", "SECURITY-MODEL.md"],
+    "docs_todo": ["SECRETS-INJECTION.md"],
+    "part_readmes": ["controlui/web/README.md", "internal/transpiler/README.md", "npm/leash/README.md"],
+    "ci": [".github/workflows/tests.yml", ".github/workflows/release.yml", ".github/workflows/coder-cli-releases-watchdog.yml"]
+  },
+  "project_parts": [
+    {
+      "part_id": "leash-core",
+      "display_name": "Leash Core (Go CLI + Daemon)",
+      "project_type_id": "backend",
+      "root_path": "/Volumes/sixto_dev/ai/leash",
+      "key_dirs": ["cmd/", "internal/"],
+      "primary_language": "Go 1.23",
+      "notes": "CLI binary that runs a daemon stack: HTTP/WS server, MCP observer, eBPF/LSM enforcement, Cedar policy engine, OpenTelemetry."
+    },
+    {
+      "part_id": "controlui-web",
+      "display_name": "Control UI (Next.js Web)",
+      "project_type_id": "web",
+      "root_path": "/Volumes/sixto_dev/ai/leash/controlui/web",
+      "key_dirs": ["src/app/", "src/components/", "src/lib/"],
+      "primary_language": "TypeScript",
+      "notes": "Next.js 16 + React 19 + Tailwind v4 + shadcn/Radix UI + Monaco + xyflow/reactflow + TanStack Query."
+    },
+    {
+      "part_id": "mac-leash",
+      "display_name": "mac-leash (macOS Native App + System Extensions)",
+      "project_type_id": "desktop",
+      "root_path": "/Volumes/sixto_dev/ai/leash/mac-leash",
+      "key_dirs": ["Leash/", "LeashES/", "LeashNetworkFilter/", "LeashCLI/", "Shared/"],
+      "primary_language": "Swift",
+      "notes": "Xcode project: status-bar app, Endpoint Security extension, Network Filter extension, CLI helper, shared models."
+    }
+  ],
+  "project_types": [
+    {"part_id": "leash-core", "project_type_id": "backend", "display_name": "Leash Core (Go CLI + Daemon)"},
+    {"part_id": "controlui-web", "project_type_id": "web", "display_name": "Control UI (Next.js Web)"},
+    {"part_id": "mac-leash", "project_type_id": "desktop", "display_name": "mac-leash (macOS Native App + System Extensions)"}
+  ],
+  "ancillary_dirs": [
+    {"name": "npm-leash", "path": "npm/leash/", "fold_into": "deployment-guide", "summary": "Thin npm wrapper that downloads prebuilt binaries (@strongdm/leash)."},
+    {"name": "build-scripts", "path": "build/", "fold_into": "deployment-guide", "summary": "Python/shell release scripts (Docker tagging, NPM publish, GHCR, goreleaser hooks)."},
+    {"name": "e2e", "path": "e2e/", "fold_into": "leash-core", "summary": "End-to-end Go tests (boot_test.go, complete_test.go, integration/, mcpserver/)."}
+  ],
+  "findings": {
+    "project_classification": "monorepo with 3 documented parts (backend Go core, Next.js web, Swift macOS native), 3 ancillary directories"
+  },
+  "outputs_generated": [
+    "project-scan-report.json",
+    "index.md",
+    "project-overview.md",
+    "source-tree-analysis.md",
+    "architecture-leash-core.md",
+    "architecture-controlui-web.md",
+    "architecture-mac-leash.md",
+    "integration-architecture.md",
+    "api-contracts-leash-core.md",
+    "data-models-leash-core.md",
+    "component-inventory-controlui-web.md",
+    "development-guide.md",
+    "deployment-guide.md"
+  ],
+  "timestamps_completed": "2026-05-26T00:27:00Z",
+  "resume_instructions": "Workflow complete. Re-run /bmad-document-project to refresh; it will detect existing index.md and offer rescan/deep-dive."
+}
