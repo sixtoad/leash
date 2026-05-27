@@ -1,0 +1,15 @@
+lockfile_version: '1'
+generated_at: '2026-05-27T20:37:37.912344+00:00'
+apm_version: 0.10.0
+dependencies:
+- repo_url: sixto/skills
+  host: gitea.cantolla.casa
+  resolved_commit: 2f267a55e58c5125e6ab18f0e8bf24ac21748827
+  resolved_ref: 2f267a5
+  package_type: skill_bundle
+  deployed_files:
+  - .claude/skills/stacked-branches
+  - .github/skills/stacked-branches
+  content_hash: sha256:662accf246e33901942f52a052ecd10ecda9b15f83ea6baded7e50fdf52878e1
+  skill_subset:
+  - stacked-branches

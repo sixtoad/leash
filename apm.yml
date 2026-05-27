@@ -1,0 +1,13 @@
+name: leash
+version: 1.0.0
+description: APM project for leash
+author: Sixto Cantolla Sanchez
+dependencies:
+  apm:
+  - git: gitea.cantolla.casa/sixto/skills
+    ref: 2f267a5
+    skills:
+    - stacked-branches
+  mcp: []
+includes: auto
+scripts: {}
