@@ -46,6 +46,8 @@ What changes is operational:
 - Performance characteristics differ from native Linux (cold-boot, syscall overhead, virtio I/O).
 - Some leash assumptions about cgroup paths, `--cgroupns=host`, or privileged operations may surface latent bugs that don't trigger on bare Linux.
 
+A critical assumption holds throughout the above: the four Vz-backed runtimes follow a **shared-VM** model — one Linux VM, many containers (target + leash manager + anything else the operator has running) inside it. A distinctly different micro-VM model exists in the wider ecosystem: **per-container-per-VM**, exemplified by Kata Containers and Firecracker direct. That model has fundamentally different consequences for leash's enforcement architecture and is deliberately out of scope for this spec; see [§3.1](#31-kata-style-per-container-per-vm-micro-vms).
+
 ### 1.3 Why this work is worth doing
 
 Today, the README endorses OrbStack as a supported runtime. In practice, no code in the runner explicitly probes for Vz-backed runtimes, no test covers OrbStack, and there are no documented runbooks for "what to expect when leash runs on Apple Silicon with Docker Desktop/OrbStack." We're operating on the assumption that everything just works. Phase 1 of this work makes that assumption explicit, instrumented, and supported.
@@ -74,7 +76,44 @@ Phase 2 is sketched in [§7](#7-phase-2-preview--in-guest-leash-on-apple-vz) bel
 
 ## 3. Non-goals
 
-- **Per-container-per-VM (Kata-style) microVMs are not addressed by this spec.** A future branch may add support; the Kata model has different consequences (host eBPF really can't reach the guest because each container is its own VM, sharing nothing). That work would be runtime-runtime, not Vz-specific.
+### 3.1 Kata-style per-container-per-VM micro-VMs
+
+**What "Kata-style" means.** The term loosely covers any model where every container gets its own dedicated micro-VM, sharing nothing with siblings or the host runtime. Two concrete representatives in the ecosystem today:
+
+- [**Kata Containers**](https://katacontainers.io/) — an OCI runtime that drops in for `runc`. You enable it via `docker run --runtime=kata-runtime ...` or as the default in containerd / CRI-O. From the orchestrator's perspective it looks like a container; underneath, each container is a tiny VM with its own kernel (typically a stripped Clear Linux derivative), an in-guest agent (`kata-agent`), and your container's rootfs. The hypervisor underneath is pluggable: QEMU, Cloud Hypervisor, or Firecracker.
+- [**Firecracker direct**](https://github.com/firecracker-microvm/firecracker) — AWS Lambda's underlying tech, invoked directly via its REST API rather than through Docker. Each function invocation gets a sub-second cold boot of a stripped-down Linux VM. Designed for extreme-scale hostile multi-tenancy.
+
+**Why it's architecturally different from this spec's shared-VM model.** In OrbStack / Docker Desktop / Podman / Lima, *one* Linux VM hosts both the target container and the leash manager container; they share that VM's kernel. In Kata-style, target and manager would live in *separate* VMs with *separate* kernels — they cannot share anything except files explicitly bridged via virtio-fs or a host-mediated socket.
+
+| Aspect | Shared-VM (this spec's target) | Kata-style (out of scope) |
+|---|---|---|
+| VMs in the path | 1 | N (one per container) |
+| Target ↔ manager kernel | shared | separate |
+| eBPF LSM cgroup scoping | meaningful (single kernel hierarchy) | meaningless (no shared cgroup hierarchy) |
+| MITM via iptables REDIRECT | works (inside the VM's network namespace) | doesn't apply (target traffic is on a host-side tap device, not in a shared netns) |
+| Bootstrap handshake (`/leash/bootstrap.ready`) | shared volume inside the VM | needs per-VM virtio-fs mount + synchronization |
+| Cold-boot cost | amortized over VM lifetime | paid per container (~125 ms Firecracker, ~500 ms QEMU) |
+| Target audience | developer desktop | hostile multi-tenant, serverless, secure CI |
+
+**What concretely breaks if we naively layered leash on Kata today.** Four things, each non-trivial:
+
+1. **eBPF LSM scoping is undefined.** Leash uses `bpf_get_current_cgroup_id` + an `allowed_cgroups` map to scope enforcement to a specific cgroup *in the kernel the BPF program is attached to*. In Kata, the manager's kernel doesn't have a cgroup that corresponds to the target's processes — they're in another kernel entirely. The map has nothing useful to put in it.
+2. **MITM iptables REDIRECT doesn't apply.** Leash places an iptables REDIRECT in the shared network namespace of target + manager. In Kata, the target's network is a virtio-net device backed by a host-side tap; the host's iptables sees the tap, not the connections inside the guest, and the manager's iptables is in yet another netns.
+3. **CA bootstrap requires per-VM choreography.** The current handshake — manager writes `/leash/ca-cert.pem`, target's `leash-entry` installs it — relies on a single shared filesystem. Kata's per-VM virtio-fs mount needs explicit pairing, and `leash-entry` needs to know which guest it's bootstrapping for.
+4. **The control plane is now N+1 endpoints.** Today there is one HTTP/WS at `:18080`. With one VM per container, we would need either a fan-in aggregator on the host (probably a vsock multiplexer) or a registration protocol so the Control UI can locate each agent.
+
+None of this is fundamentally unsolvable. It's a different architecture.
+
+**Why this spec defers.** Three reasons, in order of weight:
+
+1. **Audience mismatch.** Leash's stated user (per the README, the Mac setup guide, the Linux setup guide) is a developer running an AI agent on their own machine. Kata's design target is hostile multi-tenant — many users, none trusted by the operator. The capability gap (container vs. per-container VM) primarily matters when you don't trust your neighbors. Today's leash users *are* the neighbors.
+2. **No expressed demand.** A survey of the strongdm/leash issue tracker, all 43 forks, the README'd-into projects (packnplay, safe-ai-factory), and the leash maintainer commits over the last six months turned up zero mentions of Kata, Firecracker direct, or per-container-per-VM in any issue, PR, design doc, or roadmap. Adding speculative architectural capacity has cost — code, tests, docs, maintenance surface — and that cost is real even for a use case nobody has asked for.
+3. **Scope discipline.** Supporting per-container-per-VM means either moving enforcement *into* each guest (each VM boots with `leashd` inside it) or moving enforcement to a different layer entirely (host hypervisor introspection, syscall tracing, etc.). Either is a multi-month design effort. Bundling it into Phase 1 of a graceful-mode-on-Mac-Vz commit obscures both pieces of work and makes both harder to review.
+
+**Forward path if we ever do support it.** A future spec would introduce a `BackendKataLike` runtime classifier covering any per-container-per-VM model (Kata, Firecracker direct, Cloud Hypervisor direct). The enforcement strategy would shift to **agent-in-guest**: each guest boots a slim image we ship containing `leashd`, and the host-side runner becomes pure orchestration (provision the VM image, mount source via virtio-fs, manage lifecycle, aggregate the control plane over vsock). MITM either moves into each guest (and the guest's egress is bridged through it) or moves to a host-side proxy reachable via `DOCKER_HOST`-style URL or vsock. Cedar continues to be the authoritative source; the transpiler outputs ship into each guest at boot. This is closer in spirit to how `leash --darwin` works today (per-process enforcement via a system extension) than to today's containerized model. It is not a small change.
+
+### 3.2 Other non-goals
+
 - **`--darwin` native mode is unchanged.** It already provides macOS-native enforcement via system extensions; this work does not replace or compete with it.
 - **Linux hosts are not affected.** The graceful-mode detection is gated by `runtime.GOOS == "darwin"` and a non-empty Vz signature; on Linux it's a no-op.
 - **We are not building a Docker / OrbStack / Podman client abstraction.** Leash continues to shell out to `docker` / `podman`. The detection layer is a thin probe of `docker info` (or `podman info`).
