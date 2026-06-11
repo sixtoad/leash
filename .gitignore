@@ -31,3 +31,6 @@ node_modules
 dist
 
 /mac-leash/build/
+
+# worktree-agent session worktrees
+.claude/worktrees/
