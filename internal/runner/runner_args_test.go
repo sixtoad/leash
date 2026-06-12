@@ -80,6 +80,48 @@ func TestParseArgsInvalidVolume(t *testing.T) {
 	}
 }
 
+func TestParseArgsLabelFlag(t *testing.T) {
+	t.Parallel()
+
+	args := []string{
+		"--label", "walk.managed=true",
+		"--label=walk.project=myproj",
+		"--label", "walk.branch=main",
+	}
+
+	opts, err := parseArgs(args)
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+
+	want := []string{"walk.managed=true", "walk.project=myproj", "walk.branch=main"}
+	if len(opts.labels) != len(want) {
+		t.Fatalf("expected %d labels, got %d (%+v)", len(want), len(opts.labels), opts.labels)
+	}
+	for i := range want {
+		if opts.labels[i] != want[i] {
+			t.Fatalf("label %d mismatch: want %q got %q", i, want[i], opts.labels[i])
+		}
+	}
+}
+
+func TestParseArgsLabelMissingValue(t *testing.T) {
+	t.Parallel()
+
+	if _, err := parseArgs([]string{"--label"}); err == nil {
+		t.Fatal("expected error for --label without argument")
+	}
+	if _, err := parseArgs([]string{"--label="}); err == nil {
+		t.Fatal("expected error for empty --label= value")
+	}
+	if _, err := parseArgs([]string{"--label", "=bar"}); err == nil {
+		t.Fatal("expected error for label with empty key")
+	}
+	if _, err := parseArgs([]string{"--label==bar"}); err == nil {
+		t.Fatal("expected error for --label= with empty key")
+	}
+}
+
 func TestParseArgsSubcommandAfterDoubleDash(t *testing.T) {
 	t.Parallel()
 

@@ -104,6 +104,7 @@ type options struct {
 	openUI         bool
 	publishes      []publishSpec
 	publishAll     bool
+	labels         []string
 }
 
 type config struct {
@@ -384,6 +385,16 @@ func parseArgs(args []string) (options, error) {
 			i++
 		case "-P", "--publish-all":
 			opts.publishAll = true
+		case "--label":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for %s", arg)
+			}
+			value := strings.TrimSpace(args[i+1])
+			if value == "" || strings.HasPrefix(value, "=") {
+				return opts, fmt.Errorf("invalid label %q; expected key[=value]", args[i+1])
+			}
+			opts.labels = append(opts.labels, value)
+			i++
 		case "-v":
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && strings.Contains(args[i+1], ":") {
 				opts.volumes = append(opts.volumes, args[i+1])
@@ -494,6 +505,12 @@ func parseArgs(args []string) (options, error) {
 				if err := appendEnvSpec(&opts, value); err != nil {
 					return opts, err
 				}
+			case strings.HasPrefix(arg, "--label="):
+				value := strings.TrimSpace(strings.TrimPrefix(arg, "--label="))
+				if value == "" || strings.HasPrefix(value, "=") {
+					return opts, fmt.Errorf("invalid label %q; expected key[=value]", arg)
+				}
+				opts.labels = append(opts.labels, value)
 			case strings.HasPrefix(arg, "-V="):
 				if strings.TrimPrefix(arg, "-V=") != "" {
 					return opts, fmt.Errorf("-V does not take a value")
@@ -1835,6 +1852,10 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 	// Append requested port publishes
 	for _, ps := range r.opts.publishes {
 		args = append(args, "-p", ps.toDockerArg())
+	}
+	// Append requested docker labels (additive; absent => unchanged behavior)
+	for _, label := range r.opts.labels {
+		args = append(args, "--label", label)
 	}
 	targetMounts := []string{leashPublicMount, r.cfg.callerDir}
 	targetEnv := []string{
