@@ -178,16 +178,30 @@ func writeBootstrapMarker() error {
 	}
 	data = append(data, '\n')
 
-	dir := filepath.Dir(bootstrapPath)
+	return writeMarkerAtomic(bootstrapPath, data)
+}
+
+// writeMarkerAtomic writes data to path via a temp file + rename so a reader
+// never observes a partial marker.
+//
+// It deliberately avoids os.CreateTemp: that opens the temp file with O_EXCL,
+// which Docker Desktop's gRPC-FUSE / virtio-fs file sharing rejects with EACCES
+// on macOS — so bootstrap fails even though the directory is writable (the
+// non-O_EXCL os.WriteFile used for /leash/cgroup-path succeeds in the same dir).
+// A PID-suffixed temp name with O_CREATE|O_TRUNC (no O_EXCL) is unique enough —
+// there is one leash-entry per container — and the rename still publishes the
+// marker atomically. See issue #73.
+func writeMarkerAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil && !os.IsExist(err) {
 		return fmt.Errorf("ensure bootstrap dir: %w", err)
 	}
 
-	tmp, err := os.CreateTemp(dir, "bootstrap.ready.*")
+	tmpName := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
+	tmp, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("create temp marker: %w", err)
 	}
-	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
@@ -202,7 +216,7 @@ func writeBootstrapMarker() error {
 		os.Remove(tmpName)
 		return fmt.Errorf("close marker: %w", err)
 	}
-	if err := os.Rename(tmpName, bootstrapPath); err != nil {
+	if err := os.Rename(tmpName, path); err != nil {
 		os.Remove(tmpName)
 		return fmt.Errorf("commit marker: %w", err)
 	}
