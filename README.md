@@ -95,6 +95,7 @@ target_image = "ghcr.io/example/dev:latest"
 | Leash manager image     | `--leash-image`, `LEASH_IMAGE`          | Override when testing custom manager builds.          |
 | Cedar policy file       | `--policy`, `LEASH_POLICY_FILE`         | Mount a specific Cedar policy.                        |
 | Control UI bind address | `--listen`, `LEASH_LISTEN`              | Blank value binds to default 127.0.0.1:18080          |
+| Agent docker network    | `--network`, `LEASH_NETWORK`            | Attach the agent to an existing docker network (e.g. a compose network) so it can reach sibling services. |
 | Extra bind mount        | `-v src:dst[:ro]`                       | Repeatable for multiple mounts.                       |
 | Environment variables   | `-e KEY=value`                          | Forwarded into both containers.                       |
 

@@ -99,6 +99,7 @@ type options struct {
 	subcommand     string
 	targetImage    string
 	leashImage     string
+	network        string
 	listen         string
 	listenSet      bool
 	openUI         bool
@@ -136,6 +137,7 @@ type config struct {
 	leashImageDevFile   string
 	listenCfg           listen.Config
 	listenExplicit      bool
+	dockerNetwork       string
 }
 
 type runner struct {
@@ -315,6 +317,7 @@ Flags:
   -P, --publish-all               Publish all EXPOSEd ports (host same as container when free, auto-bump on conflicts).
   --image <name[:tag]>            Override the target container image (defaults to %s).
   --leash-image <name[:tag]>      Override the leash manager image (defaults to %s).
+  --network <name>                Attach the agent container to a docker network (e.g. a compose network). The leash container follows it automatically.
   -V, --verbose                   Enable verbose logging (also set when -v is provided without a mount spec).
 
 Environment variables:
@@ -329,6 +332,7 @@ Environment variables:
   LEASH_WORKSPACE              Overrides project workspace detection.
   LEASH_BOOTSTRAP_TIMEOUT      Controls bootstrap timeout duration.
   LEASH_LISTEN                 Overrides Control UI bind address.
+  LEASH_NETWORK                Docker network for the agent container (overridden by --network).
   LEASH_EXTRA_ARGS             Additional arguments passed into leash-entry.
   LEASH_CGROUP_PATH            Override cgroup path for the leash container.
   LEASH_HOME                   Base directory for persisted leash state.
@@ -415,6 +419,12 @@ func parseArgs(args []string) (options, error) {
 			}
 			opts.leashImage = strings.TrimSpace(args[i+1])
 			i++
+		case "--network":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for %s", arg)
+			}
+			opts.network = strings.TrimSpace(args[i+1])
+			i++
 		case "-l", "--listen":
 			if i+1 >= len(args) {
 				return opts, fmt.Errorf("missing argument for %s", arg)
@@ -461,6 +471,8 @@ func parseArgs(args []string) (options, error) {
 			case strings.HasPrefix(arg, "-l="):
 				opts.listen = strings.TrimPrefix(arg, "-l=")
 				opts.listenSet = true
+			case strings.HasPrefix(arg, "--network="):
+				opts.network = strings.TrimSpace(strings.TrimPrefix(arg, "--network="))
 			case strings.HasPrefix(arg, "--open="):
 				return opts, fmt.Errorf("--open does not take a value")
 			case strings.HasPrefix(arg, "-o="):
@@ -1007,6 +1019,16 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 	}
 	cfg.listenCfg = listenCfg
 	cfg.listenExplicit = listenExplicit
+
+	// Docker network for the target (agent) container. The leash container joins
+	// the target's network namespace via `--network container:<target>`, so it
+	// follows the target onto whatever network this selects and traffic
+	// interception is unaffected. Flag takes precedence over LEASH_NETWORK.
+	cfg.dockerNetwork = strings.TrimSpace(os.Getenv("LEASH_NETWORK"))
+	if trimmed := strings.TrimSpace(opts.network); trimmed != "" {
+		cfg.dockerNetwork = trimmed
+	}
+
 	cleanupTemp = false
 	return cfg, resolvedEnv, nil
 }
@@ -1826,6 +1848,11 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 		"--name", r.cfg.targetContainer,
 		"--entrypoint", filepath.Join(leashPublicMount, entryName),
 		"--cgroupns", "host",
+	}
+	// Join the user-requested docker network (issue #69). The leash container
+	// attaches to this container's netns, so it follows onto the same network.
+	if net := r.cfg.dockerNetwork; net != "" {
+		args = append(args, "--network", net)
 	}
 	if !r.cfg.listenCfg.Disable {
 		if publish := r.cfg.listenCfg.DockerPublish(); publish != "" {
