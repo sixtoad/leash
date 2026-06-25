@@ -724,7 +724,46 @@ func resolveWorkspaceCandidate(candidate string) (string, error) {
 
 func createTempWorkDir(callerDir string) (string, error) {
 	prefix := tempWorkDirPrefix(callerDir)
-	return os.MkdirTemp("", prefix)
+	return os.MkdirTemp(defaultWorkDirBase(), prefix)
+}
+
+// workDirBaseFor returns the parent directory for per-run work dirs given the
+// host OS and the user's home directory. An empty string means "use the system
+// temp dir" (os.MkdirTemp's default).
+//
+// On macOS the Docker runtime (Docker Desktop, colima, OrbStack, Rancher) runs
+// containers inside a Linux VM, and bind mounts are satisfied by sharing host
+// paths into that VM. The system temp dir — os.TempDir() resolves to
+// /var/folders/... on macOS — is NOT shared by default, so a /leash bind mount
+// sourced there shows up empty inside the container and
+// `exec /leash/leash-entry-linux-<arch>` fails (issue #63). The user's home
+// directory IS shared by default on all of those runtimes, so anchor the work
+// dir under ~/.leash/run instead. Other platforms keep the system temp dir:
+// native Linux Docker shares the host filesystem directly, so /var/folders has
+// no analogue and /tmp works.
+func workDirBaseFor(goos, home string) string {
+	if goos == "darwin" && home != "" {
+		return filepath.Join(home, ".leash", "run")
+	}
+	return ""
+}
+
+// defaultWorkDirBase resolves workDirBaseFor for the current host and ensures
+// the directory exists. On any failure it falls back to the system temp dir so
+// the relocation can never make leash worse off than before.
+func defaultWorkDirBase() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	base := workDirBaseFor(runtime.GOOS, home)
+	if base == "" {
+		return ""
+	}
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return ""
+	}
+	return base
 }
 
 func tempWorkDirPrefix(callerDir string) string {
