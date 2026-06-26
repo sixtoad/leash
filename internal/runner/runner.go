@@ -101,6 +101,7 @@ type options struct {
 	leashImage     string
 	containerName  string
 	network        string
+	runtime        string
 	listen         string
 	listenSet      bool
 	openUI         bool
@@ -139,11 +140,14 @@ type config struct {
 	listenCfg           listen.Config
 	listenExplicit      bool
 	dockerNetwork       string
+	runtime             string
 }
 
 type runner struct {
 	opts options
 	cfg  config
+
+	runtime Runtime
 
 	verbose         bool
 	shareDirCreated bool
@@ -234,13 +238,19 @@ func execute(cmdName string, args []string) error {
 
 	opts.envVars = resolveEnvVars(opts.envVars, configEnv, opts.subcommand)
 
-	if err := ensureCommand("docker"); err != nil {
+	rt, err := newRuntime(cfg.runtime)
+	if err != nil {
+		return err
+	}
+
+	if err := ensureCommand(rt.Name()); err != nil {
 		return err
 	}
 
 	r := &runner{
 		opts:          opts,
 		cfg:           cfg,
+		runtime:       rt,
 		verbose:       opts.verbose,
 		logger:        log.New(os.Stderr, "", 0),
 		sessionID:     sessionID,
@@ -320,6 +330,7 @@ Flags:
   --leash-image <name[:tag]>      Override the leash manager image (defaults to %s).
   --container-name <name>         Force the exact agent container name (no sanitization, no collision suffix; leash container becomes <name>-leash).
   --network <name>                Attach the agent container to a docker network (e.g. a compose network). The leash container follows it automatically.
+  --runtime <docker|podman>       Container runtime CLI to drive (defaults to docker).
   -V, --verbose                   Enable verbose logging (also set when -v is provided without a mount spec).
 
 Environment variables:
@@ -335,6 +346,7 @@ Environment variables:
   LEASH_BOOTSTRAP_TIMEOUT      Controls bootstrap timeout duration.
   LEASH_LISTEN                 Overrides Control UI bind address.
   LEASH_NETWORK                Docker network for the agent container (overridden by --network).
+  LEASH_RUNTIME                Container runtime CLI: docker (default) or podman (overridden by --runtime).
   LEASH_EXTRA_ARGS             Additional arguments passed into leash-entry.
   LEASH_CGROUP_PATH            Override cgroup path for the leash container.
   LEASH_HOME                   Base directory for persisted leash state.
@@ -436,6 +448,12 @@ func parseArgs(args []string) (options, error) {
 			}
 			opts.network = strings.TrimSpace(args[i+1])
 			i++
+		case "--runtime":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for %s", arg)
+			}
+			opts.runtime = strings.TrimSpace(args[i+1])
+			i++
 		case "-l", "--listen":
 			if i+1 >= len(args) {
 				return opts, fmt.Errorf("missing argument for %s", arg)
@@ -489,6 +507,8 @@ func parseArgs(args []string) (options, error) {
 				}
 			case strings.HasPrefix(arg, "--network="):
 				opts.network = strings.TrimSpace(strings.TrimPrefix(arg, "--network="))
+			case strings.HasPrefix(arg, "--runtime="):
+				opts.runtime = strings.TrimSpace(strings.TrimPrefix(arg, "--runtime="))
 			case strings.HasPrefix(arg, "--open="):
 				return opts, fmt.Errorf("--open does not take a value")
 			case strings.HasPrefix(arg, "-o="):
@@ -1097,6 +1117,13 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 		cfg.dockerNetwork = trimmed
 	}
 
+	// Container runtime (docker by default). Flag wins over LEASH_RUNTIME; the
+	// value is validated when the Runtime is constructed in execute().
+	cfg.runtime = strings.TrimSpace(os.Getenv("LEASH_RUNTIME"))
+	if trimmed := strings.TrimSpace(opts.runtime); trimmed != "" {
+		cfg.runtime = trimmed
+	}
+
 	cleanupTemp = false
 	return cfg, resolvedEnv, nil
 }
@@ -1200,10 +1227,19 @@ func (r *runner) logDevImage(kind, source, sourcePath, image string) {
 // output when `--verbose` is set.
 func (r *runner) runDocker(ctx context.Context, args ...string) error {
 	if r.verbose {
-		return runCommand(ctx, "docker", args...)
+		return r.rt().Run(ctx, args...)
 	}
-	_, err := commandOutput(ctx, "docker", args...)
+	_, err := r.rt().Output(ctx, args...)
 	return err
+}
+
+// rt returns the configured container runtime, defaulting to docker so runners
+// constructed directly (e.g. in tests) work without explicit wiring.
+func (r *runner) rt() Runtime {
+	if r.runtime == nil {
+		return cliRuntime{bin: defaultRuntime}
+	}
+	return r.runtime
 }
 
 func (r *runner) startContainers(ctx context.Context) error {
@@ -1568,10 +1604,10 @@ func (r *runner) ensureNotRunning(ctx context.Context) error {
 	}
 
 	if exists, _ := r.containerExists(ctx, r.cfg.targetContainer); exists {
-		_ = runCommand(ctx, "docker", "rm", "-f", r.cfg.targetContainer)
+		_ = r.rt().Run(ctx, "rm", "-f", r.cfg.targetContainer)
 	}
 	if exists, _ := r.containerExists(ctx, r.cfg.leashContainer); exists {
-		_ = runCommand(ctx, "docker", "rm", "-f", r.cfg.leashContainer)
+		_ = r.rt().Run(ctx, "rm", "-f", r.cfg.leashContainer)
 	}
 	return nil
 }
@@ -1696,11 +1732,11 @@ func (r *runner) syncPolicyFile() error {
 }
 
 func (r *runner) imageDefaultCommand(ctx context.Context) ([]string, error) {
-	entryJSON, err := commandOutput(ctx, "docker", "inspect", "--format", "{{json .Config.Entrypoint}}", r.cfg.targetImage)
+	entryJSON, err := r.rt().Output(ctx, "inspect", "--format", "{{json .Config.Entrypoint}}", r.cfg.targetImage)
 	if err != nil {
 		return nil, err
 	}
-	cmdJSON, err := commandOutput(ctx, "docker", "inspect", "--format", "{{json .Config.Cmd}}", r.cfg.targetImage)
+	cmdJSON, err := r.rt().Output(ctx, "inspect", "--format", "{{json .Config.Cmd}}", r.cfg.targetImage)
 	if err != nil {
 		return nil, err
 	}
@@ -1724,7 +1760,7 @@ func (r *runner) imageDefaultCommand(ctx context.Context) ([]string, error) {
 }
 
 func (r *runner) getImageStopSignal(ctx context.Context) (string, error) {
-	out, err := commandOutput(ctx, "docker", "inspect", "--format", "{{.Config.StopSignal}}", r.cfg.targetImage)
+	out, err := r.rt().Output(ctx, "inspect", "--format", "{{.Config.StopSignal}}", r.cfg.targetImage)
 	if err != nil {
 		return "", fmt.Errorf("query stop signal: %w", err)
 	}
@@ -1736,7 +1772,7 @@ func (r *runner) getImageStopSignal(ctx context.Context) (string, error) {
 }
 
 func (r *runner) ensurePortFree(ctx context.Context, port string) error {
-	out, err := commandOutput(ctx, "docker", "ps", "--format", "{{.Names}} {{.Ports}}")
+	out, err := r.rt().Output(ctx, "ps", "--format", "{{.Names}} {{.Ports}}")
 	if err != nil {
 		return fmt.Errorf("list docker ports: %w", err)
 	}
@@ -1889,7 +1925,7 @@ func (r *runner) expandPublishAll(ctx context.Context) error {
 	if !r.opts.publishAll {
 		return nil
 	}
-	out, err := commandOutput(ctx, "docker", "inspect", "--format", "{{json .Config.ExposedPorts}}", r.cfg.targetImage)
+	out, err := r.rt().Output(ctx, "inspect", "--format", "{{json .Config.ExposedPorts}}", r.cfg.targetImage)
 	if err != nil {
 		return fmt.Errorf("inspect exposed ports: %w", err)
 	}
@@ -2083,7 +2119,7 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 }
 
 func (r *runner) detectImageArch(ctx context.Context) (string, error) {
-	out, err := commandOutput(ctx, "docker", "inspect", "--format", "{{.Architecture}}", r.cfg.targetImage)
+	out, err := r.rt().Output(ctx, "inspect", "--format", "{{.Architecture}}", r.cfg.targetImage)
 	if err != nil {
 		return "", fmt.Errorf("detect architecture: %w", err)
 	}
@@ -2437,7 +2473,7 @@ func (r *runner) waitForBootstrap(ctx context.Context) error {
 
 func (r *runner) containerSummary(ctx context.Context, name string) string {
 	format := "{{.State.Status}} {{.State.ExitCode}}"
-	out, err := commandOutput(ctx, "docker", "inspect", "-f", format, name)
+	out, err := r.rt().Output(ctx, "inspect", "-f", format, name)
 	if err != nil {
 		if isNoSuchObjectError(err) {
 			return "missing"
@@ -2461,7 +2497,7 @@ func (r *runner) containerSummary(ctx context.Context, name string) string {
 }
 
 func (r *runner) containerLogs(ctx context.Context, name string) string {
-	out, err := commandOutput(ctx, "docker", "logs", "--tail", "200", name)
+	out, err := r.rt().Output(ctx, "logs", "--tail", "200", name)
 	if err != nil {
 		return fmt.Sprintf("unavailable: %v", err)
 	}
@@ -2542,10 +2578,10 @@ func describeBootstrapMarker(path string) string {
 }
 
 func (r *runner) detectShell(ctx context.Context) (string, error) {
-	if err := runCommand(ctx, "docker", "exec", "-w", r.cfg.callerDir, r.cfg.targetContainer, "bash", "-lc", "true"); err == nil {
+	if err := r.rt().Run(ctx, "exec", "-w", r.cfg.callerDir, r.cfg.targetContainer, "bash", "-lc", "true"); err == nil {
 		return "bash", nil
 	}
-	if err := runCommand(ctx, "docker", "exec", "-w", r.cfg.callerDir, r.cfg.targetContainer, "sh", "-lc", "true"); err == nil {
+	if err := r.rt().Run(ctx, "exec", "-w", r.cfg.callerDir, r.cfg.targetContainer, "sh", "-lc", "true"); err == nil {
 		return "sh", nil
 	}
 	return "", fmt.Errorf("failed to locate a usable shell (bash or sh) inside %s", r.cfg.targetContainer)
@@ -2553,7 +2589,7 @@ func (r *runner) detectShell(ctx context.Context) (string, error) {
 
 func (r *runner) execNonInteractive(ctx context.Context, shellBin, cmd string) (int, error) {
 	dockerArgs := []string{"exec", "-i", "-w", r.cfg.callerDir, r.cfg.targetContainer, shellBin, "-lc", "exec " + cmd}
-	execCmd := exec.CommandContext(ctx, "docker", dockerArgs...)
+	execCmd := r.rt().Cmd(ctx, dockerArgs...)
 	execCmd.Stdin = os.Stdin
 	execCmd.Stdout = os.Stdout
 	execCmd.Stderr = os.Stderr
@@ -2574,7 +2610,7 @@ func (r *runner) precheckInteractive(ctx context.Context, shellBin, runCmd strin
 	defer os.Remove(tmp.Name())
 
 	args := []string{"exec", "-it", "-w", r.cfg.callerDir, r.cfg.targetContainer, shellBin, "-lc", "true"}
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := r.rt().Cmd(ctx, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = io.MultiWriter(os.Stderr, tmp)
 	cmd.Stdin = os.Stdin
@@ -2605,7 +2641,7 @@ func (r *runner) execInteractive(shellBin, cmd string) (int, error) {
 	defer os.Remove(tmp.Name())
 
 	args := []string{"exec", "-it", "-w", r.cfg.callerDir, r.cfg.targetContainer, shellBin, "-lc", "exec " + cmd}
-	execCmd := exec.Command("docker", args...)
+	execCmd := r.rt().Cmd(context.Background(), args...)
 	execCmd.Stdin = os.Stdin
 	execCmd.Stdout = os.Stdout
 	execCmd.Stderr = io.MultiWriter(os.Stderr, tmp)
@@ -2684,7 +2720,7 @@ func (r *runner) stopContainers(ctx context.Context) error {
 	}
 
 	remove := func(name string) {
-		cmd := exec.CommandContext(ctx, "docker", "rm", "-f", name)
+		cmd := r.rt().Cmd(ctx, "rm", "-f", name)
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard
 		_ = cmd.Run()
@@ -2711,7 +2747,7 @@ func (r *runner) stopContainers(ctx context.Context) error {
 }
 
 func (r *runner) showStatus(ctx context.Context) error {
-	out, err := commandOutput(ctx, "docker", "ps", "--format", "table {{.Names}}\t{{.Status}}\t{{.Ports}}")
+	out, err := r.rt().Output(ctx, "ps", "--format", "table {{.Names}}\t{{.Status}}\t{{.Ports}}")
 	if err != nil {
 		return err
 	}
@@ -2730,7 +2766,7 @@ func (r *runner) showStatus(ctx context.Context) error {
 }
 
 func (r *runner) containerRunning(ctx context.Context, name string) (bool, error) {
-	out, err := commandOutput(ctx, "docker", "inspect", "-f", "{{.State.Running}}", name)
+	out, err := r.rt().Output(ctx, "inspect", "-f", "{{.State.Running}}", name)
 	if err != nil {
 		if isNoSuchObjectError(err) {
 			return false, nil
@@ -2741,7 +2777,7 @@ func (r *runner) containerRunning(ctx context.Context, name string) (bool, error
 }
 
 func (r *runner) containerExists(ctx context.Context, name string) (bool, error) {
-	if _, err := commandOutput(ctx, "docker", "inspect", "-f", "{{.Name}}", name); err != nil {
+	if _, err := r.rt().Output(ctx, "inspect", "-f", "{{.Name}}", name); err != nil {
 		if isNoSuchObjectError(err) {
 			return false, nil
 		}
@@ -2753,7 +2789,7 @@ func (r *runner) containerExists(ctx context.Context, name string) (bool, error)
 func (r *runner) discoverShareDir(ctx context.Context) string {
 	for _, name := range []string{r.cfg.targetContainer, r.cfg.leashContainer} {
 		format := fmt.Sprintf("{{range .Mounts}}{{if eq .Destination %q}}{{.Source}}{{end}}{{end}}", leashPublicMount)
-		out, err := commandOutput(ctx, "docker", "inspect", "--format", format, name)
+		out, err := r.rt().Output(ctx, "inspect", "--format", format, name)
 		if err == nil {
 			candidate := strings.TrimSpace(out)
 			if candidate != "" {
@@ -2821,11 +2857,11 @@ func (r *runner) execShellInTarget(ctx context.Context, command string) error {
 }
 
 func (r *runner) execShellInTargetWithInput(ctx context.Context, command string, input io.Reader) error {
-	return dockerExecWithInput(ctx, r.cfg.targetContainer, command, input)
+	return r.rt().ExecWithInput(ctx, r.cfg.targetContainer, command, input)
 }
 
 var runCommand = runCommandImpl
-var dockerExecWithInput = dockerExecWithInputImpl
+var execWithInput = execWithInputImpl
 
 func runCommandImpl(ctx context.Context, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
@@ -2834,13 +2870,13 @@ func runCommandImpl(ctx context.Context, name string, args ...string) error {
 	return cmd.Run()
 }
 
-func dockerExecWithInputImpl(ctx context.Context, container string, shellCommand string, input io.Reader) error {
+func execWithInputImpl(ctx context.Context, bin, container, shellCommand string, input io.Reader) error {
 	args := []string{"exec"}
 	if input != nil {
 		args = append(args, "-i")
 	}
 	args = append(args, container, "sh", "-c", shellCommand)
-	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	if input != nil {
 		cmd.Stdin = input
 	}
@@ -2866,10 +2902,10 @@ func isNoSuchImageError(err error) bool {
 }
 
 func (r *runner) ensureLocalImage(ctx context.Context, image string) error {
-	if _, err := commandOutput(ctx, "docker", "image", "inspect", image); err != nil {
+	if _, err := r.rt().Output(ctx, "image", "inspect", image); err != nil {
 		if isNoSuchObjectError(err) || isNoSuchImageError(err) {
 			fmt.Printf("Pulling container image %s...\n", image)
-			if pullErr := runCommand(ctx, "docker", "pull", image); pullErr != nil {
+			if pullErr := r.rt().Run(ctx, "pull", image); pullErr != nil {
 				return fmt.Errorf("pull image %s: %w", image, pullErr)
 			}
 			return nil
