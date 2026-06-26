@@ -99,6 +99,7 @@ type options struct {
 	subcommand     string
 	targetImage    string
 	leashImage     string
+	containerName  string
 	listen         string
 	listenSet      bool
 	openUI         bool
@@ -315,6 +316,7 @@ Flags:
   -P, --publish-all               Publish all EXPOSEd ports (host same as container when free, auto-bump on conflicts).
   --image <name[:tag]>            Override the target container image (defaults to %s).
   --leash-image <name[:tag]>      Override the leash manager image (defaults to %s).
+  --container-name <name>         Force the exact agent container name (no sanitization, no collision suffix; leash container becomes <name>-leash).
   -V, --verbose                   Enable verbose logging (also set when -v is provided without a mount spec).
 
 Environment variables:
@@ -415,6 +417,15 @@ func parseArgs(args []string) (options, error) {
 			}
 			opts.leashImage = strings.TrimSpace(args[i+1])
 			i++
+		case "--container-name":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for %s", arg)
+			}
+			opts.containerName = strings.TrimSpace(args[i+1])
+			if opts.containerName == "" {
+				return opts, fmt.Errorf("container name cannot be empty")
+			}
+			i++
 		case "-l", "--listen":
 			if i+1 >= len(args) {
 				return opts, fmt.Errorf("missing argument for %s", arg)
@@ -461,6 +472,11 @@ func parseArgs(args []string) (options, error) {
 			case strings.HasPrefix(arg, "-l="):
 				opts.listen = strings.TrimPrefix(arg, "-l=")
 				opts.listenSet = true
+			case strings.HasPrefix(arg, "--container-name="):
+				opts.containerName = strings.TrimSpace(strings.TrimPrefix(arg, "--container-name="))
+				if opts.containerName == "" {
+					return opts, fmt.Errorf("container name cannot be empty")
+				}
 			case strings.HasPrefix(arg, "--open="):
 				return opts, fmt.Errorf("--open does not take a value")
 			case strings.HasPrefix(arg, "-o="):
@@ -862,6 +878,19 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 		proxyPort:           envOrDefault("LEASH_PROXY_PORT", defaultProxyPort),
 		extraArgs:           os.Getenv("LEASH_EXTRA_ARGS"),
 		cgroupPathOverride:  strings.TrimSpace(os.Getenv("LEASH_CGROUP_PATH")),
+	}
+
+	// --container-name forces an exact target container name (no sanitization,
+	// no collision suffix) so orchestrators can address the agent container
+	// deterministically. Flag wins over TARGET_CONTAINER/LEASH_CONTAINER. The
+	// leash container is named "<name>-leash", mirroring the default convention,
+	// so the whole pair stays deterministic. assignContainerNames skips its
+	// suffix munging when this is set.
+	if name := strings.TrimSpace(opts.containerName); name != "" {
+		cfg.targetContainer = name
+		cfg.targetContainerBase = name
+		cfg.leashContainer = name + "-leash"
+		cfg.leashContainerBase = name + "-leash"
 	}
 
 	if envLeash := strings.TrimSpace(os.Getenv("LEASH_IMAGE")); envLeash != "" {
@@ -1277,6 +1306,26 @@ func (r *runner) assignContainerNames(ctx context.Context) error {
 	baseLeash := r.cfg.leashContainerBase
 	if strings.TrimSpace(baseLeash) == "" {
 		baseLeash = r.cfg.leashContainer
+	}
+
+	// An explicit --container-name must be honored verbatim: no suffix munging.
+	// Renaming silently would defeat the point (orchestrators address the agent
+	// by this exact name), so fail clearly if the name is already taken.
+	if strings.TrimSpace(r.opts.containerName) != "" {
+		targetExists, err := r.containerExists(ctx, baseTarget)
+		if err != nil {
+			return err
+		}
+		leashExists, err := r.containerExists(ctx, baseLeash)
+		if err != nil {
+			return err
+		}
+		if targetExists || leashExists {
+			return fmt.Errorf("container name %q (or %q) already in use; remove the existing container or choose a different --container-name", baseTarget, baseLeash)
+		}
+		r.cfg.targetContainer = baseTarget
+		r.cfg.leashContainer = baseLeash
+		return nil
 	}
 
 	const maxAttempts = 1000
