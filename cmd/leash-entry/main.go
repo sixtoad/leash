@@ -178,16 +178,30 @@ func writeBootstrapMarker() error {
 	}
 	data = append(data, '\n')
 
-	dir := filepath.Dir(bootstrapPath)
+	return writeMarkerAtomic(bootstrapPath, data)
+}
+
+// writeMarkerAtomic writes data to path via a temp file + rename so a reader
+// never observes a partial marker.
+//
+// It deliberately avoids os.CreateTemp: that opens the temp file with O_EXCL,
+// which Docker Desktop's gRPC-FUSE / virtio-fs file sharing rejects with EACCES
+// on macOS — so bootstrap fails even though the directory is writable (the
+// non-O_EXCL os.WriteFile used for /leash/cgroup-path succeeds in the same dir).
+// A PID-suffixed temp name with O_CREATE|O_TRUNC (no O_EXCL) is unique enough —
+// there is one leash-entry per container — and the rename still publishes the
+// marker atomically. See issue #73.
+func writeMarkerAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil && !os.IsExist(err) {
 		return fmt.Errorf("ensure bootstrap dir: %w", err)
 	}
 
-	tmp, err := os.CreateTemp(dir, "bootstrap.ready.*")
+	tmpName := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
+	tmp, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("create temp marker: %w", err)
 	}
-	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
@@ -202,7 +216,7 @@ func writeBootstrapMarker() error {
 		os.Remove(tmpName)
 		return fmt.Errorf("close marker: %w", err)
 	}
-	if err := os.Rename(tmpName, bootstrapPath); err != nil {
+	if err := os.Rename(tmpName, path); err != nil {
 		os.Remove(tmpName)
 		return fmt.Errorf("commit marker: %w", err)
 	}
@@ -252,7 +266,13 @@ func emitCgroupPath() error {
 	}
 
 	if resolved == "" {
-		return fmt.Errorf("cgroup path not detected; ensure container runs with --cgroupns host")
+		// Some environments (notably Docker Desktop with Kubernetes) run the
+		// container in a private cgroup namespace where /proc/self/cgroup reports
+		// "0::/", leaving no scopable cgroup. Rather than aborting the container,
+		// continue without writing cgroup-path: leashd degrades to proxy-only
+		// enforcement (kernel LSM disabled, L7 proxy still active). See issue #67.
+		os.Stderr.WriteString("leash-entry: WARNING: no scopable cgroup in /proc/self/cgroup (e.g. Docker Desktop Kubernetes); continuing without cgroup scoping — kernel LSM enforcement disabled, proxy enforcement remains active\n")
+		return nil
 	}
 
 	if err := os.WriteFile(cgroupPathFile, []byte(resolved+"\n"), 0o644); err != nil {

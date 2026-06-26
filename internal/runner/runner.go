@@ -99,6 +99,7 @@ type options struct {
 	subcommand     string
 	targetImage    string
 	leashImage     string
+	network        string
 	listen         string
 	listenSet      bool
 	openUI         bool
@@ -136,6 +137,7 @@ type config struct {
 	leashImageDevFile   string
 	listenCfg           listen.Config
 	listenExplicit      bool
+	dockerNetwork       string
 }
 
 type runner struct {
@@ -315,6 +317,7 @@ Flags:
   -P, --publish-all               Publish all EXPOSEd ports (host same as container when free, auto-bump on conflicts).
   --image <name[:tag]>            Override the target container image (defaults to %s).
   --leash-image <name[:tag]>      Override the leash manager image (defaults to %s).
+  --network <name>                Attach the agent container to a docker network (e.g. a compose network). The leash container follows it automatically.
   -V, --verbose                   Enable verbose logging (also set when -v is provided without a mount spec).
 
 Environment variables:
@@ -329,6 +332,7 @@ Environment variables:
   LEASH_WORKSPACE              Overrides project workspace detection.
   LEASH_BOOTSTRAP_TIMEOUT      Controls bootstrap timeout duration.
   LEASH_LISTEN                 Overrides Control UI bind address.
+  LEASH_NETWORK                Docker network for the agent container (overridden by --network).
   LEASH_EXTRA_ARGS             Additional arguments passed into leash-entry.
   LEASH_CGROUP_PATH            Override cgroup path for the leash container.
   LEASH_HOME                   Base directory for persisted leash state.
@@ -415,6 +419,12 @@ func parseArgs(args []string) (options, error) {
 			}
 			opts.leashImage = strings.TrimSpace(args[i+1])
 			i++
+		case "--network":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for %s", arg)
+			}
+			opts.network = strings.TrimSpace(args[i+1])
+			i++
 		case "-l", "--listen":
 			if i+1 >= len(args) {
 				return opts, fmt.Errorf("missing argument for %s", arg)
@@ -461,6 +471,8 @@ func parseArgs(args []string) (options, error) {
 			case strings.HasPrefix(arg, "-l="):
 				opts.listen = strings.TrimPrefix(arg, "-l=")
 				opts.listenSet = true
+			case strings.HasPrefix(arg, "--network="):
+				opts.network = strings.TrimSpace(strings.TrimPrefix(arg, "--network="))
 			case strings.HasPrefix(arg, "--open="):
 				return opts, fmt.Errorf("--open does not take a value")
 			case strings.HasPrefix(arg, "-o="):
@@ -724,7 +736,46 @@ func resolveWorkspaceCandidate(candidate string) (string, error) {
 
 func createTempWorkDir(callerDir string) (string, error) {
 	prefix := tempWorkDirPrefix(callerDir)
-	return os.MkdirTemp("", prefix)
+	return os.MkdirTemp(defaultWorkDirBase(), prefix)
+}
+
+// workDirBaseFor returns the parent directory for per-run work dirs given the
+// host OS and the user's home directory. An empty string means "use the system
+// temp dir" (os.MkdirTemp's default).
+//
+// On macOS the Docker runtime (Docker Desktop, colima, OrbStack, Rancher) runs
+// containers inside a Linux VM, and bind mounts are satisfied by sharing host
+// paths into that VM. The system temp dir — os.TempDir() resolves to
+// /var/folders/... on macOS — is NOT shared by default, so a /leash bind mount
+// sourced there shows up empty inside the container and
+// `exec /leash/leash-entry-linux-<arch>` fails (issue #63). The user's home
+// directory IS shared by default on all of those runtimes, so anchor the work
+// dir under ~/.leash/run instead. Other platforms keep the system temp dir:
+// native Linux Docker shares the host filesystem directly, so /var/folders has
+// no analogue and /tmp works.
+func workDirBaseFor(goos, home string) string {
+	if goos == "darwin" && home != "" {
+		return filepath.Join(home, ".leash", "run")
+	}
+	return ""
+}
+
+// defaultWorkDirBase resolves workDirBaseFor for the current host and ensures
+// the directory exists. On any failure it falls back to the system temp dir so
+// the relocation can never make leash worse off than before.
+func defaultWorkDirBase() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	base := workDirBaseFor(runtime.GOOS, home)
+	if base == "" {
+		return ""
+	}
+	if err := os.MkdirAll(base, 0o755); err != nil {
+		return ""
+	}
+	return base
 }
 
 func tempWorkDirPrefix(callerDir string) string {
@@ -1007,6 +1058,16 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 	}
 	cfg.listenCfg = listenCfg
 	cfg.listenExplicit = listenExplicit
+
+	// Docker network for the target (agent) container. The leash container joins
+	// the target's network namespace via `--network container:<target>`, so it
+	// follows the target onto whatever network this selects and traffic
+	// interception is unaffected. Flag takes precedence over LEASH_NETWORK.
+	cfg.dockerNetwork = strings.TrimSpace(os.Getenv("LEASH_NETWORK"))
+	if trimmed := strings.TrimSpace(opts.network); trimmed != "" {
+		cfg.dockerNetwork = trimmed
+	}
+
 	cleanupTemp = false
 	return cfg, resolvedEnv, nil
 }
@@ -1826,6 +1887,11 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 		"--name", r.cfg.targetContainer,
 		"--entrypoint", filepath.Join(leashPublicMount, entryName),
 		"--cgroupns", "host",
+	}
+	// Join the user-requested docker network (issue #69). The leash container
+	// attaches to this container's netns, so it follows onto the same network.
+	if net := r.cfg.dockerNetwork; net != "" {
+		args = append(args, "--network", net)
 	}
 	if !r.cfg.listenCfg.Disable {
 		if publish := r.cfg.listenCfg.DockerPublish(); publish != "" {

@@ -95,6 +95,7 @@ target_image = "ghcr.io/example/dev:latest"
 | Leash manager image     | `--leash-image`, `LEASH_IMAGE`          | Override when testing custom manager builds.          |
 | Cedar policy file       | `--policy`, `LEASH_POLICY_FILE`         | Mount a specific Cedar policy.                        |
 | Control UI bind address | `--listen`, `LEASH_LISTEN`              | Blank value binds to default 127.0.0.1:18080          |
+| Agent docker network    | `--network`, `LEASH_NETWORK`            | Attach the agent to an existing docker network (e.g. a compose network) so it can reach sibling services. |
 | Extra bind mount        | `-v src:dst[:ro]`                       | Repeatable for multiple mounts.                       |
 | Environment variables   | `-e KEY=value`                          | Forwarded into both containers.                       |
 
@@ -119,5 +120,6 @@ Dive deeper with [CEDAR.md](docs/design/CEDAR.md) for ready-to-adapt snippets.
 
 ## Troubleshooting & Next Steps
 
+- **macOS:** Docker runtimes that run inside a VM (Docker Desktop, colima, OrbStack, Rancher) only share the host paths you grant them. Leash anchors its per-run work directory under `~/.leash/run` precisely because the home directory is shared by default — the system temp dir (`/var/folders`) is not, which otherwise leaves the `/leash` mount empty and fails with `stat /leash/leash-entry-linux-<arch>: no such file or directory`. If you point `LEASH_WORK_DIR`/`LEASH_SHARE_DIR` somewhere else, make sure that path is shared into the VM (e.g. `colima start --mount ~:w`).
 - Reset mount decisions or inspect config behavior with the tips in [CONFIG.md](docs/CONFIG.md#L1).
 - Explore the development process in [DEVELOPMENT.md](docs/DEVELOPMENT.md) and [CONTRIBUTORS.md](CONTRIBUTORS.md).
