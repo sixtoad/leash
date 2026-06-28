@@ -1243,6 +1243,10 @@ func (r *runner) rt() Runtime {
 }
 
 func (r *runner) startContainers(ctx context.Context) error {
+	if err := r.preflightHostKernel(); err != nil {
+		return err
+	}
+
 	r.logDevImageSelections()
 
 	if err := r.assignContainerNames(ctx); err != nil {
