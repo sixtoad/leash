@@ -87,3 +87,28 @@ Examples:
 - `leash --darwin exec …` expects the companion CLI at `/Applications/Leash.app/Contents/Resources/leashcli`; moving the app can break launches.
 - Requires macOS 14+ for extension activation.
 - Only supports connecting to the server at `localhost:18080`
+
+## Enforcement preflight (native mode) — work in progress
+
+Native `--darwin` enforcement depends on the Endpoint Security (ES) and Network
+Extension (NE) system extensions being **activated and approved**. There is no
+Layer‑2 MITM proxy fallback on macOS, so if those extensions are not active,
+nothing enforces. Previously leash would start and run silently unprotected.
+
+`leashd` now runs a preflight (`internal/darwind/preflight_extensions_darwin.go`)
+that queries `systemextensionsctl list` and reports the ES/NE activation state.
+By default it **warns** that the agent will run unenforced and continues; set
+`LEASH_REQUIRE_ENFORCEMENT=1` to make a missing/inactive extension a **hard
+stop** (the macOS analog of Linux's `--require-lsm`).
+
+This is a scaffold to be finished and verified on a real Mac — see the
+`TODO(macOS agent)` block in `preflight_extensions_darwin.go`:
+- verify `systemextensionsctl list` parsing against captured output (the parser
+  in `extension_state.go` is ported from the Swift `interpretExtensionEntry` and
+  is unit‑tested, but the live format should be confirmed);
+- add **Full Disk Access** detection for the ES extension (no public API);
+- decide whether the NE content filter's *enabled* state needs a deeper check
+  than extension activation (`NEFilterManager.isEnabled`);
+- decide the **default**: warn‑and‑continue (current) vs. hard‑stop. Because
+  native macOS has no proxy fallback, hard‑stop is a defensible default here even
+  though Linux degrades to proxy‑only.
