@@ -422,6 +422,14 @@ func preFlight(cfg *runtimeConfig) error {
 		return fmt.Errorf("inspect CA key at %q: %w", keyPath, err)
 	}
 
+	// Native macOS enforcement relies on the ES/NE system extensions (no Layer-2
+	// proxy fallback). Surface it up front if they aren't active instead of
+	// running silently unprotected. Warns by default; LEASH_REQUIRE_ENFORCEMENT
+	// makes it fatal.
+	if err := preflightDarwinEnforcement(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
