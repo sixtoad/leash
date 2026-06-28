@@ -15,19 +15,41 @@ type LSMManager struct {
 	cgroupPath string
 	logger     *SharedLogger
 
+	// requireLSM makes an eBPF LSM attach failure fatal instead of degrading to
+	// proxy-only enforcement.
+	requireLSM bool
+
 	// Active LSM programs
 	openLsm    *OpenLsm
 	execLsm    *ExecLsm
 	connectLsm *ConnectLsm
 
 	reloadMutex sync.RWMutex
+	degradeOnce sync.Once
 }
 
-func NewLSMManager(cgroupPath string, logger *SharedLogger) *LSMManager {
+func NewLSMManager(cgroupPath string, logger *SharedLogger, requireLSM bool) *LSMManager {
 	return &LSMManager{
 		cgroupPath: cgroupPath,
 		logger:     logger,
+		requireLSM: requireLSM,
 	}
+}
+
+// handleAttachFailure decides what happens when an eBPF LSM program fails to
+// attach (most often because the kernel doesn't have "bpf" as an active LSM).
+// With requireLSM it is fatal; otherwise leash degrades to proxy-only (Layer 2,
+// fail-closed) and continues, warning loudly once.
+func (m *LSMManager) handleAttachFailure(label string, err error) {
+	if m.requireLSM {
+		fmt.Fprintf(os.Stderr, "leash: FATAL: %s LSM failed to attach and --require-lsm is set: %v\n", label, err)
+		os.Exit(1)
+	}
+	m.degradeOnce.Do(func() {
+		fmt.Fprintf(os.Stderr, "leash: WARNING: eBPF LSM enforcement (Layer 1) is unavailable (%s: %v).\n", label, err)
+		fmt.Fprintf(os.Stderr, "leash: continuing in degraded proxy-only mode — filesystem/exec/socket policies are NOT enforced; the L7 proxy (Layer 2) remains active and fail-closed.\n")
+		fmt.Fprintf(os.Stderr, "leash: enable the bpf LSM (lsm=...,bpf in the kernel cmdline) or pass --require-lsm to make this fatal.\n")
+	})
 }
 
 func (m *LSMManager) LoadAndStart() error {
@@ -72,7 +94,7 @@ func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
 
 		go func() {
 			if err := m.openLsm.LoadAndAttach(loadLsmOpen); err != nil {
-				fmt.Fprintf(os.Stderr, "File open LSM error: %v\n", err)
+				m.handleAttachFailure("file-open", err)
 			}
 		}()
 	} else {
@@ -105,7 +127,7 @@ func (m *LSMManager) updateExecLSM(policies *PolicySet) error {
 
 		go func() {
 			if err := m.execLsm.LoadAndAttach(loadLsmExec); err != nil {
-				fmt.Fprintf(os.Stderr, "Exec LSM error: %v\n", err)
+				m.handleAttachFailure("exec", err)
 			}
 		}()
 	} else {
@@ -143,7 +165,7 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 
 		go func() {
 			if err := m.connectLsm.LoadAndAttach(loadLsmConnect); err != nil {
-				fmt.Fprintf(os.Stderr, "Connect LSM error: %v\n", err)
+				m.handleAttachFailure("connect", err)
 			}
 		}()
 	} else {

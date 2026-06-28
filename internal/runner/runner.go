@@ -104,6 +104,7 @@ type options struct {
 	openUI         bool
 	publishes      []publishSpec
 	publishAll     bool
+	requireLSM     bool
 }
 
 type config struct {
@@ -136,6 +137,7 @@ type config struct {
 	leashImageDevFile   string
 	listenCfg           listen.Config
 	listenExplicit      bool
+	requireLSM          bool
 }
 
 type runner struct {
@@ -315,6 +317,7 @@ Flags:
   -P, --publish-all               Publish all EXPOSEd ports (host same as container when free, auto-bump on conflicts).
   --image <name[:tag]>            Override the target container image (defaults to %s).
   --leash-image <name[:tag]>      Override the leash manager image (defaults to %s).
+  --require-lsm                   Fail if the host kernel can't run the eBPF LSM layer (default: warn and continue proxy-only).
   -V, --verbose                   Enable verbose logging (also set when -v is provided without a mount spec).
 
 Environment variables:
@@ -331,6 +334,7 @@ Environment variables:
   LEASH_LISTEN                 Overrides Control UI bind address.
   LEASH_EXTRA_ARGS             Additional arguments passed into leash-entry.
   LEASH_CGROUP_PATH            Override cgroup path for the leash container.
+  LEASH_REQUIRE_LSM            Truthy to require the eBPF LSM layer (same as --require-lsm).
   LEASH_HOME                   Base directory for persisted leash state.
 
 	Persisted mount decisions live at $XDG_CONFIG_HOME/leash/config.toml (or ~/.config/leash/config.toml). Set LEASH_HOME to override this base directory.
@@ -424,6 +428,8 @@ func parseArgs(args []string) (options, error) {
 			i++
 		case "-o", "--open":
 			opts.openUI = true
+		case "--require-lsm":
+			opts.requireLSM = true
 		case "-h", "--help", "help":
 			return opts, errShowUsage
 		case "--":
@@ -465,6 +471,8 @@ func parseArgs(args []string) (options, error) {
 				return opts, fmt.Errorf("--open does not take a value")
 			case strings.HasPrefix(arg, "-o="):
 				return opts, fmt.Errorf("-o does not take a value")
+			case strings.HasPrefix(arg, "--require-lsm="):
+				return opts, fmt.Errorf("--require-lsm does not take a value")
 			case strings.HasPrefix(arg, "-v="):
 				volume := strings.TrimPrefix(arg, "-v=")
 				if volume == "" {
@@ -1007,6 +1015,11 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 	}
 	cfg.listenCfg = listenCfg
 	cfg.listenExplicit = listenExplicit
+
+	// Require the eBPF LSM layer (hard-stop instead of proxy-only degrade) when
+	// the flag is set or LEASH_REQUIRE_LSM is truthy.
+	cfg.requireLSM = opts.requireLSM || envTruthy("LEASH_REQUIRE_LSM")
+
 	cleanupTemp = false
 	return cfg, resolvedEnv, nil
 }
@@ -1032,6 +1045,11 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envTruthy(key string) bool {
+	v := strings.TrimSpace(os.Getenv(key))
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
 }
 
 func resolvePolicyPath(base, candidate string) (string, error) {
@@ -2121,6 +2139,14 @@ func (r *runner) launchLeashContainer(ctx context.Context, cgroupPath string) er
 		fmt.Sprintf("LEASH_BOOTSTRAP_TIMEOUT=%s", r.cfg.bootstrapTimeout.String()),
 		fmt.Sprintf("LEASH_DIR=%s", leashPublicMount),
 		fmt.Sprintf("LEASH_PRIVATE_DIR=%s", leashPrivateMount),
+	}
+
+	// Propagate --require-lsm so leashd fails hard (rather than degrading to
+	// proxy-only) if its eBPF LSM layer can't attach.
+	if r.cfg.requireLSM {
+		value := "LEASH_REQUIRE_LSM=1"
+		args = append(args, "-e", value)
+		leashEnv = append(leashEnv, value)
 	}
 
 	// n.b. Used to show `<title>Leash | {workspace} > {command}</title>` in the frontend.

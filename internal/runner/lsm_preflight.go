@@ -50,13 +50,13 @@ func classifyBPFLSM(activeLSMs []string, configBPFLSM string) bpfLSMStatus {
 	}
 }
 
-// bpfLSMError renders an actionable error for a non-active status. It returns
-// nil for bpfLSMActive.
-func bpfLSMError(status bpfLSMStatus, activeLSMs []string) error {
+// bpfLSMAdvice renders the actionable remedy for a non-active status. It returns
+// "" for bpfLSMActive.
+func bpfLSMAdvice(status bpfLSMStatus, activeLSMs []string) string {
 	active := strings.Join(activeLSMs, ",")
 	switch status {
 	case bpfLSMInactiveCompiled:
-		return fmt.Errorf(`leash needs the eBPF LSM, which this kernel supports (CONFIG_BPF_LSM=y) but has not enabled.
+		return fmt.Sprintf(`This kernel supports the eBPF LSM (CONFIG_BPF_LSM=y) but has not enabled it.
   active LSMs: %s  (missing "bpf")
 Enable it by adding bpf to the kernel LSM list and rebooting:
   1. edit /etc/default/grub and append bpf to the lsm= list in GRUB_CMDLINE_LINUX, e.g.
@@ -64,21 +64,27 @@ Enable it by adding bpf to the kernel LSM list and rebooting:
   2. sudo update-grub && sudo reboot
 After reboot, %s should include "bpf".`, active, active, activeLSMPath)
 	case bpfLSMNotCompiled:
-		return fmt.Errorf(`leash needs the eBPF LSM, but this kernel was built without CONFIG_BPF_LSM.
+		return fmt.Sprintf(`This kernel was built without CONFIG_BPF_LSM.
   active LSMs: %s
 This cannot be enabled at runtime — boot a kernel built with CONFIG_BPF_LSM=y and CONFIG_DEBUG_INFO_BTF=y (Linux >= 5.7).`, active)
 	case bpfLSMUnknown:
-		return fmt.Errorf(`leash needs the eBPF LSM, but "bpf" is not among the active LSMs (%s) and the kernel config could not be read to confirm support.
+		return fmt.Sprintf(`"bpf" is not among the active LSMs (%s) and the kernel config could not be read to confirm support.
 If this kernel has CONFIG_BPF_LSM, add bpf to the lsm= boot parameter and reboot; otherwise boot a kernel built with CONFIG_BPF_LSM=y (Linux >= 5.7).`, active)
 	default:
-		return nil
+		return ""
 	}
 }
 
-// preflightHostKernel verifies the host kernel can host leash's eBPF LSM layer.
-// It is only meaningful for a local Linux host-kernel runtime: the agent's
-// container shares the host kernel, so /sys here describes the kernel leash
-// attaches to. On macOS the kernel lives in a VM and remote daemons run
+// preflightHostKernel checks whether the host kernel can host leash's eBPF LSM
+// layer (Layer 1). Following leash's defense-in-depth model — where the MITM
+// proxy (Layer 2) is fail-closed and independent — a missing Layer 1 is NOT
+// fatal by default: leash warns loudly and continues with proxy-only
+// enforcement. `--require-lsm` (or LEASH_REQUIRE_LSM) flips this to a hard stop
+// for environments that mandate full enforcement.
+//
+// The check is only meaningful for a local Linux host-kernel runtime: the
+// agent's container shares the host kernel, so /sys here describes the kernel
+// leash attaches to. On macOS the kernel lives in a VM and remote daemons run
 // elsewhere, so those are deferred to leashd in-guest and skipped here.
 func (r *runner) preflightHostKernel() error {
 	if runtime.GOOS != "linux" {
@@ -95,10 +101,28 @@ func (r *runner) preflightHostKernel() error {
 		return nil
 	}
 	status := classifyBPFLSM(active, readKernelConfigBPFLSM())
-	if status == bpfLSMActive {
-		return nil
+	warn, err := decideBPFLSM(status, active, r.cfg.requireLSM)
+	if err != nil {
+		return err
 	}
-	return bpfLSMError(status, active)
+	if warn != "" && r.logger != nil {
+		r.logger.Printf("%s", warn)
+	}
+	return nil
+}
+
+// decideBPFLSM turns a status into either a fatal error (when requireLSM) or a
+// loud warning (the default proxy-only degrade). For bpfLSMActive it returns
+// ("", nil). Pure, so the warn-vs-fail policy is unit-testable.
+func decideBPFLSM(status bpfLSMStatus, active []string, requireLSM bool) (string, error) {
+	if status == bpfLSMActive {
+		return "", nil
+	}
+	advice := bpfLSMAdvice(status, active)
+	if requireLSM {
+		return "", fmt.Errorf("eBPF LSM enforcement (Layer 1) is unavailable and --require-lsm is set, so leash will not start.\n%s", advice)
+	}
+	return "WARNING: eBPF LSM enforcement (Layer 1) is unavailable; continuing with proxy-only enforcement (Layer 2 is fail-closed). Filesystem/exec/socket policies will NOT be enforced — pass --require-lsm to require Layer 1.\n" + advice, nil
 }
 
 func readActiveLSMs() ([]string, error) {
