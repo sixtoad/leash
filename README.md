@@ -119,5 +119,6 @@ Dive deeper with [CEDAR.md](docs/design/CEDAR.md) for ready-to-adapt snippets.
 
 ## Troubleshooting & Next Steps
 
+- **Linux: "leash needs the eBPF LSM…"** — leash's Layer 1 enforcement is an eBPF LSM program, which only attaches when `bpf` is one of the kernel's *active* LSMs (`cat /sys/kernel/security/lsm`). Many distros ship `CONFIG_BPF_LSM=y` but don't enable it at boot. leash detects this up front and prints the fix: append `bpf` to the `lsm=` list in `GRUB_CMDLINE_LINUX` (`/etc/default/grub`), then `sudo update-grub && sudo reboot`. If the kernel lacks `CONFIG_BPF_LSM` entirely, you need a kernel built with it (Linux ≥ 5.7, plus `CONFIG_DEBUG_INFO_BTF=y`).
 - Reset mount decisions or inspect config behavior with the tips in [CONFIG.md](docs/CONFIG.md#L1).
 - Explore the development process in [DEVELOPMENT.md](docs/DEVELOPMENT.md) and [CONTRIBUTORS.md](CONTRIBUTORS.md).
