@@ -348,7 +348,11 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 	go wsHub.Run()
 	logger.SetBroadcaster(wsHub)
 
-	lsmManager := lsm.NewLSMManager(cfg.CgroupPath, logger)
+	// LEASH_REQUIRE_LSM (set by the client's --require-lsm) makes an eBPF LSM
+	// attach failure fatal instead of degrading to proxy-only enforcement.
+	reqLSM := strings.TrimSpace(os.Getenv("LEASH_REQUIRE_LSM"))
+	requireLSM := reqLSM == "1" || strings.EqualFold(reqLSM, "true") || strings.EqualFold(reqLSM, "yes")
+	lsmManager := lsm.NewLSMManager(cfg.CgroupPath, logger, requireLSM)
 	lsm.BumpMemlockRlimit()
 
 	headerRewriter := proxy.NewHeaderRewriter()

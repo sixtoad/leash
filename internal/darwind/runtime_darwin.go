@@ -443,7 +443,7 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 
 	var lsmManager *lsm.LSMManager
 	if !cfg.SkipCgroup {
-		lsmManager = lsm.NewLSMManager(cfg.CgroupPath, logger)
+		lsmManager = lsm.NewLSMManager(cfg.CgroupPath, logger, false)
 		lsm.BumpMemlockRlimit()
 	} else {
 		logPolicyEvent("runtime.mode", map[string]any{

@@ -490,9 +490,12 @@ func LoadAndAttachBPFWithSetup(
 			Program: coll.Programs[programName],
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to attach %s LSM program: %v\n", programName, err)
-			fmt.Fprintf(os.Stderr, "Note: LSM attachment requires proper kernel support\n")
-			os.Exit(1)
+			// Return the error rather than exiting so the caller can decide
+			// whether to degrade to proxy-only (the default) or fail hard
+			// (--require-lsm). The deferred loop above closes any links that
+			// already attached. The most common cause is the kernel not having
+			// "bpf" as an active LSM (see the client-side preflight).
+			return fmt.Errorf("attach %s LSM program (kernel may lack an active bpf LSM): %w", programName, err)
 		}
 		links = append(links, lsmLink)
 	}
