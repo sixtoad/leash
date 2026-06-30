@@ -2,22 +2,12 @@ package runner
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 )
-
-// errHostModeNotBuilt is returned by nativeLauncher.StartEnforcement. The box
-// lifecycle below is real and runnable, but the enforcement engine it would
-// attach (leashd --host: eBPF LSM + proxy on a host process) is specified, not
-// yet implemented — see docs/LEASHD-HOST-MODE.md.
-var errHostModeNotBuilt = errors.New(
-	"native runtime: the container-free box is provisioned, but enforcement is not wired yet — " +
-		"leashd host mode (leash --daemon --host) is specified in docs/LEASHD-HOST-MODE.md but not built. " +
-		"Use --runtime docker|podman for an enforced run.")
 
 // nativeLauncher implements launcher without a container runtime: the workload
 // runs in a delegated systemd cgroup-v2 scope (Layer-1 attach point) plus, when
@@ -117,9 +107,68 @@ func (n nativeLauncher) Provision(ctx context.Context, stopSignal string) (strin
 	return cgroupPath, nil
 }
 
-// StartEnforcement is intentionally unimplemented: see errHostModeNotBuilt.
+// StartEnforcement runs leashd host mode (leash --daemon --host) inside the
+// workload's network namespace via nsenter, re-execing this same binary —
+// leashd attaches the eBPF LSM to cgroupPath and applies the netns-scoped
+// netfilter + proxy (see docs/LEASHD-HOST-MODE.md). It runs only when the
+// prerequisites hold (root for the named netns + netfilter); otherwise it
+// returns an actionable error that names the blocker and the exact command it
+// would run, rather than failing opaquely. (Enforcement also needs an active
+// bpf LSM — the lsm=…,bpf reboot — which leashd reports when it attempts attach.)
 func (n nativeLauncher) StartEnforcement(ctx context.Context, cgroupPath string) error {
-	return errHostModeNotBuilt
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("native: locate leash binary: %w", err)
+	}
+	netnsPath := n.netnsRunPath()
+	argv := n.hostLeashdArgv(self, netnsPath, cgroupPath)
+
+	if blocker := n.enforcementBlocker(netnsPath); blocker != "" {
+		return fmt.Errorf(
+			"native enforcement not startable: %s. The container-free box is provisioned; "+
+				"would run: %s (see docs/LEASHD-HOST-MODE.md)",
+			blocker, strings.Join(argv, " "))
+	}
+
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	return cmd.Start()
+}
+
+// netnsRunPath is the iproute2 named-netns path Provision creates (when root).
+func (n nativeLauncher) netnsRunPath() string {
+	return filepath.Join("/run/netns", n.netnsName())
+}
+
+// hostLeashdArgv builds the command that launches leashd host mode in the
+// workload's netns: nsenter --net=<ns> -- <self> --daemon --host --cgroup <cg>
+// [--proxy-port …] [--listen …]. Pure, so it is unit-tested directly.
+func (n nativeLauncher) hostLeashdArgv(self, netnsPath, cgroupPath string) []string {
+	argv := []string{"nsenter", "--net=" + netnsPath, "--", self, "--daemon", "--host", "--cgroup", cgroupPath}
+	if port := strings.TrimSpace(n.r.cfg.proxyPort); port != "" {
+		argv = append(argv, "--proxy-port", port)
+	}
+	if !n.r.cfg.listenCfg.Disable {
+		// Skip an unresolved address (zero-value Config yields ":"); a real run
+		// has a concrete host:port here.
+		if addr := strings.TrimSpace(n.r.cfg.listenCfg.Address()); addr != "" && addr != ":" {
+			argv = append(argv, "--listen", addr)
+		}
+	}
+	return argv
+}
+
+// enforcementBlocker reports why enforcement can't start here, or "" if it can.
+// Native enforcement needs root: Provision only creates the named netns when
+// privileged, and applying netfilter inside it requires CAP_NET_ADMIN.
+func (n nativeLauncher) enforcementBlocker(netnsPath string) string {
+	if n.useUserManager() {
+		return "requires root for the workload network namespace + netfilter (the box ran rootless, so no named netns was created)"
+	}
+	if _, err := os.Stat(netnsPath); err != nil {
+		return fmt.Sprintf("network namespace %s not found", netnsPath)
+	}
+	return ""
 }
 
 // WaitReady has nothing to wait on until leashd host mode provides a readiness
