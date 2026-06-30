@@ -2,9 +2,37 @@ package runner
 
 import (
 	"context"
+	"io"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
+
+// recordingRuntime is an in-memory Runtime that records image inspections, so
+// launcher tests need not swap package-level globals (which races the other
+// global-swapping tests in this package).
+type recordingRuntime struct {
+	inspected *[]string
+}
+
+func (rr recordingRuntime) Run(ctx context.Context, args ...string) error { return nil }
+
+func (rr recordingRuntime) Output(ctx context.Context, args ...string) (string, error) {
+	if len(args) >= 3 && args[0] == "image" && args[1] == "inspect" {
+		*rr.inspected = append(*rr.inspected, args[2])
+	}
+	return "ok", nil
+}
+
+func (rr recordingRuntime) ExecWithInput(ctx context.Context, container, shellCommand string, input io.Reader) error {
+	return nil
+}
+
+func (rr recordingRuntime) Cmd(ctx context.Context, args ...string) *exec.Cmd {
+	return exec.CommandContext(ctx, "true")
+}
+
+func (rr recordingRuntime) Name() string { return "fake" }
 
 func TestRunnerLauncherDefaultsToContainer(t *testing.T) {
 	r := &runner{}
@@ -36,26 +64,13 @@ func TestCACertPath(t *testing.T) {
 	}
 }
 
-// PullImages must drive the same wrappers ensureLocalImage used, in order
-// (target then leash). We intercept commandOutput to record image inspections.
+// PullImages must inspect (and so would pull) target before leash. Uses an
+// injected Runtime — no package globals touched.
 func TestContainerLauncherPullImagesOrder(t *testing.T) {
-	mountStateTestMu.Lock()
-	defer mountStateTestMu.Unlock()
-
-	origOut := commandOutput
-	defer func() { commandOutput = origOut }()
+	t.Parallel()
 
 	var inspected []string
-	commandOutput = func(ctx context.Context, name string, args ...string) (string, error) {
-		// `image inspect <img>` — record the image so we can assert order. A
-		// successful inspect means "present", so no pull is attempted.
-		if len(args) >= 3 && args[0] == "image" && args[1] == "inspect" {
-			inspected = append(inspected, args[2])
-		}
-		return "ok", nil
-	}
-
-	r := &runner{}
+	r := &runner{runtime: recordingRuntime{inspected: &inspected}}
 	r.cfg.targetImage = "target:latest"
 	r.cfg.leashImage = "leash:latest"
 
