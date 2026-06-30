@@ -110,6 +110,25 @@ PoC slots in at step 2's entry point.
 
 ## Open questions / risks to resolve before step 2
 
+- **Mounts become allow-directory policy rules (resolved — this is how native
+  handles working dirs).** In the container world `WorkloadSpec.Mounts` are
+  bind-mounts and confinement is *what's mounted* (mount-ns isolation: the agent
+  can't see what isn't mounted). The native world has **no mounts** — the agent
+  runs on the real host filesystem and sees everything; confinement is *policy
+  denies by path*. So `Provision` in a native launcher does **not** mount
+  anything: it seeds the policy with each `Mount.Host` as an **allowed directory
+  scope**, and the workload's working dir becomes the natural allow-prefix.
+  macOS already proves the pattern: `LeashPolicyRule.matches`
+  (`mac-leash/Shared/PolicyModels.swift`) enforces `file_open` by a normalized
+  `hasPrefix` over a `directory(String)` scope, with grant granularity
+  `once | always | directory(path)` — the path-prefix grant *is* the "mount."
+  Linux-native mirrors it exactly: the eBPF LSM `file_open` allow-rule has the
+  same prefix shape as ES's `hasPrefix`. Consequence: `WorkloadSpec.Mounts` is a
+  cross-backend *intent* ("the agent should have this dir"); `containerLauncher`
+  realizes it as `-v host:dest`, `nativeLauncher` as an allow-`directory` rule.
+  Trade-off is the documented one — policy boundary holds, isolation does not (an
+  allowed read is the real file, not a sandboxed copy): "leash on my real
+  machine."
 - **leashd host mode.** Does leashd hard-assume container paths/mounts? Host mode
   needs path config + the ability to attach given just a cgroup path. This is the
   real new work, not the box.
