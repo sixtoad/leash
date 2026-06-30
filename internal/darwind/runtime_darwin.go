@@ -293,6 +293,17 @@ func preFlight(cfg *runtimeConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("runtime configuration required")
 	}
+
+	// Native macOS enforcement relies on the ES/NE system extensions and has no
+	// Layer-2 proxy fallback (see docs/MACOS.md), so a missing/inactive extension
+	// means zero enforcement. Hard-stop FIRST — before creating/chmod'ing any
+	// directories, keys, or log files — rather than run silently unprotected.
+	// Note: --allow-lsm-failure / LEASH_ALLOW_LSM_FAILURE governs eBPF Layer-1
+	// (which native macOS does not use) and deliberately does NOT relax this gate.
+	if err := preflightDarwinEnforcement(); err != nil {
+		return err
+	}
+
 	policyPath := strings.TrimSpace(cfg.PolicyPath)
 	if policyPath == "" {
 		return fmt.Errorf("policy file path required")
@@ -420,14 +431,6 @@ func preFlight(cfg *runtimeConfig) error {
 		}
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("inspect CA key at %q: %w", keyPath, err)
-	}
-
-	// Native macOS enforcement relies on the ES/NE system extensions (no Layer-2
-	// proxy fallback). Surface it up front if they aren't active instead of
-	// running silently unprotected. Warns by default; LEASH_REQUIRE_ENFORCEMENT
-	// makes it fatal.
-	if err := preflightDarwinEnforcement(); err != nil {
-		return err
 	}
 
 	return nil

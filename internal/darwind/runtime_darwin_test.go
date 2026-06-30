@@ -2,12 +2,40 @@ package darwind
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// stubEnforcementOK neutralizes the native-enforcement hard stop so tests that
+// exercise other preFlight behavior do not require active ES/NE system
+// extensions on the test machine. Restored automatically via t.Cleanup.
+func stubEnforcementOK(t *testing.T) {
+	t.Helper()
+	orig := preflightDarwinEnforcement
+	preflightDarwinEnforcement = func() error { return nil }
+	t.Cleanup(func() { preflightDarwinEnforcement = orig })
+}
+
+func TestPreFlightHardStopsWhenEnforcementUnavailable(t *testing.T) {
+	// t.Parallel avoided: mutates the package-level preflightDarwinEnforcement var.
+	orig := preflightDarwinEnforcement
+	preflightDarwinEnforcement = func() error { return fmt.Errorf("ES/NE not active") }
+	t.Cleanup(func() { preflightDarwinEnforcement = orig })
+
+	cfg := &runtimeConfig{
+		PolicyPath: filepath.Join(t.TempDir(), "policy.cedar"),
+		SkipCgroup: true,
+		ProxyPort:  "18000",
+	}
+	err := preFlight(cfg)
+	if err == nil || !strings.Contains(err.Error(), "ES/NE not active") {
+		t.Fatalf("preFlight should propagate the enforcement hard stop, got: %v", err)
+	}
+}
 
 func TestRunExecRequiresCommand(t *testing.T) {
 	t.Parallel()
@@ -115,6 +143,7 @@ func TestParseConfigOpenEnvOverriddenByFlag(t *testing.T) {
 }
 
 func TestPreFlightSetsDefaultPrivateDir(t *testing.T) {
+	stubEnforcementOK(t)
 	// t.Parallel avoided: this test mutates process-wide environment variables and
 	// log sinks; running in parallel would race with other tests that rely on the
 	// same globals.
@@ -168,6 +197,7 @@ func TestPreFlightSetsDefaultPrivateDir(t *testing.T) {
 }
 
 func TestPreFlightRepairsPrivateDirPermissions(t *testing.T) {
+	stubEnforcementOK(t)
 	// t.Parallel avoided: relies on shared environment variables and redirects the
 	// global logger, both of which are process-wide state.
 	origPublic, hadPublic := os.LookupEnv("LEASH_DIR")
@@ -231,6 +261,7 @@ func TestPreFlightRepairsPrivateDirPermissions(t *testing.T) {
 }
 
 func TestPreFlightRepairsPrivateKeyPermissions(t *testing.T) {
+	stubEnforcementOK(t)
 	// t.Parallel avoided: manipulates global env vars and logger output.
 	origPublic, hadPublic := os.LookupEnv("LEASH_DIR")
 	origPrivate, hadPrivate := os.LookupEnv("LEASH_PRIVATE_DIR")

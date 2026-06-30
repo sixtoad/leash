@@ -3,9 +3,6 @@
 package darwind
 
 import (
-	"fmt"
-	"log"
-	"os"
 	"os/exec"
 	"strings"
 )
@@ -13,76 +10,53 @@ import (
 // Native macOS (`--darwin`) enforcement uses the Endpoint Security (ES) and
 // Network Extension (NE) system extensions. Unlike Linux, there is NO Layer-2
 // MITM proxy fallback (see docs/MACOS.md): if the extensions are not activated,
-// NOTHING enforces and today leash runs silently unprotected. This preflight is
-// the macOS analog of the Linux eBPF-LSM preflight (internal/runner/
-// lsm_preflight.go): detect the prerequisite, and surface it instead of failing
-// silent.
+// NOTHING enforces. This preflight is the macOS analog of the Linux eBPF-LSM
+// preflight (internal/runner/lsm_preflight.go) — but because there is no
+// fallback layer, the policy is a HARD STOP (decideDarwinEnforcement) rather
+// than the warn-and-degrade used on Linux.
 //
-// TODO(macOS agent): this is a scaffold to finish and verify on a real Mac.
-//   1. Verify systemextensionsctl parsing against captured `systemextensionsctl
-//      list` output (the parser in extension_state.go is ported from the Swift
-//      interpretExtensionEntry — confirm it matches; extend the test fixture).
-//   2. Add Full Disk Access detection for the ES extension. There is no public
-//      API; options: attempt an ES client connection and catch the permission
-//      error, or probe a TCC-gated path. Today FDA is NOT checked.
-//   3. NE "enabled" is more than extension activation — the content filter must
-//      also be turned on (NEFilterManager.isEnabled). Decide whether to check it
-//      here (likely needs cgo/Swift helper) or rely on the extension state.
-//   4. DECIDE THE DEFAULT: this scaffold WARNS and continues by default (mirrors
-//      Linux --require-lsm). But native macOS has no proxy fallback, so "continue
-//      unenforced" is more dangerous than on Linux — consider making the hard
-//      stop the default here, with an explicit opt-out to run unenforced. This is
-//      the same warn-vs-require call we made for Linux; pick per product intent.
-//   5. systemextensionsctl exits 69 (EX_NOPERM) without admin; the Swift app
-//      treats that as "assume inactive". systemExtensionState currently treats a
-//      non-zero exit as not-installed — confirm that's the behavior you want.
+// The check is cgo-free on purpose: the daemon is built CGO_ENABLED=0 and is not
+// an entitled process, so the authoritative entitled-only signals — Full Disk
+// Access for the ES extension and the NE content-filter `isEnabled` toggle — are
+// out of its reach by design. Those are enforced and surfaced by the entitled
+// extensions at runtime. `systemextensionsctl` is the OS's own source of truth
+// for activation and needs no entitlement.
 
-// requireEnforcement reports whether a missing native enforcement layer should
-// be fatal (LEASH_REQUIRE_ENFORCEMENT), the macOS analog of --require-lsm.
-func requireEnforcement() bool {
-	v := strings.TrimSpace(os.Getenv("LEASH_REQUIRE_ENFORCEMENT"))
-	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
-}
+// querySystemExtensions runs `systemextensionsctl list` once and returns the ES
+// and NE activation states plus their raw [state] detail. On any query failure —
+// including EX_NOPERM (exit 69) when run without admin rights — both states are
+// reported as extUnknown rather than guessed as active, so the hard stop fails
+// safe.
+// systemextensionsctlPath is the tool the daemon shells out to. It is a var so
+// tests can point it at a fake that emits a realistic listing, exercising the
+// full exec→parse→decide pipeline without installed extensions.
+var systemextensionsctlPath = "/usr/bin/systemextensionsctl"
 
-// systemExtensionState queries `systemextensionsctl list` (the same tool the
-// Leash.app GUI uses) and returns the activation state of id.
-func systemExtensionState(id string) extensionState {
-	out, err := exec.Command("/usr/bin/systemextensionsctl", "list").CombinedOutput()
+func querySystemExtensions(esID, neID string) (es, ne extensionState, esDetail, neDetail string) {
+	out, err := exec.Command(systemextensionsctlPath, "list").CombinedOutput()
 	if err != nil {
-		// Includes EX_NOPERM (69) when run without admin rights. Treat as
-		// not-installed/unknown rather than guessing it's active.
-		return extNotInstalled
+		// Surface why the probe failed (exec error + first line of any output,
+		// e.g. EX_NOPERM) so a hard stop on a genuinely-configured machine is
+		// diagnosable rather than an opaque "unknown".
+		reason := strings.TrimSpace(err.Error())
+		if first := strings.TrimSpace(string(out)); first != "" {
+			reason += ": " + strings.SplitN(first, "\n", 2)[0]
+		}
+		return extUnknown, extUnknown, reason, reason
 	}
-	return parseExtensionState(string(out), id)
+	es, esDetail = parseExtensionStateDetail(string(out), esID)
+	ne, neDetail = parseExtensionStateDetail(string(out), neID)
+	return es, ne, esDetail, neDetail
 }
 
 // preflightDarwinEnforcement verifies the native macOS enforcement layer is
-// actually active before leash relies on it. By default it warns and continues
-// (the agent runs UNENFORCED); LEASH_REQUIRE_ENFORCEMENT makes it a hard stop.
-func preflightDarwinEnforcement() error {
+// active before leash relies on it, and hard-stops daemon startup (returns an
+// error) otherwise. See decideDarwinEnforcement for the policy. It is a var so
+// tests of unrelated preFlight behavior can stub out the systemextensionsctl
+// probe (which would otherwise hard-stop on any machine lacking the extensions).
+var preflightDarwinEnforcement = func() error {
 	esID := endpointSecurityExtensionID()
 	neID := networkFilterExtensionID()
-	es := systemExtensionState(esID)
-	ne := systemExtensionState(neID)
-	if es == extActive && ne == extActive {
-		return nil
-	}
-
-	advice := darwinEnforcementAdvice(esID, neID, es, ne)
-	if requireEnforcement() {
-		return fmt.Errorf("native macOS enforcement is unavailable and LEASH_REQUIRE_ENFORCEMENT is set, so leash will not start.\n%s", advice)
-	}
-	log.Printf("WARNING: native macOS enforcement is unavailable — the agent will run UNENFORCED (native --darwin mode has no proxy fallback). Set LEASH_REQUIRE_ENFORCEMENT=1 to make this fatal.\n%s", advice)
-	return nil
-}
-
-func darwinEnforcementAdvice(esID, neID string, es, ne extensionState) string {
-	return fmt.Sprintf(`  Endpoint Security extension (%s): %s
-  Network Filter extension   (%s): %s
-Activate them:
-  1. open Leash.app and click Activate for both extensions
-  2. approve in System Settings ▸ General ▸ Login Items & Extensions
-  3. grant the Endpoint Security extension Full Disk Access
-     (System Settings ▸ Privacy & Security ▸ Full Disk Access)
-See docs/MACOS.md.`, esID, es, neID, ne)
+	es, ne, esDetail, neDetail := querySystemExtensions(esID, neID)
+	return decideDarwinEnforcement(esID, neID, es, ne, esDetail, neDetail)
 }

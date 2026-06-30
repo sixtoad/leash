@@ -88,27 +88,42 @@ Examples:
 - Requires macOS 14+ for extension activation.
 - Only supports connecting to the server at `localhost:18080`
 
-## Enforcement preflight (native mode) — work in progress
+## Enforcement preflight (native mode)
 
 Native `--darwin` enforcement depends on the Endpoint Security (ES) and Network
 Extension (NE) system extensions being **activated and approved**. There is no
 Layer‑2 MITM proxy fallback on macOS, so if those extensions are not active,
-nothing enforces. Previously leash would start and run silently unprotected.
+nothing enforces — previously leash would start and run silently unprotected.
 
-`leashd` now runs a preflight (`internal/darwind/preflight_extensions_darwin.go`)
-that queries `systemextensionsctl list` and reports the ES/NE activation state.
-By default it **warns** that the agent will run unenforced and continues; set
-`LEASH_REQUIRE_ENFORCEMENT=1` to make a missing/inactive extension a **hard
-stop** (the macOS analog of Linux's `--require-lsm`).
+When the native daemon starts, it runs a preflight
+(`internal/darwind/preflight_extensions_darwin.go`) that queries
+`systemextensionsctl list` and checks the ES/NE activation state:
 
-This is a scaffold to be finished and verified on a real Mac — see the
-`TODO(macOS agent)` block in `preflight_extensions_darwin.go`:
-- verify `systemextensionsctl list` parsing against captured output (the parser
-  in `extension_state.go` is ported from the Swift `interpretExtensionEntry` and
-  is unit‑tested, but the live format should be confirmed);
-- add **Full Disk Access** detection for the ES extension (no public API);
-- decide whether the NE content filter's *enabled* state needs a deeper check
-  than extension activation (`NEFilterManager.isEnabled`);
-- decide the **default**: warn‑and‑continue (current) vs. hard‑stop. Because
-  native macOS has no proxy fallback, hard‑stop is a defensible default here even
-  though Linux degrades to proxy‑only.
+- **Both extensions active → start normally.**
+- **Either not active (not installed / not approved / waiting‑for‑user /
+  disabled) → hard stop.** The daemon refuses to start and prints each
+  extension's reported state plus activation steps. There is **no opt‑out flag**:
+  native mode exists to use the extensions, so running it unenforced is not
+  supported — if you don't want enforcement, don't use `--darwin`.
+- **State can't be determined** (e.g. `systemextensionsctl` exits 69,
+  `EX_NOPERM`, without admin rights) → treated as not active → hard stop, so the
+  check fails safe rather than guessing the extensions are on.
+
+This contrasts with Linux, where losing the eBPF LSM still leaves the fail‑closed
+MITM proxy, so Linux warns and degrades to proxy‑only (`--require-lsm` opts into a
+hard stop). macOS has no second layer, so the hard stop is the default and there
+is nothing to opt into.
+
+Notes:
+
+- `--allow-lsm-failure` / `LEASH_ALLOW_LSM_FAILURE` governs the eBPF Layer‑1 path
+  (which native macOS does not use) and does **not** relax this gate.
+- Custom builds that set `LEASH_BUNDLE_IDENTIFIER` must export the **same** value
+  in the daemon's environment: the preflight derives the ES/NE extension ids from
+  it, so a mismatch makes correctly‑installed extensions look absent and triggers
+  a (false) hard stop.
+- The preflight only checks extension **activation**. The authoritative,
+  entitlement‑gated signals — **Full Disk Access** for the ES extension and the
+  NE content‑filter `isEnabled` toggle — are out of reach of the unentitled,
+  cgo‑free daemon by design; the entitled extensions enforce and surface those at
+  runtime (e.g. the app's Full‑Disk‑Access prompt).
