@@ -58,10 +58,14 @@ type launcher interface {
 	Remove(ctx context.Context)
 }
 
-// launcher returns the configured backend launcher. It defaults to the container
-// launcher so runners constructed directly (e.g. tests) work without explicit
-// wiring; this mirrors r.rt(). Native selection is added with nativeLauncher.
+// launcher returns the configured backend launcher, selected by the runtime:
+// the container-free nativeLauncher for --runtime native, else the container
+// launcher (the default, so runners constructed directly in tests work without
+// wiring). This mirrors r.rt().
 func (r *runner) launcher() launcher {
+	if _, ok := r.rt().(nativeRuntime); ok {
+		return nativeLauncher{r: r}
+	}
 	return containerLauncher{r: r}
 }
 
