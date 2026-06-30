@@ -133,15 +133,32 @@ flags/env pointed at host paths.
 ## Open decisions
 
 1. **Handshake A vs B** — recommend A (marker) first.
-2. **netns entry mechanism** — leashd `setns` itself for the network stage, vs.
-   the launcher running leashd already inside the netns (`nsenter`). `setns` for
-   just the network stage keeps the LSM attach (which is netns-agnostic) in the
-   host ns; simpler isolation reasoning. Decide during 2.2.
+2. **netns entry mechanism — RESOLVED (Step 2.2): the launcher runs leashd
+   inside the netns via `nsenter`**, not leashd `setns`. Reasons: no netns helper
+   is vendored (`setns` would mean raw syscalls + `LockOSThread`), and the
+   nftables OUTPUT **redirect is netns-scoped** (`apply-nftables.sh`) — it must
+   run in the workload's netns so it catches only the workload, which falls out
+   naturally when the whole daemon is `nsenter`'d in. leashd needs **no** netns
+   code. Consequence carried forward: the in-netns Control UI needs host
+   reachability (veth/forward) — launcher netns-connectivity work, deferred to
+   the on-device milestone.
 3. **System vs user scope** — system scope (root leashd, host-visible cgroup) is
    required for real enforcement; the PoC's `--user` scope was a no-root demo
    convenience only.
 4. **Privilege delivery** — root vs `setcap` vs a systemd system service for
    leashd. The agent stays unprivileged regardless.
+
+## Status (Step 2.2 built)
+
+leashd `--host` (flag + `LEASH_HOST`, host-appropriate policy default, startup
+signaling) is **built and unit-tested**; leashd compiles on the dev box via the
+committed eBPF bindings. `nativeLauncher.StartEnforcement` builds and (when
+privileged) spawns `nsenter --net=<ns> -- <self> --daemon --host --cgroup <cg> …`
+(re-execing the same binary — no separate leashd image); unprivileged it returns
+an actionable error naming the blocker + the exact command. **Not yet enforcing**
+here: needs root + the named netns and the `lsm=…,bpf` reboot (leashd reports the
+latter on attach). Reachability of the in-netns Control UI is the remaining
+launcher-side piece.
 
 ## Build & test
 
