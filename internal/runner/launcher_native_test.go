@@ -2,7 +2,6 @@ package runner
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"strings"
@@ -57,13 +56,34 @@ func TestNativePullImagesNoop(t *testing.T) {
 	}
 }
 
-func TestNativeStartEnforcementStubbed(t *testing.T) {
-	err := (nativeLauncher{r: &runner{}}).StartEnforcement(context.Background(), "/sys/fs/cgroup/x")
-	if !errors.Is(err, errHostModeNotBuilt) {
-		t.Fatalf("StartEnforcement = %v, want errHostModeNotBuilt", err)
+func TestNativeHostLeashdArgv(t *testing.T) {
+	r := &runner{}
+	r.cfg.proxyPort = "18000"
+	n := nativeLauncher{r: r}
+
+	argv := n.hostLeashdArgv("/usr/local/bin/leash", "/run/netns/leash-native-x", "/sys/fs/cgroup/scope")
+	joined := strings.Join(argv, " ")
+	want := "nsenter --net=/run/netns/leash-native-x -- /usr/local/bin/leash --daemon --host --cgroup /sys/fs/cgroup/scope --proxy-port 18000"
+	if joined != want {
+		t.Fatalf("argv = %q\nwant   %q", joined, want)
 	}
-	if !strings.Contains(err.Error(), "LEASHD-HOST-MODE.md") {
-		t.Fatalf("error should point to the spec: %v", err)
+}
+
+// On this (rootless) box enforcement can't start; StartEnforcement must say why
+// and surface the exact command it would run, not fail opaquely.
+func TestNativeStartEnforcementRequiresPrivilege(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root; the no-privilege blocker does not apply")
+	}
+	err := (nativeLauncher{r: &runner{}}).StartEnforcement(context.Background(), "/sys/fs/cgroup/x")
+	if err == nil {
+		t.Fatal("expected an actionable error when unprivileged")
+	}
+	msg := err.Error()
+	for _, want := range []string{"requires root", "would run:", "nsenter", "--daemon --host", "LEASHD-HOST-MODE.md"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("error %q missing %q", msg, want)
+		}
 	}
 }
 

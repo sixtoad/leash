@@ -84,6 +84,10 @@ func Main(args []string) error {
 	})
 	defer statsig.Stop(context.Background())
 
+	if cfg.HostMode {
+		log.Printf("leash: host mode (no container) — workload in a systemd scope; enforcement requires CAP_BPF/CAP_NET_ADMIN and an active bpf LSM (see docs/LEASHD-HOST-MODE.md)")
+	}
+
 	if err := preFlight(cfg); err != nil {
 		return err
 	}
@@ -129,6 +133,7 @@ type runtimeConfig struct {
 	BulkMaxBytes     int
 	CgroupPath       string
 	BootstrapTimeout time.Duration
+	HostMode         bool
 	MCPConfig        proxy.MCPConfig
 	TelemetryConfig  otel.Config
 }
@@ -156,11 +161,10 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 	defaultLogPath := strings.TrimSpace(os.Getenv("LEASH_LOG"))
 	logPath := fs.String("log", defaultLogPath, "Event log file path (optional)")
 
-	defaultPolicyPath := strings.TrimSpace(os.Getenv("LEASH_POLICY"))
-	if defaultPolicyPath == "" {
-		defaultPolicyPath = "/cfg/leash.cedar"
-	}
-	policyPath := fs.String("policy", defaultPolicyPath, "Cedar policy file path")
+	// The container fallback (/cfg/leash.cedar) is applied post-parse so host
+	// mode can substitute a host-appropriate default instead.
+	policyPath := fs.String("policy", strings.TrimSpace(os.Getenv("LEASH_POLICY")), "Cedar policy file path")
+	hostMode := fs.Bool("host", leashdEnvTruthy("LEASH_HOST"), "Run as a host process (no container): host-appropriate path defaults; enforcement needs CAP_BPF and an active bpf LSM. See docs/LEASHD-HOST-MODE.md")
 
 	proxyPort := fs.String("proxy-port", "18000", "Proxy port")
 	listenFlag := &stringFlag{}
@@ -220,7 +224,7 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 
 	cfg := &runtimeConfig{
 		LogPath:          strings.TrimSpace(*logPath),
-		PolicyPath:       strings.TrimSpace(*policyPath),
+		PolicyPath:       resolvePolicyPath(strings.TrimSpace(*policyPath), *hostMode),
 		ProxyPort:        strings.TrimSpace(*proxyPort),
 		WebBind:          listenCfg.Address(),
 		WebDisabled:      listenCfg.Disable,
@@ -229,11 +233,37 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 		BulkMaxBytes:     *bulkMaxBytes,
 		CgroupPath:       strings.TrimSpace(*cgroupFlag),
 		BootstrapTimeout: timeout,
+		HostMode:         *hostMode,
 	}
 	cfg.MCPConfig = loadMCPConfigFromEnv()
 	cfg.TelemetryConfig = otel.LoadConfigFromEnv()
 
 	return cfg, nil
+}
+
+// resolvePolicyPath applies the default policy location when none was given. In
+// container mode that is the image's /cfg/leash.cedar; in host mode there is no
+// /cfg, so default under the host shared dir (LEASH_DIR, or its /leash
+// fallback) instead of an unwritable container path.
+func resolvePolicyPath(explicit string, hostMode bool) string {
+	if explicit != "" {
+		return explicit
+	}
+	if hostMode {
+		return filepath.Join(getLeashDirFromEnv(), "leash.cedar")
+	}
+	return "/cfg/leash.cedar"
+}
+
+// leashdEnvTruthy reports whether an env var is set to a truthy value
+// (1/true/yes/on, case-insensitive). Used for boolean flag defaults.
+func leashdEnvTruthy(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func preFlight(cfg *runtimeConfig) error {
