@@ -31,3 +31,6 @@ node_modules
 dist
 
 /mac-leash/build/
+
+# Local-only native-runtime PoC box repro (dev scratch, not shipped)
+scratch-native-poc/
