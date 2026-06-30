@@ -66,6 +66,13 @@ const defaultRuntime = "docker"
 // supportedRuntimes lists the CLI-compatible runtimes this seam handles today.
 var supportedRuntimes = []string{"docker", "podman"}
 
+// nativeRuntimeName selects the container-free PoC backend (nativeRuntime). It
+// is intentionally kept out of supportedRuntimes: it is not a CLI-compatible
+// swap and its launch path is not wired (see runtime_native.go), so it should
+// not be advertised alongside docker/podman — but newRuntime resolves it so the
+// seam can be exercised end to end against a non-cliRuntime backend.
+const nativeRuntimeName = "native"
+
 // newRuntime resolves a runtime name to a Runtime. An empty name defaults to
 // docker. Unsupported names return an error rather than failing later at the
 // first container command.
@@ -73,6 +80,9 @@ func newRuntime(name string) (Runtime, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = defaultRuntime
+	}
+	if name == nativeRuntimeName {
+		return newNativeRuntime(), nil
 	}
 	for _, s := range supportedRuntimes {
 		if name == s {

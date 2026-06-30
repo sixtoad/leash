@@ -32,6 +32,8 @@ dist
 
 /mac-leash/build/
 
-
 # APM dependencies
 apm_modules/
+
+# Local-only native-runtime PoC box repro (dev scratch, not shipped)
+scratch-native-poc/
