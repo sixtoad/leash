@@ -240,7 +240,14 @@ func execute(cmdName string, args []string) error {
 		return err
 	}
 
-	if err := ensureCommand(rt.Name()); err != nil {
+	if _, isNative := rt.(nativeRuntime); isNative {
+		// Native drives host tooling, not a container CLI named "native".
+		for _, bin := range []string{"systemd-run", "systemctl"} {
+			if err := ensureCommand(bin); err != nil {
+				return err
+			}
+		}
+	} else if err := ensureCommand(rt.Name()); err != nil {
 		return err
 	}
 
@@ -1293,6 +1300,15 @@ func (r *runner) assignContainerNames(ctx context.Context) error {
 		baseLeash = r.cfg.leashContainer
 	}
 
+	// Native has no container registry to probe for name collisions; the box is
+	// a systemd unit derived from these names, and the launcher clears any stale
+	// unit in Provision. Take the base names directly.
+	if r.usingNativeRuntime() {
+		r.cfg.targetContainer = baseTarget
+		r.cfg.leashContainer = baseLeash
+		return nil
+	}
+
 	const maxAttempts = 1000
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		targetCandidate := containerNameWithSuffix(baseTarget, attempt)
@@ -1456,6 +1472,10 @@ func isPortConflictError(err error) bool {
 // Additional helper methods will be defined below.
 
 func (r *runner) ensureNotRunning(ctx context.Context) error {
+	if r.usingNativeRuntime() {
+		// No container to inspect; nativeLauncher.Provision clears any stale box.
+		return nil
+	}
 	running, err := r.containerRunning(ctx, r.cfg.targetContainer)
 	if err != nil {
 		return err
@@ -1628,6 +1648,10 @@ func (r *runner) imageDefaultCommand(ctx context.Context) ([]string, error) {
 }
 
 func (r *runner) getImageStopSignal(ctx context.Context) (string, error) {
+	if r.usingNativeRuntime() {
+		// No image to query; the holder is stopped via systemctl, not a signal.
+		return "SIGTERM", nil
+	}
 	out, err := r.rt().Output(ctx, "inspect", "--format", "{{.Config.StopSignal}}", r.cfg.targetImage)
 	if err != nil {
 		return "", fmt.Errorf("query stop signal: %w", err)
@@ -1640,6 +1664,10 @@ func (r *runner) getImageStopSignal(ctx context.Context) (string, error) {
 }
 
 func (r *runner) ensurePortFree(ctx context.Context, port string) error {
+	if r.usingNativeRuntime() {
+		// This check only inspects container-published ports; native has none.
+		return nil
+	}
 	out, err := r.rt().Output(ctx, "ps", "--format", "{{.Names}} {{.Ports}}")
 	if err != nil {
 		return fmt.Errorf("list docker ports: %w", err)
@@ -1792,6 +1820,9 @@ func (r *runner) allocatePublishPorts(ctx context.Context) error {
 func (r *runner) expandPublishAll(ctx context.Context) error {
 	if !r.opts.publishAll {
 		return nil
+	}
+	if r.usingNativeRuntime() {
+		return fmt.Errorf("--publish-all is not supported with --runtime native (no container image ports)")
 	}
 	out, err := r.rt().Output(ctx, "inspect", "--format", "{{json .Config.ExposedPorts}}", r.cfg.targetImage)
 	if err != nil {

@@ -63,10 +63,19 @@ type launcher interface {
 // launcher (the default, so runners constructed directly in tests work without
 // wiring). This mirrors r.rt().
 func (r *runner) launcher() launcher {
-	if _, ok := r.rt().(nativeRuntime); ok {
+	if r.usingNativeRuntime() {
 		return nativeLauncher{r: r}
 	}
 	return containerLauncher{r: r}
+}
+
+// usingNativeRuntime reports whether the container-free native backend is
+// selected. Backend-agnostic orchestration in startContainers uses this to skip
+// the container-CLI–specific steps (image/name/ps probing) that have no native
+// equivalent, so a native run reaches the launcher.
+func (r *runner) usingNativeRuntime() bool {
+	_, ok := r.rt().(nativeRuntime)
+	return ok
 }
 
 // containerLauncher implements launcher for docker/podman by delegating to the
