@@ -87,6 +87,41 @@ func TestNativeStartEnforcementRequiresPrivilege(t *testing.T) {
 	}
 }
 
+// TestNativeRuntimeSkipsContainerPrelaunch locks in Step 3: the pre-launcher
+// orchestration steps must not touch the container CLI under --runtime native.
+// nativeRuntime.Output errors on any container verb, so an accidental call here
+// would fail this test rather than only surfacing in a live run.
+func TestNativeRuntimeSkipsContainerPrelaunch(t *testing.T) {
+	r := &runner{runtime: newNativeRuntime()}
+	r.cfg.targetContainer = "tgt"
+	r.cfg.leashContainer = "tgt-leash"
+	ctx := context.Background()
+
+	if err := r.assignContainerNames(ctx); err != nil {
+		t.Fatalf("assignContainerNames: %v", err)
+	}
+	if r.cfg.targetContainer != "tgt" || r.cfg.leashContainer != "tgt-leash" {
+		t.Fatalf("native names = %q/%q, want the base names unprobed", r.cfg.targetContainer, r.cfg.leashContainer)
+	}
+	if err := r.ensureNotRunning(ctx); err != nil {
+		t.Fatalf("ensureNotRunning: %v", err)
+	}
+	if sig, err := r.getImageStopSignal(ctx); err != nil || sig != "SIGTERM" {
+		t.Fatalf("getImageStopSignal = %q, %v; want SIGTERM, nil", sig, err)
+	}
+	if err := r.ensurePortFree(ctx, "18080"); err != nil {
+		t.Fatalf("ensurePortFree: %v", err)
+	}
+	if err := r.expandPublishAll(ctx); err != nil {
+		t.Fatalf("expandPublishAll (no publish-all): %v", err)
+	}
+	// --publish-all is unsupported for native and must error clearly.
+	r.opts.publishAll = true
+	if err := r.expandPublishAll(ctx); err == nil || !strings.Contains(err.Error(), "publish-all") {
+		t.Fatalf("expandPublishAll with --publish-all = %v, want an unsupported error", err)
+	}
+}
+
 // TestNativeBoxLifecycle_Integration drives the real box on this machine:
 // Provision a delegated cgroup, run a workload placed into it, confirm the
 // workload's cgroup is the box's, then Remove and confirm teardown. Rootless via
