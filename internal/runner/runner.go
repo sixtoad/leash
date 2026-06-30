@@ -1175,10 +1175,7 @@ func (r *runner) startContainers(ctx context.Context) error {
 		return err
 	}
 
-	if err := r.ensureLocalImage(ctx, r.cfg.targetImage); err != nil {
-		return err
-	}
-	if err := r.ensureLocalImage(ctx, r.cfg.leashImage); err != nil {
+	if err := r.launcher().PullImages(ctx); err != nil {
 		return err
 	}
 
@@ -1218,36 +1215,16 @@ func (r *runner) startContainers(ctx context.Context) error {
 		return err
 	}
 
-	for {
-		if err := r.launchTargetContainer(ctx, stopSignal); err != nil {
-			retry, retryErr := r.handleListenPortRetry(ctx, err)
-			if retryErr != nil {
-				return r.finishLifecycle(ctx, 0, retryErr)
-			}
-			if retry {
-				continue
-			}
-			return r.finishLifecycle(ctx, 0, err)
-		}
-		break
-	}
-
-	cgroupPath, err := r.resolveCgroupPath()
+	cgroupPath, err := r.launcher().Provision(ctx, stopSignal)
 	if err != nil {
 		return r.finishLifecycle(ctx, 0, err)
 	}
 
-	if err := r.launchLeashContainer(ctx, cgroupPath); err != nil {
+	if err := r.launcher().StartEnforcement(ctx, cgroupPath); err != nil {
 		return r.finishLifecycle(ctx, 0, err)
 	}
 
-	if err := r.waitForFile(filepath.Join(r.cfg.shareDir, "ca-cert.pem"), 50, 200*time.Millisecond); err != nil {
-		r.logger.Println("Warning: Leash CA certificate was not detected after waiting.")
-	} else if r.verbose {
-		r.logger.Printf("Leash CA certificate is available at %s\n", filepath.Join(r.cfg.shareDir, "ca-cert.pem"))
-	}
-
-	if err := r.waitForBootstrap(ctx); err != nil {
+	if err := r.launcher().WaitReady(ctx); err != nil {
 		return r.finishLifecycle(ctx, 0, err)
 	}
 
@@ -2605,14 +2582,7 @@ func (r *runner) stopContainers(ctx context.Context) error {
 		}
 	}
 
-	remove := func(name string) {
-		cmd := r.rt().Cmd(ctx, "rm", "-f", name)
-		cmd.Stdout = io.Discard
-		cmd.Stderr = io.Discard
-		_ = cmd.Run()
-	}
-	remove(r.cfg.leashContainer)
-	remove(r.cfg.targetContainer)
+	r.launcher().Remove(ctx)
 
 	if r.cfg.shareDir != "" && !r.cfg.shareDirFromEnv {
 		if r.shareDirCreated || strings.HasPrefix(r.cfg.shareDir, r.cfg.workDir+string(os.PathSeparator)) {
