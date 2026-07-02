@@ -44,24 +44,41 @@ from the active LSM list, do Part A.
 ## Part A — Activate the eBPF LSM (the universal gate)
 
 This is required on **every** Linux host for Layer 1, not a quirk of any box. The
-preflight prints these exact steps for your machine.
+value to add is your current active LSMs (`cat /sys/kernel/security/lsm`) with
+`bpf` appended. **First identify your bootloader** — it is not always GRUB:
 
 ```sh
-# 1. Append bpf to the kernel LSM list.
-sudo sed -i 's/\(GRUB_CMDLINE_LINUX="[^"]*\)"/\1 lsm=lockdown,capability,landlock,yama,apparmor,ima,evm,bpf"/' /etc/default/grub
-#    (or edit /etc/default/grub by hand: add `lsm=…,bpf` to GRUB_CMDLINE_LINUX,
-#     keeping your distro's existing LSMs and appending bpf LAST.)
-
-# 2. Regenerate grub + reboot.
-sudo update-grub        # Debian/Ubuntu/Pop!_OS; on Fedora: sudo grub2-mkconfig -o /boot/grub2/grub.cfg
-sudo reboot
-
-# 3. After reboot, confirm.
-cat /sys/kernel/security/lsm    # must now include "bpf"
+[ -d /sys/firmware/efi ] && bootctl status 2>/dev/null | grep -q systemd-boot \
+  && echo "systemd-boot (use kernelstub — Part A.2)" || echo "GRUB (Part A.1)"
 ```
 
-**Rollback:** remove the `lsm=…` clause you added from `/etc/default/grub`,
-`update-grub`, reboot.
+### A.1 — GRUB (Debian/Ubuntu/most distros)
+
+```sh
+sudo sed -i 's/\(GRUB_CMDLINE_LINUX="[^"]*\)"/\1 lsm=lockdown,capability,landlock,yama,apparmor,ima,evm,bpf"/' /etc/default/grub
+sudo update-grub          # Fedora: sudo grub2-mkconfig -o /boot/grub2/grub.cfg
+sudo reboot
+```
+**Rollback:** remove the `lsm=…` clause from `/etc/default/grub`, `update-grub`, reboot.
+
+### A.2 — systemd-boot / kernelstub (Pop!_OS, and any systemd-boot host)
+
+Pop!_OS has **no `/etc/default/grub`**; `update-grub` does nothing. Use
+`kernelstub` (note the flag is `--add-options`/`-a`, NOT `--add-cmdline`):
+
+```sh
+sudo kernelstub --add-options "lsm=lockdown,capability,landlock,yama,apparmor,ima,evm,bpf"
+sudo reboot
+```
+**Rollback:** `sudo kernelstub --delete-options "lsm=…,bpf"` (same string), reboot.
+Plain systemd-boot without kernelstub: append `lsm=…,bpf` to the `options` line
+in `/boot/efi/loader/entries/*.conf` (or `bootctl set-default`), reboot.
+
+### Confirm (either path)
+
+```sh
+cat /sys/kernel/security/lsm    # must now include "bpf"
+```
 
 ## Part B — Build leashd (= the leash binary)
 
@@ -78,49 +95,77 @@ has no clang): use the dockerized codegen — `make lsm-generate-docker` (rootfu
 
 ## Part C — Smoke-test the engine directly (proves Layer 1, bypasses the runner)
 
+> **✅ VERIFIED on-device (Pop!_OS, kernel with `bpf` active, 2026-07-02).** A
+> forbidden read returned `cat: /run/leash-denied: Permission denied` while an
+> allowed read succeeded — selective, container-free enforcement. The recipe
+> below is the corrected, working one.
+
 Before finishing the runner path (Part D), prove native enforcement itself works.
 This stands up the box by hand and runs host-mode leashd against it, so it
 isolates "does the eBPF LSM attach + deny natively" from "is the full CLI wired."
 
 ```sh
 sudo -i      # enforcement needs CAP_BPF + CAP_NET_ADMIN
-ID=smoke; CG_UNIT=leash-native-$ID.service; NS=leash-native-$ID
+ID=smoke; UNIT=leash-native-$ID.service; NS=leash-native-$ID
 RUN=/run/leash/$ID; mkdir -p $RUN/public $RUN/private; chmod 700 $RUN/private
 
-# 1. Box: a delegated system scope holder + a named netns (what Provision does as root).
-systemd-run --scope --property=Delegate=yes --unit=$CG_UNIT -- sleep infinity &
-CG=/sys/fs/cgroup$(systemctl show -p ControlGroup --value $CG_UNIT)
-ip netns add $NS
+# 1. Box: a detached, delegated transient SERVICE (NOT --scope) + a named netns
+#    with loopback up (a fresh netns has lo DOWN; leashd binds 127.0.0.1).
+systemctl reset-failed $UNIT 2>/dev/null
+systemd-run --property=Delegate=yes --collect --unit=$UNIT -- sleep infinity
+CG=/sys/fs/cgroup$(systemctl show -p ControlGroup --value $UNIT)   # must NOT be /sys/fs/cgroup
+ip netns add $NS && ip -n $NS link set lo up
 
-# 2. A minimal policy that DENIES reading a marker file (adjust to your Cedar schema).
+# 2. Policy: permissive baseline + a forbid on one file. The resource MUST be in
+#    the `resource in [ … ]` form — leash silently drops `resource == …` in a
+#    when-clause ("no resources found in policy"). File::/Dir:: are the entities.
 cat > $RUN/public/leash.cedar <<'EOF'
-// deny reads of /etc/leash-denied across the board (illustrative)
-forbid(principal, action == Action::"file_open", resource)
-when { resource.path == "/etc/leash-denied" };
+permit (principal, action in [Action::"FileOpen", Action::"FileOpenReadOnly", Action::"FileOpenReadWrite"], resource)
+when { resource in [ Dir::"/" ] };
+permit (principal, action == Action::"ProcessExec", resource) when { resource in [ Dir::"/" ] };
+permit (principal, action == Action::"NetworkConnect", resource) when { resource in [ Host::"*" ] };
+forbid (principal, action in [Action::"FileOpen", Action::"FileOpenReadOnly", Action::"FileOpenReadWrite"], resource)
+when { resource in [ File::"/run/leash-denied" ] };
 EOF
-echo secret > /etc/leash-denied
+echo top-secret > /run/leash-denied
 
 # 3. Host-mode leashd, inside the workload netns, attached to the box cgroup.
 LEASH_DIR=$RUN/public LEASH_PRIVATE_DIR=$RUN/private \
 nsenter --net=/run/netns/$NS -- \
-  /usr/local/bin/leash --daemon --host \
-    --cgroup "$CG" --policy $RUN/public/leash.cedar \
-    --proxy-port 18000 --listen 127.0.0.1:18080 &
+  leash --daemon --host --cgroup "$CG" --policy $RUN/public/leash.cedar \
+    --proxy-port 18000 --listen 127.0.0.1:18080 & sleep 2
 
-# 4. Until the bootstrap handshake is wired (Part D / option A), satisfy it manually:
+# 4. Until the bootstrap handshake is wired (Part D / option A), satisfy it manually.
 touch $RUN/public/bootstrap.ready    # filename: entrypoint.BootstrapReadyFileName
+sleep 2                              # let leashd reach "Successfully started monitoring file opens"
 
-# 5. Run a workload IN the box cgroup and confirm Layer 1 denies the read.
-sh -c 'echo $$ > '"$CG"'/cgroup.procs && cat /etc/leash-denied'
-#    EXPECT: permission denied (eBPF LSM file_open), and an event in leashd's log.
+# 5. Run workloads IN the box cgroup: control (allowed) then the forbidden read.
+sh -c 'echo $$ > '"$CG"'/cgroup.procs && cat /etc/hostname'      # EXPECT: succeeds
+sh -c 'echo $$ > '"$CG"'/cgroup.procs && cat /run/leash-denied'  # EXPECT: Permission denied
 
 # 6. Teardown.
-ip netns del $NS; systemctl stop $CG_UNIT; rm -rf $RUN /etc/leash-denied
+kill %1 2>/dev/null; ip netns del $NS; systemctl stop $UNIT
+systemctl reset-failed $UNIT 2>/dev/null; rm -rf $RUN /run/leash-denied
 ```
 
-If step 5 is denied, **native enforcement works** — the rest is wiring.
-If leashd errors at attach with "kernel may lack an active bpf LSM", Part A
-didn't take (recheck `/sys/kernel/security/lsm`).
+A ready-to-run version is at `scratch-native-poc/smoke.sh` (local, gitignored).
+If the forbidden read is denied, **native enforcement works** — the rest is
+wiring. If leashd errors at attach with "kernel may lack an active bpf LSM",
+Part A didn't take (recheck `/sys/kernel/security/lsm`).
+
+### Two real bugs found during on-device verification (fix upstream)
+
+1. **`resource == File::"…"` in a when-clause is silently dropped.** The
+   transpiler's `extractResources` (`internal/transpiler/cedar_to_leash.go`) only
+   reads a when-clause resource from the `resource in [ … ]` form
+   (`ConditionResourceIn`); an `==` there yields "no resources found in policy"
+   and the whole rule is skipped — a policy footgun. Support `==` in when-clauses
+   or fail loudly instead of warning-and-dropping.
+2. **nftables control-plane rule doesn't quote the cgroup path.** `apply-nftables.sh`
+   emits `socket cgroupv2 level 1 /sys/fs/cgroup/…/x.service …` → `nft` errors
+   `unexpected /`, so it falls back to blocking *all* local access to the UI port.
+   Quote the path (or use the cgroup id) so cgroup-scoped isolation works on host
+   paths too. Non-fatal (fallback preserves the boundary) but degrades precision.
 
 ## Part D — Step 3b: finish the runner's native path
 
