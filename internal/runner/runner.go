@@ -152,6 +152,11 @@ type runner struct {
 	selinuxRelabel  bool
 	selinuxChecked  bool
 
+	// cgroupPath is the box's cgroup, captured from the launcher's Provision so
+	// the native exec path can place the workload into it. Empty for container
+	// backends (they exec via the container runtime).
+	cgroupPath string
+
 	logger        *log.Logger
 	mountState    *mountState
 	sessionID     string
@@ -1161,6 +1166,10 @@ func (r *runner) rt() Runtime {
 }
 
 func (r *runner) startContainers(ctx context.Context) error {
+	if err := r.preflightNativeRuntime(); err != nil {
+		return err
+	}
+
 	r.logDevImageSelections()
 
 	if err := r.assignContainerNames(ctx); err != nil {
@@ -1226,6 +1235,7 @@ func (r *runner) startContainers(ctx context.Context) error {
 	if err != nil {
 		return r.finishLifecycle(ctx, 0, err)
 	}
+	r.cgroupPath = cgroupPath
 
 	if err := r.launcher().StartEnforcement(ctx, cgroupPath); err != nil {
 		return r.finishLifecycle(ctx, 0, err)
@@ -2472,6 +2482,16 @@ func describeBootstrapMarker(path string) string {
 }
 
 func (r *runner) detectShell(ctx context.Context) (string, error) {
+	if r.usingNativeRuntime() {
+		// The workload runs on the host; pick the host's shell.
+		if _, err := exec.LookPath("bash"); err == nil {
+			return "bash", nil
+		}
+		if _, err := exec.LookPath("sh"); err == nil {
+			return "sh", nil
+		}
+		return "", fmt.Errorf("failed to locate a usable shell (bash or sh) on the host")
+	}
 	if err := r.rt().Run(ctx, "exec", "-w", r.cfg.callerDir, r.cfg.targetContainer, "bash", "-lc", "true"); err == nil {
 		return "bash", nil
 	}
@@ -2482,8 +2502,13 @@ func (r *runner) detectShell(ctx context.Context) (string, error) {
 }
 
 func (r *runner) execNonInteractive(ctx context.Context, shellBin, cmd string) (int, error) {
-	dockerArgs := []string{"exec", "-i", "-w", r.cfg.callerDir, r.cfg.targetContainer, shellBin, "-lc", "exec " + cmd}
-	execCmd := r.rt().Cmd(ctx, dockerArgs...)
+	var execCmd *exec.Cmd
+	if r.usingNativeRuntime() {
+		execCmd = nativeLauncher{r: r}.workloadCommand(ctx, r.cgroupPath, r.cfg.callerDir, shellBin, cmd)
+	} else {
+		dockerArgs := []string{"exec", "-i", "-w", r.cfg.callerDir, r.cfg.targetContainer, shellBin, "-lc", "exec " + cmd}
+		execCmd = r.rt().Cmd(ctx, dockerArgs...)
+	}
 	execCmd.Stdin = os.Stdin
 	execCmd.Stdout = os.Stdout
 	execCmd.Stderr = os.Stderr
@@ -2497,6 +2522,9 @@ func (r *runner) execNonInteractive(ctx context.Context, shellBin, cmd string) (
 }
 
 func (r *runner) precheckInteractive(ctx context.Context, shellBin, runCmd string) error {
+	if r.usingNativeRuntime() {
+		return nil // the setns/tty precheck is a container-exec concern
+	}
 	tmp, err := os.CreateTemp("", "leash-runner-precheck-*.log")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
@@ -2534,8 +2562,13 @@ func (r *runner) execInteractive(shellBin, cmd string) (int, error) {
 	}
 	defer os.Remove(tmp.Name())
 
-	args := []string{"exec", "-it", "-w", r.cfg.callerDir, r.cfg.targetContainer, shellBin, "-lc", "exec " + cmd}
-	execCmd := r.rt().Cmd(context.Background(), args...)
+	var execCmd *exec.Cmd
+	if r.usingNativeRuntime() {
+		execCmd = nativeLauncher{r: r}.workloadCommand(context.Background(), r.cgroupPath, r.cfg.callerDir, shellBin, cmd)
+	} else {
+		args := []string{"exec", "-it", "-w", r.cfg.callerDir, r.cfg.targetContainer, shellBin, "-lc", "exec " + cmd}
+		execCmd = r.rt().Cmd(context.Background(), args...)
+	}
 	execCmd.Stdin = os.Stdin
 	execCmd.Stdout = os.Stdout
 	execCmd.Stderr = io.MultiWriter(os.Stderr, tmp)
@@ -2688,6 +2721,11 @@ func (r *runner) discoverShareDir(ctx context.Context) string {
 }
 
 func (r *runner) installPromptAssets(ctx context.Context) error {
+	if r.usingNativeRuntime() {
+		// Native runs on the host filesystem; installing the prompt would write
+		// to the host's /etc/profile.d, which we must not do. Skip it.
+		return nil
+	}
 	script := strings.TrimSpace(assets.LeashPromptScript)
 	if script == "" {
 		return nil

@@ -6,8 +6,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 )
+
+// goos reports the target OS; a package var so runtime-selection logic is
+// unit-testable without a build matrix.
+var goos = func() string { return runtime.GOOS }
 
 // Runtime abstracts the container CLI so leash can drive docker, podman, or
 // (later) other backends. docker and podman are CLI-compatible — same verbs and

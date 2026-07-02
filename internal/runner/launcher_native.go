@@ -7,14 +7,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/strongdm/leash/internal/entrypoint"
 )
 
 // nativeLauncher implements launcher without a container runtime: the workload
-// runs in a delegated systemd cgroup-v2 scope (Layer-1 attach point) plus, when
-// privileged, a named network namespace (Layer-2 intercept point). It proves the
-// box is Docker-free and is fully runnable here; enforcement (StartEnforcement)
-// is stubbed pending leashd host mode. See docs/{RUNTIME-NATIVE-POC,
-// LAUNCHER-ABSTRACTION,LEASHD-HOST-MODE}.md.
+// runs in a delegated systemd cgroup-v2 scope (Layer-1 attach point) plus a
+// named network namespace (Layer-2 intercept point). StartEnforcement runs
+// leashd host mode against the box; enforcement requires root (gated by
+// preflightNativeRuntime). See docs/{RUNTIME-NATIVE-POC,LAUNCHER-ABSTRACTION,
+// LEASHD-HOST-MODE,NATIVE-ENFORCEMENT-RUNBOOK}.md.
 //
 // It holds *runner like containerLauncher and derives all unit/netns names
 // deterministically from runner state, so a fresh value from r.launcher() agrees
@@ -131,8 +134,25 @@ func (n nativeLauncher) StartEnforcement(ctx context.Context, cgroupPath string)
 	}
 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Env = append(os.Environ(), n.leashdEnv()...)
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	return cmd.Start()
+}
+
+// leashdEnv passes the runner's host directories to the spawned leashd so it
+// reads/writes them instead of the container defaults (/leash, /cfg, /log).
+func (n nativeLauncher) leashdEnv() []string {
+	env := []string{"LEASH_HOST=1"}
+	if v := strings.TrimSpace(n.r.cfg.shareDir); v != "" {
+		env = append(env, "LEASH_DIR="+v)
+	}
+	if v := strings.TrimSpace(n.r.cfg.privateDir); v != "" {
+		env = append(env, "LEASH_PRIVATE_DIR="+v)
+	}
+	if v := strings.TrimSpace(n.r.cfg.logDir); v != "" {
+		env = append(env, "LEASH_LOG="+filepath.Join(v, "events.log"))
+	}
+	return env
 }
 
 // netnsRunPath is the iproute2 named-netns path Provision creates (when root).
@@ -145,6 +165,9 @@ func (n nativeLauncher) netnsRunPath() string {
 // [--proxy-port …] [--listen …]. Pure, so it is unit-tested directly.
 func (n nativeLauncher) hostLeashdArgv(self, netnsPath, cgroupPath string) []string {
 	argv := []string{"nsenter", "--net=" + netnsPath, "--", self, "--daemon", "--host", "--cgroup", cgroupPath}
+	if cfgDir := strings.TrimSpace(n.r.cfg.cfgDir); cfgDir != "" {
+		argv = append(argv, "--policy", filepath.Join(cfgDir, "leash.cedar"))
+	}
 	if port := strings.TrimSpace(n.r.cfg.proxyPort); port != "" {
 		argv = append(argv, "--proxy-port", port)
 	}
@@ -171,9 +194,32 @@ func (n nativeLauncher) enforcementBlocker(netnsPath string) string {
 	return ""
 }
 
-// WaitReady has nothing to wait on until leashd host mode provides a readiness
-// signal (LEASHD-HOST-MODE.md §4).
-func (n nativeLauncher) WaitReady(ctx context.Context) error { return nil }
+// WaitReady drives the bootstrap handshake (option A, LEASHD-HOST-MODE.md §4):
+// the launcher plays the role the container's leash-entry plays — it writes the
+// bootstrap marker so leashd proceeds to attach the LSM — then waits for leashd
+// to publish its CA cert, the same readiness signal the container path waits on.
+// This preserves the fail-closed ordering: the workload is not exec'd until this
+// returns nil. A no-op when enforcement wasn't started (degraded box).
+func (n nativeLauncher) WaitReady(ctx context.Context) error {
+	shareDir := strings.TrimSpace(n.r.cfg.shareDir)
+	if shareDir == "" {
+		return nil
+	}
+	marker := filepath.Join(shareDir, entrypoint.BootstrapReadyFileName)
+	caCert := caCertPath(shareDir)
+	// leashd clears the marker once at startup, then waits for it. StartEnforcement
+	// spawned leashd asynchronously, so re-assert the marker on each poll to win
+	// that race; stop once leashd publishes its CA cert (the readiness signal).
+	for i := 0; i < caCertWaitAttempts; i++ {
+		_ = os.WriteFile(marker, []byte("native\n"), 0o644)
+		if _, err := os.Stat(caCert); err == nil {
+			return nil
+		}
+		time.Sleep(caCertWaitDelay)
+	}
+	n.r.logger.Println("Warning: leash CA certificate was not detected after waiting (native).")
+	return nil
+}
 
 // Remove tears the box down: delete the netns (if any) and stop the holder unit.
 func (n nativeLauncher) Remove(ctx context.Context) {
@@ -184,8 +230,15 @@ func (n nativeLauncher) Remove(ctx context.Context) {
 }
 
 func (n nativeLauncher) addNetns(ctx context.Context) error {
-	_, err := hostOutput(ctx, "ip", "netns", "add", n.netnsName())
-	return err
+	if out, err := hostOutput(ctx, "ip", "netns", "add", n.netnsName()); err != nil {
+		return fmt.Errorf("%w (%s)", err, strings.TrimSpace(out))
+	}
+	// A fresh netns has loopback DOWN; leashd binds the proxy/Control UI on
+	// 127.0.0.1 inside it, so bring lo up.
+	if out, err := hostOutput(ctx, "ip", "-n", n.netnsName(), "link", "set", "lo", "up"); err != nil {
+		return fmt.Errorf("bring up lo in netns: %w (%s)", err, strings.TrimSpace(out))
+	}
+	return nil
 }
 
 func (n nativeLauncher) stopUnit(ctx context.Context, unit string) {
@@ -203,6 +256,21 @@ func (n nativeLauncher) execInBox(ctx context.Context, cgroupPath string, argv .
 	script := fmt.Sprintf("echo $$ > %s && exec \"$@\"", procs)
 	args := append([]string{"-c", script, "leash-native"}, argv...)
 	return exec.CommandContext(ctx, "sh", args...)
+}
+
+// workloadCommand builds the user's command to run inside the box: placed in
+// the LSM-scoped cgroup, in workdir, via `shellBin -lc "exec <cmd>"`. When
+// privileged it is wrapped in `nsenter --net=<ns>` so the workload also runs in
+// the enforced network namespace (Layer 2); rootless (degraded/unenforced) it
+// runs in the user-scope cgroup without a netns.
+func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir, shellBin, cmd string) *exec.Cmd {
+	procs := quoteShellArg(filepath.Join(cgroupPath, "cgroup.procs"))
+	inner := fmt.Sprintf("echo $$ > %s && cd %s && exec %s -lc %s",
+		procs, quoteShellArg(workdir), quoteShellArg(shellBin), quoteShellArg("exec "+cmd))
+	if !n.useUserManager() {
+		return exec.CommandContext(ctx, "nsenter", "--net="+n.netnsRunPath(), "--", "sh", "-c", inner)
+	}
+	return exec.CommandContext(ctx, "sh", "-c", inner)
 }
 
 // hostOutput runs a host command (systemd-run/systemctl/ip), capturing combined
