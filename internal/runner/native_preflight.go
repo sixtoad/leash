@@ -2,7 +2,6 @@ package runner
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 )
 
@@ -66,14 +65,6 @@ func decideNativeRuntime(v nativeViability) error {
 		return nil
 	}
 	return fmt.Errorf("native runtime is unavailable, so leash will not start (native never falls back to docker — pass --runtime docker to opt in).\n%s", nativeRuntimeAdvice(v))
-}
-
-func (r *runner) preflightNativeRuntime() error {
-	if !r.usingNativeRuntime() {
-		return nil
-	}
-	hasSystemd := hostHasSystemd()
-	return decideNativeRuntime(classifyNativeRuntime(goos(), hasSystemd, os.Geteuid()))
 }
 
 func hostHasSystemd() bool {

@@ -262,6 +262,53 @@ func (n nativeLauncher) execInBox(ctx context.Context, cgroupPath string, argv .
 	return exec.CommandContext(ctx, "sh", args...)
 }
 
+// Preflight validates that native can enforce here (Linux + systemd + root),
+// failing with actionable advice otherwise — never a silent docker fallback.
+func (n nativeLauncher) Preflight() error {
+	return decideNativeRuntime(classifyNativeRuntime(goos(), hostHasSystemd(), os.Geteuid()))
+}
+
+func (n nativeLauncher) RequiredCommands() []string { return []string{"systemd-run", "systemctl"} }
+
+// EnsureNotRunning is a no-op: Provision clears any stale box (systemd unit).
+func (n nativeLauncher) EnsureNotRunning(ctx context.Context) error { return nil }
+
+// AssignNames takes the base names directly — the box is a systemd unit derived
+// from them; there is no registry to probe for collisions.
+func (n nativeLauncher) AssignNames(ctx context.Context, baseTarget, baseLeash string) error {
+	n.r.cfg.targetContainer = baseTarget
+	n.r.cfg.leashContainer = baseLeash
+	return nil
+}
+
+// StopSignal: the holder is stopped via systemctl, not a signal.
+func (n nativeLauncher) StopSignal(ctx context.Context) (string, error) { return "SIGTERM", nil }
+
+// PublishesPorts: native runs on the host and maps no container ports.
+func (n nativeLauncher) PublishesPorts() bool { return false }
+
+func (n nativeLauncher) DetectShell(ctx context.Context) (string, error) {
+	// The workload runs on the host; pick the host's shell.
+	if _, err := exec.LookPath("bash"); err == nil {
+		return "bash", nil
+	}
+	if _, err := exec.LookPath("sh"); err == nil {
+		return "sh", nil
+	}
+	return "", fmt.Errorf("failed to locate a usable shell (bash or sh) on the host")
+}
+
+func (n nativeLauncher) ExecCommand(ctx context.Context, shellBin, cmd string, interactive bool) *exec.Cmd {
+	return n.workloadCommand(ctx, n.r.cgroupPath, n.r.cfg.callerDir, shellBin, cmd)
+}
+
+// Precheck: the container setns/tty precheck is not a native concern.
+func (n nativeLauncher) Precheck(ctx context.Context, shellBin, cmd string) error { return nil }
+
+// InstallPromptAssets: no-op — native runs on the host filesystem and must not
+// write to the host's /etc/profile.d.
+func (n nativeLauncher) InstallPromptAssets(ctx context.Context) error { return nil }
+
 // workloadCommand builds the user's command to run inside the box: placed in
 // the LSM-scoped cgroup, in workdir, via `shellBin -lc "exec <cmd>"`. When
 // privileged it is wrapped in `nsenter --net=<ns>` so the workload also runs in

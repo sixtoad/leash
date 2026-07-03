@@ -250,17 +250,6 @@ func execute(cmdName string, args []string) error {
 		return err
 	}
 
-	if _, isNative := rt.(nativeRuntime); isNative {
-		// Native drives host tooling, not a container CLI named "native".
-		for _, bin := range []string{"systemd-run", "systemctl"} {
-			if err := ensureCommand(bin); err != nil {
-				return err
-			}
-		}
-	} else if err := ensureCommand(rt.Name()); err != nil {
-		return err
-	}
-
 	r := &runner{
 		opts:          opts,
 		cfg:           cfg,
@@ -269,6 +258,14 @@ func execute(cmdName string, args []string) error {
 		logger:        log.New(os.Stderr, "", 0),
 		sessionID:     sessionID,
 		workspaceHash: workspaceHash,
+	}
+
+	// Each backend declares the host binaries it drives (container: the runtime
+	// CLI; native: systemd-run/systemctl).
+	for _, bin := range r.launcher().RequiredCommands() {
+		if err := ensureCommand(bin); err != nil {
+			return err
+		}
 	}
 
 	if err := r.initMountState(context.Background(), callerDir); err != nil {
@@ -1278,7 +1275,7 @@ func (r *runner) rt() Runtime {
 }
 
 func (r *runner) startContainers(ctx context.Context) error {
-	if err := r.preflightNativeRuntime(); err != nil {
+	if err := r.launcher().Preflight(); err != nil {
 		return err
 	}
 	if err := r.preflightHostKernel(); err != nil {
@@ -1291,7 +1288,7 @@ func (r *runner) startContainers(ctx context.Context) error {
 		return err
 	}
 
-	if err := r.ensureNotRunning(ctx); err != nil {
+	if err := r.launcher().EnsureNotRunning(ctx); err != nil {
 		return err
 	}
 
@@ -1341,7 +1338,7 @@ func (r *runner) startContainers(ctx context.Context) error {
 		return fmt.Errorf("prepare leash-entry binaries: %w", err)
 	}
 
-	stopSignal, err := r.getImageStopSignal(ctx)
+	stopSignal, err := r.launcher().StopSignal(ctx)
 	if err != nil {
 		return err
 	}
@@ -1360,7 +1357,7 @@ func (r *runner) startContainers(ctx context.Context) error {
 		return r.finishLifecycle(ctx, 0, err)
 	}
 
-	if err := r.installPromptAssets(ctx); err != nil {
+	if err := r.launcher().InstallPromptAssets(ctx); err != nil {
 		fmt.Printf("Warning: failed to install leash prompt: %v\n", err)
 		if r.logger != nil {
 			r.logger.Printf("Warning: failed to install leash prompt: %v", err)
@@ -1384,7 +1381,7 @@ func (r *runner) startContainers(ctx context.Context) error {
 
 	runCmd := shellQuote(r.opts.command)
 
-	shellBin, err := r.detectShell(ctx)
+	shellBin, err := r.launcher().DetectShell(ctx)
 	if err != nil {
 		return r.finishLifecycle(ctx, 0, err)
 	}
@@ -1400,7 +1397,7 @@ func (r *runner) startContainers(ctx context.Context) error {
 		return r.finishLifecycle(ctx, exitCode, err)
 	}
 
-	if err := r.precheckInteractive(ctx, shellBin, runCmd); err != nil {
+	if err := r.launcher().Precheck(ctx, shellBin, runCmd); err != nil {
 		r.keepContainers = true
 		return r.finishLifecycle(ctx, 0, err)
 	}
@@ -1424,7 +1421,10 @@ func (r *runner) assignContainerNames(ctx context.Context) error {
 	if strings.TrimSpace(baseLeash) == "" {
 		baseLeash = r.cfg.leashContainer
 	}
+	return r.launcher().AssignNames(ctx, baseTarget, baseLeash)
+}
 
+func (r *runner) assignContainerNamesContainer(ctx context.Context, baseTarget, baseLeash string) error {
 	// An explicit --container-name must be honored verbatim: no suffix munging.
 	// Renaming silently would defeat the point (orchestrators address the agent
 	// by this exact name), so fail clearly if the name is already taken.
@@ -1440,15 +1440,6 @@ func (r *runner) assignContainerNames(ctx context.Context) error {
 		if targetExists || leashExists {
 			return fmt.Errorf("container name %q (or %q) already in use; remove the existing container or choose a different --container-name", baseTarget, baseLeash)
 		}
-		r.cfg.targetContainer = baseTarget
-		r.cfg.leashContainer = baseLeash
-		return nil
-	}
-
-	// Native has no container registry to probe for name collisions; the box is
-	// a systemd unit derived from these names, and the launcher clears any stale
-	// unit in Provision. Take the base names directly.
-	if r.usingNativeRuntime() {
 		r.cfg.targetContainer = baseTarget
 		r.cfg.leashContainer = baseLeash
 		return nil
@@ -1616,11 +1607,7 @@ func isPortConflictError(err error) bool {
 
 // Additional helper methods will be defined below.
 
-func (r *runner) ensureNotRunning(ctx context.Context) error {
-	if r.usingNativeRuntime() {
-		// No container to inspect; nativeLauncher.Provision clears any stale box.
-		return nil
-	}
+func (r *runner) ensureNotRunningContainer(ctx context.Context) error {
 	running, err := r.containerRunning(ctx, r.cfg.targetContainer)
 	if err != nil {
 		return err
@@ -1792,11 +1779,7 @@ func (r *runner) imageDefaultCommand(ctx context.Context) ([]string, error) {
 	return append(entry, cmd...), nil
 }
 
-func (r *runner) getImageStopSignal(ctx context.Context) (string, error) {
-	if r.usingNativeRuntime() {
-		// No image to query; the holder is stopped via systemctl, not a signal.
-		return "SIGTERM", nil
-	}
+func (r *runner) getImageStopSignalContainer(ctx context.Context) (string, error) {
 	out, err := r.rt().Output(ctx, "inspect", "--format", "{{.Config.StopSignal}}", r.cfg.targetImage)
 	if err != nil {
 		return "", fmt.Errorf("query stop signal: %w", err)
@@ -1809,7 +1792,7 @@ func (r *runner) getImageStopSignal(ctx context.Context) (string, error) {
 }
 
 func (r *runner) ensurePortFree(ctx context.Context, port string) error {
-	if r.usingNativeRuntime() {
+	if !r.launcher().PublishesPorts() {
 		// This check only inspects container-published ports; native has none.
 		return nil
 	}
@@ -1966,8 +1949,8 @@ func (r *runner) expandPublishAll(ctx context.Context) error {
 	if !r.opts.publishAll {
 		return nil
 	}
-	if r.usingNativeRuntime() {
-		return fmt.Errorf("--publish-all is not supported with --runtime native (no container image ports)")
+	if !r.launcher().PublishesPorts() {
+		return fmt.Errorf("--publish-all is not supported without a container runtime (no container image ports)")
 	}
 	out, err := r.rt().Output(ctx, "inspect", "--format", "{{json .Config.ExposedPorts}}", r.cfg.targetImage)
 	if err != nil {
@@ -2629,34 +2612,8 @@ func describeBootstrapMarker(path string) string {
 	return strings.Join(parts, " ")
 }
 
-func (r *runner) detectShell(ctx context.Context) (string, error) {
-	if r.usingNativeRuntime() {
-		// The workload runs on the host; pick the host's shell.
-		if _, err := exec.LookPath("bash"); err == nil {
-			return "bash", nil
-		}
-		if _, err := exec.LookPath("sh"); err == nil {
-			return "sh", nil
-		}
-		return "", fmt.Errorf("failed to locate a usable shell (bash or sh) on the host")
-	}
-	if err := r.rt().Run(ctx, "exec", "-w", r.cfg.callerDir, r.cfg.targetContainer, "bash", "-lc", "true"); err == nil {
-		return "bash", nil
-	}
-	if err := r.rt().Run(ctx, "exec", "-w", r.cfg.callerDir, r.cfg.targetContainer, "sh", "-lc", "true"); err == nil {
-		return "sh", nil
-	}
-	return "", fmt.Errorf("failed to locate a usable shell (bash or sh) inside %s", r.cfg.targetContainer)
-}
-
 func (r *runner) execNonInteractive(ctx context.Context, shellBin, cmd string) (int, error) {
-	var execCmd *exec.Cmd
-	if r.usingNativeRuntime() {
-		execCmd = nativeLauncher{r: r}.workloadCommand(ctx, r.cgroupPath, r.cfg.callerDir, shellBin, cmd)
-	} else {
-		dockerArgs := []string{"exec", "-i", "-w", r.cfg.callerDir, r.cfg.targetContainer, shellBin, "-lc", "exec " + cmd}
-		execCmd = r.rt().Cmd(ctx, dockerArgs...)
-	}
+	execCmd := r.launcher().ExecCommand(ctx, shellBin, cmd, false)
 	execCmd.Stdin = os.Stdin
 	execCmd.Stdout = os.Stdout
 	execCmd.Stderr = os.Stderr
@@ -2669,10 +2626,7 @@ func (r *runner) execNonInteractive(ctx context.Context, shellBin, cmd string) (
 	return 0, nil
 }
 
-func (r *runner) precheckInteractive(ctx context.Context, shellBin, runCmd string) error {
-	if r.usingNativeRuntime() {
-		return nil // the setns/tty precheck is a container-exec concern
-	}
+func (r *runner) precheckInteractiveContainer(ctx context.Context, shellBin, runCmd string) error {
 	tmp, err := os.CreateTemp("", "leash-runner-precheck-*.log")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
@@ -2710,13 +2664,7 @@ func (r *runner) execInteractive(shellBin, cmd string) (int, error) {
 	}
 	defer os.Remove(tmp.Name())
 
-	var execCmd *exec.Cmd
-	if r.usingNativeRuntime() {
-		execCmd = nativeLauncher{r: r}.workloadCommand(context.Background(), r.cgroupPath, r.cfg.callerDir, shellBin, cmd)
-	} else {
-		args := []string{"exec", "-it", "-w", r.cfg.callerDir, r.cfg.targetContainer, shellBin, "-lc", "exec " + cmd}
-		execCmd = r.rt().Cmd(context.Background(), args...)
-	}
+	execCmd := r.launcher().ExecCommand(context.Background(), shellBin, cmd, true)
 	execCmd.Stdin = os.Stdin
 	execCmd.Stdout = os.Stdout
 	execCmd.Stderr = io.MultiWriter(os.Stderr, tmp)
@@ -2868,12 +2816,7 @@ func (r *runner) discoverShareDir(ctx context.Context) string {
 	return ""
 }
 
-func (r *runner) installPromptAssets(ctx context.Context) error {
-	if r.usingNativeRuntime() {
-		// Native runs on the host filesystem; installing the prompt would write
-		// to the host's /etc/profile.d, which we must not do. Skip it.
-		return nil
-	}
+func (r *runner) installPromptAssetsContainer(ctx context.Context) error {
 	script := strings.TrimSpace(assets.LeashPromptScript)
 	if script == "" {
 		return nil

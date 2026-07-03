@@ -2,7 +2,9 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"os/exec"
 	"path/filepath"
 	"time"
 )
@@ -56,6 +58,41 @@ type launcher interface {
 	// Remove stops and reclaims the workload + enforcement. Backend-agnostic
 	// filesystem cleanup remains the runner's responsibility.
 	Remove(ctx context.Context)
+
+	// DetectShell returns the shell to run the workload with (container: probed
+	// inside the container; native: the host shell).
+	DetectShell(ctx context.Context) (string, error)
+	// ExecCommand builds the command that runs `shellBin -lc "exec cmd"` inside
+	// the enforced box. The runner runs it and handles the exit code, so the exec
+	// UX stays backend-agnostic. interactive requests a TTY.
+	ExecCommand(ctx context.Context, shellBin, cmd string, interactive bool) *exec.Cmd
+	// Precheck validates the interactive exec path before starting a session
+	// (container: catches Docker-Desktop setns issues; native: no-op).
+	Precheck(ctx context.Context, shellBin, cmd string) error
+	// InstallPromptAssets installs the leash shell prompt (container: into the
+	// container filesystem; native: no-op — the workload runs on the host).
+	InstallPromptAssets(ctx context.Context) error
+
+	// Preflight validates the backend can run before anything is provisioned
+	// (native: Linux + systemd + root; container: nil).
+	Preflight() error
+	// RequiredCommands lists host binaries that must be on PATH (container: the
+	// runtime binary; native: systemd-run + systemctl).
+	RequiredCommands() []string
+	// EnsureNotRunning fails/cleans up if a prior session is still present
+	// (container: inspects/removes the containers; native: no-op — Provision
+	// clears any stale box).
+	EnsureNotRunning(ctx context.Context) error
+	// AssignNames resolves the workload/leash identity from the base names
+	// (container: probes the registry to avoid collisions; native: uses the base
+	// names directly — the box is a systemd unit).
+	AssignNames(ctx context.Context, baseTarget, baseLeash string) error
+	// StopSignal is the signal used to stop the workload (container: the image's
+	// StopSignal; native: SIGTERM — the holder is stopped via systemctl).
+	StopSignal(ctx context.Context) (string, error)
+	// PublishesPorts reports whether the backend maps host↔container ports.
+	// Native runs on the host and has none.
+	PublishesPorts() bool
 }
 
 // launcher returns the configured backend launcher, selected by the runtime:
@@ -130,3 +167,47 @@ func (c containerLauncher) Remove(ctx context.Context) {
 	c.r.removeContainer(ctx, c.r.cfg.leashContainer)
 	c.r.removeContainer(ctx, c.r.cfg.targetContainer)
 }
+
+func (c containerLauncher) DetectShell(ctx context.Context) (string, error) {
+	if err := c.r.rt().Run(ctx, "exec", "-w", c.r.cfg.callerDir, c.r.cfg.targetContainer, "bash", "-lc", "true"); err == nil {
+		return "bash", nil
+	}
+	if err := c.r.rt().Run(ctx, "exec", "-w", c.r.cfg.callerDir, c.r.cfg.targetContainer, "sh", "-lc", "true"); err == nil {
+		return "sh", nil
+	}
+	return "", fmt.Errorf("failed to locate a usable shell (bash or sh) inside %s", c.r.cfg.targetContainer)
+}
+
+func (c containerLauncher) ExecCommand(ctx context.Context, shellBin, cmd string, interactive bool) *exec.Cmd {
+	flag := "-i"
+	if interactive {
+		flag = "-it"
+	}
+	return c.r.rt().Cmd(ctx, "exec", flag, "-w", c.r.cfg.callerDir, c.r.cfg.targetContainer, shellBin, "-lc", "exec "+cmd)
+}
+
+func (c containerLauncher) Precheck(ctx context.Context, shellBin, cmd string) error {
+	return c.r.precheckInteractiveContainer(ctx, shellBin, cmd)
+}
+
+func (c containerLauncher) InstallPromptAssets(ctx context.Context) error {
+	return c.r.installPromptAssetsContainer(ctx)
+}
+
+func (c containerLauncher) Preflight() error { return nil }
+
+func (c containerLauncher) RequiredCommands() []string { return []string{c.r.rt().Name()} }
+
+func (c containerLauncher) EnsureNotRunning(ctx context.Context) error {
+	return c.r.ensureNotRunningContainer(ctx)
+}
+
+func (c containerLauncher) AssignNames(ctx context.Context, baseTarget, baseLeash string) error {
+	return c.r.assignContainerNamesContainer(ctx, baseTarget, baseLeash)
+}
+
+func (c containerLauncher) StopSignal(ctx context.Context) (string, error) {
+	return c.r.getImageStopSignalContainer(ctx)
+}
+
+func (c containerLauncher) PublishesPorts() bool { return true }
