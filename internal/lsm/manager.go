@@ -45,6 +45,8 @@ func (m *LSMManager) handleAttachFailure(label string, err error) {
 		fmt.Fprintf(os.Stderr, "leash: FATAL: %s LSM failed to attach and --require-lsm is set: %v\n", label, err)
 		os.Exit(1)
 	}
+	// Enforcement settled (degraded to proxy-only) — release any host launcher.
+	notifyEnforcementSettled()
 	m.degradeOnce.Do(func() {
 		fmt.Fprintf(os.Stderr, "leash: WARNING: eBPF LSM enforcement (Layer 1) is unavailable (%s: %v).\n", label, err)
 		fmt.Fprintf(os.Stderr, "leash: continuing in degraded proxy-only mode — filesystem/exec/socket policies are NOT enforced; the L7 proxy (Layer 2) remains active and fail-closed.\n")

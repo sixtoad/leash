@@ -86,6 +86,12 @@ func Main(args []string) error {
 
 	if cfg.HostMode {
 		log.Printf("leash: host mode (no container) — workload in a systemd scope; enforcement requires CAP_BPF/CAP_NET_ADMIN and an active bpf LSM (see docs/LEASHD-HOST-MODE.md)")
+		// Release the native launcher once enforcement settles (LSM attached, or
+		// degraded to proxy-only). Set before any attach; fires at most once.
+		var readyOnce sync.Once
+		lsm.SetEnforcementSettledHook(func() {
+			readyOnce.Do(func() { writeEnforcementReadyMarker(getLeashDirFromEnv()) })
+		})
 	}
 
 	if err := preFlight(cfg); err != nil {
@@ -479,7 +485,9 @@ func (rt *runtimeState) activate() error {
 	if skipEnforcement() {
 		logPolicyEvent("bootstrap.activate", map[string]any{"status": "skipped"})
 		rt.policyReady.Store(true)
-		rt.signalHostEnforcementReady()
+		if rt.cfg != nil && rt.cfg.HostMode {
+			writeEnforcementReadyMarker(getLeashDirFromEnv())
+		}
 		waitForShutdown()
 		return nil
 	}
@@ -504,18 +512,16 @@ func (rt *runtimeState) activate() error {
 
 	logPolicyEvent("bootstrap.activate", map[string]any{"status": "ok"})
 	rt.policyReady.Store(true)
-	rt.signalHostEnforcementReady()
+	// Note: LoadAndStart blocks until shutdown, so the actual enforcement-ready
+	// signal is fired from the LSM settle hook installed in Main (host mode).
 	return nil
 }
 
-// signalHostEnforcementReady writes the enforcement-ready marker in host mode,
-// after the LSM is attached — the signal a native launcher waits on before it
-// runs the workload (fail-closed). No-op on the container path.
-func (rt *runtimeState) signalHostEnforcementReady() {
-	if rt.cfg == nil || !rt.cfg.HostMode {
-		return
-	}
-	dir := getLeashDirFromEnv()
+// writeEnforcementReadyMarker writes the enforcement-ready marker — the signal a
+// native launcher waits on before it runs the workload (fail-closed). Installed
+// as the LSM settle hook (fires after the eBPF LSM attaches, or on degrade) and
+// also called on the skip-enforcement path.
+func writeEnforcementReadyMarker(dir string) {
 	if strings.TrimSpace(dir) == "" {
 		return
 	}
