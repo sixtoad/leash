@@ -22,6 +22,18 @@ import (
 // It holds *runner like containerLauncher and derives all unit/netns names
 // deterministically from runner state, so a fresh value from r.launcher() agrees
 // with a prior Provision (no stored state needed across calls).
+// nativeLayer2Enabled gates native's Layer-2 path (a dedicated workload netns +
+// nsenter + the leashd MITM proxy/netfilter REDIRECT). It is DISABLED until
+// native netns egress (veth + NAT + DNS) is implemented: without egress the
+// netns has no route out, so the agent can't reach the network and the Control
+// UI is unreachable. Until then native runs LSM-only in the host netns —
+// file/exec/network-connect are still enforced by the eBPF LSM on the cgroup;
+// only the L7 HTTP MITM is absent.
+//
+// TODO(native egress): implement veth+NAT+DNS in Provision/Remove, then flip
+// this to true. NOT upstream-ready until then (Layer 2 must work).
+const nativeLayer2Enabled = false
+
 type nativeLauncher struct {
 	r *runner
 }
@@ -100,10 +112,12 @@ func (n nativeLauncher) Provision(ctx context.Context, stopSignal string) (strin
 	}
 	cgroupPath := filepath.Join("/sys/fs/cgroup", rel)
 
-	if n.useUserManager() {
-		n.r.debugf("native box: netns skipped (needs root; the proxy/Layer-2 path it serves is not wired yet)")
-	} else if err := n.addNetns(ctx); err != nil {
-		n.r.debugf("native box: netns %q not created: %v", n.netnsName(), err)
+	if nativeLayer2Enabled && !n.useUserManager() {
+		if err := n.addNetns(ctx); err != nil {
+			n.r.debugf("native box: netns %q not created: %v", n.netnsName(), err)
+		}
+	} else {
+		n.r.debugf("native box: LSM-only (no netns/proxy; Layer 2 pending native egress)")
 	}
 
 	n.r.debugf("native box ready: unit=%s cgroup=%s", unit, cgroupPath)
@@ -160,11 +174,16 @@ func (n nativeLauncher) netnsRunPath() string {
 	return filepath.Join("/run/netns", n.netnsName())
 }
 
-// hostLeashdArgv builds the command that launches leashd host mode in the
-// workload's netns: nsenter --net=<ns> -- <self> --daemon --host --cgroup <cg>
-// [--proxy-port …] [--listen …]. Pure, so it is unit-tested directly.
+// hostLeashdArgv builds the command that launches leashd host mode. With Layer 2
+// it runs inside the workload netns (nsenter … --daemon --host …); LSM-only it
+// runs in the host netns with --lsm-only (no proxy/netfilter). Pure, unit-tested.
 func (n nativeLauncher) hostLeashdArgv(self, netnsPath, cgroupPath string) []string {
-	argv := []string{"nsenter", "--net=" + netnsPath, "--", self, "--daemon", "--host", "--cgroup", cgroupPath}
+	var argv []string
+	if nativeLayer2Enabled {
+		argv = []string{"nsenter", "--net=" + netnsPath, "--", self, "--daemon", "--host", "--cgroup", cgroupPath}
+	} else {
+		argv = []string{self, "--daemon", "--host", "--lsm-only", "--cgroup", cgroupPath}
+	}
 	if cfgDir := strings.TrimSpace(n.r.cfg.cfgDir); cfgDir != "" {
 		argv = append(argv, "--policy", filepath.Join(cfgDir, "leash.cedar"))
 	}
@@ -182,14 +201,16 @@ func (n nativeLauncher) hostLeashdArgv(self, netnsPath, cgroupPath string) []str
 }
 
 // enforcementBlocker reports why enforcement can't start here, or "" if it can.
-// Native enforcement needs root: Provision only creates the named netns when
-// privileged, and applying netfilter inside it requires CAP_NET_ADMIN.
+// Native enforcement needs root to attach the eBPF LSM (and, with Layer 2, to
+// create the netns + apply netfilter).
 func (n nativeLauncher) enforcementBlocker(netnsPath string) string {
 	if n.useUserManager() {
-		return "requires root for the workload network namespace + netfilter (the box ran rootless, so no named netns was created)"
+		return "requires root to attach the eBPF LSM (the box ran rootless). Re-run with sudo, or use --runtime docker"
 	}
-	if _, err := os.Stat(netnsPath); err != nil {
-		return fmt.Sprintf("network namespace %s not found", netnsPath)
+	if nativeLayer2Enabled {
+		if _, err := os.Stat(netnsPath); err != nil {
+			return fmt.Sprintf("network namespace %s not found", netnsPath)
+		}
 	}
 	return ""
 }
@@ -227,7 +248,7 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 
 // Remove tears the box down: delete the netns (if any) and stop the holder unit.
 func (n nativeLauncher) Remove(ctx context.Context) {
-	if !n.useUserManager() {
+	if nativeLayer2Enabled && !n.useUserManager() {
 		_, _ = hostOutput(ctx, "ip", "netns", "del", n.netnsName())
 	}
 	n.stopUnit(ctx, n.unitName())
@@ -316,7 +337,7 @@ func (n nativeLauncher) InstallPromptAssets(ctx context.Context) error { return 
 // runs in the user-scope cgroup without a netns.
 func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir, shellBin, cmd string) *exec.Cmd {
 	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.workloadUser())
-	if !n.useUserManager() {
+	if nativeLayer2Enabled && !n.useUserManager() {
 		return exec.CommandContext(ctx, "nsenter", "--net="+n.netnsRunPath(), "--", "sh", "-c", inner)
 	}
 	return exec.CommandContext(ctx, "sh", "-c", inner)
