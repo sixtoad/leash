@@ -206,20 +206,22 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 		return nil
 	}
 	marker := filepath.Join(shareDir, entrypoint.BootstrapReadyFileName)
-	caCert := caCertPath(shareDir)
-	// leashd clears the marker once at startup, then waits for it. StartEnforcement
-	// spawned leashd asynchronously, so re-assert the marker on each poll to win
-	// that race; stop once leashd publishes its CA cert (the readiness signal).
+	ready := filepath.Join(shareDir, entrypoint.EnforcementReadyFileName)
+	// leashd clears the bootstrap marker once at startup, then waits for it.
+	// StartEnforcement spawned leashd asynchronously, so re-assert the marker on
+	// each poll to win that race. Crucially, wait for the *enforcement-ready*
+	// marker — leashd writes it AFTER attaching the eBPF LSM — not the CA cert,
+	// which is published earlier: the workload must not run until Layer 1 is live
+	// (fail-closed).
 	for i := 0; i < caCertWaitAttempts; i++ {
-		// leashd reads the marker as JSON metadata; write a valid object so it
-		// doesn't log a parse error.
+		// leashd reads the bootstrap marker as JSON metadata; write a valid object.
 		_ = os.WriteFile(marker, []byte(`{"source":"native"}`+"\n"), 0o644)
-		if _, err := os.Stat(caCert); err == nil {
+		if _, err := os.Stat(ready); err == nil {
 			return nil
 		}
 		time.Sleep(caCertWaitDelay)
 	}
-	n.r.logger.Println("Warning: leash CA certificate was not detected after waiting (native).")
+	n.r.logger.Println("Warning: native enforcement was not confirmed ready after waiting; the workload may run before Layer 1 is active.")
 	return nil
 }
 

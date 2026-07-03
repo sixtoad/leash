@@ -479,6 +479,7 @@ func (rt *runtimeState) activate() error {
 	if skipEnforcement() {
 		logPolicyEvent("bootstrap.activate", map[string]any{"status": "skipped"})
 		rt.policyReady.Store(true)
+		rt.signalHostEnforcementReady()
 		waitForShutdown()
 		return nil
 	}
@@ -503,7 +504,25 @@ func (rt *runtimeState) activate() error {
 
 	logPolicyEvent("bootstrap.activate", map[string]any{"status": "ok"})
 	rt.policyReady.Store(true)
+	rt.signalHostEnforcementReady()
 	return nil
+}
+
+// signalHostEnforcementReady writes the enforcement-ready marker in host mode,
+// after the LSM is attached — the signal a native launcher waits on before it
+// runs the workload (fail-closed). No-op on the container path.
+func (rt *runtimeState) signalHostEnforcementReady() {
+	if rt.cfg == nil || !rt.cfg.HostMode {
+		return
+	}
+	dir := getLeashDirFromEnv()
+	if strings.TrimSpace(dir) == "" {
+		return
+	}
+	path := filepath.Join(dir, entrypoint.EnforcementReadyFileName)
+	if err := os.WriteFile(path, []byte("ready\n"), 0o644); err != nil {
+		log.Printf("Warning: failed to write enforcement-ready marker %s: %v", path, err)
+	}
 }
 
 func (rt *runtimeState) waitForBootstrap() error {

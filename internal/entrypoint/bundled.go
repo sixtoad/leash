@@ -23,6 +23,10 @@ import (
 const (
 	ReadyFileName          = "leash-entry.ready"
 	BootstrapReadyFileName = "bootstrap.ready"
+	// EnforcementReadyFileName is written by leashd (host mode) after the eBPF
+	// LSM is attached and enforcement is live, so a host launcher can hold the
+	// workload until then (fail-closed). Not used on the container path.
+	EnforcementReadyFileName = "enforcement.ready"
 )
 
 var (
