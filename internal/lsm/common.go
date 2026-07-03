@@ -465,10 +465,19 @@ func LoadAndAttachBPFWithSetup(
 	config BPFConfig,
 	customSetup func(*ebpf.Collection) error,
 ) error {
-	// Report this attach attempt as settled on every exit — attached OR failed —
-	// so a readiness barrier (see onLSMAttached) never hangs on a program that
-	// couldn't attach.
-	defer notifyLSMAttached()
+	// Report this attach attempt as settled exactly once (see onLSMAttached): on
+	// success right after the programs attach — BEFORE the blocking event loop
+	// below — and on any early return (failure) via this defer. Firing it via a
+	// bare defer would be wrong: this function blocks in the event loop until
+	// shutdown, so the settle would only fire then, hanging a readiness barrier.
+	settled := false
+	settle := func() {
+		if !settled {
+			settled = true
+			notifyLSMAttached()
+		}
+	}
+	defer settle()
 
 	// Load BPF program
 	spec, err := loader()
@@ -532,6 +541,9 @@ func LoadAndAttachBPFWithSetup(
 		}
 		links = append(links, lsmLink)
 	}
+
+	// Attached — settle now, before the blocking event loop below.
+	settle()
 
 	// Set up ring buffer
 	rd, err := ringbuf.NewReader(coll.Maps[config.EventMapName])
