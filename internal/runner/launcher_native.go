@@ -211,7 +211,9 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 	// spawned leashd asynchronously, so re-assert the marker on each poll to win
 	// that race; stop once leashd publishes its CA cert (the readiness signal).
 	for i := 0; i < caCertWaitAttempts; i++ {
-		_ = os.WriteFile(marker, []byte("native\n"), 0o644)
+		// leashd reads the marker as JSON metadata; write a valid object so it
+		// doesn't log a parse error.
+		_ = os.WriteFile(marker, []byte(`{"source":"native"}`+"\n"), 0o644)
 		if _, err := os.Stat(caCert); err == nil {
 			return nil
 		}
