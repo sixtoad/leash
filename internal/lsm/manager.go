@@ -26,14 +26,35 @@ type LSMManager struct {
 
 	reloadMutex sync.RWMutex
 	degradeOnce sync.Once
+
+	// attachWG tracks the initial LSM program attaches so a host launcher is
+	// released only after ALL of them settle (attached or degraded), not the
+	// first. settleWatchOnce guards the single watcher goroutine.
+	attachWG        sync.WaitGroup
+	settleWatchOnce sync.Once
 }
 
 func NewLSMManager(cgroupPath string, logger *SharedLogger, requireLSM bool) *LSMManager {
-	return &LSMManager{
+	m := &LSMManager{
 		cgroupPath: cgroupPath,
 		logger:     logger,
 		requireLSM: requireLSM,
 	}
+	// Count each successful program attach toward "all attached".
+	onLSMAttached = m.attachWG.Done
+	return m
+}
+
+// StartSettleWatch fires the enforcement-settled hook once every attach spawned
+// by the initial policy load has reported (attached or degraded). Call it after
+// that load, before LoadAndStart blocks. Safe to call more than once.
+func (m *LSMManager) StartSettleWatch() {
+	m.settleWatchOnce.Do(func() {
+		go func() {
+			m.attachWG.Wait()
+			notifyEnforcementSettled()
+		}()
+	})
 }
 
 // handleAttachFailure decides what happens when an eBPF LSM program fails to
@@ -45,8 +66,9 @@ func (m *LSMManager) handleAttachFailure(label string, err error) {
 		fmt.Fprintf(os.Stderr, "leash: FATAL: %s LSM failed to attach and --require-lsm is set: %v\n", label, err)
 		os.Exit(1)
 	}
-	// Enforcement settled (degraded to proxy-only) — release any host launcher.
-	notifyEnforcementSettled()
+	// This program failed to attach — count it as settled (degraded) so the
+	// "all attached" watcher can still fire.
+	m.attachWG.Done()
 	m.degradeOnce.Do(func() {
 		fmt.Fprintf(os.Stderr, "leash: WARNING: eBPF LSM enforcement (Layer 1) is unavailable (%s: %v).\n", label, err)
 		fmt.Fprintf(os.Stderr, "leash: continuing in degraded proxy-only mode — filesystem/exec/socket policies are NOT enforced; the L7 proxy (Layer 2) remains active and fail-closed.\n")
@@ -94,6 +116,7 @@ func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to load open policies: %w", err)
 		}
 
+		m.attachWG.Add(1)
 		go func() {
 			if err := m.openLsm.LoadAndAttach(loadLsmOpen); err != nil {
 				m.handleAttachFailure("file-open", err)
@@ -127,6 +150,7 @@ func (m *LSMManager) updateExecLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to load exec policies: %w", err)
 		}
 
+		m.attachWG.Add(1)
 		go func() {
 			if err := m.execLsm.LoadAndAttach(loadLsmExec); err != nil {
 				m.handleAttachFailure("exec", err)
@@ -165,6 +189,7 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to load connect policies: %w", err)
 		}
 
+		m.attachWG.Add(1)
 		go func() {
 			if err := m.connectLsm.LoadAndAttach(loadLsmConnect); err != nil {
 				m.handleAttachFailure("connect", err)
