@@ -8,7 +8,7 @@ import "testing"
 // cgroup-scoped BPF programs (which would either fail to load or govern the
 // whole host). See issue #67.
 func TestUpdateRuntimeRulesSkippedWithoutCgroup(t *testing.T) {
-	m := NewLSMManager("", nil)
+	m := NewLSMManager("", nil, false)
 
 	// A non-empty policy set: without the degraded-mode guard this would drive
 	// updateOpenLSM into a real BPF attach.
