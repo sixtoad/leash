@@ -134,6 +134,7 @@ type runtimeConfig struct {
 	CgroupPath       string
 	BootstrapTimeout time.Duration
 	HostMode         bool
+	LSMOnly          bool
 	MCPConfig        proxy.MCPConfig
 	TelemetryConfig  otel.Config
 }
@@ -165,6 +166,7 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 	// mode can substitute a host-appropriate default instead.
 	policyPath := fs.String("policy", strings.TrimSpace(os.Getenv("LEASH_POLICY")), "Cedar policy file path")
 	hostMode := fs.Bool("host", leashdEnvTruthy("LEASH_HOST"), "Run as a host process (no container): host-appropriate path defaults; enforcement needs CAP_BPF and an active bpf LSM. See docs/LEASHD-HOST-MODE.md")
+	lsmOnly := fs.Bool("lsm-only", leashdEnvTruthy("LEASH_LSM_ONLY"), "Enforce with the eBPF LSM only (file/exec/network-connect); skip the L7 MITM proxy and its netfilter. Used by native until netns egress lands.")
 
 	proxyPort := fs.String("proxy-port", "18000", "Proxy port")
 	listenFlag := &stringFlag{}
@@ -234,6 +236,7 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 		CgroupPath:       strings.TrimSpace(*cgroupFlag),
 		BootstrapTimeout: timeout,
 		HostMode:         *hostMode,
+		LSMOnly:          *lsmOnly,
 	}
 	cfg.MCPConfig = loadMCPConfigFromEnv()
 	cfg.TelemetryConfig = otel.LoadConfigFromEnv()
@@ -479,15 +482,20 @@ func (rt *runtimeState) activate() error {
 		return err
 	}
 
-	if err := rt.configureNetwork(); err != nil {
-		return err
-	}
-
-	go func() {
-		if err := rt.mitmProxy.Run(); err != nil {
-			log.Fatal(err)
+	// LSM-only mode (native, until netns egress lands): enforce with the eBPF
+	// LSM alone; skip the netfilter REDIRECT + L7 MITM proxy, which need the
+	// workload's own netns. file/exec/network-connect are still enforced.
+	if !rt.cfg.LSMOnly {
+		if err := rt.configureNetwork(); err != nil {
+			return err
 		}
-	}()
+
+		go func() {
+			if err := rt.mitmProxy.Run(); err != nil {
+				log.Fatal(err)
+			}
+		}()
+	}
 
 	// Release a host launcher only once ALL LSM programs have attached (or
 	// failed) — before LoadAndStart blocks. The initial policy load already

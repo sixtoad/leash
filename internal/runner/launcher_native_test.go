@@ -63,7 +63,8 @@ func TestNativeHostLeashdArgv(t *testing.T) {
 
 	argv := n.hostLeashdArgv("/usr/local/bin/leash", "/run/netns/leash-native-x", "/sys/fs/cgroup/scope")
 	joined := strings.Join(argv, " ")
-	want := "nsenter --net=/run/netns/leash-native-x -- /usr/local/bin/leash --daemon --host --cgroup /sys/fs/cgroup/scope --proxy-port 18000"
+	// LSM-only (nativeLayer2Enabled=false): host netns, no nsenter, --lsm-only.
+	want := "/usr/local/bin/leash --daemon --host --lsm-only --cgroup /sys/fs/cgroup/scope --proxy-port 18000"
 	if joined != want {
 		t.Fatalf("argv = %q\nwant   %q", joined, want)
 	}
@@ -80,7 +81,7 @@ func TestNativeStartEnforcementRequiresPrivilege(t *testing.T) {
 		t.Fatal("expected an actionable error when unprivileged")
 	}
 	msg := err.Error()
-	for _, want := range []string{"requires root", "would run:", "nsenter", "--daemon --host", "LEASHD-HOST-MODE.md"} {
+	for _, want := range []string{"requires root", "would run:", "--daemon --host", "LEASHD-HOST-MODE.md"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("error %q missing %q", msg, want)
 		}
