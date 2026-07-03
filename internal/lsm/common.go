@@ -18,6 +18,22 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 )
 
+// enforcementSettledHook, if set, is invoked when eBPF-LSM enforcement settles:
+// after the first successful program attach, or when the manager degrades to
+// proxy-only. Host mode installs it to release a launcher that is holding the
+// workload until enforcement is live (fail-closed). Set once at startup before
+// any attach, so no locking is needed.
+var enforcementSettledHook func()
+
+// SetEnforcementSettledHook installs the settle hook (pass nil to clear).
+func SetEnforcementSettledHook(f func()) { enforcementSettledHook = f }
+
+func notifyEnforcementSettled() {
+	if h := enforcementSettledHook; h != nil {
+		h()
+	}
+}
+
 // Common policy rule structure that can be converted to specific types
 type PolicyRule struct {
 	Action      int32 // 0 = deny, 1 = allow
@@ -490,12 +506,19 @@ func LoadAndAttachBPFWithSetup(
 			Program: coll.Programs[programName],
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to attach %s LSM program: %v\n", programName, err)
-			fmt.Fprintf(os.Stderr, "Note: LSM attachment requires proper kernel support\n")
-			os.Exit(1)
+			// Return the error rather than exiting so the caller can decide
+			// whether to degrade to proxy-only (the default) or fail hard
+			// (--require-lsm). The deferred loop above closes any links that
+			// already attached. The most common cause is the kernel not having
+			// "bpf" as an active LSM (see the client-side preflight).
+			return fmt.Errorf("attach %s LSM program (kernel may lack an active bpf LSM): %w", programName, err)
 		}
 		links = append(links, lsmLink)
 	}
+
+	// Enforcement is live for this program set — signal any settle hook (host
+	// mode uses this to release the workload, fail-closed).
+	notifyEnforcementSettled()
 
 	// Set up ring buffer
 	rd, err := ringbuf.NewReader(coll.Maps[config.EventMapName])
