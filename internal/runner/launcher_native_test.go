@@ -103,11 +103,11 @@ func TestNativeRuntimeSkipsContainerPrelaunch(t *testing.T) {
 	if r.cfg.targetContainer != "tgt" || r.cfg.leashContainer != "tgt-leash" {
 		t.Fatalf("native names = %q/%q, want the base names unprobed", r.cfg.targetContainer, r.cfg.leashContainer)
 	}
-	if err := r.ensureNotRunning(ctx); err != nil {
-		t.Fatalf("ensureNotRunning: %v", err)
+	if err := r.launcher().EnsureNotRunning(ctx); err != nil {
+		t.Fatalf("EnsureNotRunning: %v", err)
 	}
-	if sig, err := r.getImageStopSignal(ctx); err != nil || sig != "SIGTERM" {
-		t.Fatalf("getImageStopSignal = %q, %v; want SIGTERM, nil", sig, err)
+	if sig, err := r.launcher().StopSignal(ctx); err != nil || sig != "SIGTERM" {
+		t.Fatalf("StopSignal = %q, %v; want SIGTERM, nil", sig, err)
 	}
 	if err := r.ensurePortFree(ctx, "18080"); err != nil {
 		t.Fatalf("ensurePortFree: %v", err)
