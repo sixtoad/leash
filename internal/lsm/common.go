@@ -33,11 +33,11 @@ func notifyEnforcementSettled() {
 	}
 }
 
-// onLSMAttached, if set, is invoked once per LSM program set after it attaches.
-// The manager uses it to count attaches so it can fire the settled hook only
-// after ALL programs are live (not just the first — the connect LSM attaches
-// before the slower file-open one, which would otherwise release the workload
-// before file policy is enforced).
+// onLSMAttached, if set, is invoked once per attach attempt after it settles
+// (attached or failed — see the defer in LoadAndAttachBPFWithSetup). The manager
+// uses it to count attempts so it can fire the settled hook only after ALL
+// programs report (not just the first — the connect LSM settles before the
+// slower file-open one, which would otherwise release the workload early).
 var onLSMAttached func()
 
 func notifyLSMAttached() {
@@ -465,6 +465,11 @@ func LoadAndAttachBPFWithSetup(
 	config BPFConfig,
 	customSetup func(*ebpf.Collection) error,
 ) error {
+	// Report this attach attempt as settled on every exit — attached OR failed —
+	// so a readiness barrier (see onLSMAttached) never hangs on a program that
+	// couldn't attach.
+	defer notifyLSMAttached()
+
 	// Load BPF program
 	spec, err := loader()
 	if err != nil {
@@ -527,9 +532,6 @@ func LoadAndAttachBPFWithSetup(
 		}
 		links = append(links, lsmLink)
 	}
-
-	// This program set is attached — count it toward "all attached".
-	notifyLSMAttached()
 
 	// Set up ring buffer
 	rd, err := ringbuf.NewReader(coll.Maps[config.EventMapName])

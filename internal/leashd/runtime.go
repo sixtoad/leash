@@ -85,13 +85,7 @@ func Main(args []string) error {
 	defer statsig.Stop(context.Background())
 
 	if cfg.HostMode {
-		log.Printf("leash: host mode (no container) — workload in a systemd scope; enforcement requires CAP_BPF/CAP_NET_ADMIN and an active bpf LSM (see docs/LEASHD-HOST-MODE.md)")
-		// Release the native launcher once enforcement settles (LSM attached, or
-		// degraded to proxy-only). Set before any attach; fires at most once.
-		var readyOnce sync.Once
-		lsm.SetEnforcementSettledHook(func() {
-			readyOnce.Do(func() { writeEnforcementReadyMarker(getLeashDirFromEnv()) })
-		})
+		enableHostMode()
 	}
 
 	if err := preFlight(cfg); err != nil {
@@ -509,20 +503,6 @@ func (rt *runtimeState) activate() error {
 	// Note: LoadAndStart blocks until shutdown, so the actual enforcement-ready
 	// signal is fired from the LSM settle hook installed in Main (host mode).
 	return nil
-}
-
-// writeEnforcementReadyMarker writes the enforcement-ready marker — the signal a
-// native launcher waits on before it runs the workload (fail-closed). Installed
-// as the LSM settle hook (fires after the eBPF LSM attaches, or on degrade) and
-// also called on the skip-enforcement path.
-func writeEnforcementReadyMarker(dir string) {
-	if strings.TrimSpace(dir) == "" {
-		return
-	}
-	path := filepath.Join(dir, entrypoint.EnforcementReadyFileName)
-	if err := os.WriteFile(path, []byte("ready\n"), 0o644); err != nil {
-		log.Printf("Warning: failed to write enforcement-ready marker %s: %v", path, err)
-	}
 }
 
 func (rt *runtimeState) waitForBootstrap() error {

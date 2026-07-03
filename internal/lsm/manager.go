@@ -22,26 +22,33 @@ type LSMManager struct {
 
 	reloadMutex sync.RWMutex
 
-	// attachWG tracks the initial LSM program attaches so a host launcher is
-	// released only after ALL of them settle (attached or failed), not the first.
-	// settleWatchOnce guards the single watcher goroutine.
+	// attachWG tracks the initial LSM program attaches so a readiness watcher
+	// fires only after ALL of them settle (attached or failed), not the first.
+	// trackOnce wires the per-attempt hook lazily; settleWatchOnce guards the
+	// single watcher goroutine.
 	attachWG        sync.WaitGroup
+	trackOnce       sync.Once
 	settleWatchOnce sync.Once
 }
 
 func NewLSMManager(cgroupPath string, logger *SharedLogger) *LSMManager {
-	m := &LSMManager{
+	return &LSMManager{
 		cgroupPath: cgroupPath,
 		logger:     logger,
 	}
-	// Count each successful program attach toward "all attached".
-	onLSMAttached = m.attachWG.Done
-	return m
 }
 
-// StartSettleWatch fires the enforcement-settled hook once every attach spawned
-// by the initial policy load has reported (attached or failed). Call it after
-// that load, before LoadAndStart blocks. Safe to call more than once.
+// trackAttach registers one pending attach attempt. It lazily wires the
+// per-attempt settle hook, so every LoadAndAttachBPF exit (via its defer)
+// decrements the group.
+func (m *LSMManager) trackAttach() {
+	m.trackOnce.Do(func() { onLSMAttached = m.attachWG.Done })
+	m.attachWG.Add(1)
+}
+
+// StartSettleWatch fires the enforcement-settled hook once every tracked attach
+// has settled. Call it after the initial policy load, before LoadAndStart
+// blocks. Safe to call more than once.
 func (m *LSMManager) StartSettleWatch() {
 	m.settleWatchOnce.Do(func() {
 		go func() {
@@ -91,11 +98,10 @@ func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to load open policies: %w", err)
 		}
 
-		m.attachWG.Add(1)
+		m.trackAttach()
 		go func() {
 			if err := m.openLsm.LoadAndAttach(loadLsmOpen); err != nil {
 				fmt.Fprintf(os.Stderr, "File open LSM error: %v\n", err)
-				m.attachWG.Done() // failed program still counts as settled
 			}
 		}()
 	} else {
@@ -126,11 +132,10 @@ func (m *LSMManager) updateExecLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to load exec policies: %w", err)
 		}
 
-		m.attachWG.Add(1)
+		m.trackAttach()
 		go func() {
 			if err := m.execLsm.LoadAndAttach(loadLsmExec); err != nil {
 				fmt.Fprintf(os.Stderr, "Exec LSM error: %v\n", err)
-				m.attachWG.Done() // failed program still counts as settled
 			}
 		}()
 	} else {
@@ -166,11 +171,10 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to load connect policies: %w", err)
 		}
 
-		m.attachWG.Add(1)
+		m.trackAttach()
 		go func() {
 			if err := m.connectLsm.LoadAndAttach(loadLsmConnect); err != nil {
 				fmt.Fprintf(os.Stderr, "Connect LSM error: %v\n", err)
-				m.attachWG.Done() // failed program still counts as settled
 			}
 		}()
 	} else {
