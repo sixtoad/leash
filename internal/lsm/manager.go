@@ -21,13 +21,34 @@ type LSMManager struct {
 	connectLsm *ConnectLsm
 
 	reloadMutex sync.RWMutex
+
+	// attachWG tracks the initial LSM program attaches so a host launcher is
+	// released only after ALL of them settle (attached or failed), not the first.
+	// settleWatchOnce guards the single watcher goroutine.
+	attachWG        sync.WaitGroup
+	settleWatchOnce sync.Once
 }
 
 func NewLSMManager(cgroupPath string, logger *SharedLogger) *LSMManager {
-	return &LSMManager{
+	m := &LSMManager{
 		cgroupPath: cgroupPath,
 		logger:     logger,
 	}
+	// Count each successful program attach toward "all attached".
+	onLSMAttached = m.attachWG.Done
+	return m
+}
+
+// StartSettleWatch fires the enforcement-settled hook once every attach spawned
+// by the initial policy load has reported (attached or failed). Call it after
+// that load, before LoadAndStart blocks. Safe to call more than once.
+func (m *LSMManager) StartSettleWatch() {
+	m.settleWatchOnce.Do(func() {
+		go func() {
+			m.attachWG.Wait()
+			notifyEnforcementSettled()
+		}()
+	})
 }
 
 func (m *LSMManager) LoadAndStart() error {
@@ -70,9 +91,11 @@ func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to load open policies: %w", err)
 		}
 
+		m.attachWG.Add(1)
 		go func() {
 			if err := m.openLsm.LoadAndAttach(loadLsmOpen); err != nil {
 				fmt.Fprintf(os.Stderr, "File open LSM error: %v\n", err)
+				m.attachWG.Done() // failed program still counts as settled
 			}
 		}()
 	} else {
@@ -103,9 +126,11 @@ func (m *LSMManager) updateExecLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to load exec policies: %w", err)
 		}
 
+		m.attachWG.Add(1)
 		go func() {
 			if err := m.execLsm.LoadAndAttach(loadLsmExec); err != nil {
 				fmt.Fprintf(os.Stderr, "Exec LSM error: %v\n", err)
+				m.attachWG.Done() // failed program still counts as settled
 			}
 		}()
 	} else {
@@ -141,9 +166,11 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to load connect policies: %w", err)
 		}
 
+		m.attachWG.Add(1)
 		go func() {
 			if err := m.connectLsm.LoadAndAttach(loadLsmConnect); err != nil {
 				fmt.Fprintf(os.Stderr, "Connect LSM error: %v\n", err)
+				m.attachWG.Done() // failed program still counts as settled
 			}
 		}()
 	} else {

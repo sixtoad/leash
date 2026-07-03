@@ -18,11 +18,10 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 )
 
-// enforcementSettledHook, if set, is invoked when eBPF-LSM enforcement settles:
-// after the first successful program attach, or when the manager degrades to
-// proxy-only. Host mode installs it to release a launcher that is holding the
-// workload until enforcement is live (fail-closed). Set once at startup before
-// any attach, so no locking is needed.
+// enforcementSettledHook, if set, is invoked once when eBPF-LSM enforcement has
+// settled — ALL of the manager's programs have attached (or degraded). Host mode
+// installs it to release a launcher holding the workload until enforcement is
+// live (fail-closed). Set once at startup before any attach.
 var enforcementSettledHook func()
 
 // SetEnforcementSettledHook installs the settle hook (pass nil to clear).
@@ -30,6 +29,19 @@ func SetEnforcementSettledHook(f func()) { enforcementSettledHook = f }
 
 func notifyEnforcementSettled() {
 	if h := enforcementSettledHook; h != nil {
+		h()
+	}
+}
+
+// onLSMAttached, if set, is invoked once per LSM program set after it attaches.
+// The manager uses it to count attaches so it can fire the settled hook only
+// after ALL programs are live (not just the first — the connect LSM attaches
+// before the slower file-open one, which would otherwise release the workload
+// before file policy is enforced).
+var onLSMAttached func()
+
+func notifyLSMAttached() {
+	if h := onLSMAttached; h != nil {
 		h()
 	}
 }
@@ -516,9 +528,8 @@ func LoadAndAttachBPFWithSetup(
 		links = append(links, lsmLink)
 	}
 
-	// Enforcement is live for this program set — signal any settle hook (host
-	// mode uses this to release the workload, fail-closed).
-	notifyEnforcementSettled()
+	// This program set is attached — count it toward "all attached".
+	notifyLSMAttached()
 
 	// Set up ring buffer
 	rd, err := ringbuf.NewReader(coll.Maps[config.EventMapName])

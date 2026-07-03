@@ -495,6 +495,11 @@ func (rt *runtimeState) activate() error {
 		}
 	}()
 
+	// Release a host launcher only once ALL LSM programs have attached (or
+	// failed) — before LoadAndStart blocks. The initial policy load already
+	// spawned the attach goroutines.
+	rt.lsmManager.StartSettleWatch()
+
 	if err := rt.lsmManager.LoadAndStart(); err != nil {
 		return err
 	}
