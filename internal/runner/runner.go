@@ -1143,6 +1143,12 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 	if trimmed := strings.TrimSpace(opts.runtime); trimmed != "" {
 		cfg.runtime = trimmed
 	}
+	// DOWNSTREAM: default to the platform-native backend (see
+	// runtime_default_native.go); the native preflight surfaces viability and
+	// never silently falls back to docker. Docker/podman are opt-in via --runtime.
+	if cfg.runtime == "" {
+		cfg.runtime = defaultRuntimeName()
+	}
 
 	// Require the eBPF LSM layer (hard-stop instead of proxy-only degrade) when
 	// the flag is set or LEASH_REQUIRE_LSM is truthy.
