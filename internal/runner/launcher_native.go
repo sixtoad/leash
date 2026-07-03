@@ -315,13 +315,41 @@ func (n nativeLauncher) InstallPromptAssets(ctx context.Context) error { return 
 // the enforced network namespace (Layer 2); rootless (degraded/unenforced) it
 // runs in the user-scope cgroup without a netns.
 func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir, shellBin, cmd string) *exec.Cmd {
-	procs := quoteShellArg(filepath.Join(cgroupPath, "cgroup.procs"))
-	inner := fmt.Sprintf("echo $$ > %s && cd %s && exec %s -lc %s",
-		procs, quoteShellArg(workdir), quoteShellArg(shellBin), quoteShellArg("exec "+cmd))
+	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.workloadUser())
 	if !n.useUserManager() {
 		return exec.CommandContext(ctx, "nsenter", "--net="+n.netnsRunPath(), "--", "sh", "-c", inner)
 	}
 	return exec.CommandContext(ctx, "sh", "-c", inner)
+}
+
+// workloadUser returns the non-root user the workload should run as, or "" to
+// keep the current uid. The eBPF LSM enforces on the cgroup regardless of uid,
+// so when leash runs as root (typical: `sudo leash`) the agent need not — and
+// many agents refuse to (e.g. Claude Code blocks --dangerously-skip-permissions
+// as root). We drop to the invoking user ($SUDO_USER); leash and leashd keep
+// root only for enforcement. Non-root leash (rootless box) needs no drop.
+func (n nativeLauncher) workloadUser() string {
+	if os.Geteuid() != 0 {
+		return ""
+	}
+	u := strings.TrimSpace(os.Getenv("SUDO_USER"))
+	if u == "" || u == "root" {
+		return ""
+	}
+	return u
+}
+
+// nativeWorkloadScript builds the shell placed in the box: join the LSM-scoped
+// cgroup, cd to workdir, then exec the command — dropping to dropUser via runuser
+// when set. Pure, so it is unit-tested.
+func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser string) string {
+	procs := quoteShellArg(filepath.Join(cgroupPath, "cgroup.procs"))
+	run := fmt.Sprintf("exec %s -lc %s", quoteShellArg(shellBin), quoteShellArg("exec "+cmd))
+	if dropUser != "" {
+		run = fmt.Sprintf("exec runuser -u %s -- %s -lc %s",
+			quoteShellArg(dropUser), quoteShellArg(shellBin), quoteShellArg("exec "+cmd))
+	}
+	return fmt.Sprintf("echo $$ > %s && cd %s && %s", procs, quoteShellArg(workdir), run)
 }
 
 // hostOutput runs a host command (systemd-run/systemctl/ip), capturing combined

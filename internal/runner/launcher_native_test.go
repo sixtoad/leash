@@ -175,3 +175,23 @@ func TestNativeBoxLifecycle_Integration(t *testing.T) {
 		t.Fatalf("unit %s still present after Remove (ControlGroup=%q)", n.unitName(), strings.TrimSpace(rel))
 	}
 }
+
+func TestNativeWorkloadScript(t *testing.T) {
+	cg := "/sys/fs/cgroup/system.slice/leash-native-x.service"
+
+	noDrop := nativeWorkloadScript(cg, "/wd", "bash", "claude", "")
+	if !strings.Contains(noDrop, "cgroup.procs") || !strings.Contains(noDrop, "exec bash -lc") {
+		t.Fatalf("no-drop script missing cgroup join / exec: %s", noDrop)
+	}
+	if strings.Contains(noDrop, "runuser") {
+		t.Fatalf("no-drop script should not use runuser: %s", noDrop)
+	}
+
+	drop := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice")
+	if !strings.Contains(drop, "runuser -u alice -- bash -lc") {
+		t.Fatalf("drop script should runuser to the user: %s", drop)
+	}
+	if !strings.Contains(drop, "cgroup.procs") {
+		t.Fatalf("drop script must still join the enforced cgroup: %s", drop)
+	}
+}
