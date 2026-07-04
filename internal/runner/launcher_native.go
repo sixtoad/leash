@@ -468,7 +468,17 @@ func (n nativeLauncher) InstallPromptAssets(ctx context.Context) error { return 
 // the enforced network namespace (Layer 2); rootless (degraded/unenforced) it
 // runs in the user-scope cgroup without a netns.
 func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir, shellBin, cmd string) *exec.Cmd {
-	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.workloadUser())
+	// Under Layer 2 the proxy MITMs TLS, so the agent must trust leash's CA. The
+	// container path installs it via the entrypoint; native has none, so point
+	// Node (Claude Code is Node) at the CA additively via NODE_EXTRA_CA_CERTS
+	// (leaves the system roots intact). Only meaningful with the proxy active.
+	caCert := ""
+	if n.layer2Active() {
+		if sd := strings.TrimSpace(n.r.cfg.shareDir); sd != "" {
+			caCert = caCertPath(sd)
+		}
+	}
+	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.workloadUser(), caCert)
 	if n.layer2Active() {
 		argv := n.layer2Wrap(inner)
 		return exec.CommandContext(ctx, argv[0], argv[1:]...)
@@ -495,13 +505,19 @@ func (n nativeLauncher) workloadUser() string {
 
 // nativeWorkloadScript builds the shell placed in the box: join the LSM-scoped
 // cgroup, cd to workdir, then exec the command — dropping to dropUser via runuser
-// when set. Pure, so it is unit-tested.
-func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser string) string {
+// when set, and exporting NODE_EXTRA_CA_CERTS (for the L2 MITM) when caCert is
+// set. The export goes in the innermost shell so it survives the runuser hop.
+// Pure, so it is unit-tested.
+func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert string) string {
 	procs := quoteShellArg(filepath.Join(cgroupPath, "cgroup.procs"))
-	run := fmt.Sprintf("exec %s -lc %s", quoteShellArg(shellBin), quoteShellArg("exec "+cmd))
+	innerCmd := "exec " + cmd
+	if caCert != "" {
+		innerCmd = "export NODE_EXTRA_CA_CERTS=" + quoteShellArg(caCert) + "; " + innerCmd
+	}
+	run := fmt.Sprintf("exec %s -lc %s", quoteShellArg(shellBin), quoteShellArg(innerCmd))
 	if dropUser != "" {
 		run = fmt.Sprintf("exec runuser -u %s -- %s -lc %s",
-			quoteShellArg(dropUser), quoteShellArg(shellBin), quoteShellArg("exec "+cmd))
+			quoteShellArg(dropUser), quoteShellArg(shellBin), quoteShellArg(innerCmd))
 	}
 	return fmt.Sprintf("echo $$ > %s && cd %s && %s", procs, quoteShellArg(workdir), run)
 }
