@@ -8,16 +8,27 @@ upstream-eligible slice (`feat/runtime-native-poc`).
 
 ## Install a ready binary (one-time)
 
-Build `leash` from this checkout onto your PATH — no rebuild per use:
+**Download a prebuilt binary** from the GitHub Release (recommended — no toolchain):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sixtoad/leash/walk-integration/scripts/leash-install.sh | bash
+```
+
+Detects your OS/arch, installs `leash` to `~/.local/bin` (override `LEASH_DEST`,
+or `LEASH_TAG` for a specific release). Linux binaries are fully enforcing; on
+macOS also `brew install --cask leash-app` (the binary is the CLI, enforcement is
+in the app — see "macOS" below).
+
+**Or build from source** onto your PATH:
 
 ```bash
 scripts/install-leash.sh                    # -> ~/.local/bin/leash  (no sudo)
-# or system-wide, for all users / an environment image:
-sudo scripts/install-leash.sh /usr/local/bin
+sudo scripts/install-leash.sh /usr/local/bin  # system-wide / env image
 ```
 
-The binary embeds the Control UI. If `internal/ui/dist` is still the build stub,
-run `make build-ui` (needs pnpm) first so the dashboard isn't blank.
+Build embeds the Control UI; if `internal/ui/dist` is still the stub, run
+`make build-ui` (needs pnpm) first. Maintainers cut releases with
+`scripts/release.sh <tag>`.
 
 ## Run Claude sandboxed
 
