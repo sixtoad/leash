@@ -113,10 +113,18 @@ explicit, or `--runtime docker` to opt into the container path.
    **blocks until every LSM program has settled** (attached or failed) via an
    enforcement-ready marker. The workload is not launched until Layer 1 is live.
    It also publishes leash's MITM CA to a world-readable `/tmp` copy.
-4. **Workload** — placed into the box cgroup (`echo $$ > cgroup.procs`), `cd` to
-   the workspace, then **dropped to the invoking user** (`runuser -u $SUDO_USER`)
-   and exec'd. Under Layer 2 it inherits the netns and `NODE_EXTRA_CA_CERTS` (the
-   `/tmp` CA copy) so Node clients trust the proxy.
+4. **Workload** — placed into the box cgroup (`echo $$ > cgroup.procs`, in the
+   host PID ns so the pid resolves), `cd` to the workspace, then **hardened**:
+   fresh **PID + IPC namespaces** with their own `/proc` (`unshare --ipc --pid
+   --fork --mount-proc`) so it can't read host processes' `/proc/<pid>/environ` or
+   share IPC; the private mount ns **masks** `/run/user/<uid>` (keyring/D-Bus) and
+   `/tmp/.X11-unix` (X11); `DBUS_SESSION_BUS_ADDRESS`/`DISPLAY`/`XAUTHORITY` are
+   scrubbed. Finally **dropped to the invoking user** (`runuser -u $SUDO_USER`).
+   Under Layer 2 it inherits the netns and `NODE_EXTRA_CA_CERTS` (the `/tmp` CA
+   copy) so Node clients trust the proxy. The cgroup placement stays in the host
+   PID ns (the LSM is cgroup-scoped, unaffected by the workload's PID ns). This
+   gives native container-grade **session isolation** (process table, IPC,
+   keyring, GUI) on top of the file/exec/network policy.
 5. **Teardown** — `Remove` tears down the egress (veth + host NAT rules +
    `/etc/netns/<ns>`), deletes the netns, removes the CA copy, and stops the unit.
 
@@ -202,9 +210,16 @@ test needs no egress; drop it to exercise Layer 2.)
 
 ## 9. Safety notes
 
-- No mount-namespace isolation — the workload sees the **real host filesystem**;
-  the policy is the only boundary. Use a scoped, default-deny policy.
+- **Filesystem**: no mount-namespace isolation — the workload sees the **real
+  host filesystem**; the policy is the only boundary there. Use a scoped,
+  default-deny policy (a wrong rule = exposure, with no rootfs behind it).
+- **Session**: PID/IPC/keyring/GUI *are* isolated (fresh PID+IPC ns, keyring/D-Bus
+  + X11 masks, env scrub) — see step 4. So the residual "runs in your session"
+  risk is narrowed to the filesystem, which the policy covers.
 - leashd holds `CAP_BPF`/`CAP_SYS_ADMIN`/`CAP_NET_ADMIN`; the **workload runs as
   the invoking user**, not root.
+- **Shared kernel**: a kernel exploit escapes leash (as it would a container);
+  only a VM contains that class. For untrusted content, run leash inside a
+  container/VM.
 - Confirm teardown removed the unit, netns, veth, and host NAT rules (the box
   lifecycle integration test asserts the unit/netns cleanup).

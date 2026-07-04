@@ -30,6 +30,7 @@ permit (principal, action in [Action::"FileOpen", Action::"FileOpenReadOnly"], r
 when { resource in [
   Dir::"/usr/", Dir::"/lib/", Dir::"/lib64/", Dir::"/bin/", Dir::"/sbin/", Dir::"/opt/",
   Dir::"/etc/", Dir::"/proc/", Dir::"/sys/", Dir::"/dev/", Dir::"/run/", Dir::"/tmp/",
+  File::"/proc", File::"/sys",  // allow listing the roots (the fresh PID ns already limits /proc to own pids)
   Dir::"$HOME/.claude/", Dir::"$HOME/.config/", Dir::"$HOME/.cache/",
   Dir::"$HOME/.npm/", Dir::"$HOME/.local/",
   File::"$HOME/.claude.json", File::"$HOME/.claude.json.backup",

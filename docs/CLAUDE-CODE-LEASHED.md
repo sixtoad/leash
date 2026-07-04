@@ -70,6 +70,22 @@ explicit allow-list. Non-obvious entries, each learned the hard way:
 The confinement is real: Claude **cannot** read `~/.ssh`, other projects, or
 `/root`, and cannot write outside the workspace / its own config.
 
+### Session isolation (beyond the file/net policy)
+
+A container isolates the process table, IPC, keyring, and GUI by default; native
+runs as your user in your session, so leash adds that back explicitly. When run as
+root, the workload launches in **fresh PID + IPC namespaces** (its own `/proc`),
+and the private mount ns **masks the keyring/D-Bus runtime dir** (`/run/user/<uid>`)
+and the **X11 socket dir** (`/tmp/.X11-unix`), with `DBUS_SESSION_BUS_ADDRESS` /
+`DISPLAY` / `XAUTHORITY` scrubbed from the env. Net effect, verified from inside
+the box: the agent **can't see host processes** (`/proc/1` is its own `runuser`,
+not `systemd`), **can't reach your keyring** (no D-Bus), and **can't keylog or
+screenshot** your session (no X11) — Cedar models file/exec/network, and these
+namespaces/masks cover the channels it doesn't. Result: **container-grade session
+isolation without a container.** (On the degraded **LSM-only fallback** path there
+is no netns, so the *abstract* X11 socket isn't blocked; the file/exec/network
+policy still holds.)
+
 ## Claude Code emits telemetry to Datadog
 
 With the network locked to Anthropic, you'll see leash deny (HTTP `403`) a
