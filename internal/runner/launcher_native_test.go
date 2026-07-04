@@ -182,7 +182,7 @@ func TestNativeWorkloadScript(t *testing.T) {
 	cg := "/sys/fs/cgroup/system.slice/leash-native-x.service"
 
 	// Unhardened (rootless path): plain placement — no ns/mask/scrub.
-	plain := nativeWorkloadScript(cg, "/wd", "bash", "claude", "", "", "", false)
+	plain := nativeWorkloadScript(cg, "/wd", "bash", "claude", "", "", hardenOpts{})
 	if !strings.Contains(plain, "cgroup.procs") || !strings.Contains(plain, "exec bash -lc") {
 		t.Fatalf("plain script missing cgroup join / exec: %s", plain)
 	}
@@ -192,9 +192,9 @@ func TestNativeWorkloadScript(t *testing.T) {
 		}
 	}
 
-	// Hardened (root) with drop-user + CA + uid: masks + fresh PID/IPC ns + env
-	// scrub + CA export, and the cgroup write stays before the unshare.
-	h := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "/share/ca-cert.pem", "1000", true)
+	// Hardened default (root): masks + fresh PID+IPC ns + full scrub + CA export.
+	h := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "/share/ca-cert.pem",
+		hardenOpts{enabled: true, uid: "1000"})
 	for _, want := range []string{
 		"mount -t tmpfs -o uid=1000,mode=0700 tmpfs /run/user/1000",
 		"/tmp/.X11-unix",
@@ -208,9 +208,27 @@ func TestNativeWorkloadScript(t *testing.T) {
 			t.Fatalf("hardened script missing %q: %s", want, h)
 		}
 	}
-	// cgroup placement must precede the PID-ns unshare (pid resolves in host ns).
-	if strings.Index(h, "cgroup.procs") > strings.Index(h, "unshare --ipc") {
+	if strings.Index(h, "cgroup.procs") > strings.Index(h, "unshare") {
 		t.Fatalf("cgroup write must come before the unshare: %s", h)
+	}
+
+	// GUI opt-outs: --allow-display + --share-ipc → no X11 mask, DISPLAY kept, no
+	// IPC ns; but D-Bus stays masked/scrubbed (not opted out).
+	gui := nativeWorkloadScript(cg, "/wd", "bash", "app", "alice", "",
+		hardenOpts{enabled: true, uid: "1000", allowDisplay: true, shareIPC: true})
+	for _, unexpected := range []string{"/tmp/.X11-unix", "--ipc", "-u DISPLAY", "-u XAUTHORITY"} {
+		if strings.Contains(gui, unexpected) {
+			t.Fatalf("GUI script must not contain %q: %s", unexpected, gui)
+		}
+	}
+	for _, want := range []string{
+		"unshare --pid --fork --mount-proc --",                      // PID ns still on
+		"env -u DBUS_SESSION_BUS_ADDRESS",                           // D-Bus still scrubbed
+		"mount -t tmpfs -o uid=1000,mode=0700 tmpfs /run/user/1000", // D-Bus dir still masked
+	} {
+		if !strings.Contains(gui, want) {
+			t.Fatalf("GUI script missing %q: %s", want, gui)
+		}
 	}
 }
 

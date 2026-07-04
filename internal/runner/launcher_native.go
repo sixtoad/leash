@@ -522,18 +522,23 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 	}
 	// Harden (fresh PID/IPC ns + keyring/GUI socket masks) only when root — the
 	// namespace/mount ops need privilege, and rootless is the degraded/unenforced
-	// path anyway.
-	harden := !n.useUserManager()
-	uid := ""
-	if harden {
-		uid = n.workloadUID()
+	// path anyway. Granular flags relax it for GUI/desktop workloads.
+	h := hardenOpts{}
+	if !n.useUserManager() {
+		h = hardenOpts{
+			enabled:      true,
+			uid:          n.workloadUID(),
+			shareIPC:     n.r.opts.shareIPC,
+			allowDisplay: n.r.opts.allowDisplay,
+			allowDBus:    n.r.opts.allowDBus,
+		}
 	}
-	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.workloadUser(), caCert, uid, harden)
+	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.workloadUser(), caCert, h)
 	if n.layer2Active() {
 		argv := n.layer2Wrap(inner) // nsenter --net + private mount ns (resolv bind)
 		return exec.CommandContext(ctx, argv[0], argv[1:]...)
 	}
-	if harden {
+	if h.enabled {
 		// LSM-only but root: the masks need a private mount ns of their own.
 		return exec.CommandContext(ctx, "unshare", "--mount", "--propagation", "private", "--", "sh", "-c", inner)
 	}
@@ -577,7 +582,19 @@ func (n nativeLauncher) workloadUser() string {
 // when set, and exporting NODE_EXTRA_CA_CERTS (for the L2 MITM) when caCert is
 // set. The export goes in the innermost shell so it survives the runuser hop.
 // Pure, so it is unit-tested.
-func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, uid string, harden bool) string {
+// hardenOpts controls the workload's session isolation. Default (enabled, no
+// opt-outs): fresh PID+IPC ns, keyring/GUI socket masks, and a scrubbed env.
+// The allow*/share* flags relax it for GUI/desktop workloads — leash is
+// agnostic, so a container-shaped default must be opt-out-able.
+type hardenOpts struct {
+	enabled      bool   // master (root only); false = rootless/unenforced, no isolation
+	uid          string // validated-numeric $SUDO_UID for the keyring-dir mask
+	shareIPC     bool   // --share-ipc: no IPC ns (X MIT-SHM etc.)
+	allowDisplay bool   // --allow-display: keep DISPLAY/XAUTHORITY + the X11 socket
+	allowDBus    bool   // --allow-dbus: keep DBUS_SESSION_BUS_ADDRESS + /run/user
+}
+
+func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert string, h hardenOpts) string {
 	procs := quoteShellArg(filepath.Join(cgroupPath, "cgroup.procs"))
 	innerCmd := "exec " + cmd
 	if caCert != "" {
@@ -585,38 +602,55 @@ func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, 
 	}
 	shellRun := fmt.Sprintf("%s -lc %s", quoteShellArg(shellBin), quoteShellArg(innerCmd))
 
-	// Drop privileges (runuser) and, when hardening, scrub the session env vars
-	// that leak the keyring/GUI location (DBUS/DISPLAY/XAUTHORITY).
-	userRun := shellRun
-	if dropUser != "" {
-		userRun = "runuser -u " + quoteShellArg(dropUser) + " -- " + shellRun
-	}
-	if harden {
-		scrub := "env -u DBUS_SESSION_BUS_ADDRESS -u DISPLAY -u XAUTHORITY "
-		if dropUser != "" {
-			userRun = "runuser -u " + quoteShellArg(dropUser) + " -- " + scrub + shellRun
-		} else {
-			userRun = scrub + shellRun
+	// Scrub the session env vars that leak the keyring/GUI location — unless the
+	// matching allow flag keeps them.
+	scrub := ""
+	if h.enabled {
+		var vars []string
+		if !h.allowDBus {
+			vars = append(vars, "DBUS_SESSION_BUS_ADDRESS")
+		}
+		if !h.allowDisplay {
+			vars = append(vars, "DISPLAY", "XAUTHORITY")
+		}
+		if len(vars) > 0 {
+			scrub = "env"
+			for _, v := range vars {
+				scrub += " -u " + v
+			}
+			scrub += " "
 		}
 	}
 
-	// Fresh PID+IPC namespaces (own /proc via --mount-proc) so the workload can't
-	// read host processes' /proc (env/secrets) or share SysV/POSIX IPC. Placed
-	// AFTER the cgroup write below, which must run in the host PID ns so the pid
-	// resolves correctly (the LSM is cgroup-scoped, unaffected by the PID ns).
-	run := "exec " + userRun
-	if harden {
-		run = "exec unshare --ipc --pid --fork --mount-proc -- " + userRun
+	// Drop privileges (runuser), keeping the scrub in the innermost exec.
+	userRun := scrub + shellRun
+	if dropUser != "" {
+		userRun = "runuser -u " + quoteShellArg(dropUser) + " -- " + scrub + shellRun
 	}
 
-	// Mask session sockets reachable via the filesystem: the keyring/D-Bus runtime
-	// dir and the X11 socket dir. Runs in the caller's PRIVATE mount ns (layer2Wrap
-	// or the lsm-only `unshare --mount`), so the host's are untouched.
+	// Fresh PID (+ IPC unless shared) namespaces with own /proc (--mount-proc), so
+	// the workload can't read host processes' /proc (env/secrets) or share IPC.
+	// Placed AFTER the cgroup write below, which must run in the host PID ns so the
+	// pid resolves (the LSM is cgroup-scoped, unaffected by the PID ns).
+	run := "exec " + userRun
+	if h.enabled {
+		ns := "--pid --fork --mount-proc"
+		if !h.shareIPC {
+			ns = "--ipc " + ns
+		}
+		run = "exec unshare " + ns + " -- " + userRun
+	}
+
+	// Mask the session sockets reachable via the filesystem (keyring/D-Bus, X11) —
+	// unless the matching allow flag keeps them. Runs in the caller's PRIVATE mount
+	// ns (layer2Wrap or the lsm-only `unshare --mount`), so the host's are untouched.
 	masks := ""
-	if harden {
-		masks = "[ -d /tmp/.X11-unix ] && mount -t tmpfs -o mode=0755 tmpfs /tmp/.X11-unix 2>/dev/null || true; "
-		if uid != "" { // uid is validated-numeric; safe to interpolate
-			masks = fmt.Sprintf("mount -t tmpfs -o uid=%s,mode=0700 tmpfs /run/user/%s 2>/dev/null || true; ", uid, uid) + masks
+	if h.enabled {
+		if !h.allowDisplay {
+			masks += "[ -d /tmp/.X11-unix ] && mount -t tmpfs -o mode=0755 tmpfs /tmp/.X11-unix 2>/dev/null || true; "
+		}
+		if !h.allowDBus && h.uid != "" { // uid is validated-numeric; safe to interpolate
+			masks = fmt.Sprintf("mount -t tmpfs -o uid=%s,mode=0700 tmpfs /run/user/%s 2>/dev/null || true; ", h.uid, h.uid) + masks
 		}
 	}
 	return fmt.Sprintf("%secho $$ > %s && cd %s && %s", masks, procs, quoteShellArg(workdir), run)
