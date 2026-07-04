@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/strongdm/leash/internal/leashd/listen"
 )
 
 // CA-cert readiness wait — extracted verbatim from the previous inline values in
@@ -93,6 +95,10 @@ type launcher interface {
 	// PublishesPorts reports whether the backend maps host↔container ports.
 	// Native runs on the host and has none.
 	PublishesPorts() bool
+	// ControlUIURL is the reachable Control-UI URL for this backend (container:
+	// localhost:published-port; native Layer 2: the netns IP, since leashd runs
+	// inside the workload's netns; native LSM-only: localhost).
+	ControlUIURL(cfg listen.Config) string
 }
 
 // launcher returns the configured backend launcher, selected by the runtime:
@@ -211,3 +217,7 @@ func (c containerLauncher) StopSignal(ctx context.Context) (string, error) {
 }
 
 func (c containerLauncher) PublishesPorts() bool { return true }
+
+// ControlUIURL: the container publishes the UI port to the host, so the standard
+// localhost URL is reachable.
+func (c containerLauncher) ControlUIURL(cfg listen.Config) string { return cfg.DisplayURL() }
