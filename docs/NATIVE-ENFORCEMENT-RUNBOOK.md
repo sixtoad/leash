@@ -124,7 +124,14 @@ explicit, or `--runtime docker` to opt into the container path.
    copy) so Node clients trust the proxy. The cgroup placement stays in the host
    PID ns (the LSM is cgroup-scoped, unaffected by the workload's PID ns). This
    gives native container-grade **session isolation** (process table, IPC,
-   keyring, GUI) on top of the file/exec/network policy.
+   keyring, GUI) on top of the file/exec/network policy. leash is agnostic, so
+   this default is **opt-out-able** for GUI/desktop workloads: `--allow-display`
+   (keep `DISPLAY`/`XAUTHORITY` + the X11 socket — the *filesystem* socket
+   `/tmp/.X11-unix/X0` works even under the netns; only the abstract one is
+   netns-scoped), `--allow-dbus` (keep the session D-Bus/keyring), `--share-ipc`
+   (share the host IPC ns, e.g. X MIT-SHM). PID-ns/`/proc` isolation stays on
+   regardless; a GUI workload's policy must also permit the X socket and
+   `~/.Xauthority`.
 5. **Teardown** — `Remove` tears down the egress (veth + host NAT rules +
    `/etc/netns/<ns>`), deletes the netns, removes the CA copy, and stops the unit.
 

@@ -86,6 +86,11 @@ isolation without a container.** (On the degraded **LSM-only fallback** path the
 is no netns, so the *abstract* X11 socket isn't blocked; the file/exec/network
 policy still holds.)
 
+Claude is headless, so it needs none of this relaxed. But leash is agnostic — a
+GUI/desktop workload can opt out granularly: `--allow-display`, `--allow-dbus`,
+`--share-ipc` (see the runbook). `leash-claude.sh` passes none of them, so Claude
+gets the full hardening.
+
 ## Claude Code emits telemetry to Datadog
 
 With the network locked to Anthropic, you'll see leash deny (HTTP `403`) a
