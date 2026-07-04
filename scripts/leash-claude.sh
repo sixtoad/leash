@@ -58,8 +58,17 @@ when { resource in [
 EOF
 
 echo "leash-claude: confining Claude to $WORKSPACE (+ ~/.claude); network → Anthropic only." >&2
-echo "leash-claude: policy=$POL  (Control UI: see the netns IP in the startup log, not localhost)" >&2
+# Set LEASH_OPEN=1 to auto-open the Control UI in your browser (handy under the
+# TUI, where the printed URL scrolls away). Pass DISPLAY/XAUTHORITY through so
+# leash can open the browser in your session (the workload still has them scrubbed).
+env_extra=()
+leash_flags=()
+if [ -n "${LEASH_OPEN:-}" ]; then
+  leash_flags+=(--open)
+  [ -n "${DISPLAY:-}" ] && env_extra+=("DISPLAY=$DISPLAY" "XAUTHORITY=${XAUTHORITY:-$HOME/.Xauthority}")
+fi
+echo "leash-claude: policy=$POL  (Control UI opens in-browser if LEASH_OPEN=1; else see the netns IP in the log)" >&2
 
 # -E + explicit PATH/HOME so leash finds claude and Claude finds ~/.claude auth.
-exec sudo -E env "PATH=$PATH" "HOME=$HOME" "$LEASH_BIN" \
+exec sudo -E env "PATH=$PATH" "HOME=$HOME" "${env_extra[@]}" "$LEASH_BIN" "${leash_flags[@]}" \
   --policy "$POL" "$CLAUDE" --dangerously-skip-permissions "$@"
