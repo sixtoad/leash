@@ -108,6 +108,11 @@ type options struct {
 	publishes      []publishSpec
 	publishAll     bool
 	requireLSM     bool
+
+	// Native session-isolation opt-outs (default: hardened). See launcher_native.go.
+	allowDisplay bool // keep DISPLAY/XAUTHORITY + the X11 socket (GUI apps)
+	allowDBus    bool // keep DBUS_SESSION_BUS_ADDRESS + the keyring/D-Bus runtime dir
+	shareIPC     bool // share the host IPC namespace (e.g. X MIT-SHM)
 }
 
 type config struct {
@@ -342,6 +347,9 @@ Flags:
   -e, --env <key[=value]>         Set environment variables inside the leash containers (repeatable).
   -p, --publish <[ip:]host:container[/proto]>   Publish a container port to the host (repeatable). Examples: -p 3000, -p 8000:3000, -p 127.0.0.1:3000:3000, -p :3000, -p 3000/udp
   -P, --publish-all               Publish all EXPOSEd ports (host same as container when free, auto-bump on conflicts).
+  --allow-display                 (native) Let the workload reach the X11 display (keep DISPLAY; don't mask the X socket). For GUI apps.
+  --allow-dbus                    (native) Let the workload reach the session D-Bus/keyring (keep DBUS_SESSION_BUS_ADDRESS; don't mask /run/user).
+  --share-ipc                     (native) Share the host IPC namespace (e.g. X MIT-SHM). Default: isolated.
   --image <name[:tag]>            Override the target container image (defaults to %s).
   --leash-image <name[:tag]>      Override the leash manager image (defaults to %s).
   --container-name <name>         Force the exact agent container name (no sanitization, no collision suffix; leash container becomes <name>-leash).
@@ -420,6 +428,12 @@ func parseArgs(args []string) (options, error) {
 			i++
 		case "-P", "--publish-all":
 			opts.publishAll = true
+		case "--allow-display":
+			opts.allowDisplay = true
+		case "--allow-dbus":
+			opts.allowDBus = true
+		case "--share-ipc":
+			opts.shareIPC = true
 		case "-v":
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && strings.Contains(args[i+1], ":") {
 				opts.volumes = append(opts.volumes, args[i+1])
