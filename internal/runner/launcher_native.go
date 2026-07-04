@@ -159,8 +159,23 @@ func (n nativeLauncher) StartEnforcement(ctx context.Context, cgroupPath string)
 
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Env = append(os.Environ(), n.leashdEnv()...)
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	// Native runs leashd in the same TTY as the (interactive) workload, so its
+	// ongoing proxy/LSM logs would corrupt the agent's TUI. Send them to a file
+	// instead — the container path sends leashd logs to the runtime, not the
+	// workload's terminal. On failure, leave stdout/stderr nil (discarded) rather
+	// than fall back to the TTY.
+	if logf, err := os.Create(n.leashdLogPath()); err == nil {
+		cmd.Stdout, cmd.Stderr = logf, logf
+	} else {
+		n.r.debugf("native: leashd log file %s: %v (discarding leashd output)", n.leashdLogPath(), err)
+	}
 	return cmd.Start()
+}
+
+// leashdLogPath is where native tees leashd's stdout/stderr, off the workload's
+// TTY. Truncated per run; tail it to watch enforcement/proxy activity.
+func (n nativeLauncher) leashdLogPath() string {
+	return filepath.Join("/tmp", "leash-native-leashd-"+n.netnsName()+".log")
 }
 
 // leashdEnv passes the runner's host directories to the spawned leashd so it
