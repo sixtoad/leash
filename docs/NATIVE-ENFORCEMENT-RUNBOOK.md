@@ -1,5 +1,12 @@
 # Native enforcement — on-device runbook
 
+> **Status — 2026-07-04:** The kernel-prep parts (enabling the `bpf` LSM) are
+> current, but this runbook predates the full Layer-2 path. For the up-to-date,
+> verified way to run a sandboxed workload today — netns **egress**, the workload
+> **running as the invoking user**, **CA trust**, the Control-UI netns IP, and the
+> **leashd log file** — use [CLAUDE-CODE-LEASHED.md](CLAUDE-CODE-LEASHED.md), and
+> see [CHANGELOG.md](../CHANGELOG.md) for the shipped feature set.
+
 How to take the container-free Linux backend from **built & runnable
 (non-enforcing)** to **live enforcement**, on a machine you can reboot and run as
 root. Everything here is gated on a privileged, eBPF-LSM-activated host — it

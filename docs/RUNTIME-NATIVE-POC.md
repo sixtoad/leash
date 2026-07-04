@@ -1,5 +1,13 @@
 # `--runtime native` — proof of concept
 
+> **Status — 2026-07-04:** This is the design/PoC-era doc. The native runtime is
+> implemented and released (`native-v0.1.0`). Shipped beyond this PoC: netns
+> **egress** / Layer 2, the **LSM-only** fallback (`layer2Active`), the workload
+> **running as the invoking user** (`runuser`, not root), **CA trust**
+> (`NODE_EXTRA_CA_CERTS`), and the **leashd log-file** redirect. Current truth:
+> [CHANGELOG.md](../CHANGELOG.md) (what shipped) and
+> [CLAUDE-CODE-LEASHED.md](CLAUDE-CODE-LEASHED.md) (how to run it).
+
 **Status: PoC, held. Proves the box; does not yet enforce.** Not advertised
 alongside docker/podman.
 

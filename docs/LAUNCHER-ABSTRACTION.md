@@ -1,5 +1,13 @@
 # Launcher abstraction — the seam above `Runtime`
 
+> **Status — 2026-07-04:** Design-era doc. The `launcher` interface shipped as
+> described (container + native adapters, composition-root selection). Shipped
+> beyond this: the native launcher now wires netns **egress** / Layer 2, the
+> **LSM-only** fallback (`layer2Active`), the workload **running as the invoking
+> user** (`runuser`), **CA trust**, and a **leashd log-file** redirect. Current
+> truth: [CHANGELOG.md](../CHANGELOG.md) and
+> [CLAUDE-CODE-LEASHED.md](CLAUDE-CODE-LEASHED.md).
+
 **Status: design sketch, held.** Companion to
 [`RUNTIME-NATIVE-POC.md`](RUNTIME-NATIVE-POC.md). A compile-checked version of
 every type below lives at `scratch-native-poc/launcher-sketch/` (local,

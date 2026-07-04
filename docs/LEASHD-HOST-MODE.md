@@ -1,5 +1,12 @@
 # leashd host mode — spec
 
+> **Status — 2026-07-04:** Spec-era doc; host mode shipped (`--daemon --host`).
+> Shipped beyond this spec: netns **egress** / Layer 2, the `--lsm-only` mode +
+> **LSM-only** fallback (`layer2Active`), the workload **running as the invoking
+> user** (`runuser`), **CA trust** (`NODE_EXTRA_CA_CERTS`), and the **leashd
+> log-file** redirect. Current truth: [CHANGELOG.md](../CHANGELOG.md) and
+> [CLAUDE-CODE-LEASHED.md](CLAUDE-CODE-LEASHED.md).
+
 **Status: spec, held. No code.** The new leashd capability that
 [`LAUNCHER-ABSTRACTION.md`](LAUNCHER-ABSTRACTION.md) named as the real blocker
 for a native (container-free) backend. Companion to
