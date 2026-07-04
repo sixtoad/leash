@@ -520,12 +520,39 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 	if n.layer2Active() {
 		caCert = n.userReadableCACert() // world-readable copy WaitReady published
 	}
-	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.workloadUser(), caCert)
+	// Harden (fresh PID/IPC ns + keyring/GUI socket masks) only when root — the
+	// namespace/mount ops need privilege, and rootless is the degraded/unenforced
+	// path anyway.
+	harden := !n.useUserManager()
+	uid := ""
+	if harden {
+		uid = n.workloadUID()
+	}
+	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.workloadUser(), caCert, uid, harden)
 	if n.layer2Active() {
-		argv := n.layer2Wrap(inner)
+		argv := n.layer2Wrap(inner) // nsenter --net + private mount ns (resolv bind)
 		return exec.CommandContext(ctx, argv[0], argv[1:]...)
 	}
+	if harden {
+		// LSM-only but root: the masks need a private mount ns of their own.
+		return exec.CommandContext(ctx, "unshare", "--mount", "--propagation", "private", "--", "sh", "-c", inner)
+	}
 	return exec.CommandContext(ctx, "sh", "-c", inner)
+}
+
+// workloadUID returns the invoking user's numeric uid ($SUDO_UID) for the
+// keyring-dir mask, or "" if unavailable/non-numeric.
+func (n nativeLauncher) workloadUID() string {
+	u := strings.TrimSpace(os.Getenv("SUDO_UID"))
+	if u == "" {
+		return ""
+	}
+	for _, c := range u {
+		if c < '0' || c > '9' {
+			return ""
+		}
+	}
+	return u
 }
 
 // workloadUser returns the non-root user the workload should run as, or "" to
@@ -550,18 +577,49 @@ func (n nativeLauncher) workloadUser() string {
 // when set, and exporting NODE_EXTRA_CA_CERTS (for the L2 MITM) when caCert is
 // set. The export goes in the innermost shell so it survives the runuser hop.
 // Pure, so it is unit-tested.
-func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert string) string {
+func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, uid string, harden bool) string {
 	procs := quoteShellArg(filepath.Join(cgroupPath, "cgroup.procs"))
 	innerCmd := "exec " + cmd
 	if caCert != "" {
 		innerCmd = "export NODE_EXTRA_CA_CERTS=" + quoteShellArg(caCert) + "; " + innerCmd
 	}
-	run := fmt.Sprintf("exec %s -lc %s", quoteShellArg(shellBin), quoteShellArg(innerCmd))
+	shellRun := fmt.Sprintf("%s -lc %s", quoteShellArg(shellBin), quoteShellArg(innerCmd))
+
+	// Drop privileges (runuser) and, when hardening, scrub the session env vars
+	// that leak the keyring/GUI location (DBUS/DISPLAY/XAUTHORITY).
+	userRun := shellRun
 	if dropUser != "" {
-		run = fmt.Sprintf("exec runuser -u %s -- %s -lc %s",
-			quoteShellArg(dropUser), quoteShellArg(shellBin), quoteShellArg(innerCmd))
+		userRun = "runuser -u " + quoteShellArg(dropUser) + " -- " + shellRun
 	}
-	return fmt.Sprintf("echo $$ > %s && cd %s && %s", procs, quoteShellArg(workdir), run)
+	if harden {
+		scrub := "env -u DBUS_SESSION_BUS_ADDRESS -u DISPLAY -u XAUTHORITY "
+		if dropUser != "" {
+			userRun = "runuser -u " + quoteShellArg(dropUser) + " -- " + scrub + shellRun
+		} else {
+			userRun = scrub + shellRun
+		}
+	}
+
+	// Fresh PID+IPC namespaces (own /proc via --mount-proc) so the workload can't
+	// read host processes' /proc (env/secrets) or share SysV/POSIX IPC. Placed
+	// AFTER the cgroup write below, which must run in the host PID ns so the pid
+	// resolves correctly (the LSM is cgroup-scoped, unaffected by the PID ns).
+	run := "exec " + userRun
+	if harden {
+		run = "exec unshare --ipc --pid --fork --mount-proc -- " + userRun
+	}
+
+	// Mask session sockets reachable via the filesystem: the keyring/D-Bus runtime
+	// dir and the X11 socket dir. Runs in the caller's PRIVATE mount ns (layer2Wrap
+	// or the lsm-only `unshare --mount`), so the host's are untouched.
+	masks := ""
+	if harden {
+		masks = "[ -d /tmp/.X11-unix ] && mount -t tmpfs -o mode=0755 tmpfs /tmp/.X11-unix 2>/dev/null || true; "
+		if uid != "" { // uid is validated-numeric; safe to interpolate
+			masks = fmt.Sprintf("mount -t tmpfs -o uid=%s,mode=0700 tmpfs /run/user/%s 2>/dev/null || true; ", uid, uid) + masks
+		}
+	}
+	return fmt.Sprintf("%secho $$ > %s && cd %s && %s", masks, procs, quoteShellArg(workdir), run)
 }
 
 // hostOutput runs a host command (systemd-run/systemctl/ip), capturing combined

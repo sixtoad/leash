@@ -181,29 +181,36 @@ func TestNativeBoxLifecycle_Integration(t *testing.T) {
 func TestNativeWorkloadScript(t *testing.T) {
 	cg := "/sys/fs/cgroup/system.slice/leash-native-x.service"
 
-	noDrop := nativeWorkloadScript(cg, "/wd", "bash", "claude", "", "")
-	if !strings.Contains(noDrop, "cgroup.procs") || !strings.Contains(noDrop, "exec bash -lc") {
-		t.Fatalf("no-drop script missing cgroup join / exec: %s", noDrop)
+	// Unhardened (rootless path): plain placement — no ns/mask/scrub.
+	plain := nativeWorkloadScript(cg, "/wd", "bash", "claude", "", "", "", false)
+	if !strings.Contains(plain, "cgroup.procs") || !strings.Contains(plain, "exec bash -lc") {
+		t.Fatalf("plain script missing cgroup join / exec: %s", plain)
 	}
-	if strings.Contains(noDrop, "runuser") || strings.Contains(noDrop, "NODE_EXTRA_CA_CERTS") {
-		t.Fatalf("no-drop/no-CA script should not use runuser or set CA: %s", noDrop)
-	}
-
-	// With a CA (Layer 2), the export lives in the innermost shell so it survives runuser.
-	withCA := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "/share/ca-cert.pem")
-	if !strings.Contains(withCA, "runuser -u alice -- bash -lc") {
-		t.Fatalf("drop script should runuser to the user: %s", withCA)
-	}
-	if !strings.Contains(withCA, "export NODE_EXTRA_CA_CERTS=/share/ca-cert.pem; exec claude") {
-		t.Fatalf("CA export must precede the command in the inner shell: %s", withCA)
+	for _, unexpected := range []string{"unshare", "runuser", "mount -t tmpfs", "NODE_EXTRA_CA_CERTS", "env -u"} {
+		if strings.Contains(plain, unexpected) {
+			t.Fatalf("plain script must not contain %q: %s", unexpected, plain)
+		}
 	}
 
-	drop := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "")
-	if !strings.Contains(drop, "runuser -u alice -- bash -lc") {
-		t.Fatalf("drop script should runuser to the user: %s", drop)
+	// Hardened (root) with drop-user + CA + uid: masks + fresh PID/IPC ns + env
+	// scrub + CA export, and the cgroup write stays before the unshare.
+	h := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "/share/ca-cert.pem", "1000", true)
+	for _, want := range []string{
+		"mount -t tmpfs -o uid=1000,mode=0700 tmpfs /run/user/1000",
+		"/tmp/.X11-unix",
+		"cgroup.procs",
+		"exec unshare --ipc --pid --fork --mount-proc --",
+		"runuser -u alice --",
+		"env -u DBUS_SESSION_BUS_ADDRESS -u DISPLAY -u XAUTHORITY",
+		"export NODE_EXTRA_CA_CERTS=/share/ca-cert.pem; exec claude",
+	} {
+		if !strings.Contains(h, want) {
+			t.Fatalf("hardened script missing %q: %s", want, h)
+		}
 	}
-	if !strings.Contains(drop, "cgroup.procs") {
-		t.Fatalf("drop script must still join the enforced cgroup: %s", drop)
+	// cgroup placement must precede the PID-ns unshare (pid resolves in host ns).
+	if strings.Index(h, "cgroup.procs") > strings.Index(h, "unshare --ipc") {
+		t.Fatalf("cgroup write must come before the unshare: %s", h)
 	}
 }
 
