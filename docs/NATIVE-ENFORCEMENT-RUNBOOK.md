@@ -1,131 +1,155 @@
-# Native enforcement — on-device runbook
+# Native enforcement — runbook (Linux, container-free)
 
-> **Status — 2026-07-04:** The kernel-prep parts (enabling the `bpf` LSM) are
-> current, but this runbook predates the full Layer-2 path. For the up-to-date,
-> verified way to run a sandboxed workload today — netns **egress**, the workload
-> **running as the invoking user**, **CA trust**, the Control-UI netns IP, and the
-> **leashd log file** — use [CLAUDE-CODE-LEASHED.md](CLAUDE-CODE-LEASHED.md), and
-> see [CHANGELOG.md](../CHANGELOG.md) for the shipped feature set.
+Canonical guide to leash's **container-free native runtime** on Linux: what it is,
+how to prepare a host, how to run it, how it works end to end, and how to verify
+and troubleshoot. This reflects the **shipped** architecture (released as
+`native-v0.1.0`); see [CHANGELOG.md](../CHANGELOG.md) for the feature list and
+[CLAUDE-CODE-LEASHED.md](CLAUDE-CODE-LEASHED.md) for the Claude Code recipe. The
+design-era docs [`RUNTIME-NATIVE-POC.md`](RUNTIME-NATIVE-POC.md),
+[`LAUNCHER-ABSTRACTION.md`](LAUNCHER-ABSTRACTION.md), and
+[`LEASHD-HOST-MODE.md`](LEASHD-HOST-MODE.md) are historical.
 
-How to take the container-free Linux backend from **built & runnable
-(non-enforcing)** to **live enforcement**, on a machine you can reboot and run as
-root. Everything here is gated on a privileged, eBPF-LSM-activated host — it
-**cannot** be done in the dev sandbox, which is why it's a runbook, not code.
+## What it is
 
-**Companion docs:** [`RUNTIME-NATIVE-POC.md`](RUNTIME-NATIVE-POC.md),
-[`LAUNCHER-ABSTRACTION.md`](LAUNCHER-ABSTRACTION.md),
-[`LEASHD-HOST-MODE.md`](LEASHD-HOST-MODE.md).
+`--runtime native` runs the workload **directly on the host — no container** —
+enforced by two layers:
 
-## What's already built (runs without this runbook)
+- **Layer 1 — eBPF LSM** on a per-run cgroup: `file_open` / `exec` /
+  `network-connect` decisions, uid-independent. Needs the `bpf` LSM active.
+- **Layer 2 — MITM proxy** in a per-run network namespace: HTTPS is REDIRECTed to
+  leashd's proxy, decrypted, and host/HTTP-policy-checked.
 
-- `--runtime native` selects `nativeLauncher` (Step 2.1): a delegated systemd
-  cgroup-v2 box + (root-only) named netns; rootless box lifecycle verified.
-- `leash --daemon --host` (Step 2.2): host-mode config/paths; re-execs the same
-  binary; built and unit-tested.
-- `leash --runtime native run` (Step 3): flows end to end to the launcher and
-  stops at `StartEnforcement` with an actionable message + the exact privileged
-  command it would run.
+leash and `leashd` hold root for enforcement; the **workload runs as the invoking
+user**. It's "leash on your real machine": the policy boundary holds (every
+`file_open` is checked) but there is **no mount-namespace isolation**, so always
+use a scoped policy. On walk, native is the **default** runtime (OS-detected).
 
-What this runbook adds: the **two host prerequisites** (Parts A–B), a **direct
-engine smoke test** that proves Layer 1 attaches natively (Part C), and the
-**Step 3b** code that finishes the full `leash --runtime native run` path
-(Part D).
+## 1. Prerequisites
 
-## Prerequisites
-
-A Linux host (not a VM-in-a-VM) where you can edit GRUB, reboot, and `sudo`.
-Verify the kernel can do it (the in-tree preflight checks this and prints the
-remedy automatically on any `--runtime native`/Linux run):
+A Linux host you can reboot and `sudo` on. Check the kernel (the in-tree preflight
+also checks this and prints the remedy on any native run):
 
 ```sh
 zgrep -E 'CONFIG_BPF_LSM|CONFIG_DEBUG_INFO_BTF' /proc/config.gz 2>/dev/null \
   || grep -E 'CONFIG_BPF_LSM|CONFIG_DEBUG_INFO_BTF' /boot/config-$(uname -r)
 stat -fc %T /sys/fs/cgroup        # want: cgroup2fs
-cat /sys/kernel/security/lsm      # if this already lists "bpf", skip Part A
-command -v systemd-run systemctl nsenter ip nft iptables
+cat /sys/kernel/security/lsm      # if this lists "bpf", skip step 2
+command -v systemd-run systemctl nsenter ip iptables runuser
 ```
 
-Need `CONFIG_BPF_LSM=y` and BTF (`CONFIG_DEBUG_INFO_BTF=y`). If `bpf` is missing
-from the active LSM list, do Part A.
+Need `CONFIG_BPF_LSM=y` + BTF (`CONFIG_DEBUG_INFO_BTF=y`). If `bpf` is missing
+from the active LSM list, do step 2.
 
-## Part A — Activate the eBPF LSM (the universal gate)
+## 2. Activate the eBPF LSM (once per host)
 
-This is required on **every** Linux host for Layer 1, not a quirk of any box. The
-value to add is your current active LSMs (`cat /sys/kernel/security/lsm`) with
-`bpf` appended. **First identify your bootloader** — it is not always GRUB:
+Required on **every** Linux host for Layer 1. Add your current active LSMs
+(`cat /sys/kernel/security/lsm`) with `bpf` appended. **Identify the bootloader
+first** — it is not always GRUB:
 
 ```sh
 [ -d /sys/firmware/efi ] && bootctl status 2>/dev/null | grep -q systemd-boot \
-  && echo "systemd-boot (use kernelstub — Part A.2)" || echo "GRUB (Part A.1)"
+  && echo "systemd-boot (kernelstub — 2b)" || echo "GRUB (2a)"
 ```
 
-### A.1 — GRUB (Debian/Ubuntu/most distros)
-
+**2a — GRUB** (Debian/Ubuntu/most):
 ```sh
 sudo sed -i 's/\(GRUB_CMDLINE_LINUX="[^"]*\)"/\1 lsm=lockdown,capability,landlock,yama,apparmor,ima,evm,bpf"/' /etc/default/grub
 sudo update-grub          # Fedora: sudo grub2-mkconfig -o /boot/grub2/grub.cfg
 sudo reboot
 ```
-**Rollback:** remove the `lsm=…` clause from `/etc/default/grub`, `update-grub`, reboot.
+Rollback: remove the `lsm=…` clause, `update-grub`, reboot.
 
-### A.2 — systemd-boot / kernelstub (Pop!_OS, and any systemd-boot host)
-
-Pop!_OS has **no `/etc/default/grub`**; `update-grub` does nothing. Use
-`kernelstub` (note the flag is `--add-options`/`-a`, NOT `--add-cmdline`):
-
+**2b — systemd-boot / kernelstub** (Pop!_OS): there is **no `/etc/default/grub`**;
+`update-grub` does nothing. The flag is `--add-options`, not `--add-cmdline`:
 ```sh
 sudo kernelstub --add-options "lsm=lockdown,capability,landlock,yama,apparmor,ima,evm,bpf"
 sudo reboot
 ```
-**Rollback:** `sudo kernelstub --delete-options "lsm=…,bpf"` (same string), reboot.
-Plain systemd-boot without kernelstub: append `lsm=…,bpf` to the `options` line
-in `/boot/efi/loader/entries/*.conf` (or `bootctl set-default`), reboot.
+Rollback: `sudo kernelstub --delete-options "lsm=…,bpf"`, reboot.
 
-### Confirm (either path)
+Confirm after reboot: `cat /sys/kernel/security/lsm` must now include `bpf`.
+
+## 3. Install the binary
 
 ```sh
-cat /sys/kernel/security/lsm    # must now include "bpf"
+curl -fsSL https://raw.githubusercontent.com/sixtoad/leash/walk-integration/scripts/leash-install.sh | bash
+# or from source:  scripts/install-leash.sh   (or  sudo scripts/install-leash.sh /usr/local/bin)
 ```
 
-## Part B — Build leashd (= the leash binary)
+## 4. Run it
 
-leashd is `leash --daemon`; the eBPF Go bindings are committed, so it builds with
-a stock Go toolchain — no clang needed unless you change the eBPF C:
-
+**Claude Code** (turnkey — generates a confinement policy, runs sandboxed):
 ```sh
-CGO_ENABLED=1 go build -o /usr/local/bin/leash ./cmd/leash
+cd <project> && scripts/leash-claude.sh          # see CLAUDE-CODE-LEASHED.md
 ```
 
-Only if you modify `internal/lsm/*.c` and must regenerate bindings (the dev box
-has no clang): use the dockerized codegen — `make lsm-generate-docker` (rootful
-`sudo podman`, FQN images), as used for #67.
+**Any workload**, with your own Cedar policy:
+```sh
+sudo -E env "PATH=$PATH" "HOME=$HOME" leash --policy <policy.cedar> <command> [args…]
+```
 
-## Part C — Smoke-test the engine directly (proves Layer 1, bypasses the runner)
+`sudo` is required (Layer 1 + netns need `CAP_BPF`/`CAP_NET_ADMIN`); `-E` +
+explicit `PATH`/`HOME` let leash find the command and preserve the invoking user's
+environment. Native is the default backend on walk; add `--runtime native` to be
+explicit, or `--runtime docker` to opt into the container path.
 
-> **✅ VERIFIED on-device (Pop!_OS, kernel with `bpf` active, 2026-07-02).** A
-> forbidden read returned `cat: /run/leash-denied: Permission denied` while an
-> allowed read succeeded — selective, container-free enforcement. The recipe
-> below is the corrected, working one.
+## 5. How a run works (end to end)
 
-Before finishing the runner path (Part D), prove native enforcement itself works.
-This stands up the box by hand and runs host-mode leashd against it, so it
-isolates "does the eBPF LSM attach + deny natively" from "is the full CLI wired."
+1. **Box** — `Provision` starts a delegated systemd cgroup-v2 **transient service**
+   (`systemd-run --property=Delegate=yes`; *not* `--scope`, which fails as root)
+   and, for Layer 2, a named **network namespace** with **egress**: a veth pair
+   (`10.<a>.<b>.1` host ⇄ `.2` netns, derived from the netns name), host NAT
+   (`ip_forward` + `MASQUERADE` + `FORWARD` accept), and `/etc/netns/<ns>/resolv.conf`
+   (public DNS — the host's `127.0.0.53` stub is meaningless in the netns).
+2. **leashd (host mode)** — the launcher re-execs the same binary as
+   `leash --daemon --host --cgroup <cg> [--policy …] [--lsm-only]`, entered into
+   the netns via `nsenter --net` (which **preserves `/sys/fs/{cgroup,bpf}`** — `ip
+   netns exec` would remount `/sys` and break the LSM) inside a **private mount ns**
+   that bind-mounts the netns `resolv.conf`. leashd attaches the eBPF LSM to the
+   cgroup and (Layer 2) applies the netfilter REDIRECT + starts the MITM proxy.
+   Its stdout/stderr go to **`/tmp/leash-native-leashd-<netns>.log`**, not your
+   TTY (so an interactive agent's UI isn't corrupted).
+3. **Readiness (fail-closed)** — `WaitReady` writes the bootstrap marker, then
+   **blocks until every LSM program has settled** (attached or failed) via an
+   enforcement-ready marker. The workload is not launched until Layer 1 is live.
+   It also publishes leash's MITM CA to a world-readable `/tmp` copy.
+4. **Workload** — placed into the box cgroup (`echo $$ > cgroup.procs`), `cd` to
+   the workspace, then **dropped to the invoking user** (`runuser -u $SUDO_USER`)
+   and exec'd. Under Layer 2 it inherits the netns and `NODE_EXTRA_CA_CERTS` (the
+   `/tmp` CA copy) so Node clients trust the proxy.
+5. **Teardown** — `Remove` tears down the egress (veth + host NAT rules +
+   `/etc/netns/<ns>`), deletes the netns, removes the CA copy, and stops the unit.
+
+**LSM-only fallback:** if egress setup fails, the run degrades to **host-netns
+LSM-only** (Layer 1 keeps enforcing file/exec/network-connect; no L7 proxy) rather
+than trapping the workload in a netns with no route out. Gated by
+`nativeLayer2Enabled` / `layer2Active` (`internal/runner/launcher_native.go`).
+
+**Control UI:** under Layer 2, leashd runs *inside the netns*, so the UI is at the
+**netns IP** (`http://10.<a>.<b>.2:18080/`), **not** `localhost:18080` (which the
+startup line currently still prints — a known wart).
+
+## 6. Verify enforcement directly (engine smoke test)
+
+To isolate "does the eBPF LSM attach + deny natively" from the full CLI, stand up
+the box by hand and run host-mode leashd against it.
+
+> **✅ VERIFIED on-device** (Pop!_OS, `bpf` active): a forbidden read returned
+> `Permission denied` while an allowed read succeeded — selective, container-free
+> enforcement.
 
 ```sh
-sudo -i      # enforcement needs CAP_BPF + CAP_NET_ADMIN
+sudo -i
 ID=smoke; UNIT=leash-native-$ID.service; NS=leash-native-$ID
 RUN=/run/leash/$ID; mkdir -p $RUN/public $RUN/private; chmod 700 $RUN/private
 
-# 1. Box: a detached, delegated transient SERVICE (NOT --scope) + a named netns
-#    with loopback up (a fresh netns has lo DOWN; leashd binds 127.0.0.1).
 systemctl reset-failed $UNIT 2>/dev/null
 systemd-run --property=Delegate=yes --collect --unit=$UNIT -- sleep infinity
 CG=/sys/fs/cgroup$(systemctl show -p ControlGroup --value $UNIT)   # must NOT be /sys/fs/cgroup
 ip netns add $NS && ip -n $NS link set lo up
 
-# 2. Policy: permissive baseline + a forbid on one file. The resource MUST be in
-#    the `resource in [ … ]` form — leash silently drops `resource == …` in a
-#    when-clause ("no resources found in policy"). File::/Dir:: are the entities.
+# Policy: permissive baseline + a forbid on one file. The resource MUST use the
+# `resource in [ … ]` form (leash silently drops `resource == …` in a when-clause).
 cat > $RUN/public/leash.cedar <<'EOF'
 permit (principal, action in [Action::"FileOpen", Action::"FileOpenReadOnly", Action::"FileOpenReadWrite"], resource)
 when { resource in [ Dir::"/" ] };
@@ -136,82 +160,51 @@ when { resource in [ File::"/run/leash-denied" ] };
 EOF
 echo top-secret > /run/leash-denied
 
-# 3. Host-mode leashd, inside the workload netns, attached to the box cgroup.
 LEASH_DIR=$RUN/public LEASH_PRIVATE_DIR=$RUN/private \
 nsenter --net=/run/netns/$NS -- \
-  leash --daemon --host --cgroup "$CG" --policy $RUN/public/leash.cedar \
+  leash --daemon --host --lsm-only --cgroup "$CG" --policy $RUN/public/leash.cedar \
     --proxy-port 18000 --listen 127.0.0.1:18080 & sleep 2
+touch $RUN/public/bootstrap.ready ; sleep 2
 
-# 4. Until the bootstrap handshake is wired (Part D / option A), satisfy it manually.
-touch $RUN/public/bootstrap.ready    # filename: entrypoint.BootstrapReadyFileName
-sleep 2                              # let leashd reach "Successfully started monitoring file opens"
-
-# 5. Run workloads IN the box cgroup: control (allowed) then the forbidden read.
 sh -c 'echo $$ > '"$CG"'/cgroup.procs && cat /etc/hostname'      # EXPECT: succeeds
 sh -c 'echo $$ > '"$CG"'/cgroup.procs && cat /run/leash-denied'  # EXPECT: Permission denied
 
-# 6. Teardown.
 kill %1 2>/dev/null; ip netns del $NS; systemctl stop $UNIT
 systemctl reset-failed $UNIT 2>/dev/null; rm -rf $RUN /run/leash-denied
 ```
 
-A ready-to-run version is at `scratch-native-poc/smoke.sh` (local, gitignored).
-If the forbidden read is denied, **native enforcement works** — the rest is
-wiring. If leashd errors at attach with "kernel may lack an active bpf LSM",
-Part A didn't take (recheck `/sys/kernel/security/lsm`).
+If the forbidden read is denied, native enforcement works. If leashd errors at
+attach with "kernel may lack an active bpf LSM", step 2 didn't take (recheck
+`/sys/kernel/security/lsm`). (`--lsm-only` here skips the proxy/netfilter so the
+test needs no egress; drop it to exercise Layer 2.)
 
-### Two real bugs found during on-device verification (fix upstream)
+## 7. Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `not confirmed ready` warning, workload ran anyway | Readiness didn't settle in time — check the leashd log for attach errors; usually the `bpf` LSM isn't active (step 2). |
+| Workload can't reach the network / `ETIMEOUT` | Egress didn't come up → LSM-only fallback (no netns route). Check `/tmp/leash-native-leashd-<ns>.log` and the `egress setup failed` line. |
+| `SELF_SIGNED_CERT_IN_CHAIN` | Workload can't read/trust the CA. Ensure the policy permits reading `/tmp` (the CA copy lives there); non-Node tools need the CA on the system bundle (pending). |
+| UI blank at `localhost:18080` | Under Layer 2 the UI is at the **netns IP** (`10.<a>.<b>.2:18080`), not localhost. |
+| Agent TUI garbled | Old binary — leashd output now goes to the log file, not the TTY. |
+| `nft: unexpected /` on the control-plane rule | Upstream [#83](https://github.com/strongdm/leash/issues/83); the fallback is harmless inside the netns. |
+
+## 8. Known upstream bugs (found during verification)
 
 1. **`resource == File::"…"` in a when-clause is silently dropped.** The
    transpiler's `extractResources` (`internal/transpiler/cedar_to_leash.go`) only
-   reads a when-clause resource from the `resource in [ … ]` form
-   (`ConditionResourceIn`); an `==` there yields "no resources found in policy"
-   and the whole rule is skipped — a policy footgun. Support `==` in when-clauses
-   or fail loudly instead of warning-and-dropping.
-2. **nftables control-plane rule doesn't quote the cgroup path.** `apply-nftables.sh`
-   emits `socket cgroupv2 level 1 /sys/fs/cgroup/…/x.service …` → `nft` errors
-   `unexpected /`, so it falls back to blocking *all* local access to the UI port.
-   Quote the path (or use the cgroup id) so cgroup-scoped isolation works on host
-   paths too. Non-fatal (fallback preserves the boundary) but degrades precision.
+   reads the `resource in [ … ]` form; an `==` yields "no resources found in
+   policy" and the rule is skipped. Use `in [ … ]`. *(Not yet filed.)*
+2. **nftables control-plane rule doesn't quote the cgroup path** — filed as
+   [strongdm/leash#83](https://github.com/strongdm/leash/issues/83). Non-fatal;
+   its fallback blocks all in-netns access to the UI port (which is only the
+   agent, so the intent holds).
 
-## Part D — Step 3b: finish the runner's native path
+## 9. Safety notes
 
-With the engine proven, close the two code gaps so `sudo leash --runtime native
-run <cmd>` works fully. All in `internal/runner/launcher_native.go` unless noted.
-
-1. **Bootstrap handshake (option A — see LEASHD-HOST-MODE.md §4).** leashd
-   `waitForBootstrap()` blocks on `bootstrap.ready` in `LEASH_DIR`; nothing
-   writes it natively. Have the launcher write it once the workload is staged
-   (e.g. in `Provision` after the holder is up, or a new `WaitReady` step),
-   preserving the fail-closed ordering (workload must not run before leashd is
-   live). This replaces the manual `touch` in Part C step 4.
-2. **Post-enforcement exec path.** After `StartEnforcement`/`WaitReady`,
-   `startContainers` still calls the container CLI: `installPromptAssets`,
-   `detectShell`, `execNonInteractive`/`execInteractive` use `docker exec`. For
-   native, route these through `nativeLauncher.execInBox` (already present —
-   places a process in the box cgroup) extended to also `nsenter --net=<ns>` into
-   the workload netns, so the user command inherits both the LSM-scoped cgroup
-   and the enforced netns. Guard each with `r.usingNativeRuntime()` exactly like
-   the Step-3 pre-launcher guards.
-3. **`StartEnforcement` lifecycle.** It currently `cmd.Start()`s leashd detached.
-   Track the process so `Remove`/`finishLifecycle` stops it on exit, and surface
-   leashd's early failures (attach/netfilter) instead of racing past them.
-4. **In-netns Control UI reachability (optional).** leashd's `--listen` UI binds
-   inside the workload netns; to reach it from the host, add a veth pair (host ⇄
-   netns) or a port-forward in `Provision`. Until then, drive policy via the
-   config file / event log.
-
-Verify Step 3b on-device: `sudo leash --runtime native run -- cat
-/etc/leash-denied` should be denied by policy, the agent command should
-otherwise run from the host filesystem, and teardown should leave no
-`leash-native-*` units or `/run/netns/leash-native-*`.
-
-## Safety notes
-
-- Native runs the workload from the **real host filesystem** (no image rootfs):
-  the policy boundary holds (every `file_open` is checked), but there's no
-  mount-namespace isolation — "leash on my real machine". Use a scoped policy.
-- leashd holds `CAP_BPF`/`CAP_SYS_ADMIN`/`CAP_NET_ADMIN`; the **workload stays
-  unprivileged** in the scope.
-- Always confirm teardown removed the scope unit and netns (the integration
-  tests assert this for the box lifecycle).
+- No mount-namespace isolation — the workload sees the **real host filesystem**;
+  the policy is the only boundary. Use a scoped, default-deny policy.
+- leashd holds `CAP_BPF`/`CAP_SYS_ADMIN`/`CAP_NET_ADMIN`; the **workload runs as
+  the invoking user**, not root.
+- Confirm teardown removed the unit, netns, veth, and host NAT rules (the box
+  lifecycle integration test asserts the unit/netns cleanup).
