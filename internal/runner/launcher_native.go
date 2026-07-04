@@ -261,12 +261,40 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 		// leashd reads the bootstrap marker as JSON metadata; write a valid object.
 		_ = os.WriteFile(marker, []byte(`{"source":"native"}`+"\n"), 0o644)
 		if _, err := os.Stat(ready); err == nil {
+			// Layer 2 MITMs TLS: publish leash's CA where the dropped-privilege
+			// workload can read it (leashd's share dir is a 0700 root tree).
+			if n.layer2Active() {
+				n.exportCACert(shareDir)
+			}
 			return nil
 		}
 		time.Sleep(caCertWaitDelay)
 	}
 	n.r.logger.Println("Warning: native enforcement was not confirmed ready after waiting; the workload may run before Layer 1 is active.")
 	return nil
+}
+
+// userReadableCACert is a world-readable copy of leash's CA under /tmp (which
+// the confinement policy already allows), so the workload — running as the
+// invoking user — can load it via NODE_EXTRA_CA_CERTS. leashd's own ca-cert.pem
+// sits in a 0700 root-owned share tree the dropped user can't traverse.
+func (n nativeLauncher) userReadableCACert() string {
+	// /tmp explicitly (not os.TempDir, which may inherit a TMPDIR outside the
+	// confinement allow-list): world-traversable and policy-allowed by default.
+	return filepath.Join("/tmp", "leash-native-ca-"+n.netnsName()+".pem")
+}
+
+// exportCACert copies leashd's CA to userReadableCACert (0644). Best-effort: a
+// failure only means the workload won't trust the MITM (TLS errors), not a crash.
+func (n nativeLauncher) exportCACert(shareDir string) {
+	data, err := os.ReadFile(caCertPath(shareDir))
+	if err != nil {
+		n.r.debugf("native L2: read CA: %v", err)
+		return
+	}
+	if err := os.WriteFile(n.userReadableCACert(), data, 0o644); err != nil {
+		n.r.debugf("native L2: publish CA: %v", err)
+	}
 }
 
 // Remove tears the box down: undo the netns egress (veth + host NAT + DNS),
@@ -277,6 +305,7 @@ func (n nativeLauncher) Remove(ctx context.Context) {
 	if nativeLayer2Enabled && !n.useUserManager() {
 		n.teardownEgress(ctx)
 		_, _ = hostOutput(ctx, "ip", "netns", "del", n.netnsName())
+		_ = os.Remove(n.userReadableCACert())
 	}
 	n.stopUnit(ctx, n.unitName())
 }
@@ -474,9 +503,7 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 	// (leaves the system roots intact). Only meaningful with the proxy active.
 	caCert := ""
 	if n.layer2Active() {
-		if sd := strings.TrimSpace(n.r.cfg.shareDir); sd != "" {
-			caCert = caCertPath(sd)
-		}
+		caCert = n.userReadableCACert() // world-readable copy WaitReady published
 	}
 	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.workloadUser(), caCert)
 	if n.layer2Active() {
