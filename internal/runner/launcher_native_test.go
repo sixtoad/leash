@@ -59,11 +59,12 @@ func TestNativePullImagesNoop(t *testing.T) {
 func TestNativeHostLeashdArgv(t *testing.T) {
 	r := &runner{}
 	r.cfg.proxyPort = "18000"
+	r.nativeEgressFailed = true // force the LSM-only path deterministically (independent of euid)
 	n := nativeLauncher{r: r}
 
 	argv := n.hostLeashdArgv("/usr/local/bin/leash", "/run/netns/leash-native-x", "/sys/fs/cgroup/scope")
 	joined := strings.Join(argv, " ")
-	// LSM-only (nativeLayer2Enabled=false): host netns, no nsenter, --lsm-only.
+	// LSM-only: host netns, no nsenter, --lsm-only.
 	want := "/usr/local/bin/leash --daemon --host --lsm-only --cgroup /sys/fs/cgroup/scope --proxy-port 18000"
 	if joined != want {
 		t.Fatalf("argv = %q\nwant   %q", joined, want)
@@ -194,5 +195,36 @@ func TestNativeWorkloadScript(t *testing.T) {
 	}
 	if !strings.Contains(drop, "cgroup.procs") {
 		t.Fatalf("drop script must still join the enforced cgroup: %s", drop)
+	}
+}
+
+func TestNativeEgressDerivation(t *testing.T) {
+	n := nativeLauncher{r: &runner{}}
+	e1, e2 := n.egress(), n.egress()
+	if e1 != e2 {
+		t.Fatalf("egress not deterministic: %+v vs %+v", e1, e2)
+	}
+	if !strings.HasPrefix(e1.subnet, "10.") || e1.hostIP != e1.subnet+".1" || e1.nsIP != e1.subnet+".2" {
+		t.Fatalf("bad addressing: %+v", e1)
+	}
+	if len(e1.vethHost) > 15 || len(e1.vethNS) > 15 { // Linux iface name limit
+		t.Fatalf("veth name exceeds 15 chars: %+v", e1)
+	}
+	if e1.vethHost == e1.vethNS {
+		t.Fatalf("veth host/ns names collide: %s", e1.vethHost)
+	}
+}
+
+func TestNativeLayer2Wrap(t *testing.T) {
+	n := nativeLauncher{r: &runner{}}
+	argv := n.layer2Wrap("echo hi")
+	joined := strings.Join(argv, " ")
+	for _, want := range []string{"nsenter", "--net=", "unshare --mount --propagation private", "mount --bind", "/etc/resolv.conf", "echo hi"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("layer2Wrap missing %q in %q", want, joined)
+		}
+	}
+	if argv[len(argv)-2] != "-c" {
+		t.Fatalf("expected `sh -c <script>` tail, got %v", argv[len(argv)-3:])
 	}
 }
