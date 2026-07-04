@@ -3,6 +3,7 @@ package listen
 import (
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -144,6 +145,18 @@ func normalizeHost(host string) string {
 func OpenURL(url string) error {
 	var err error
 	rt := runtime.GOOS
+	// Under `sudo leash`, open the browser as the invoking user in their session,
+	// not as root (root's xdg-open won't reach the user's display/D-Bus).
+	if rt == "linux" && os.Geteuid() == 0 {
+		if u := strings.TrimSpace(os.Getenv("SUDO_USER")); u != "" && u != "root" {
+			cmd := exec.Command("runuser", "-u", u, "--", "xdg-open", url)
+			cmd.Env = os.Environ() // carries the user's DISPLAY/XAUTHORITY (via sudo -E)
+			if e := cmd.Start(); e != nil {
+				return fmt.Errorf("open browser as %s: %v", u, e)
+			}
+			return nil
+		}
+	}
 	switch rt {
 	case "darwin":
 		err = exec.Command("open", url).Start()

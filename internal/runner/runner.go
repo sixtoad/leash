@@ -1271,7 +1271,7 @@ func (r *runner) startContainers(ctx context.Context) error {
 	if r.cfg.listenCfg.Disable {
 		fmt.Println()
 	} else {
-		url := r.cfg.listenCfg.DisplayURL()
+		url := r.launcher().ControlUIURL(r.cfg.listenCfg)
 		fmt.Printf("\nLeash UI (Control UI): %s\n", url)
 		if r.opts.openUI {
 			if err := listen.OpenURL(url); err != nil {

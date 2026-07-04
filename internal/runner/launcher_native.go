@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/strongdm/leash/internal/entrypoint"
+	"github.com/strongdm/leash/internal/leashd/listen"
 )
 
 // nativeLauncher implements launcher without a container runtime: the workload
@@ -497,6 +498,19 @@ func (n nativeLauncher) StopSignal(ctx context.Context) (string, error) { return
 
 // PublishesPorts: native runs on the host and maps no container ports.
 func (n nativeLauncher) PublishesPorts() bool { return false }
+
+// ControlUIURL: under Layer 2 leashd runs inside the workload's netns, so the UI
+// is reachable at the netns veth IP (not localhost); LSM-only runs in the host
+// netns, so localhost is correct.
+func (n nativeLauncher) ControlUIURL(cfg listen.Config) string {
+	if cfg.Disable {
+		return ""
+	}
+	if n.layer2Active() {
+		return fmt.Sprintf("http://%s:%s/", n.egress().nsIP, cfg.Port)
+	}
+	return cfg.DisplayURL()
+}
 
 func (n nativeLauncher) DetectShell(ctx context.Context) (string, error) {
 	// The workload runs on the host; pick the host's shell.
