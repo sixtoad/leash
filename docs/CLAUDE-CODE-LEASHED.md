@@ -6,15 +6,30 @@ restricted to Anthropic — while leash enforces both layers (eBPF LSM + MITM
 proxy). This is the downstream recipe; the native runtime itself lives in the
 upstream-eligible slice (`feat/runtime-native-poc`).
 
-## TL;DR
+## Install a ready binary (one-time)
+
+Build `leash` from this checkout onto your PATH — no rebuild per use:
+
+```bash
+scripts/install-leash.sh                    # -> ~/.local/bin/leash  (no sudo)
+# or system-wide, for all users / an environment image:
+sudo scripts/install-leash.sh /usr/local/bin
+```
+
+The binary embeds the Control UI. If `internal/ui/dist` is still the build stub,
+run `make build-ui` (needs pnpm) first so the dashboard isn't blank.
+
+## Run Claude sandboxed
 
 ```bash
 cd <your project>
-LEASH_BIN=/path/to/leash scripts/leash-claude.sh
+scripts/leash-claude.sh
 ```
 
 That generates the confinement policy from `$HOME`/`$PWD`, then runs Claude
-sandboxed. Everything below is the *why*.
+sandboxed (workspace-confined, network → Anthropic only, running as you). If
+`leash` isn't on PATH, point at it with `LEASH_BIN=/path/to/leash`. Everything
+below is the *why*.
 
 ## Prerequisites
 
