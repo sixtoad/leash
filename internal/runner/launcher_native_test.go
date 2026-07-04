@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -35,18 +36,22 @@ func TestSanitizeNativeName(t *testing.T) {
 }
 
 func TestNativeUnitAndNetnsNames(t *testing.T) {
+	pid := os.Getpid()
 	r := &runner{}
 	r.cfg.targetContainer = "Acme_App"
 	n := nativeLauncher{r: r}
-	if got := n.unitName(); got != "leash-native-acme-app.service" {
-		t.Fatalf("unitName = %q", got)
+	// The per-run PID suffix is what lets concurrent same-project native runs
+	// coexist (distinct netns/unit/subnet); it's stable within a process.
+	wantBase := fmt.Sprintf("leash-native-acme-app-%d", pid)
+	if got := n.netnsName(); got != wantBase {
+		t.Fatalf("netnsName = %q, want %q", got, wantBase)
 	}
-	if got := n.netnsName(); got != "leash-native-acme-app" {
-		t.Fatalf("netnsName = %q", got)
+	if got := n.unitName(); got != wantBase+".service" {
+		t.Fatalf("unitName = %q, want %q", got, wantBase+".service")
 	}
-	// Empty target falls back to a stable name (no naked "leash-native-").
-	if got := (nativeLauncher{r: &runner{}}).unitName(); got != "leash-native-session.service" {
-		t.Fatalf("fallback unitName = %q", got)
+	// Empty target falls back to a stable base (no naked "leash-native--<pid>").
+	if got := (nativeLauncher{r: &runner{}}).netnsName(); got != fmt.Sprintf("leash-native-session-%d", pid) {
+		t.Fatalf("fallback netnsName = %q", got)
 	}
 }
 

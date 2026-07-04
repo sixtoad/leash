@@ -57,13 +57,21 @@ func (n nativeLauncher) userFlag() []string {
 	return nil
 }
 
-// boxBaseName is a filesystem/unit-safe identity for this session's box.
+// boxBaseName is a filesystem/unit-safe identity for this session's box. It
+// carries a per-run suffix (this leash process's PID) so that CONCURRENT native
+// runs — even in the same project — get distinct netns/unit/subnet/CA/log names
+// and don't collide. Container backends get that isolation for free (a fresh
+// netns per container); native shares the host, so the box identity must be
+// unique. os.Getpid() is stable across this process's launcher calls (so a fresh
+// launcher value still agrees with Provision) and unique among live processes (so
+// no probe/race is needed). Stale same-named state from a crashed run whose PID
+// is later reused is cleared defensively in Provision/addNetns.
 func (n nativeLauncher) boxBaseName() string {
 	base := sanitizeNativeName(n.r.cfg.targetContainer)
 	if base == "" {
 		base = "session"
 	}
-	return "leash-native-" + base
+	return fmt.Sprintf("leash-native-%s-%d", base, os.Getpid())
 }
 
 func (n nativeLauncher) unitName() string  { return n.boxBaseName() + ".service" }
@@ -326,6 +334,12 @@ func (n nativeLauncher) Remove(ctx context.Context) {
 }
 
 func (n nativeLauncher) addNetns(ctx context.Context) error {
+	// Clear same-named stale state from a crashed prior run whose PID we've
+	// reused (best-effort). A live run can't share our name — PIDs are unique
+	// among live processes — so deleting a colliding netns/egress here is safe.
+	n.teardownEgress(ctx)
+	_, _ = hostOutput(ctx, "ip", "netns", "del", n.netnsName())
+
 	if out, err := hostOutput(ctx, "ip", "netns", "add", n.netnsName()); err != nil {
 		return fmt.Errorf("%w (%s)", err, strings.TrimSpace(out))
 	}
