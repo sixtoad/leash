@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,20 +23,24 @@ import (
 // It holds *runner like containerLauncher and derives all unit/netns names
 // deterministically from runner state, so a fresh value from r.launcher() agrees
 // with a prior Provision (no stored state needed across calls).
-// nativeLayer2Enabled gates native's Layer-2 path (a dedicated workload netns +
-// nsenter + the leashd MITM proxy/netfilter REDIRECT). It is DISABLED until
-// native netns egress (veth + NAT + DNS) is implemented: without egress the
-// netns has no route out, so the agent can't reach the network and the Control
-// UI is unreachable. Until then native runs LSM-only in the host netns —
-// file/exec/network-connect are still enforced by the eBPF LSM on the cgroup;
-// only the L7 HTTP MITM is absent.
-//
-// TODO(native egress): implement veth+NAT+DNS in Provision/Remove, then flip
-// this to true. NOT upstream-ready until then (Layer 2 must work).
-const nativeLayer2Enabled = false
+// nativeLayer2Enabled gates native's Layer-2 path: a dedicated workload netns
+// with egress (veth + host NAT + DNS) plus the leashd MITM proxy / netfilter
+// REDIRECT. When enabled, Provision wires the netns egress; if that setup fails
+// at runtime the box falls back to LSM-only (see layer2Active). LSM-only keeps
+// file/exec/network-connect enforcement (eBPF LSM on the cgroup) but drops the
+// L7 HTTP MITM.
+const nativeLayer2Enabled = true
 
 type nativeLauncher struct {
 	r *runner
+}
+
+// layer2Active reports whether the Layer-2 proxy path is in effect for this run:
+// compiled in AND root (netns needs privilege) AND egress setup didn't fail
+// during Provision. Every netns/nsenter/proxy decision routes through here so a
+// failed egress cleanly degrades the whole run to LSM-only.
+func (n nativeLauncher) layer2Active() bool {
+	return nativeLayer2Enabled && !n.useUserManager() && !n.r.nativeEgressFailed
 }
 
 func (n nativeLauncher) Name() string { return "native" }
@@ -114,10 +119,15 @@ func (n nativeLauncher) Provision(ctx context.Context, stopSignal string) (strin
 
 	if nativeLayer2Enabled && !n.useUserManager() {
 		if err := n.addNetns(ctx); err != nil {
-			n.r.debugf("native box: netns %q not created: %v", n.netnsName(), err)
+			// Egress setup failed — degrade this run to LSM-only rather than trap
+			// the workload in a netns with no route out. Clean up any partial state.
+			n.r.nativeEgressFailed = true
+			n.teardownEgress(ctx)
+			_, _ = hostOutput(ctx, "ip", "netns", "del", n.netnsName())
+			n.r.logger.Printf("leash: native Layer-2 egress setup failed (%v); falling back to LSM-only (no L7 proxy).", err)
 		}
 	} else {
-		n.r.debugf("native box: LSM-only (no netns/proxy; Layer 2 pending native egress)")
+		n.r.debugf("native box: LSM-only (rootless or Layer 2 disabled)")
 	}
 
 	n.r.debugf("native box ready: unit=%s cgroup=%s", unit, cgroupPath)
@@ -175,29 +185,42 @@ func (n nativeLauncher) netnsRunPath() string {
 }
 
 // hostLeashdArgv builds the command that launches leashd host mode. With Layer 2
-// it runs inside the workload netns (nsenter … --daemon --host …); LSM-only it
-// runs in the host netns with --lsm-only (no proxy/netfilter). Pure, unit-tested.
+// active it runs inside the workload netns with a private resolv.conf bind (the
+// proxy needs DNS to reach upstreams); LSM-only it runs in the host netns with
+// --lsm-only (no proxy/netfilter). Unit-tested via the LSM-only path.
 func (n nativeLauncher) hostLeashdArgv(self, netnsPath, cgroupPath string) []string {
-	var argv []string
-	if nativeLayer2Enabled {
-		argv = []string{"nsenter", "--net=" + netnsPath, "--", self, "--daemon", "--host", "--cgroup", cgroupPath}
-	} else {
-		argv = []string{self, "--daemon", "--host", "--lsm-only", "--cgroup", cgroupPath}
+	leashd := []string{self, "--daemon", "--host"}
+	if !n.layer2Active() {
+		leashd = append(leashd, "--lsm-only")
 	}
+	leashd = append(leashd, "--cgroup", cgroupPath)
 	if cfgDir := strings.TrimSpace(n.r.cfg.cfgDir); cfgDir != "" {
-		argv = append(argv, "--policy", filepath.Join(cfgDir, "leash.cedar"))
+		leashd = append(leashd, "--policy", filepath.Join(cfgDir, "leash.cedar"))
 	}
 	if port := strings.TrimSpace(n.r.cfg.proxyPort); port != "" {
-		argv = append(argv, "--proxy-port", port)
+		leashd = append(leashd, "--proxy-port", port)
 	}
 	if !n.r.cfg.listenCfg.Disable {
 		// Skip an unresolved address (zero-value Config yields ":"); a real run
 		// has a concrete host:port here.
 		if addr := strings.TrimSpace(n.r.cfg.listenCfg.Address()); addr != "" && addr != ":" {
-			argv = append(argv, "--listen", addr)
+			leashd = append(leashd, "--listen", addr)
 		}
 	}
-	return argv
+	if !n.layer2Active() {
+		return leashd // host netns, run directly
+	}
+	// Layer 2: run leashd in the netns with the DNS bind (see layer2Wrap).
+	return n.layer2Wrap("exec " + shellJoin(leashd))
+}
+
+// shellJoin renders argv as a shell-safe single string for `sh -c`.
+func shellJoin(argv []string) string {
+	parts := make([]string, len(argv))
+	for i, a := range argv {
+		parts[i] = quoteShellArg(a)
+	}
+	return strings.Join(parts, " ")
 }
 
 // enforcementBlocker reports why enforcement can't start here, or "" if it can.
@@ -207,7 +230,7 @@ func (n nativeLauncher) enforcementBlocker(netnsPath string) string {
 	if n.useUserManager() {
 		return "requires root to attach the eBPF LSM (the box ran rootless). Re-run with sudo, or use --runtime docker"
 	}
-	if nativeLayer2Enabled {
+	if n.layer2Active() {
 		if _, err := os.Stat(netnsPath); err != nil {
 			return fmt.Sprintf("network namespace %s not found", netnsPath)
 		}
@@ -246,9 +269,13 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 	return nil
 }
 
-// Remove tears the box down: delete the netns (if any) and stop the holder unit.
+// Remove tears the box down: undo the netns egress (veth + host NAT + DNS),
+// delete the netns, and stop the holder unit. Gated on the attempt (root +
+// compiled), not layer2Active, so a run that fell back to LSM-only after a
+// partial egress setup still cleans up.
 func (n nativeLauncher) Remove(ctx context.Context) {
 	if nativeLayer2Enabled && !n.useUserManager() {
+		n.teardownEgress(ctx)
 		_, _ = hostOutput(ctx, "ip", "netns", "del", n.netnsName())
 	}
 	n.stopUnit(ctx, n.unitName())
@@ -263,7 +290,112 @@ func (n nativeLauncher) addNetns(ctx context.Context) error {
 	if out, err := hostOutput(ctx, "ip", "-n", n.netnsName(), "link", "set", "lo", "up"); err != nil {
 		return fmt.Errorf("bring up lo in netns: %w (%s)", err, strings.TrimSpace(out))
 	}
+	// Give the netns a route out (veth + host NAT + DNS) so the proxy can forward
+	// and the agent can reach the network. Without this the netns has only lo.
+	if err := n.setupEgress(ctx); err != nil {
+		return fmt.Errorf("egress: %w", err)
+	}
 	return nil
+}
+
+// nativeEgressResolvConf is the resolv.conf bind-mounted into the workload's
+// mount ns. Pop!_OS points /etc/resolv.conf at systemd-resolved's 127.0.0.53
+// stub, which is meaningless inside the netns; use public resolvers reachable
+// via the NAT. (TODO: optionally forward the host's real upstream for split-horizon/LAN DNS.)
+const nativeEgressResolvConf = "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+
+// egressNet holds the per-box network parameters, derived deterministically from
+// the netns name so a fresh launcher value agrees with a prior Provision and
+// concurrent boxes get distinct subnets/veth names.
+type egressNet struct {
+	ns, vethHost, vethNS, subnet, hostIP, nsIP string
+	prefix                                     int
+}
+
+func fnv32(s string) uint32 {
+	var h uint32 = 2166136261
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h
+}
+
+func (n nativeLauncher) egress() egressNet {
+	ns := n.netnsName()
+	h := fnv32(ns)
+	// 10.<100..199>.<0..253>.0/30 → ~25k distinct /30s, collision-unlikely.
+	subnet := fmt.Sprintf("10.%d.%d", 100+int(h%100), int((h/100)%254))
+	short := fmt.Sprintf("%06x", h&0xFFFFFF) // 6 hex → veth name ≤ 8 chars (< 15 limit)
+	return egressNet{
+		ns:       ns,
+		vethHost: "lh" + short,
+		vethNS:   "ln" + short,
+		subnet:   subnet,
+		hostIP:   subnet + ".1",
+		nsIP:     subnet + ".2",
+		prefix:   30,
+	}
+}
+
+// setupEgress wires veth + addressing + default route + DNS + host NAT so the
+// netns reaches the internet. Mirrors the recipe verified in netns-egress.sh.
+func (n nativeLauncher) setupEgress(ctx context.Context) error {
+	e := n.egress()
+	cidr := func(ip string) string { return ip + "/" + strconv.Itoa(e.prefix) }
+	steps := [][]string{
+		{"ip", "link", "add", e.vethHost, "type", "veth", "peer", "name", e.vethNS},
+		{"ip", "link", "set", e.vethNS, "netns", e.ns},
+		{"ip", "addr", "add", cidr(e.hostIP), "dev", e.vethHost},
+		{"ip", "-n", e.ns, "addr", "add", cidr(e.nsIP), "dev", e.vethNS},
+		{"ip", "link", "set", e.vethHost, "up"},
+		{"ip", "-n", e.ns, "link", "set", e.vethNS, "up"},
+		{"ip", "-n", e.ns, "route", "add", "default", "via", e.hostIP},
+		{"sysctl", "-q", "-w", "net.ipv4.ip_forward=1"},
+		{"iptables", "-t", "nat", "-A", "POSTROUTING", "-s", cidr(e.subnet + ".0"), "-j", "MASQUERADE"},
+		{"iptables", "-A", "FORWARD", "-i", e.vethHost, "-j", "ACCEPT"},
+		{"iptables", "-A", "FORWARD", "-o", e.vethHost, "-j", "ACCEPT"},
+	}
+	for _, s := range steps {
+		if out, err := hostOutput(ctx, s[0], s[1:]...); err != nil {
+			return fmt.Errorf("%v: %w (%s)", s, err, strings.TrimSpace(out))
+		}
+	}
+	dir := filepath.Join("/etc/netns", e.ns)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("resolv.conf dir: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "resolv.conf"), []byte(nativeEgressResolvConf), 0o644); err != nil {
+		return fmt.Errorf("resolv.conf: %w", err)
+	}
+	return nil
+}
+
+// teardownEgress reverses setupEgress, best-effort (each step ignores errors so a
+// partial setup still cleans up). Deleting vethHost removes its netns peer.
+func (n nativeLauncher) teardownEgress(ctx context.Context) {
+	e := n.egress()
+	cidr := e.subnet + ".0/" + strconv.Itoa(e.prefix)
+	_, _ = hostOutput(ctx, "iptables", "-t", "nat", "-D", "POSTROUTING", "-s", cidr, "-j", "MASQUERADE")
+	_, _ = hostOutput(ctx, "iptables", "-D", "FORWARD", "-i", e.vethHost, "-j", "ACCEPT")
+	_, _ = hostOutput(ctx, "iptables", "-D", "FORWARD", "-o", e.vethHost, "-j", "ACCEPT")
+	_, _ = hostOutput(ctx, "ip", "link", "del", e.vethHost)
+	_ = os.RemoveAll(filepath.Join("/etc/netns", e.ns))
+}
+
+// layer2Wrap wraps an inner shell command to run in the workload netns with the
+// netns resolv.conf bind-mounted in a PRIVATE mount ns (so the host's is
+// untouched), entering via nsenter --net — which preserves /sys/fs/{cgroup,bpf}
+// that the LSM and cgroup placement need (ip netns exec would remount /sys). This
+// is the exact chain verified in netns-launch.sh.
+func (n nativeLauncher) layer2Wrap(inner string) []string {
+	resolv := quoteShellArg(filepath.Join("/etc/netns", n.egress().ns, "resolv.conf"))
+	bind := fmt.Sprintf("mount --bind %s /etc/resolv.conf 2>/dev/null || mount --bind %s \"$(readlink -f /etc/resolv.conf)\" 2>/dev/null; ", resolv, resolv)
+	return []string{
+		"nsenter", "--net=" + n.netnsRunPath(), "--",
+		"unshare", "--mount", "--propagation", "private", "--",
+		"sh", "-c", bind + inner,
+	}
 }
 
 func (n nativeLauncher) stopUnit(ctx context.Context, unit string) {
@@ -337,8 +469,9 @@ func (n nativeLauncher) InstallPromptAssets(ctx context.Context) error { return 
 // runs in the user-scope cgroup without a netns.
 func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir, shellBin, cmd string) *exec.Cmd {
 	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.workloadUser())
-	if nativeLayer2Enabled && !n.useUserManager() {
-		return exec.CommandContext(ctx, "nsenter", "--net="+n.netnsRunPath(), "--", "sh", "-c", inner)
+	if n.layer2Active() {
+		argv := n.layer2Wrap(inner)
+		return exec.CommandContext(ctx, argv[0], argv[1:]...)
 	}
 	return exec.CommandContext(ctx, "sh", "-c", inner)
 }

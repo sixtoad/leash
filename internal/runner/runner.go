@@ -157,6 +157,11 @@ type runner struct {
 	// backends (they exec via the container runtime).
 	cgroupPath string
 
+	// nativeEgressFailed records that native's Layer-2 netns egress setup failed
+	// during Provision, so StartEnforcement/exec fall back to LSM-only (host
+	// netns) rather than a netns with no route out. Native only.
+	nativeEgressFailed bool
+
 	logger        *log.Logger
 	mountState    *mountState
 	sessionID     string
