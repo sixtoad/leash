@@ -32,7 +32,7 @@ for pair in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
   os="${pair%/*}"; arch="${pair#*/}"
   echo "release: building $os/$arch..." >&2
   CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
-    -ldflags "-X main.commit=$COMMIT -X main.buildDate=$DATE" \
+    -ldflags "-X main.version=$TAG -X main.commit=$COMMIT -X main.buildDate=$DATE" \
     -o "$DIST/leash" ./cmd/leash
   tar -C "$DIST" -czf "$DIST/leash_${os}_${arch}.tar.gz" leash
   rm -f "$DIST/leash"

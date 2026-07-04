@@ -23,10 +23,11 @@ if [ ! -s internal/ui/dist/index.html ] || grep -q '>stub<\|<title>stub' interna
 fi
 
 COMMIT="$(git rev-parse --short=7 HEAD 2>/dev/null || echo dev)"
+VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "install-leash: building $(git branch --show-current 2>/dev/null || echo HEAD) -> $DEST/leash" >&2
 CGO_ENABLED=0 go build -trimpath \
-  -ldflags "-X main.commit=$COMMIT -X main.buildDate=$BUILD_DATE" \
+  -ldflags "-X main.version=$VERSION -X main.commit=$COMMIT -X main.buildDate=$BUILD_DATE" \
   -o "$DEST/leash" ./cmd/leash
 
 if command -v leash >/dev/null 2>&1 && [ "$(command -v leash)" = "$DEST/leash" ]; then
