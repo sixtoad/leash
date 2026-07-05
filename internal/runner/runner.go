@@ -110,6 +110,7 @@ type options struct {
 	allowDisplay bool // keep DISPLAY/XAUTHORITY + the X11 socket (GUI apps)
 	allowDBus    bool // keep DBUS_SESSION_BUS_ADDRESS + the keyring/D-Bus runtime dir
 	shareIPC     bool // share the host IPC namespace (e.g. X MIT-SHM)
+	requireLSM   bool // fail closed if the eBPF LSM can't attach (no proxy-only degrade)
 }
 
 type config struct {
@@ -345,6 +346,7 @@ Flags:
   --allow-display                 (native) Let the workload reach the X11 display (keep DISPLAY; don't mask the X socket). For GUI apps.
   --allow-dbus                    (native) Let the workload reach the session D-Bus/keyring (keep DBUS_SESSION_BUS_ADDRESS; don't mask /run/user).
   --share-ipc                     (native) Share the host IPC namespace (e.g. X MIT-SHM). Default: isolated.
+  --require-lsm                   (native) Fail closed if the eBPF LSM can't attach, instead of silently degrading to proxy-only. Refuses to run the workload unenforced.
   --image <name[:tag]>            Override the target container image (defaults to %s).
   --leash-image <name[:tag]>      Override the leash manager image (defaults to %s).
   --runtime <docker|podman>       Container runtime CLI to drive (defaults to docker).
@@ -424,6 +426,8 @@ func parseArgs(args []string) (options, error) {
 			opts.allowDBus = true
 		case "--share-ipc":
 			opts.shareIPC = true
+		case "--require-lsm":
+			opts.requireLSM = true
 		case "-v":
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && strings.Contains(args[i+1], ":") {
 				opts.volumes = append(opts.volumes, args[i+1])

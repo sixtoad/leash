@@ -217,6 +217,9 @@ func (n nativeLauncher) hostLeashdArgv(self, netnsPath, cgroupPath string) []str
 	if !n.layer2Active() {
 		leashd = append(leashd, "--lsm-only")
 	}
+	if n.r.opts.requireLSM {
+		leashd = append(leashd, "--require-lsm")
+	}
 	leashd = append(leashd, "--cgroup", cgroupPath)
 	if cfgDir := strings.TrimSpace(n.r.cfg.cfgDir); cfgDir != "" {
 		leashd = append(leashd, "--policy", filepath.Join(cfgDir, "leash.cedar"))

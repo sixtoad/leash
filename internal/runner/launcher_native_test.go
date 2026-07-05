@@ -69,10 +69,18 @@ func TestNativeHostLeashdArgv(t *testing.T) {
 
 	argv := n.hostLeashdArgv("/usr/local/bin/leash", "/run/netns/leash-native-x", "/sys/fs/cgroup/scope")
 	joined := strings.Join(argv, " ")
-	// LSM-only: host netns, no nsenter, --lsm-only.
+	// LSM-only: host netns, no nsenter, --lsm-only, and no --require-lsm by default.
 	want := "/usr/local/bin/leash --daemon --host --lsm-only --cgroup /sys/fs/cgroup/scope --proxy-port 18000"
 	if joined != want {
 		t.Fatalf("argv = %q\nwant   %q", joined, want)
+	}
+
+	// --require-lsm on the client propagates to the daemon args (fail-closed).
+	r.opts.requireLSM = true
+	joined = strings.Join(n.hostLeashdArgv("/usr/local/bin/leash", "/run/netns/leash-native-x", "/sys/fs/cgroup/scope"), " ")
+	want = "/usr/local/bin/leash --daemon --host --lsm-only --require-lsm --cgroup /sys/fs/cgroup/scope --proxy-port 18000"
+	if joined != want {
+		t.Fatalf("with --require-lsm argv = %q\nwant   %q", joined, want)
 	}
 }
 
