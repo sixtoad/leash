@@ -68,10 +68,11 @@ struct {
     __uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
-// Map to store the target cgroup ID for filtering (root of subtree to monitor)
+// Box cgroup descriptor: [0] = box cgroup id (0 = monitoring off), [1] = box
+// depth from the cgroup root (for the hierarchy check in is_target_cgroup).
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
+    __uint(max_entries, 2);
     __type(key, u32);
     __type(value, u64);
 } target_cgroup SEC(".maps");
@@ -125,6 +126,18 @@ static __always_inline bool is_target_cgroup()
     // The userspace program populates this with all descendant cgroup IDs
     u8 *allowed = bpf_map_lookup_elem(&allowed_cgroups, &current_cgroup_id);
     if (allowed && *allowed == 1) {
+        return true;
+    }
+
+    // Also enforce on cgroups created AFTER the attach-time snapshot: match by
+    // hierarchy so a nested/delegated sub-cgroup of the box can't escape. [1] is
+    // the box's depth from the cgroup root; the current task's ancestor at that
+    // depth equals the box id ([0]) iff the task is under the box. (When [0] is
+    // the legacy enable value 1 it can't equal a real cgroup id, so this no-ops
+    // and the snapshot above still applies.)
+    u32 level_key = 1;
+    u64 *box_level = bpf_map_lookup_elem(&target_cgroup, &level_key);
+    if (box_level && bpf_get_current_ancestor_cgroup_id((int)*box_level) == *target_cgroup_id) {
         return true;
     }
 
