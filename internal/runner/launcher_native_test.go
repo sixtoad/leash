@@ -186,26 +186,28 @@ func TestNativeBoxLifecycle_Integration(t *testing.T) {
 func TestNativeWorkloadScript(t *testing.T) {
 	cg := "/sys/fs/cgroup/system.slice/leash-native-x.service"
 
-	// Unhardened (rootless path): plain placement — no ns/mask/scrub.
-	plain := nativeWorkloadScript(cg, "/wd", "bash", "claude", "", "", hardenOpts{})
+	// Unhardened (rootless path): plain placement — no ns/mask/scrub/harden.
+	plain := nativeWorkloadScript(cg, "/wd", "bash", "claude", "", "", "/opt/leash", hardenOpts{})
 	if !strings.Contains(plain, "cgroup.procs") || !strings.Contains(plain, "exec bash -lc") {
 		t.Fatalf("plain script missing cgroup join / exec: %s", plain)
 	}
-	for _, unexpected := range []string{"unshare", "runuser", "mount -t tmpfs", "NODE_EXTRA_CA_CERTS", "env -u"} {
+	for _, unexpected := range []string{"unshare", "runuser", "mount -t tmpfs", "NODE_EXTRA_CA_CERTS", "env -u", "--harden-exec"} {
 		if strings.Contains(plain, unexpected) {
 			t.Fatalf("plain script must not contain %q: %s", unexpected, plain)
 		}
 	}
 
-	// Hardened default (root): masks + fresh PID+IPC ns + full scrub + CA export.
+	// Hardened default (root): masks + fresh PID+IPC ns + full scrub + CA export +
+	// the seccomp re-exec wrapper (blocks the userns→bind-mount path-LSM bypass).
 	h := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "/share/ca-cert.pem",
-		hardenOpts{enabled: true, uid: "1000"})
+		"/opt/leash", hardenOpts{enabled: true, uid: "1000"})
 	for _, want := range []string{
 		"mount -t tmpfs -o uid=1000,mode=0700 tmpfs /run/user/1000",
 		"/tmp/.X11-unix",
 		"cgroup.procs",
 		"exec unshare --ipc --pid --fork --mount-proc --",
 		"runuser -u alice --",
+		"/opt/leash --harden-exec --",
 		"env -u DBUS_SESSION_BUS_ADDRESS -u DISPLAY -u XAUTHORITY",
 		"export NODE_EXTRA_CA_CERTS=/share/ca-cert.pem; exec claude",
 	} {
@@ -216,11 +218,25 @@ func TestNativeWorkloadScript(t *testing.T) {
 	if strings.Index(h, "cgroup.procs") > strings.Index(h, "unshare") {
 		t.Fatalf("cgroup write must come before the unshare: %s", h)
 	}
+	// The seccomp filter must be applied AFTER leash's own unshare/mount (so leash's
+	// setup succeeds) but is inherited by the agent: harden-exec sits inside runuser,
+	// which sits inside unshare.
+	if !(strings.Index(h, "unshare") < strings.Index(h, "runuser") &&
+		strings.Index(h, "runuser") < strings.Index(h, "--harden-exec")) {
+		t.Fatalf("harden-exec must nest inside runuser inside unshare: %s", h)
+	}
+
+	// Hardened but no self path (os.Executable failed): degrade gracefully — the
+	// session isolation still applies, but no seccomp re-exec.
+	noSelf := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "", "", hardenOpts{enabled: true, uid: "1000"})
+	if strings.Contains(noSelf, "--harden-exec") {
+		t.Fatalf("no-self script must not contain harden-exec: %s", noSelf)
+	}
 
 	// GUI opt-outs: --allow-display + --share-ipc → no X11 mask, DISPLAY kept, no
 	// IPC ns; but D-Bus stays masked/scrubbed (not opted out).
 	gui := nativeWorkloadScript(cg, "/wd", "bash", "app", "alice", "",
-		hardenOpts{enabled: true, uid: "1000", allowDisplay: true, shareIPC: true})
+		"/opt/leash", hardenOpts{enabled: true, uid: "1000", allowDisplay: true, shareIPC: true})
 	for _, unexpected := range []string{"/tmp/.X11-unix", "--ipc", "-u DISPLAY", "-u XAUTHORITY"} {
 		if strings.Contains(gui, unexpected) {
 			t.Fatalf("GUI script must not contain %q: %s", unexpected, gui)

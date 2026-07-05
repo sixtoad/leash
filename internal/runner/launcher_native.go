@@ -561,7 +561,13 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 			allowDBus:    n.r.opts.allowDBus,
 		}
 	}
-	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.workloadUser(), caCert, h)
+	// The leash binary re-execs itself as `--harden-exec` to seccomp the workload;
+	// resolve its path now (empty disables hardening rather than failing the run).
+	self, err := os.Executable()
+	if err != nil {
+		self = ""
+	}
+	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.workloadUser(), caCert, self, h)
 	if n.layer2Active() {
 		argv := n.layer2Wrap(inner) // nsenter --net + private mount ns (resolv bind)
 		return exec.CommandContext(ctx, argv[0], argv[1:]...)
@@ -622,7 +628,7 @@ type hardenOpts struct {
 	allowDBus    bool   // --allow-dbus: keep DBUS_SESSION_BUS_ADDRESS + /run/user
 }
 
-func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert string, h hardenOpts) string {
+func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, self string, h hardenOpts) string {
 	procs := quoteShellArg(filepath.Join(cgroupPath, "cgroup.procs"))
 	innerCmd := "exec " + cmd
 	if caCert != "" {
@@ -650,10 +656,22 @@ func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert s
 		}
 	}
 
-	// Drop privileges (runuser), keeping the scrub in the innermost exec.
-	userRun := scrub + shellRun
+	// Seccomp-harden the workload just before it execs the agent: re-exec through
+	// `leash --harden-exec`, which installs the mount/unshare-denying filter and
+	// then execs onward. Placed INSIDE runuser (so it runs as the dropped user) but
+	// AFTER leash's own `unshare --mount-proc` below — leash's namespace setup
+	// completes first, then the filter blocks the agent from creating its own
+	// user+mount namespace to bind-mount a denied path under an allowed prefix
+	// (the path-LSM bypass). Inherited across exec → covers every subprocess.
+	payload := scrub + shellRun
+	if h.enabled && self != "" {
+		payload = quoteShellArg(self) + " --harden-exec -- " + scrub + shellRun
+	}
+
+	// Drop privileges (runuser), keeping the harden+scrub in the innermost exec.
+	userRun := payload
 	if dropUser != "" {
-		userRun = "runuser -u " + quoteShellArg(dropUser) + " -- " + scrub + shellRun
+		userRun = "runuser -u " + quoteShellArg(dropUser) + " -- " + payload
 	}
 
 	// Fresh PID (+ IPC unless shared) namespaces with own /proc (--mount-proc), so
