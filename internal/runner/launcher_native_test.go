@@ -261,6 +261,22 @@ func TestNativeWorkloadScript(t *testing.T) {
 			t.Fatalf("GUI script missing %q: %s", want, gui)
 		}
 	}
+
+	// --allow-namespaces opts out of ONLY the seccomp block: no harden-exec, but
+	// the session isolation (PID/IPC ns, masks, runuser) stays on.
+	ns := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "",
+		"/opt/leash", hardenOpts{enabled: true, uid: "1000", allowNamespaces: true})
+	if strings.Contains(ns, "--harden-exec") {
+		t.Fatalf("allow-namespaces script must not seccomp-harden: %s", ns)
+	}
+	for _, want := range []string{
+		"exec unshare --ipc --pid --fork --mount-proc --", // leash's own isolation still on
+		"runuser -u alice --",
+	} {
+		if !strings.Contains(ns, want) {
+			t.Fatalf("allow-namespaces script missing %q: %s", want, ns)
+		}
+	}
 }
 
 func TestNativeLeashdDied(t *testing.T) {

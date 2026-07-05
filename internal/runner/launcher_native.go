@@ -607,11 +607,12 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 	h := hardenOpts{}
 	if !n.useUserManager() {
 		h = hardenOpts{
-			enabled:      true,
-			uid:          n.workloadUID(),
-			shareIPC:     n.r.opts.shareIPC,
-			allowDisplay: n.r.opts.allowDisplay,
-			allowDBus:    n.r.opts.allowDBus,
+			enabled:         true,
+			uid:             n.workloadUID(),
+			shareIPC:        n.r.opts.shareIPC,
+			allowDisplay:    n.r.opts.allowDisplay,
+			allowDBus:       n.r.opts.allowDBus,
+			allowNamespaces: n.r.opts.allowNamespaces,
 		}
 	}
 	// The leash binary re-execs itself as `--harden-exec` to seccomp the workload;
@@ -674,11 +675,12 @@ func (n nativeLauncher) workloadUser() string {
 // The allow*/share* flags relax it for GUI/desktop workloads — leash is
 // agnostic, so a container-shaped default must be opt-out-able.
 type hardenOpts struct {
-	enabled      bool   // master (root only); false = rootless/unenforced, no isolation
-	uid          string // validated-numeric $SUDO_UID for the keyring-dir mask
-	shareIPC     bool   // --share-ipc: no IPC ns (X MIT-SHM etc.)
-	allowDisplay bool   // --allow-display: keep DISPLAY/XAUTHORITY + the X11 socket
-	allowDBus    bool   // --allow-dbus: keep DBUS_SESSION_BUS_ADDRESS + /run/user
+	enabled         bool   // master (root only); false = rootless/unenforced, no isolation
+	uid             string // validated-numeric $SUDO_UID for the keyring-dir mask
+	shareIPC        bool   // --share-ipc: no IPC ns (X MIT-SHM etc.)
+	allowDisplay    bool   // --allow-display: keep DISPLAY/XAUTHORITY + the X11 socket
+	allowDBus       bool   // --allow-dbus: keep DBUS_SESSION_BUS_ADDRESS + /run/user
+	allowNamespaces bool   // --allow-namespaces: skip the seccomp mount/unshare block
 }
 
 func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, self string, h hardenOpts) string {
@@ -716,8 +718,11 @@ func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, 
 	// completes first, then the filter blocks the agent from creating its own
 	// user+mount namespace to bind-mount a denied path under an allowed prefix
 	// (the path-LSM bypass). Inherited across exec → covers every subprocess.
+	// --allow-namespaces opts out for workloads that legitimately need unshare/
+	// mount (nested containers, sandbox tools) — at the cost of reopening the
+	// bypass, so it is off by default.
 	payload := scrub + shellRun
-	if h.enabled && self != "" {
+	if h.enabled && !h.allowNamespaces && self != "" {
 		payload = quoteShellArg(self) + " --harden-exec -- " + scrub + shellRun
 	}
 

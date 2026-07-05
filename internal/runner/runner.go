@@ -107,10 +107,11 @@ type options struct {
 	publishAll     bool
 
 	// Native session-isolation opt-outs (default: hardened). See launcher_native.go.
-	allowDisplay bool // keep DISPLAY/XAUTHORITY + the X11 socket (GUI apps)
-	allowDBus    bool // keep DBUS_SESSION_BUS_ADDRESS + the keyring/D-Bus runtime dir
-	shareIPC     bool // share the host IPC namespace (e.g. X MIT-SHM)
-	requireLSM   bool // fail closed if the eBPF LSM can't attach (no proxy-only degrade)
+	allowDisplay    bool // keep DISPLAY/XAUTHORITY + the X11 socket (GUI apps)
+	allowDBus       bool // keep DBUS_SESSION_BUS_ADDRESS + the keyring/D-Bus runtime dir
+	shareIPC        bool // share the host IPC namespace (e.g. X MIT-SHM)
+	requireLSM      bool // fail closed if the eBPF LSM can't attach (no proxy-only degrade)
+	allowNamespaces bool // skip the seccomp mount/unshare block (reopens the userns bind-mount bypass)
 }
 
 type config struct {
@@ -354,6 +355,7 @@ Flags:
   --allow-dbus                    (native) Let the workload reach the session D-Bus/keyring (keep DBUS_SESSION_BUS_ADDRESS; don't mask /run/user).
   --share-ipc                     (native) Share the host IPC namespace (e.g. X MIT-SHM). Default: isolated.
   --require-lsm                   (native) Fail closed if the eBPF LSM can't attach, instead of silently degrading to proxy-only. Refuses to run the workload unenforced.
+  --allow-namespaces              (native) Let the workload create user/mount namespaces (unshare/mount) — for nested containers or sandbox tools. Reopens the userns bind-mount path-LSM bypass, so default is hardened (off).
   --image <name[:tag]>            Override the target container image (defaults to %s).
   --leash-image <name[:tag]>      Override the leash manager image (defaults to %s).
   --runtime <docker|podman>       Container runtime CLI to drive (defaults to docker).
@@ -435,6 +437,8 @@ func parseArgs(args []string) (options, error) {
 			opts.shareIPC = true
 		case "--require-lsm":
 			opts.requireLSM = true
+		case "--allow-namespaces":
+			opts.allowNamespaces = true
 		case "-v":
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && strings.Contains(args[i+1], ":") {
 				opts.volumes = append(opts.volumes, args[i+1])
