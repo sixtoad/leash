@@ -168,6 +168,13 @@ type runner struct {
 	// netns) rather than a netns with no route out. Native only.
 	nativeEgressFailed bool
 
+	// leashdExited is closed when the native leashd process exits (StartEnforcement
+	// starts a reaper). WaitReady selects on it to fail fast — instead of waiting
+	// out the full readiness timeout — when leashd died before enforcement went
+	// live (e.g. an LSM attach abort under --require-lsm). Nil until enforcement
+	// starts / on non-native backends.
+	leashdExited chan struct{}
+
 	logger        *log.Logger
 	mountState    *mountState
 	sessionID     string

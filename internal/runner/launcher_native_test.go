@@ -3,6 +3,8 @@ package runner
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -258,6 +260,52 @@ func TestNativeWorkloadScript(t *testing.T) {
 		if !strings.Contains(gui, want) {
 			t.Fatalf("GUI script missing %q: %s", want, gui)
 		}
+	}
+}
+
+func TestNativeLeashdDied(t *testing.T) {
+	r := &runner{}
+	n := nativeLauncher{r: r}
+	if n.leashdDied() {
+		t.Fatal("nil channel → not died")
+	}
+	ch := make(chan struct{})
+	r.leashdExited = ch
+	if n.leashdDied() {
+		t.Fatal("open channel → not died")
+	}
+	close(ch)
+	if !n.leashdDied() {
+		t.Fatal("closed channel → died")
+	}
+}
+
+// WaitReady must fail closed under --require-lsm when enforcement never confirms,
+// and preserve the historical warn-and-proceed otherwise. Uses the leashd-died
+// fast path so the test doesn't sit through the full readiness timeout.
+func TestNativeWaitReadyFailClosed(t *testing.T) {
+	exited := make(chan struct{})
+	close(exited) // simulate leashd already gone → WaitReady stops on the first poll
+
+	mk := func(require bool) nativeLauncher {
+		r := &runner{}
+		r.cfg.shareDir = t.TempDir() // present but no enforcement-ready marker
+		r.opts.requireLSM = require
+		r.leashdExited = exited
+		r.logger = log.New(io.Discard, "", 0)
+		return nativeLauncher{r: r}
+	}
+
+	err := mk(true).WaitReady(context.Background())
+	if err == nil {
+		t.Fatal("WaitReady must error under --require-lsm when leashd died before ready")
+	}
+	if !strings.Contains(err.Error(), "--require-lsm") {
+		t.Fatalf("error should name --require-lsm: %v", err)
+	}
+
+	if err := mk(false).WaitReady(context.Background()); err != nil {
+		t.Fatalf("WaitReady should warn-and-proceed (nil) without --require-lsm: %v", err)
 	}
 }
 

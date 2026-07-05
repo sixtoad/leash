@@ -173,12 +173,46 @@ func (n nativeLauncher) StartEnforcement(ctx context.Context, cgroupPath string)
 	// instead — the container path sends leashd logs to the runtime, not the
 	// workload's terminal. On failure, leave stdout/stderr nil (discarded) rather
 	// than fall back to the TTY.
-	if logf, err := os.Create(n.leashdLogPath()); err == nil {
-		cmd.Stdout, cmd.Stderr = logf, logf
+	var logf *os.File
+	if f, err := os.Create(n.leashdLogPath()); err == nil {
+		logf = f
+		cmd.Stdout, cmd.Stderr = f, f
 	} else {
 		n.r.debugf("native: leashd log file %s: %v (discarding leashd output)", n.leashdLogPath(), err)
 	}
-	return cmd.Start()
+	if err := cmd.Start(); err != nil {
+		if logf != nil {
+			logf.Close()
+		}
+		return err
+	}
+	// Reap leashd and signal its exit so WaitReady can fail fast if it dies before
+	// enforcement is ready (e.g. leashd os.Exit(1)s on an LSM attach abort under
+	// --require-lsm) instead of blocking for the whole readiness timeout.
+	exited := make(chan struct{})
+	n.r.leashdExited = exited
+	go func() {
+		_ = cmd.Wait()
+		if logf != nil {
+			logf.Close()
+		}
+		close(exited)
+	}()
+	return nil
+}
+
+// leashdDied reports whether the reaped leashd process has already exited.
+func (n nativeLauncher) leashdDied() bool {
+	ch := n.r.leashdExited
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
 }
 
 // leashdLogPath is where native tees leashd's stdout/stderr, off the workload's
@@ -295,9 +329,25 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 			}
 			return nil
 		}
+		// Fast path: if leashd already exited it will never publish the marker, so
+		// stop waiting now (fail-closed below decides the verdict).
+		if n.leashdDied() {
+			return n.notReady("native leashd exited before enforcement was ready")
+		}
 		time.Sleep(caCertWaitDelay)
 	}
-	n.r.logger.Println("Warning: native enforcement was not confirmed ready after waiting; the workload may run before Layer 1 is active.")
+	return n.notReady(fmt.Sprintf("native enforcement was not confirmed ready after %s", time.Duration(caCertWaitAttempts)*caCertWaitDelay))
+}
+
+// notReady resolves an unconfirmed-enforcement situation: fail closed when the
+// operator passed --require-lsm (refuse to run the workload unenforced), else
+// preserve the historical behavior — warn and proceed (degrade to whatever
+// enforcement did attach). The leashd log has the specifics either way.
+func (n nativeLauncher) notReady(reason string) error {
+	if n.r.opts.requireLSM {
+		return fmt.Errorf("%s; refusing to run the workload unenforced (--require-lsm). See %s", reason, n.leashdLogPath())
+	}
+	n.r.logger.Printf("Warning: %s; the workload may run before Layer 1 is active. See %s", reason, n.leashdLogPath())
 	return nil
 }
 
