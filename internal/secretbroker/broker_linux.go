@@ -48,17 +48,25 @@ type linuxBroker struct {
 	allow    *Allowlist
 }
 
-// Start launches the private bus + shadow service. The returned Broker's
-// SocketPath is injected into the sandbox by the launcher.
-func Start(ctx context.Context, allow *Allowlist) (Broker, error) {
+// Start launches the private bus + shadow service. sockPath is where the private
+// bus listens (chosen by the launcher so it can inject it into the sandbox); if
+// empty, a temp path is used. The returned Broker's SocketPath is what the
+// launcher exposes to the box as DBUS_SESSION_BUS_ADDRESS.
+func Start(ctx context.Context, allow *Allowlist, sockPath string) (Broker, error) {
 	if allow == nil || !allow.Enabled() {
 		return nil, errors.New("secretbroker: no secrets allow-listed")
 	}
-	dir, err := os.MkdirTemp("", "leash-secretbus-")
-	if err != nil {
-		return nil, fmt.Errorf("secretbroker: temp dir: %w", err)
+	var dir string
+	if sockPath == "" {
+		d, err := os.MkdirTemp("", "leash-secretbus-")
+		if err != nil {
+			return nil, fmt.Errorf("secretbroker: temp dir: %w", err)
+		}
+		dir, sockPath = d, filepath.Join(d, "bus")
+	} else if err := os.MkdirAll(filepath.Dir(sockPath), 0o755); err != nil {
+		return nil, fmt.Errorf("secretbroker: socket dir: %w", err)
 	}
-	b := &linuxBroker{dir: dir, sockPath: filepath.Join(dir, "bus"), allow: allow}
+	b := &linuxBroker{dir: dir, sockPath: sockPath, allow: allow}
 
 	for _, step := range []func(context.Context) error{b.startDaemon, b.connect, b.exportShadow} {
 		if err := step(ctx); err != nil {
