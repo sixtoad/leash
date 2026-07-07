@@ -765,7 +765,17 @@ func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, 
 	procs := quoteShellArg(filepath.Join(cgroupPath, "cgroup.procs"))
 	innerCmd := "exec " + cmd
 	if caCert != "" {
-		innerCmd = "export NODE_EXTRA_CA_CERTS=" + quoteShellArg(caCert) + "; " + innerCmd
+		// Trust leash's L2 MITM CA across runtimes, not just Node: Go and
+		// OpenSSL/curl read SSL_CERT_FILE, curl also CURL_CA_BUNDLE, Python-requests
+		// REQUESTS_CA_BUNDLE, git GIT_SSL_CAINFO, Node NODE_EXTRA_CA_CERTS. In the
+		// box all allowed egress is proxied through the MITM, so every cert is
+		// signed by this CA. (Go binaries like agy failed x509 with Node-only.)
+		q := quoteShellArg(caCert)
+		innerCmd = "export NODE_EXTRA_CA_CERTS=" + q +
+			" SSL_CERT_FILE=" + q +
+			" CURL_CA_BUNDLE=" + q +
+			" REQUESTS_CA_BUNDLE=" + q +
+			" GIT_SSL_CAINFO=" + q + "; " + innerCmd
 	}
 	shellRun := fmt.Sprintf("%s -lc %s", quoteShellArg(shellBin), quoteShellArg(innerCmd))
 
