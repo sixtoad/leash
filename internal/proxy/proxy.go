@@ -293,15 +293,32 @@ func (p *MITMProxy) blockConnection(clientConn net.Conn, isHTTPS bool, hostname,
 	// Log the denied request to shared logger
 	p.logRequest(protocol, hostname, portStr, path, query, authHeader, 403, policyErr)
 
-	body := "Connection denied by security policy: " + hostname
-	response := fmt.Sprintf("HTTP/1.1 403 Forbidden\r\n"+
-		"Content-Type: text/plain\r\n"+
-		"Content-Length: %d\r\n"+
-		"Connection: close\r\n"+
-		"\r\n"+
-		"%s", len(body), body)
-	if _, err := clientConn.Write([]byte(response)); err != nil {
-		log.Printf("failed to write policy denial response: %v", err)
+	// If the client negotiated HTTP/2 (now reachable here because the connect
+	// policy runs before the h2 tunnel), an HTTP/1.1 denial body is parsed as
+	// malformed h2 frames ("frame too large … looked like an HTTP/1.1 header").
+	// Send a proper h2 refusal instead: an empty SETTINGS preface + a
+	// GOAWAY(REFUSED_STREAM), so the client sees a clean protocol-level refusal.
+	if tc, ok := clientConn.(*tls.Conn); ok && tc.ConnectionState().NegotiatedProtocol == "h2" {
+		h2Refuse := []byte{
+			0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, // SETTINGS (len 0), stream 0
+			0x00, 0x00, 0x08, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, // GOAWAY header (len 8), stream 0
+			0x00, 0x00, 0x00, 0x00, // last-stream-id = 0
+			0x00, 0x00, 0x00, 0x07, // error code REFUSED_STREAM
+		}
+		if _, err := clientConn.Write(h2Refuse); err != nil {
+			log.Printf("failed to write h2 policy denial (GOAWAY): %v", err)
+		}
+	} else {
+		body := "Connection denied by security policy: " + hostname
+		response := fmt.Sprintf("HTTP/1.1 403 Forbidden\r\n"+
+			"Content-Type: text/plain\r\n"+
+			"Content-Length: %d\r\n"+
+			"Connection: close\r\n"+
+			"\r\n"+
+			"%s", len(body), body)
+		if _, err := clientConn.Write([]byte(response)); err != nil {
+			log.Printf("failed to write policy denial response: %v", err)
+		}
 	}
 	if closer, ok := clientConn.(interface{ CloseWrite() error }); ok {
 		_ = closer.CloseWrite()
