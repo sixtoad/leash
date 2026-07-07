@@ -546,28 +546,10 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 		return
 	}
 
-	// If the client negotiated HTTP/2 via ALPN, tunnel the connection
-	// transparently to the origin. Full h2 MITM (framing, HPACK, flow control)
-	// is complex; a transparent tunnel preserves all h2 semantics while still
-	// enforcing the connect policy that was already checked above.
-	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
-		p.tunnelH2(tlsConn, originalDest, actualHostname)
-		return
-	}
-
-	// Use the hostname from SNI if available, otherwise fall back to originalDest
-	targetHost := actualHostname
-	if targetHost == "" || net.ParseIP(targetHost) != nil {
-		targetHost = originalDest
-	} else {
-		// For hostname, preserve port from originalDest
-		_, port, err := net.SplitHostPort(originalDest)
-		if err == nil {
-			targetHost = net.JoinHostPort(targetHost, port)
-		}
-	}
-
-	// Check connect policy for HTTPS connections
+	// Resolve destination + SNI hostname and enforce the connect policy BEFORE
+	// anything else — crucially before the h2 tunnel below. Previously the h2
+	// branch returned before this check, so any ALPN=h2 client (gRPC, curl
+	// --http2, browsers) bypassed the network allowlist entirely (issue #6).
 	destHost, destPort, err := net.SplitHostPort(originalDest)
 	if err != nil {
 		destHost = originalDest
@@ -585,6 +567,27 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 		// For HTTPS connection denials, we don't have specific path/query/auth info yet
 		p.blockConnection(tlsConn, true, hostname, destHost, uint16(portNum), "/", "", "")
 		return
+	}
+
+	// Policy passed. If the client negotiated HTTP/2 via ALPN, tunnel transparently
+	// to the origin. Full h2 MITM (framing, HPACK, flow control) is complex; the
+	// tunnel preserves h2 semantics, and the connect policy above already gated it.
+	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
+		p.tunnelH2(tlsConn, originalDest, actualHostname)
+		return
+	}
+
+	// HTTP/1.1 path: resolve the upstream target for the per-request MITM below.
+	// Use the hostname from SNI if available, otherwise fall back to originalDest.
+	targetHost := actualHostname
+	if targetHost == "" || net.ParseIP(targetHost) != nil {
+		targetHost = originalDest
+	} else {
+		// For hostname, preserve port from originalDest
+		_, port, err := net.SplitHostPort(originalDest)
+		if err == nil {
+			targetHost = net.JoinHostPort(targetHost, port)
+		}
 	}
 
 	// Handle HTTP requests over the TLS connection
