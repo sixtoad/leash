@@ -183,7 +183,8 @@ func (b *linuxBroker) realSearch(attrs map[string]string) []dbus.ObjectPath {
 	if err := b.realSvc().Call(ifaceService+".SearchItems", 0, attrs).Store(&unlocked, &locked); err != nil {
 		return nil
 	}
-	out := make([]dbus.ObjectPath, 0, len(unlocked)+len(locked))
+	total := len(unlocked) + len(locked)
+	out := make([]dbus.ObjectPath, 0, total)
 	for _, it := range append(unlocked, locked...) {
 		if !b.allow.AllowsAttributes(b.realItemAttrs(it)) {
 			continue
@@ -194,6 +195,10 @@ func (b *linuxBroker) realSearch(attrs map[string]string) []dbus.ObjectPath {
 		})
 		out = append(out, it)
 	}
+	// Discovery aid: the search attributes reveal the client's go-keyring
+	// "service" — useful for setting --secret. Attribute keys/values are not
+	// secrets (the secret value itself is never logged).
+	fmt.Fprintf(os.Stderr, "secretbroker: SearchItems %v -> %d of %d served\n", attrs, len(out), total)
 	return out
 }
 
