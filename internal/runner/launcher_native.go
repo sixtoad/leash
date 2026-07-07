@@ -198,7 +198,77 @@ func (n nativeLauncher) StartEnforcement(ctx context.Context, cgroupPath string)
 		}
 		close(exited)
 	}()
+	if err := n.startSecretBroker(ctx); err != nil {
+		return err
+	}
 	return nil
+}
+
+// startSecretBroker launches the keyring secret broker (native --secret) as the
+// invoking user — root can't reach the user's session keyring — and records its
+// shadow socket for injection into the workload. The socket lives under /tmp,
+// which the box sees unmasked, so native needs no bind-mount (container launchers
+// reuse the same socket via -v). Fails the run if the broker can't start, rather
+// than run the agent expecting keyring access it won't get.
+func (n nativeLauncher) startSecretBroker(ctx context.Context) error {
+	if len(n.r.opts.secrets) == 0 {
+		return nil
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("native: locate leash binary for secret broker: %w", err)
+	}
+	sock := filepath.Join("/tmp", "leash-secretbus-"+n.netnsName(), "bus")
+	brokerArgs := []string{self, "--secret-broker", "--secret-bus", sock}
+	for _, s := range n.r.opts.secrets {
+		brokerArgs = append(brokerArgs, "--secret", s)
+	}
+	// Run AS the invoking user, with that user's D-Bus/runtime env so the broker
+	// can reach their real keyring.
+	argv := brokerArgs
+	if user := n.workloadUser(); user != "" {
+		argv = append([]string{"runuser", "-u", user, "--", "env"}, n.userSessionEnv()...)
+		argv = append(argv, brokerArgs...)
+	}
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	if n.workloadUser() == "" {
+		cmd.Env = append(os.Environ(), n.userSessionEnv()...)
+	}
+	if logf, err := os.Create(n.secretBrokerLogPath()); err == nil {
+		cmd.Stdout, cmd.Stderr = logf, logf
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("native: start secret broker: %w", err)
+	}
+	n.r.secretBroker = cmd
+	for i := 0; i < 100; i++ {
+		if _, err := os.Stat(sock); err == nil {
+			n.r.secretBusAddr = sock
+			return nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return fmt.Errorf("native: secret broker socket %s did not appear (see %s)", sock, n.secretBrokerLogPath())
+}
+
+// userSessionEnv is the invoking user's D-Bus/runtime env, passed to the broker
+// subprocess so it connects to the user's real keyring.
+func (n nativeLauncher) userSessionEnv() []string {
+	var env []string
+	uid := n.workloadUID()
+	if v := strings.TrimSpace(os.Getenv("DBUS_SESSION_BUS_ADDRESS")); v != "" {
+		env = append(env, "DBUS_SESSION_BUS_ADDRESS="+v)
+	} else if uid != "" {
+		env = append(env, "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/"+uid+"/bus")
+	}
+	if uid != "" {
+		env = append(env, "XDG_RUNTIME_DIR=/run/user/"+uid)
+	}
+	return env
+}
+
+func (n nativeLauncher) secretBrokerLogPath() string {
+	return filepath.Join("/tmp", "leash-native-secretbroker-"+n.netnsName()+".log")
 }
 
 // leashdDied reports whether the reaped leashd process has already exited.
@@ -379,6 +449,12 @@ func (n nativeLauncher) exportCACert(shareDir string) {
 // compiled), not layer2Active, so a run that fell back to LSM-only after a
 // partial egress setup still cleans up.
 func (n nativeLauncher) Remove(ctx context.Context) {
+	if n.r.secretBroker != nil && n.r.secretBroker.Process != nil {
+		// Signal (not kill) so the broker tears down its private dbus-daemon.
+		_ = n.r.secretBroker.Process.Signal(os.Interrupt)
+		_ = n.r.secretBroker.Wait()
+		_ = os.RemoveAll(filepath.Join("/tmp", "leash-secretbus-"+n.netnsName()))
+	}
 	if nativeLayer2Enabled && !n.useUserManager() {
 		n.teardownEgress(ctx)
 		_, _ = hostOutput(ctx, "ip", "netns", "del", n.netnsName())
@@ -613,6 +689,7 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 			allowDisplay:    n.r.opts.allowDisplay,
 			allowDBus:       n.r.opts.allowDBus,
 			allowNamespaces: n.r.opts.allowNamespaces,
+			secretBus:       n.r.secretBusAddr,
 		}
 	}
 	// The leash binary re-execs itself as `--harden-exec` to seccomp the workload;
@@ -681,6 +758,7 @@ type hardenOpts struct {
 	allowDisplay    bool   // --allow-display: keep DISPLAY/XAUTHORITY + the X11 socket
 	allowDBus       bool   // --allow-dbus: keep DBUS_SESSION_BUS_ADDRESS + /run/user
 	allowNamespaces bool   // --allow-namespaces: skip the seccomp mount/unshare block
+	secretBus       string // --secret: shadow Secret Service socket to set as DBUS_SESSION_BUS_ADDRESS
 }
 
 func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, self string, h hardenOpts) string {
@@ -695,17 +773,26 @@ func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, 
 	// matching allow flag keeps them.
 	scrub := ""
 	if h.enabled {
-		var vars []string
-		if !h.allowDBus {
-			vars = append(vars, "DBUS_SESSION_BUS_ADDRESS")
+		var unset, set []string
+		switch {
+		case h.secretBus != "":
+			// Point the workload at the shadow Secret Service (not the real bus,
+			// whose /run/user socket stays masked): the broker serves only the
+			// --secret items.
+			set = append(set, "DBUS_SESSION_BUS_ADDRESS=unix:path="+h.secretBus)
+		case !h.allowDBus:
+			unset = append(unset, "DBUS_SESSION_BUS_ADDRESS")
 		}
 		if !h.allowDisplay {
-			vars = append(vars, "DISPLAY", "XAUTHORITY")
+			unset = append(unset, "DISPLAY", "XAUTHORITY")
 		}
-		if len(vars) > 0 {
+		if len(unset) > 0 || len(set) > 0 {
 			scrub = "env"
-			for _, v := range vars {
+			for _, v := range unset {
 				scrub += " -u " + v
+			}
+			for _, kv := range set {
+				scrub += " " + quoteShellArg(kv)
 			}
 			scrub += " "
 		}

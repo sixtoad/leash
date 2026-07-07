@@ -110,8 +110,9 @@ type options struct {
 	allowDisplay    bool // keep DISPLAY/XAUTHORITY + the X11 socket (GUI apps)
 	allowDBus       bool // keep DBUS_SESSION_BUS_ADDRESS + the keyring/D-Bus runtime dir
 	shareIPC        bool // share the host IPC namespace (e.g. X MIT-SHM)
-	requireLSM      bool // fail closed if the eBPF LSM can't attach (no proxy-only degrade)
-	allowNamespaces bool // skip the seccomp mount/unshare block (reopens the userns bind-mount bypass)
+	requireLSM      bool     // fail closed if the eBPF LSM can't attach (no proxy-only degrade)
+	allowNamespaces bool     // skip the seccomp mount/unshare block (reopens the userns bind-mount bypass)
+	secrets         []string // --secret <service>: keyring items the agent may read via the broker
 }
 
 type config struct {
@@ -175,6 +176,12 @@ type runner struct {
 	// live (e.g. an LSM attach abort under --require-lsm). Nil until enforcement
 	// starts / on non-native backends.
 	leashdExited chan struct{}
+
+	// secretBroker is the keyring secret-broker subprocess (native --secret), run
+	// as the invoking user; secretBusAddr is the shadow bus socket injected into
+	// the workload as DBUS_SESSION_BUS_ADDRESS. Nil/empty when --secret is unused.
+	secretBroker  *exec.Cmd
+	secretBusAddr string
 
 	logger        *log.Logger
 	mountState    *mountState
@@ -356,6 +363,7 @@ Flags:
   --share-ipc                     (native) Share the host IPC namespace (e.g. X MIT-SHM). Default: isolated.
   --require-lsm                   (native) Fail closed if the eBPF LSM can't attach, instead of silently degrading to proxy-only. Refuses to run the workload unenforced.
   --allow-namespaces              (native) Let the workload create user/mount namespaces (unshare/mount) — for nested containers or sandbox tools. Reopens the userns bind-mount path-LSM bypass, so default is hardened (off).
+  --secret <service>              (native) Let the agent read this keyring item (by go-keyring "service") via a shadow Secret Service — without exposing the rest of the keyring. Repeatable. Default: keyring blocked.
   --image <name[:tag]>            Override the target container image (defaults to %s).
   --leash-image <name[:tag]>      Override the leash manager image (defaults to %s).
   --runtime <docker|podman>       Container runtime CLI to drive (defaults to docker).
@@ -439,6 +447,11 @@ func parseArgs(args []string) (options, error) {
 			opts.requireLSM = true
 		case "--allow-namespaces":
 			opts.allowNamespaces = true
+		case "--secret":
+			if i+1 < len(args) {
+				opts.secrets = append(opts.secrets, args[i+1])
+				i++
+			}
 		case "-v":
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && strings.Contains(args[i+1], ":") {
 				opts.volumes = append(opts.volumes, args[i+1])
