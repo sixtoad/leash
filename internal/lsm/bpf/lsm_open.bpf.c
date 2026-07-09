@@ -68,10 +68,11 @@ struct {
     __uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
-// Map to store the target cgroup ID for filtering (root of subtree to monitor)
+// Box cgroup descriptor: [0] = box cgroup id (0 = monitoring off), [1] = box
+// depth from the cgroup root (for the hierarchy check in is_target_cgroup).
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
+    __uint(max_entries, 2);
     __type(key, u32);
     __type(value, u64);
 } target_cgroup SEC(".maps");
@@ -125,6 +126,18 @@ static __always_inline bool is_target_cgroup()
     // The userspace program populates this with all descendant cgroup IDs
     u8 *allowed = bpf_map_lookup_elem(&allowed_cgroups, &current_cgroup_id);
     if (allowed && *allowed == 1) {
+        return true;
+    }
+
+    // Also enforce on cgroups created AFTER the attach-time snapshot: match by
+    // hierarchy so a nested/delegated sub-cgroup of the box can't escape. [1] is
+    // the box's depth from the cgroup root; the current task's ancestor at that
+    // depth equals the box id ([0]) iff the task is under the box. (When [0] is
+    // the legacy enable value 1 it can't equal a real cgroup id, so this no-ops
+    // and the snapshot above still applies.)
+    u32 level_key = 1;
+    u64 *box_level = bpf_map_lookup_elem(&target_cgroup, &level_key);
+    if (box_level && bpf_get_current_ancestor_cgroup_id((int)*box_level) == *target_cgroup_id) {
         return true;
     }
 
@@ -322,61 +335,11 @@ int BPF_PROG(lsm_open, struct file *file)
     // Get process command name
     bpf_get_current_comm(event->comm, sizeof(event->comm));
 
-    // Special case: allow all operations for apt-get, dpkg*, and update*
-    bool is_apt_get = true;
-    bool is_dpkg = true;
-    bool is_update = true;
-
-    // Check for "apt-get"
-    #pragma clang loop unroll(disable)
-    for (int i = 0; i < 8; i++) {
-        if (i >= 7) break; // "apt-get" is 7 characters
-        char expected = (i == 0) ? 'a' :
-                       (i == 1) ? 'p' :
-                       (i == 2) ? 't' :
-                       (i == 3) ? '-' :
-                       (i == 4) ? 'g' :
-                       (i == 5) ? 'e' :
-                       (i == 6) ? 't' : '\0';
-        if (event->comm[i] != expected) {
-            is_apt_get = false;
-            break;
-        }
-    }
-
-    // Check for "dpkg" prefix
-    #pragma clang loop unroll(disable)
-    for (int i = 0; i < 5; i++) {
-        if (i >= 4) break; // "dpkg" is 4 characters
-        char expected = (i == 0) ? 'd' :
-                       (i == 1) ? 'p' :
-                       (i == 2) ? 'k' :
-                       (i == 3) ? 'g' : '\0';
-        if (event->comm[i] != expected) {
-            is_dpkg = false;
-            break;
-        }
-    }
-
-    // Check for "update" prefix
-    #pragma clang loop unroll(disable)
-    for (int i = 0; i < 7; i++) {
-        if (i >= 6) break; // "update" is 6 characters
-        char expected = (i == 0) ? 'u' :
-                       (i == 1) ? 'p' :
-                       (i == 2) ? 'd' :
-                       (i == 3) ? 'a' :
-                       (i == 4) ? 't' :
-                       (i == 5) ? 'e' : '\0';
-        if (event->comm[i] != expected) {
-            is_update = false;
-            break;
-        }
-    }
-
-    if ((is_apt_get && event->comm[7] == '\0') || is_dpkg || is_update) {
-        policy_result = 1; // Force allow for apt-get, dpkg*, or update* executables
-    }
+    // NOTE: a spoofable comm-name allowlist (apt-get / dpkg* / update*) that
+    // force-allowed every file open was removed here (issue #5). comm is the
+    // executable's basename and is trivially forged (e.g. cp /bin/sh /tmp/update),
+    // which disabled ALL path enforcement. Package tooling that needs relaxed
+    // access must be granted by explicit path policy, not by process name.
 
     // Copy path to event with BPF verifier-friendly bounded loop
     #pragma clang loop unroll(disable)

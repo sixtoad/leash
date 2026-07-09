@@ -84,6 +84,14 @@ func Main(args []string) error {
 	})
 	defer statsig.Stop(context.Background())
 
+	if cfg.HostMode {
+		enableHostMode()
+	}
+
+	// Select fail-closed vs degrade-to-proxy for LSM attach failures before any
+	// attach happens.
+	lsm.SetRequireLSM(cfg.RequireLSM)
+
 	if err := preFlight(cfg); err != nil {
 		return err
 	}
@@ -129,6 +137,9 @@ type runtimeConfig struct {
 	BulkMaxBytes     int
 	CgroupPath       string
 	BootstrapTimeout time.Duration
+	HostMode         bool
+	LSMOnly          bool
+	RequireLSM       bool
 	MCPConfig        proxy.MCPConfig
 	TelemetryConfig  otel.Config
 }
@@ -156,11 +167,12 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 	defaultLogPath := strings.TrimSpace(os.Getenv("LEASH_LOG"))
 	logPath := fs.String("log", defaultLogPath, "Event log file path (optional)")
 
-	defaultPolicyPath := strings.TrimSpace(os.Getenv("LEASH_POLICY"))
-	if defaultPolicyPath == "" {
-		defaultPolicyPath = "/cfg/leash.cedar"
-	}
-	policyPath := fs.String("policy", defaultPolicyPath, "Cedar policy file path")
+	// The container fallback (/cfg/leash.cedar) is applied post-parse so host
+	// mode can substitute a host-appropriate default instead.
+	policyPath := fs.String("policy", strings.TrimSpace(os.Getenv("LEASH_POLICY")), "Cedar policy file path")
+	hostMode := fs.Bool("host", leashdEnvTruthy("LEASH_HOST"), "Run as a host process (no container): host-appropriate path defaults; enforcement needs CAP_BPF and an active bpf LSM. See docs/LEASHD-HOST-MODE.md")
+	lsmOnly := fs.Bool("lsm-only", leashdEnvTruthy("LEASH_LSM_ONLY"), "Enforce with the eBPF LSM only (file/exec/network-connect); skip the L7 MITM proxy and its netfilter. Used by native until netns egress lands.")
+	requireLSM := fs.Bool("require-lsm", leashdEnvTruthy("LEASH_REQUIRE_LSM"), "Fail closed if the eBPF LSM can't attach (e.g. kernel lacks an active bpf LSM) instead of silently degrading to proxy-only. Refuses to run the workload unenforced.")
 
 	proxyPort := fs.String("proxy-port", "18000", "Proxy port")
 	listenFlag := &stringFlag{}
@@ -220,7 +232,7 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 
 	cfg := &runtimeConfig{
 		LogPath:          strings.TrimSpace(*logPath),
-		PolicyPath:       strings.TrimSpace(*policyPath),
+		PolicyPath:       resolvePolicyPath(strings.TrimSpace(*policyPath), *hostMode),
 		ProxyPort:        strings.TrimSpace(*proxyPort),
 		WebBind:          listenCfg.Address(),
 		WebDisabled:      listenCfg.Disable,
@@ -229,11 +241,39 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 		BulkMaxBytes:     *bulkMaxBytes,
 		CgroupPath:       strings.TrimSpace(*cgroupFlag),
 		BootstrapTimeout: timeout,
+		HostMode:         *hostMode,
+		LSMOnly:          *lsmOnly,
+		RequireLSM:       *requireLSM,
 	}
 	cfg.MCPConfig = loadMCPConfigFromEnv()
 	cfg.TelemetryConfig = otel.LoadConfigFromEnv()
 
 	return cfg, nil
+}
+
+// resolvePolicyPath applies the default policy location when none was given. In
+// container mode that is the image's /cfg/leash.cedar; in host mode there is no
+// /cfg, so default under the host shared dir (LEASH_DIR, or its /leash
+// fallback) instead of an unwritable container path.
+func resolvePolicyPath(explicit string, hostMode bool) string {
+	if explicit != "" {
+		return explicit
+	}
+	if hostMode {
+		return filepath.Join(getLeashDirFromEnv(), "leash.cedar")
+	}
+	return "/cfg/leash.cedar"
+}
+
+// leashdEnvTruthy reports whether an env var is set to a truthy value
+// (1/true/yes/on, case-insensitive). Used for boolean flag defaults.
+func leashdEnvTruthy(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func preFlight(cfg *runtimeConfig) error {
@@ -438,6 +478,9 @@ func (rt *runtimeState) activate() error {
 	if skipEnforcement() {
 		logPolicyEvent("bootstrap.activate", map[string]any{"status": "skipped"})
 		rt.policyReady.Store(true)
+		if rt.cfg != nil && rt.cfg.HostMode {
+			writeEnforcementReadyMarker(getLeashDirFromEnv())
+		}
 		waitForShutdown()
 		return nil
 	}
@@ -446,15 +489,25 @@ func (rt *runtimeState) activate() error {
 		return err
 	}
 
-	if err := rt.configureNetwork(); err != nil {
-		return err
+	// LSM-only mode (native, until netns egress lands): enforce with the eBPF
+	// LSM alone; skip the netfilter REDIRECT + L7 MITM proxy, which need the
+	// workload's own netns. file/exec/network-connect are still enforced.
+	if !rt.cfg.LSMOnly {
+		if err := rt.configureNetwork(); err != nil {
+			return err
+		}
+
+		go func() {
+			if err := rt.mitmProxy.Run(); err != nil {
+				log.Fatal(err)
+			}
+		}()
 	}
 
-	go func() {
-		if err := rt.mitmProxy.Run(); err != nil {
-			log.Fatal(err)
-		}
-	}()
+	// Release a host launcher only once ALL LSM programs have attached (or
+	// failed) — before LoadAndStart blocks. The initial policy load already
+	// spawned the attach goroutines.
+	rt.lsmManager.StartSettleWatch()
 
 	if err := rt.lsmManager.LoadAndStart(); err != nil {
 		return err
@@ -462,6 +515,8 @@ func (rt *runtimeState) activate() error {
 
 	logPolicyEvent("bootstrap.activate", map[string]any{"status": "ok"})
 	rt.policyReady.Store(true)
+	// Note: LoadAndStart blocks until shutdown, so the actual enforcement-ready
+	// signal is fired from the LSM settle hook installed in Main (host mode).
 	return nil
 }
 

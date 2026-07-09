@@ -377,6 +377,18 @@ func getCgroupID(cgroupPath string) (uint64, error) {
 	return cgroupID, nil
 }
 
+// cgroupLevel is the depth of a cgroup path below the v2 root (/sys/fs/cgroup),
+// which equals the kernel's cgroup "level" that bpf_get_current_ancestor_cgroup_id
+// indexes by. The unified root itself is level 0. Used so the LSM can match a
+// process by cgroup hierarchy (box + any descendant) rather than a static snapshot.
+func cgroupLevel(cgroupPath string) int {
+	rel := strings.Trim(strings.TrimPrefix(cgroupPath, "/sys/fs/cgroup"), "/")
+	if rel == "" {
+		return 0
+	}
+	return len(strings.Split(rel, "/"))
+}
+
 // addSingleCgroup adds only the exact cgroup ID to the allowed map (non-recursive scope)
 func addSingleCgroup(cgroupMap *ebpf.Map, cgroupPath string) error {
 	value := uint8(1)

@@ -21,6 +21,14 @@ type LSMManager struct {
 	connectLsm *ConnectLsm
 
 	reloadMutex sync.RWMutex
+
+	// attachWG tracks the initial LSM program attaches so a readiness watcher
+	// fires only after ALL of them settle (attached or failed), not the first.
+	// trackOnce wires the per-attempt hook lazily; settleWatchOnce guards the
+	// single watcher goroutine.
+	attachWG        sync.WaitGroup
+	trackOnce       sync.Once
+	settleWatchOnce sync.Once
 }
 
 func NewLSMManager(cgroupPath string, logger *SharedLogger) *LSMManager {
@@ -28,6 +36,26 @@ func NewLSMManager(cgroupPath string, logger *SharedLogger) *LSMManager {
 		cgroupPath: cgroupPath,
 		logger:     logger,
 	}
+}
+
+// trackAttach registers one pending attach attempt. It lazily wires the
+// per-attempt settle hook, so every LoadAndAttachBPF exit (via its defer)
+// decrements the group.
+func (m *LSMManager) trackAttach() {
+	m.trackOnce.Do(func() { onLSMAttached = m.attachWG.Done })
+	m.attachWG.Add(1)
+}
+
+// StartSettleWatch fires the enforcement-settled hook once every tracked attach
+// has settled. Call it after the initial policy load, before LoadAndStart
+// blocks. Safe to call more than once.
+func (m *LSMManager) StartSettleWatch() {
+	m.settleWatchOnce.Do(func() {
+		go func() {
+			m.attachWG.Wait()
+			notifyEnforcementSettled()
+		}()
+	})
 }
 
 func (m *LSMManager) LoadAndStart() error {
@@ -70,6 +98,7 @@ func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to load open policies: %w", err)
 		}
 
+		m.trackAttach()
 		go func() {
 			if err := m.openLsm.LoadAndAttach(loadLsmOpen); err != nil {
 				fmt.Fprintf(os.Stderr, "File open LSM error: %v\n", err)
@@ -103,6 +132,7 @@ func (m *LSMManager) updateExecLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to load exec policies: %w", err)
 		}
 
+		m.trackAttach()
 		go func() {
 			if err := m.execLsm.LoadAndAttach(loadLsmExec); err != nil {
 				fmt.Fprintf(os.Stderr, "Exec LSM error: %v\n", err)
@@ -141,6 +171,7 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to load connect policies: %w", err)
 		}
 
+		m.trackAttach()
 		go func() {
 			if err := m.connectLsm.LoadAndAttach(loadLsmConnect); err != nil {
 				fmt.Fprintf(os.Stderr, "Connect LSM error: %v\n", err)

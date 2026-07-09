@@ -389,6 +389,34 @@ func TestParseConfigListenFlagOverridesEnv(t *testing.T) {
 	}
 }
 
+func TestParseConfigRequireLSM(t *testing.T) {
+	// Default: degrade-to-proxy (fail-open).
+	cfg, err := parseConfig([]string{"leashd"})
+	if err != nil {
+		t.Fatalf("parseConfig returned error: %v", err)
+	}
+	if cfg.RequireLSM {
+		t.Fatalf("RequireLSM should default to false")
+	}
+	// Flag flips it to fail-closed.
+	cfg, err = parseConfig([]string{"leashd", "--require-lsm"})
+	if err != nil {
+		t.Fatalf("parseConfig returned error: %v", err)
+	}
+	if !cfg.RequireLSM {
+		t.Fatalf("--require-lsm should set RequireLSM")
+	}
+	// Env default honored too.
+	t.Setenv("LEASH_REQUIRE_LSM", "1")
+	cfg, err = parseConfig([]string{"leashd"})
+	if err != nil {
+		t.Fatalf("parseConfig returned error: %v", err)
+	}
+	if !cfg.RequireLSM {
+		t.Fatalf("LEASH_REQUIRE_LSM=1 should set RequireLSM")
+	}
+}
+
 func TestPreFlightMissingIptables(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("iptables dependency only enforced on linux")

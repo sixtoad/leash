@@ -18,6 +18,44 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 )
 
+// enforcementSettledHook, if set, is invoked once when eBPF-LSM enforcement has
+// settled — ALL of the manager's programs have attached (or degraded). Host mode
+// installs it to release a launcher holding the workload until enforcement is
+// live (fail-closed). Set once at startup before any attach.
+var enforcementSettledHook func()
+
+// SetEnforcementSettledHook installs the settle hook (pass nil to clear).
+func SetEnforcementSettledHook(f func()) { enforcementSettledHook = f }
+
+func notifyEnforcementSettled() {
+	if h := enforcementSettledHook; h != nil {
+		h()
+	}
+}
+
+// onLSMAttached, if set, is invoked once per attach attempt after it settles
+// (attached or failed — see the defer in LoadAndAttachBPFWithSetup). The manager
+// uses it to count attempts so it can fire the settled hook only after ALL
+// programs report (not just the first — the connect LSM settles before the
+// slower file-open one, which would otherwise release the workload early).
+var onLSMAttached func()
+
+// requireLSM, when true, makes a failed LSM attach fatal (fail-closed) rather
+// than degrading to proxy-only. Set once at startup from the --require-lsm flag,
+// before any attach. The default (false) preserves the historical behavior:
+// degrade silently so a kernel without an active bpf LSM still runs the proxy.
+var requireLSM bool
+
+// SetRequireLSM selects fail-closed (true) vs degrade-to-proxy (false) behavior
+// for LSM attach failures. Call once at startup before enforcement begins.
+func SetRequireLSM(v bool) { requireLSM = v }
+
+func notifyLSMAttached() {
+	if h := onLSMAttached; h != nil {
+		h()
+	}
+}
+
 // Common policy rule structure that can be converted to specific types
 type PolicyRule struct {
 	Action      int32 // 0 = deny, 1 = allow
@@ -436,7 +474,31 @@ func LoadAndAttachBPFWithSetup(
 	loader func() (*ebpf.CollectionSpec, error),
 	config BPFConfig,
 	customSetup func(*ebpf.Collection) error,
-) error {
+) (retErr error) {
+	// Report this attach attempt as settled exactly once (see onLSMAttached): on
+	// success right after the programs attach — BEFORE the blocking event loop
+	// below — and on any early return (failure) via this defer. Firing it via a
+	// bare defer would be wrong: this function blocks in the event loop until
+	// shutdown, so the settle would only fire then, hanging a readiness barrier.
+	settled := false
+	settle := func() {
+		if settled {
+			return
+		}
+		settled = true
+		// Fail-closed: if this attach failed and the operator passed
+		// --require-lsm, exit BEFORE notifying the settle watcher — otherwise the
+		// host launcher would be released to run the workload with file/exec/
+		// connect enforcement silently degraded to proxy-only. Exiting here (not
+		// after notify) closes the release race.
+		if retErr != nil && requireLSM {
+			fmt.Fprintf(os.Stderr, "FATAL: --require-lsm set but LSM enforcement is unavailable; refusing to run unenforced: %v\n", retErr)
+			os.Exit(1)
+		}
+		notifyLSMAttached()
+	}
+	defer settle()
+
 	// Load BPF program
 	spec, err := loader()
 	if err != nil {
@@ -469,11 +531,27 @@ func LoadAndAttachBPFWithSetup(
 		return fmt.Errorf("failed to add descendant cgroups: %w", err)
 	}
 
-	// Set a non-zero value in target_cgroup to enable monitoring
-	key := uint32(0)
-	enable := uint64(1)
-	if err := coll.Maps[config.TargetCgroupMap].Put(&key, &enable); err != nil {
+	// Enable monitoring and describe the box cgroup for the hierarchy check:
+	// target_cgroup[0] = box cgroup id (nonzero = monitoring on), [1] = box depth
+	// from the cgroup root. With the real id in [0], is_target_cgroup can match
+	// descendant cgroups created AFTER the snapshot above (nested/delegated
+	// sub-cgroups can't escape). If the id can't be read, fall back to the legacy
+	// enable flag: snapshot-only, and the in-BPF ancestor check safely no-ops.
+	boxPath := module.getCgroupPath()
+	idVal := uint64(1)
+	levelVal := uint64(0)
+	if id, err := getCgroupID(boxPath); err == nil && id != 0 {
+		idVal = id
+		levelVal = uint64(cgroupLevel(boxPath))
+	}
+	tcMap := coll.Maps[config.TargetCgroupMap]
+	k0, k1 := uint32(0), uint32(1)
+	if err := tcMap.Put(&k0, &idVal); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to enable monitoring: %v\n", err)
+		os.Exit(1)
+	}
+	if err := tcMap.Put(&k1, &levelVal); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to set box cgroup level: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -490,12 +568,18 @@ func LoadAndAttachBPFWithSetup(
 			Program: coll.Programs[programName],
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to attach %s LSM program: %v\n", programName, err)
-			fmt.Fprintf(os.Stderr, "Note: LSM attachment requires proper kernel support\n")
-			os.Exit(1)
+			// Return the error rather than exiting so the caller can decide
+			// whether to degrade to proxy-only (the default) or fail hard
+			// (--require-lsm). The deferred loop above closes any links that
+			// already attached. The most common cause is the kernel not having
+			// "bpf" as an active LSM (see the client-side preflight).
+			return fmt.Errorf("attach %s LSM program (kernel may lack an active bpf LSM): %w", programName, err)
 		}
 		links = append(links, lsmLink)
 	}
+
+	// Attached — settle now, before the blocking event loop below.
+	settle()
 
 	// Set up ring buffer
 	rd, err := ringbuf.NewReader(coll.Maps[config.EventMapName])
