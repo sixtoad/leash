@@ -198,6 +198,13 @@ type runner struct {
 	injectedEnv     []string
 	injectedCleanup []string
 
+	// injectedDockerArgs are the `-v`/`-e` docker run flags that bind each injected
+	// plugin's socket dir into the workload container and point the workload env var
+	// at it. Built once by spawnInjectServicesContainer (before the launch retry
+	// loop) and appended to the target container's run args. Empty for native /
+	// when --inject-service is unused.
+	injectedDockerArgs []string
+
 	logger        *log.Logger
 	mountState    *mountState
 	sessionID     string
@@ -2161,6 +2168,15 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 		if dest := volumeContainerPath(volume); dest != "" {
 			targetMounts = append(targetMounts, dest)
 		}
+	}
+	// Bind each --inject-service plugin's socket dir into the container at the
+	// identical path (so the in-container socket path == the host path the plugin
+	// bound) and set the workload env var pointing at it. The plugins were already
+	// spawned once by spawnInjectServicesContainer before the launch retry loop.
+	args = append(args, r.injectedDockerArgs...)
+	for _, svc := range r.opts.injectServices {
+		targetMounts = append(targetMounts, filepath.Dir(svc.socket))
+		targetEnv = append(targetEnv, svc.env+"=unix:path="+svc.socket)
 	}
 	args = append(args, r.cfg.targetImage)
 	r.logContainerConfig("target", targetMounts, targetEnv)

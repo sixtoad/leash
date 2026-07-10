@@ -1,9 +1,11 @@
 package runner
 
 import (
+	"context"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -141,6 +143,105 @@ func TestInjectServicesRejectsDuplicatesAcrossSpecs(t *testing.T) {
 			t.Fatalf("expected duplicate-env error, got: %v", err)
 		}
 	})
+}
+
+// writeStubInjectPlugin writes an executable helper that binds its socket (from
+// LEASH_INJECT_SOCKET) so the fail-closed readiness wait sees it appear, then
+// blocks. Returned path is absolute so spawnInjectService resolves it directly.
+func writeStubInjectPlugin(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "stub-plugin.sh")
+	script := "#!/bin/sh\n" +
+		": > \"$LEASH_INJECT_SOCKET\"\n" + // create the socket path so os.Stat succeeds
+		"exec sleep 30\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// The container backend spawns each plugin once and builds the docker `-v`/`-e`
+// flags that bind the socket dir into the workload container and point the env var
+// at it. Uses a stubbed plugin (no real daemon).
+func TestSpawnInjectServicesContainerDockerArgs(t *testing.T) {
+	dir := t.TempDir()
+	plugin := writeStubInjectPlugin(t, dir)
+	sock := filepath.Join(dir, "helper.sock")
+
+	r := &runner{opts: options{injectServices: []injectService{
+		{plugin: plugin, env: "HELPER_ADDR", socket: sock},
+	}}}
+	if err := r.spawnInjectServicesContainer(context.Background()); err != nil {
+		t.Fatalf("spawnInjectServicesContainer failed: %v", err)
+	}
+	defer r.teardownInjectedPlugins()
+
+	want := []string{
+		"-v", dir + ":" + dir,
+		"-e", "HELPER_ADDR=unix:path=" + sock,
+	}
+	if !reflect.DeepEqual(r.injectedDockerArgs, want) {
+		t.Fatalf("injectedDockerArgs mismatch:\n got %q\nwant %q", r.injectedDockerArgs, want)
+	}
+	// The container path binds the socket into the container (docker args) and does
+	// NOT set the workload env directly the way native does.
+	if len(r.injectedEnv) != 0 {
+		t.Fatalf("container backend must not populate injectedEnv, got %q", r.injectedEnv)
+	}
+	// The plugin/socket were recorded for teardown.
+	if len(r.injectedPlugins) != 1 || len(r.injectedCleanup) != 1 || r.injectedCleanup[0] != sock {
+		t.Fatalf("plugin/cleanup not recorded: plugins=%d cleanup=%v", len(r.injectedPlugins), r.injectedCleanup)
+	}
+}
+
+// Cross-spec duplicate socket/env checks apply on the container path too, before
+// anything is spawned.
+func TestSpawnInjectServicesContainerRejectsDuplicates(t *testing.T) {
+	t.Run("duplicate socket", func(t *testing.T) {
+		r := &runner{opts: options{injectServices: []injectService{
+			{plugin: "p", env: "A", socket: "/tmp/dup.sock"},
+			{plugin: "p", env: "B", socket: "/tmp/dup.sock"},
+		}}}
+		err := r.spawnInjectServicesContainer(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "duplicate --inject-service socket") {
+			t.Fatalf("expected duplicate-socket error, got: %v", err)
+		}
+		if r.injectedDockerArgs != nil {
+			t.Fatalf("no docker args should be built on a rejected spec, got %q", r.injectedDockerArgs)
+		}
+	})
+	t.Run("duplicate env", func(t *testing.T) {
+		r := &runner{opts: options{injectServices: []injectService{
+			{plugin: "p", env: "SAME", socket: "/tmp/a.sock"},
+			{plugin: "p", env: "SAME", socket: "/tmp/b.sock"},
+		}}}
+		err := r.spawnInjectServicesContainer(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "duplicate --inject-service env") {
+			t.Fatalf("expected duplicate-env error, got: %v", err)
+		}
+	})
+}
+
+// teardownInjectedPlugins (shared by native + container Remove) stops the plugin
+// and removes its recorded socket.
+func TestTeardownInjectedPluginsRemovesSocket(t *testing.T) {
+	dir := t.TempDir()
+	plugin := writeStubInjectPlugin(t, dir)
+	sock := filepath.Join(dir, "helper.sock")
+
+	r := &runner{opts: options{injectServices: []injectService{
+		{plugin: plugin, env: "HELPER_ADDR", socket: sock},
+	}}}
+	if err := r.spawnInjectServicesContainer(context.Background()); err != nil {
+		t.Fatalf("spawnInjectServicesContainer failed: %v", err)
+	}
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("socket should exist after spawn: %v", err)
+	}
+	r.teardownInjectedPlugins()
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Fatalf("socket should be removed after teardown, stat err: %v", err)
+	}
 }
 
 func TestParseArgsInjectService(t *testing.T) {

@@ -226,17 +226,8 @@ func (n nativeLauncher) injectServices(ctx context.Context) error {
 	// Reject duplicate socket paths / env keys across specs BEFORE spawning anything:
 	// two plugins binding the same socket, or two env vars colliding, is always a
 	// misconfiguration — catch it up front rather than after starting some plugins.
-	seenSocket := make(map[string]bool, len(n.r.opts.injectServices))
-	seenEnv := make(map[string]bool, len(n.r.opts.injectServices))
-	for _, svc := range n.r.opts.injectServices {
-		if seenSocket[svc.socket] {
-			return fmt.Errorf("native: duplicate --inject-service socket %q", svc.socket)
-		}
-		if seenEnv[svc.env] {
-			return fmt.Errorf("native: duplicate --inject-service env %q", svc.env)
-		}
-		seenSocket[svc.socket] = true
-		seenEnv[svc.env] = true
+	if err := n.r.checkInjectDuplicates("native"); err != nil {
+		return err
 	}
 	for _, svc := range n.r.opts.injectServices {
 		if err := n.injectOne(ctx, svc); err != nil {
@@ -246,8 +237,53 @@ func (n nativeLauncher) injectServices(ctx context.Context) error {
 	return nil
 }
 
+// injectOne spawns one native inject-service plugin (via the shared, hardened
+// r.spawnInjectService) and records the socket→env mapping the native workload
+// script consumes. Container backends bind the socket into the container instead
+// of setting the workload env directly (see spawnInjectServicesContainer).
 func (n nativeLauncher) injectOne(ctx context.Context, svc injectService) error {
-	pluginPath, err := n.resolvePlugin(svc.plugin)
+	if err := n.r.spawnInjectService(ctx, svc); err != nil {
+		return err
+	}
+	// The workload reaches the plugin via a generic unix-domain-socket address;
+	// leash sets only the mapped env var and stays protocol-agnostic.
+	n.r.injectedEnv = append(n.r.injectedEnv, svc.env+"=unix:path="+svc.socket)
+	return nil
+}
+
+// checkInjectDuplicates rejects duplicate socket paths / env keys across the
+// --inject-service specs BEFORE anything is spawned: two plugins binding the same
+// socket, or two env vars colliding, is always a misconfiguration. backend names
+// the launcher for the error message ("native"/"container").
+func (r *runner) checkInjectDuplicates(backend string) error {
+	seenSocket := make(map[string]bool, len(r.opts.injectServices))
+	seenEnv := make(map[string]bool, len(r.opts.injectServices))
+	for _, svc := range r.opts.injectServices {
+		if seenSocket[svc.socket] {
+			return fmt.Errorf("%s: duplicate --inject-service socket %q", backend, svc.socket)
+		}
+		if seenEnv[svc.env] {
+			return fmt.Errorf("%s: duplicate --inject-service env %q", backend, svc.env)
+		}
+		seenSocket[svc.socket] = true
+		seenEnv[svc.env] = true
+	}
+	return nil
+}
+
+// spawnInjectService spawns one --inject-service helper plugin and blocks until it
+// is ready (fail-closed), shared verbatim by the native and container launchers so
+// both get identical hardening. It resolves the plugin, creates+chowns the socket
+// dir (only when it created it), re-checks the symlink-resolved socket path against
+// the protected roots, clears a stale socket, writes the opaque config to a 0600
+// file out of argv, spawns the plugin AS the invoking user (runuser when euid==0
+// with a SUDO_USER, else as self — so it works for the rootless container path
+// where leash already runs as the user), records the process/cleanup paths, and
+// waits up to 2s for the socket to appear. It does NOT map the socket to the
+// workload env / docker args — the caller does that (native sets injectedEnv;
+// container builds injectedDockerArgs).
+func (r *runner) spawnInjectService(ctx context.Context, svc injectService) error {
+	pluginPath, err := r.resolvePlugin(svc.plugin)
 	if err != nil {
 		return fmt.Errorf("native: locate inject-service plugin %q: %w", svc.plugin, err)
 	}
@@ -264,8 +300,8 @@ func (n nativeLauncher) injectOne(ctx context.Context, svc injectService) error 
 	// When we spawn the plugin as the invoking user, a root-owned socket dir we just
 	// created isn't writable by that user; chown the created dir so the dropped
 	// plugin can bind. Only for a dir we created — never chown a pre-existing one.
-	if n.workloadUser() != "" && !parentPreexisted {
-		if uid, gid := n.workloadUIDGID(); uid >= 0 {
+	if r.workloadUser() != "" && !parentPreexisted {
+		if uid, gid := r.workloadUIDGID(); uid >= 0 {
 			if err := os.Chown(parent, uid, gid); err != nil {
 				return fmt.Errorf("native: chown inject-service socket dir %q: %w", parent, err)
 			}
@@ -291,7 +327,7 @@ func (n nativeLauncher) injectOne(ctx context.Context, svc injectService) error 
 	// env, so the config never appears in `ps`/cmdline on the `runuser -- env
 	// KEY=VAL` path. The socket path also travels via env. leash never interprets the
 	// config. When no config is supplied, no file is written.
-	configFile, err := n.writeInjectConfig(svc)
+	configFile, err := r.writeInjectConfig(svc)
 	if err != nil {
 		return err
 	}
@@ -306,41 +342,93 @@ func (n nativeLauncher) injectOne(ctx context.Context, svc injectService) error 
 	// reach the user's own session resources (root can't).
 	argv := []string{pluginPath}
 	var cmdEnv []string
-	if user := n.workloadUser(); user != "" {
-		argv = append([]string{"runuser", "-u", user, "--", "env"}, n.invokingUserEnv()...)
+	if user := r.workloadUser(); user != "" {
+		argv = append([]string{"runuser", "-u", user, "--", "env"}, r.invokingUserEnv()...)
 		argv = append(argv, injectEnv...)
 		argv = append(argv, pluginPath)
 	} else {
-		cmdEnv = append(os.Environ(), n.invokingUserEnv()...)
+		cmdEnv = append(os.Environ(), r.invokingUserEnv()...)
 		cmdEnv = append(cmdEnv, injectEnv...)
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	if cmdEnv != nil {
 		cmd.Env = cmdEnv
 	}
-	if logf, err := os.Create(n.injectLogPath(svc)); err == nil {
+	if logf, err := os.Create(r.injectLogPath(svc)); err == nil {
 		cmd.Stdout, cmd.Stderr = logf, logf
 	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("native: start inject-service plugin %q: %w", svc.plugin, err)
 	}
-	n.r.injectedPlugins = append(n.r.injectedPlugins, cmd)
-	n.r.injectedCleanup = append(n.r.injectedCleanup, svc.socket)
+	r.injectedPlugins = append(r.injectedPlugins, cmd)
+	r.injectedCleanup = append(r.injectedCleanup, svc.socket)
 	if configFile != "" {
-		n.r.injectedCleanup = append(n.r.injectedCleanup, configFile)
+		r.injectedCleanup = append(r.injectedCleanup, configFile)
 	}
 	// Fail-closed: wait for the plugin to create its socket; if it never does the
 	// run aborts rather than launch the workload expecting a service it won't get.
 	for i := 0; i < 100; i++ {
 		if _, err := os.Stat(svc.socket); err == nil {
-			// The workload reaches the plugin via a generic unix-domain-socket
-			// address; leash sets only the mapped env var and stays protocol-agnostic.
-			n.r.injectedEnv = append(n.r.injectedEnv, svc.env+"=unix:path="+svc.socket)
 			return nil
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return fmt.Errorf("native: inject-service plugin %q socket %s did not appear (see %s)", svc.plugin, svc.socket, n.injectLogPath(svc))
+	return fmt.Errorf("native: inject-service plugin %q socket %s did not appear (see %s)", svc.plugin, svc.socket, r.injectLogPath(svc))
+}
+
+// spawnInjectServicesContainer spawns every --inject-service plugin ONCE for the
+// container backend (before the launch retry loop, so a port-conflict retry does
+// not respawn them) and builds r.injectedDockerArgs: for each plugin, bind its
+// socket's dir into the workload container at the identical path and set the
+// workload env var to the in-container socket address. Fail-closed: any spawn
+// failure aborts before the workload container is launched.
+func (r *runner) spawnInjectServicesContainer(ctx context.Context) error {
+	if err := r.checkInjectDuplicates("container"); err != nil {
+		return err
+	}
+	for _, svc := range r.opts.injectServices {
+		if err := r.spawnInjectService(ctx, svc); err != nil {
+			return err
+		}
+		// Bind the socket's dir to the identical path in the container so the
+		// in-container socket path == the host path the plugin bound.
+		dir := filepath.Dir(svc.socket)
+		r.injectedDockerArgs = append(r.injectedDockerArgs,
+			"-v", dir+":"+dir,
+			"-e", svc.env+"=unix:path="+svc.socket,
+		)
+	}
+	return nil
+}
+
+// teardownInjectedPlugins stops every injected plugin and removes its socket/config
+// files. Shared by the native and container launchers' Remove. Each plugin is
+// signalled (SIGINT) for a clean teardown, then force-killed after a grace period
+// so teardown can't hang.
+func (r *runner) teardownInjectedPlugins() {
+	for _, cmd := range r.injectedPlugins {
+		if cmd == nil || cmd.Process == nil {
+			continue
+		}
+		// Signal (not kill) so the plugin can tear down cleanly, but don't wait
+		// forever: give it a grace period, then force-kill so teardown can't hang.
+		_ = cmd.Process.Signal(os.Interrupt)
+		done := make(chan struct{})
+		go func(c *exec.Cmd) {
+			_ = c.Wait()
+			close(done)
+		}(cmd)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			<-done
+		}
+	}
+	// Remove every injected socket / config file regardless of wait outcome.
+	for _, sock := range r.injectedCleanup {
+		_ = os.Remove(sock)
+	}
 }
 
 // removeStaleSocket removes a leftover plugin socket so the plugin can bind fresh.
@@ -367,7 +455,7 @@ func removeStaleSocket(path string) error {
 // resolvePlugin locates a helper binary: an absolute path is used directly (when
 // it exists and isn't a dir), otherwise alongside the running leash binary first
 // (release layout ships them together), then on PATH.
-func (n nativeLauncher) resolvePlugin(name string) (string, error) {
+func (r *runner) resolvePlugin(name string) (string, error) {
 	if filepath.IsAbs(name) {
 		if st, err := os.Stat(name); err == nil && !st.IsDir() {
 			return name, nil
@@ -386,16 +474,28 @@ func (n nativeLauncher) resolvePlugin(name string) (string, error) {
 // passed to injected plugins so a plugin can find the user's own session
 // resources. leash forwards only XDG_RUNTIME_DIR and leaves any protocol-specific
 // derivation (e.g. a session bus address) to the plugin, staying agnostic.
-func (n nativeLauncher) invokingUserEnv() []string {
+func (r *runner) invokingUserEnv() []string {
 	var env []string
-	if uid := n.workloadUID(); uid != "" {
+	if uid := r.workloadUID(); uid != "" {
 		env = append(env, "XDG_RUNTIME_DIR=/run/user/"+uid)
 	}
 	return env
 }
 
-func (n nativeLauncher) injectLogPath(svc injectService) string {
-	return filepath.Join("/tmp", "leash-native-inject-"+sanitizeNativeName(svc.plugin)+"-"+n.netnsName()+".log")
+// injectBoxName is the per-run identity used to name an injected plugin's temp
+// log/config files uniquely (target-container base + this leash PID). It matches
+// nativeLauncher.netnsName() so native's file paths are unchanged, and works for
+// the container backend too (which has no netns).
+func (r *runner) injectBoxName() string {
+	base := sanitizeNativeName(r.cfg.targetContainer)
+	if base == "" {
+		base = "session"
+	}
+	return fmt.Sprintf("leash-native-%s-%d", base, os.Getpid())
+}
+
+func (r *runner) injectLogPath(svc injectService) string {
+	return filepath.Join("/tmp", "leash-native-inject-"+sanitizeNativeName(svc.plugin)+"-"+r.injectBoxName()+".log")
 }
 
 // writeInjectConfig writes the opaque config payload (svc.config) verbatim to a
@@ -403,17 +503,17 @@ func (n nativeLauncher) injectLogPath(svc injectService) string {
 // config out of `ps`/cmdline. The file is chowned to the dropped user when we spawn
 // the plugin as them, so the plugin can read it. Returns the file path, or "" (no
 // file written) when no config was supplied. leash never interprets the payload.
-func (n nativeLauncher) writeInjectConfig(svc injectService) (string, error) {
+func (r *runner) writeInjectConfig(svc injectService) (string, error) {
 	if svc.config == "" {
 		return "", nil
 	}
-	path := filepath.Join("/tmp", "leash-native-injectcfg-"+sanitizeNativeName(svc.plugin)+"-"+n.netnsName())
+	path := filepath.Join("/tmp", "leash-native-injectcfg-"+sanitizeNativeName(svc.plugin)+"-"+r.injectBoxName())
 	data := svc.config
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		return "", fmt.Errorf("native: write inject-service config: %w", err)
 	}
-	if n.workloadUser() != "" {
-		if uid, gid := n.workloadUIDGID(); uid >= 0 {
+	if r.workloadUser() != "" {
+		if uid, gid := r.workloadUIDGID(); uid >= 0 {
 			if err := os.Chown(path, uid, gid); err != nil {
 				_ = os.Remove(path)
 				return "", fmt.Errorf("native: chown inject-service config %q: %w", path, err)
@@ -601,29 +701,7 @@ func (n nativeLauncher) exportCACert(shareDir string) {
 // compiled), not layer2Active, so a run that fell back to LSM-only after a
 // partial egress setup still cleans up.
 func (n nativeLauncher) Remove(ctx context.Context) {
-	for _, cmd := range n.r.injectedPlugins {
-		if cmd == nil || cmd.Process == nil {
-			continue
-		}
-		// Signal (not kill) so the plugin can tear down cleanly, but don't wait
-		// forever: give it a grace period, then force-kill so teardown can't hang.
-		_ = cmd.Process.Signal(os.Interrupt)
-		done := make(chan struct{})
-		go func(c *exec.Cmd) {
-			_ = c.Wait()
-			close(done)
-		}(cmd)
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
-		}
-	}
-	// Remove every injected socket / config file regardless of wait outcome.
-	for _, sock := range n.r.injectedCleanup {
-		_ = os.Remove(sock)
-	}
+	n.r.teardownInjectedPlugins()
 	if nativeLayer2Enabled && !n.useUserManager() {
 		n.teardownEgress(ctx)
 		_, _ = hostOutput(ctx, "ip", "netns", "del", n.netnsName())
@@ -853,7 +931,7 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 	if !n.useUserManager() {
 		h = hardenOpts{
 			enabled:         true,
-			uid:             n.workloadUID(),
+			uid:             n.r.workloadUID(),
 			shareIPC:        n.r.opts.shareIPC,
 			allowDisplay:    n.r.opts.allowDisplay,
 			allowDBus:       n.r.opts.allowDBus,
@@ -867,7 +945,7 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 	if err != nil {
 		self = ""
 	}
-	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.workloadUser(), caCert, self, h)
+	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.r.workloadUser(), caCert, self, h)
 	if n.layer2Active() {
 		argv := n.layer2Wrap(inner) // nsenter --net + private mount ns (resolv bind)
 		return exec.CommandContext(ctx, argv[0], argv[1:]...)
@@ -881,7 +959,7 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 
 // workloadUID returns the invoking user's numeric uid ($SUDO_UID) for the
 // keyring-dir mask, or "" if unavailable/non-numeric.
-func (n nativeLauncher) workloadUID() string {
+func (r *runner) workloadUID() string {
 	u := strings.TrimSpace(os.Getenv("SUDO_UID"))
 	if u == "" {
 		return ""
@@ -897,8 +975,8 @@ func (n nativeLauncher) workloadUID() string {
 // workloadUIDGID returns the invoking user's numeric uid/gid ($SUDO_UID/$SUDO_GID)
 // for chowning dirs/files the dropped-privilege plugin must own, or (-1, -1) when
 // the uid is unavailable. The gid falls back to the uid when $SUDO_GID is unset.
-func (n nativeLauncher) workloadUIDGID() (int, int) {
-	u := n.workloadUID()
+func (r *runner) workloadUIDGID() (int, int) {
+	u := r.workloadUID()
 	if u == "" {
 		return -1, -1
 	}
@@ -921,7 +999,7 @@ func (n nativeLauncher) workloadUIDGID() (int, int) {
 // many agents refuse to (e.g. Claude Code blocks --dangerously-skip-permissions
 // as root). We drop to the invoking user ($SUDO_USER); leash and leashd keep
 // root only for enforcement. Non-root leash (rootless box) needs no drop.
-func (n nativeLauncher) workloadUser() string {
+func (r *runner) workloadUser() string {
 	if os.Geteuid() != 0 {
 		return ""
 	}
