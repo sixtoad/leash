@@ -42,22 +42,34 @@ func TestParseInjectServiceConfig(t *testing.T) {
 
 func TestParseInjectServiceRejectsBadSpecs(t *testing.T) {
 	cases := map[string]string{
-		"missing plugin":     "env=X,socket=/tmp/s.sock",
-		"missing env":        "plugin=p,socket=/tmp/s.sock",
-		"missing socket":     "plugin=p,env=X",
-		"unknown key":        "plugin=p,env=X,socket=/tmp/s.sock,foo=bar",
-		"plugin with path":   "plugin=/usr/bin/p,env=X,socket=/tmp/s.sock",
-		"relative socket":    "plugin=p,env=X,socket=rel.sock",
-		"traversal socket":   "plugin=p,env=X,socket=/tmp/../etc/x.sock",
-		"protected run/user": "plugin=p,env=X,socket=/run/user/1000/bus",
-		"protected dbus":     "plugin=p,env=X,socket=/run/dbus/system_bus_socket",
-		"protected docker":   "plugin=p,env=X,socket=/var/run/docker.sock",
-		"bad env name":       "plugin=p,env=A B,socket=/tmp/s.sock",
+		"missing plugin":       "env=X,socket=/tmp/s.sock",
+		"missing env":          "plugin=p,socket=/tmp/s.sock",
+		"missing socket":       "plugin=p,env=X",
+		"unknown key":          "plugin=p,env=X,socket=/tmp/s.sock,foo=bar",
+		"plugin relative path": "plugin=sub/p,env=X,socket=/tmp/s.sock",
+		"relative socket":      "plugin=p,env=X,socket=rel.sock",
+		"traversal socket":     "plugin=p,env=X,socket=/tmp/../etc/x.sock",
+		"protected run/user":   "plugin=p,env=X,socket=/run/user/1000/bus",
+		"protected dbus":       "plugin=p,env=X,socket=/run/dbus/system_bus_socket",
+		"protected docker":     "plugin=p,env=X,socket=/var/run/docker.sock",
+		"bad env name":         "plugin=p,env=A B,socket=/tmp/s.sock",
 	}
 	for name, spec := range cases {
 		if _, err := parseInjectService(spec); err == nil {
 			t.Fatalf("%s: expected error for spec %q", name, spec)
 		}
+	}
+}
+
+// walk resolves and passes the ABSOLUTE path of the plugin it ships, so an
+// absolute plugin path must be accepted (bare names and abs paths both valid).
+func TestParseInjectServiceAcceptsAbsPluginPath(t *testing.T) {
+	svc, err := parseInjectService("plugin=/opt/leash/leash-plugin-secretbroker,env=X,socket=/tmp/s.sock")
+	if err != nil {
+		t.Fatalf("absolute plugin path should be accepted: %v", err)
+	}
+	if svc.plugin != "/opt/leash/leash-plugin-secretbroker" {
+		t.Fatalf("plugin = %q, want the absolute path preserved", svc.plugin)
 	}
 }
 

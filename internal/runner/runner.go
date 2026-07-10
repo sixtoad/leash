@@ -510,8 +510,11 @@ func parseInjectService(spec string) (injectService, error) {
 	if svc.plugin == "" {
 		return svc, errors.New("--inject-service requires plugin=<binary>")
 	}
-	if strings.ContainsRune(svc.plugin, filepath.Separator) || svc.plugin != filepath.Base(svc.plugin) {
-		return svc, fmt.Errorf("--inject-service plugin %q must be a bare binary name (no path)", svc.plugin)
+	// The plugin may be a bare binary name (resolved next to the leash binary,
+	// then on PATH) or an absolute path (walk passes the abs path of the plugin it
+	// ships). Reject relative paths with separators (ambiguous / traversal).
+	if strings.ContainsRune(svc.plugin, filepath.Separator) && !filepath.IsAbs(svc.plugin) {
+		return svc, fmt.Errorf("--inject-service plugin %q must be a bare binary name or an absolute path", svc.plugin)
 	}
 	if svc.env == "" {
 		return svc, errors.New("--inject-service requires env=<VAR>")
