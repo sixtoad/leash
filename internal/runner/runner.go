@@ -107,12 +107,25 @@ type options struct {
 	publishAll     bool
 
 	// Native session-isolation opt-outs (default: hardened). See launcher_native.go.
-	allowDisplay    bool // keep DISPLAY/XAUTHORITY + the X11 socket (GUI apps)
-	allowDBus       bool // keep DBUS_SESSION_BUS_ADDRESS + the keyring/D-Bus runtime dir
-	shareIPC        bool // share the host IPC namespace (e.g. X MIT-SHM)
-	requireLSM      bool     // fail closed if the eBPF LSM can't attach (no proxy-only degrade)
-	allowNamespaces bool     // skip the seccomp mount/unshare block (reopens the userns bind-mount bypass)
-	secrets         []string // --secret <service>: keyring items the agent may read via the broker
+	allowDisplay    bool            // keep DISPLAY/XAUTHORITY + the X11 socket (GUI apps)
+	allowDBus       bool            // keep DBUS_SESSION_BUS_ADDRESS + the keyring/D-Bus runtime dir
+	shareIPC        bool            // share the host IPC namespace (e.g. X MIT-SHM)
+	requireLSM      bool            // fail closed if the eBPF LSM can't attach (no proxy-only degrade)
+	allowNamespaces bool            // skip the seccomp mount/unshare block (reopens the userns bind-mount bypass)
+	injectServices  []injectService // --inject-service: helper plugins to spawn and bind into the box
+}
+
+// injectService describes one --inject-service
+// plugin=<bin>,env=<VAR>,socket=<path>[,config=<opaque>] mapping. leash spawns the
+// plugin as the invoking user, binds/exposes its socket to the box, and sets the
+// workload's <env> to point at that socket. The mechanism is protocol-agnostic:
+// leash knows only these fields plus an opaque config payload it never interprets —
+// never the plugin's wire protocol.
+type injectService struct {
+	plugin string // helper binary name (resolved next to leash, then on PATH)
+	env    string // env var set in the workload, mapped to the plugin socket
+	socket string // host socket path the plugin listens on / is exposed to the box
+	config string // opaque config payload handed to the plugin; leash never interprets it
 }
 
 type config struct {
@@ -177,11 +190,13 @@ type runner struct {
 	// starts / on non-native backends.
 	leashdExited chan struct{}
 
-	// secretBroker is the keyring secret-broker subprocess (native --secret), run
-	// as the invoking user; secretBusAddr is the shadow bus socket injected into
-	// the workload as DBUS_SESSION_BUS_ADDRESS. Nil/empty when --secret is unused.
-	secretBroker  *exec.Cmd
-	secretBusAddr string
+	// injectedPlugins are the --inject-service helper subprocesses (native), run as
+	// the invoking user. injectedEnv are the "VAR=value" pairs that point the
+	// workload at each plugin's socket. injectedCleanup are host paths (sockets) to
+	// remove on teardown. All empty when --inject-service is unused.
+	injectedPlugins []*exec.Cmd
+	injectedEnv     []string
+	injectedCleanup []string
 
 	logger        *log.Logger
 	mountState    *mountState
@@ -363,7 +378,7 @@ Flags:
   --share-ipc                     (native) Share the host IPC namespace (e.g. X MIT-SHM). Default: isolated.
   --require-lsm                   (native) Fail closed if the eBPF LSM can't attach, instead of silently degrading to proxy-only. Refuses to run the workload unenforced.
   --allow-namespaces              (native) Let the workload create user/mount namespaces (unshare/mount) — for nested containers or sandbox tools. Reopens the userns bind-mount path-LSM bypass, so default is hardened (off).
-  --secret <service>              (native) Let the agent read this keyring item (by go-keyring "service") via a shadow Secret Service — without exposing the rest of the keyring. Repeatable. Default: keyring blocked.
+  --inject-service <spec>         (native) Spawn a helper plugin as the invoking user, expose its socket to the box, and set an env var pointing at it. spec is comma-separated: plugin=<binary>,env=<VAR>,socket=<path>[,config=<opaque>]. config is optional and opaque (leash never interprets it). Fail-closed if the plugin can't start. Repeatable.
   --image <name[:tag]>            Override the target container image (defaults to %s).
   --leash-image <name[:tag]>      Override the leash manager image (defaults to %s).
   --runtime <docker|podman>       Container runtime CLI to drive (defaults to docker).
@@ -400,6 +415,110 @@ func commandName(args []string) string {
 		return "leash"
 	}
 	return filepath.Base(name)
+}
+
+// protectedSocketRoots are host locations an injected plugin socket must never
+// live in: pointing a plugin there could clobber or impersonate a critical host
+// socket (the system/user D-Bus buses, the container runtime, systemd). leash
+// stays protocol-agnostic — it just refuses obviously dangerous socket paths.
+var protectedSocketRoots = []string{
+	"/run/dbus", "/var/run/dbus",
+	"/run/systemd", "/var/run/systemd",
+	"/run/docker.sock", "/var/run/docker.sock",
+	"/run/containerd", "/var/run/containerd",
+	"/run/user", // the invoking user's real session bus lives here
+	"/proc", "/sys", "/dev",
+}
+
+// socketUnderProtectedRoot reports the protected root that a cleaned socket path
+// lands under, or "" if none. Shared so both parse-time validation and native
+// use-time (post symlink-resolution) re-check apply the identical rule.
+func socketUnderProtectedRoot(clean string) string {
+	for _, root := range protectedSocketRoots {
+		if clean == root || strings.HasPrefix(clean, root+"/") {
+			return root
+		}
+	}
+	return ""
+}
+
+// validateInjectSocket sanitizes a plugin socket path: it must be absolute,
+// traversal-free, and outside every protected host location.
+func validateInjectSocket(p string) error {
+	if strings.TrimSpace(p) == "" {
+		return errors.New("socket path is empty")
+	}
+	if !filepath.IsAbs(p) {
+		return fmt.Errorf("socket path %q must be absolute", p)
+	}
+	// Reject only genuine traversal (a ".." path SEGMENT); a filename that merely
+	// contains ".." such as /tmp/a..b/bus is legitimate.
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return fmt.Errorf("socket path %q must not contain a '..' path segment", p)
+		}
+	}
+	clean := filepath.Clean(p)
+	if root := socketUnderProtectedRoot(clean); root != "" {
+		return fmt.Errorf("socket path %q is inside protected host location %q", p, root)
+	}
+	return nil
+}
+
+// parseInjectService parses a --inject-service spec of the form
+// plugin=<binary>,env=<VAR>,socket=<path> into an injectService, validating each
+// field (including the socket path).
+func parseInjectService(spec string) (injectService, error) {
+	var svc injectService
+	seen := make(map[string]bool, 3)
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			return svc, fmt.Errorf("invalid --inject-service segment %q; want key=value", part)
+		}
+		switch k {
+		case "plugin", "env", "socket", "config":
+			if seen[k] {
+				return svc, fmt.Errorf("--inject-service key %q specified more than once", k)
+			}
+			seen[k] = true
+		}
+		switch k {
+		case "plugin":
+			svc.plugin = v
+		case "env":
+			svc.env = v
+		case "socket":
+			svc.socket = v
+		case "config":
+			svc.config = v
+		default:
+			return svc, fmt.Errorf("unknown --inject-service key %q (want plugin, env, socket, config)", k)
+		}
+	}
+	if svc.plugin == "" {
+		return svc, errors.New("--inject-service requires plugin=<binary>")
+	}
+	if strings.ContainsRune(svc.plugin, filepath.Separator) || svc.plugin != filepath.Base(svc.plugin) {
+		return svc, fmt.Errorf("--inject-service plugin %q must be a bare binary name (no path)", svc.plugin)
+	}
+	if svc.env == "" {
+		return svc, errors.New("--inject-service requires env=<VAR>")
+	}
+	if strings.ContainsAny(svc.env, "= ") {
+		return svc, fmt.Errorf("--inject-service env %q is not a valid variable name", svc.env)
+	}
+	if svc.socket == "" {
+		return svc, errors.New("--inject-service requires socket=<path>")
+	}
+	if err := validateInjectSocket(svc.socket); err != nil {
+		return svc, fmt.Errorf("--inject-service socket: %w", err)
+	}
+	return svc, nil
 }
 
 func parseArgs(args []string) (options, error) {
@@ -447,11 +566,16 @@ func parseArgs(args []string) (options, error) {
 			opts.requireLSM = true
 		case "--allow-namespaces":
 			opts.allowNamespaces = true
-		case "--secret":
-			if i+1 < len(args) {
-				opts.secrets = append(opts.secrets, args[i+1])
-				i++
+		case "--inject-service":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for %s", arg)
 			}
+			svc, err := parseInjectService(args[i+1])
+			if err != nil {
+				return opts, err
+			}
+			opts.injectServices = append(opts.injectServices, svc)
+			i++
 		case "-v":
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && strings.Contains(args[i+1], ":") {
 				opts.volumes = append(opts.volumes, args[i+1])
@@ -535,6 +659,12 @@ func parseArgs(args []string) (options, error) {
 			case strings.HasPrefix(arg, "-l="):
 				opts.listen = strings.TrimPrefix(arg, "-l=")
 				opts.listenSet = true
+			case strings.HasPrefix(arg, "--inject-service="):
+				svc, err := parseInjectService(strings.TrimPrefix(arg, "--inject-service="))
+				if err != nil {
+					return opts, err
+				}
+				opts.injectServices = append(opts.injectServices, svc)
 			case strings.HasPrefix(arg, "--runtime="):
 				opts.runtime = strings.TrimSpace(strings.TrimPrefix(arg, "--runtime="))
 			case strings.HasPrefix(arg, "--open="):

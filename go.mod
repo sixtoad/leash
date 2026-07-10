@@ -12,7 +12,6 @@ require (
 require (
 	github.com/charmbracelet/bubbletea v0.25.0
 	github.com/charmbracelet/lipgloss v0.9.1
-	github.com/godbus/dbus/v5 v5.2.2
 	github.com/klauspost/compress v1.17.10
 	github.com/pelletier/go-toml/v2 v2.2.4
 	go.opentelemetry.io/otel v1.38.0

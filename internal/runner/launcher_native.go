@@ -198,77 +198,229 @@ func (n nativeLauncher) StartEnforcement(ctx context.Context, cgroupPath string)
 		}
 		close(exited)
 	}()
-	if err := n.startSecretBroker(ctx); err != nil {
+	if err := n.injectServices(ctx); err != nil {
 		return err
 	}
 	return nil
 }
 
-// startSecretBroker launches the keyring secret broker (native --secret) as the
-// invoking user — root can't reach the user's session keyring — and records its
-// shadow socket for injection into the workload. The socket lives under /tmp,
-// which the box sees unmasked, so native needs no bind-mount (container launchers
-// reuse the same socket via -v). Fails the run if the broker can't start, rather
-// than run the agent expecting keyring access it won't get.
-func (n nativeLauncher) startSecretBroker(ctx context.Context) error {
-	if len(n.r.opts.secrets) == 0 {
-		return nil
+// injectSocketEnv and injectConfigFileEnv carry a plugin's listen socket and its
+// opaque config to the helper via the environment (not argv, so the config stays
+// out of `ps`).
+const (
+	injectSocketEnv = "LEASH_INJECT_SOCKET"
+	// injectConfigFileEnv points the plugin at a 0600 file holding the opaque
+	// config instead of passing it inline: on the `runuser -- env KEY=VAL` path an
+	// inline value shows in /proc/<pid>/cmdline (visible in `ps`), so the config
+	// travels via a file the plugin reads.
+	injectConfigFileEnv = "LEASH_INJECT_CONFIG_FILE"
+)
+
+// injectServices spawns each --inject-service helper plugin: leash knows only the
+// plugin name, an env var, a socket path, and an opaque config payload it never
+// interprets — never the plugin's protocol. Each plugin runs as the invoking user
+// (root can't reach the user's session resources); leash records the socket→env
+// mapping for the workload and fails the run if any plugin can't start
+// (fail-closed).
+func (n nativeLauncher) injectServices(ctx context.Context) error {
+	// Reject duplicate socket paths / env keys across specs BEFORE spawning anything:
+	// two plugins binding the same socket, or two env vars colliding, is always a
+	// misconfiguration — catch it up front rather than after starting some plugins.
+	seenSocket := make(map[string]bool, len(n.r.opts.injectServices))
+	seenEnv := make(map[string]bool, len(n.r.opts.injectServices))
+	for _, svc := range n.r.opts.injectServices {
+		if seenSocket[svc.socket] {
+			return fmt.Errorf("native: duplicate --inject-service socket %q", svc.socket)
+		}
+		if seenEnv[svc.env] {
+			return fmt.Errorf("native: duplicate --inject-service env %q", svc.env)
+		}
+		seenSocket[svc.socket] = true
+		seenEnv[svc.env] = true
 	}
-	self, err := os.Executable()
+	for _, svc := range n.r.opts.injectServices {
+		if err := n.injectOne(ctx, svc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (n nativeLauncher) injectOne(ctx context.Context, svc injectService) error {
+	pluginPath, err := n.resolvePlugin(svc.plugin)
 	if err != nil {
-		return fmt.Errorf("native: locate leash binary for secret broker: %w", err)
+		return fmt.Errorf("native: locate inject-service plugin %q: %w", svc.plugin, err)
 	}
-	sock := filepath.Join("/tmp", "leash-secretbus-"+n.netnsName(), "bus")
-	brokerArgs := []string{self, "--secret-broker", "--secret-bus", sock}
-	for _, s := range n.r.opts.secrets {
-		brokerArgs = append(brokerArgs, "--secret", s)
+	parent := filepath.Dir(svc.socket)
+	// Note whether we create the parent: only a dir WE create may be chowned to the
+	// dropped user (P2) — never a pre-existing dir like /tmp.
+	parentPreexisted := true
+	if _, err := os.Stat(parent); os.IsNotExist(err) {
+		parentPreexisted = false
 	}
-	// Run AS the invoking user, with that user's D-Bus/runtime env so the broker
-	// can reach their real keyring.
-	argv := brokerArgs
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return fmt.Errorf("native: inject-service socket dir: %w", err)
+	}
+	// When we spawn the plugin as the invoking user, a root-owned socket dir we just
+	// created isn't writable by that user; chown the created dir so the dropped
+	// plugin can bind. Only for a dir we created — never chown a pre-existing one.
+	if n.workloadUser() != "" && !parentPreexisted {
+		if uid, gid := n.workloadUIDGID(); uid >= 0 {
+			if err := os.Chown(parent, uid, gid); err != nil {
+				return fmt.Errorf("native: chown inject-service socket dir %q: %w", parent, err)
+			}
+		}
+	}
+	// A symlinked parent could redirect the real socket path under a protected root
+	// (e.g. /tmp/x -> /run/user/1000) after the parse-time check passed; re-check the
+	// symlink-resolved path and abort if it now lands in a protected location.
+	if realParent, err := filepath.EvalSymlinks(parent); err == nil {
+		realSocket := filepath.Clean(filepath.Join(realParent, filepath.Base(svc.socket)))
+		if root := socketUnderProtectedRoot(realSocket); root != "" {
+			return fmt.Errorf("native: inject-service socket %q resolves to %q inside protected host location %q", svc.socket, realSocket, root)
+		}
+	}
+	// Clear any stale socket so the plugin can bind fresh — but only if it is in fact
+	// a socket (fail-closed rather than clobber a planted file/dir/symlink).
+	if err := removeStaleSocket(svc.socket); err != nil {
+		return err
+	}
+
+	// Opaque config (svc.config): when supplied, write it verbatim to a 0600 file
+	// (chowned to the dropped user when we spawn as them) and pass the file PATH via
+	// env, so the config never appears in `ps`/cmdline on the `runuser -- env
+	// KEY=VAL` path. The socket path also travels via env. leash never interprets the
+	// config. When no config is supplied, no file is written.
+	configFile, err := n.writeInjectConfig(svc)
+	if err != nil {
+		return err
+	}
+	injectEnv := []string{
+		injectSocketEnv + "=" + svc.socket,
+	}
+	if configFile != "" {
+		injectEnv = append(injectEnv, injectConfigFileEnv+"="+configFile)
+	}
+
+	// Run AS the invoking user, with that user's runtime env so the plugin can
+	// reach the user's own session resources (root can't).
+	argv := []string{pluginPath}
+	var cmdEnv []string
 	if user := n.workloadUser(); user != "" {
-		argv = append([]string{"runuser", "-u", user, "--", "env"}, n.userSessionEnv()...)
-		argv = append(argv, brokerArgs...)
+		argv = append([]string{"runuser", "-u", user, "--", "env"}, n.invokingUserEnv()...)
+		argv = append(argv, injectEnv...)
+		argv = append(argv, pluginPath)
+	} else {
+		cmdEnv = append(os.Environ(), n.invokingUserEnv()...)
+		cmdEnv = append(cmdEnv, injectEnv...)
 	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	if n.workloadUser() == "" {
-		cmd.Env = append(os.Environ(), n.userSessionEnv()...)
+	if cmdEnv != nil {
+		cmd.Env = cmdEnv
 	}
-	if logf, err := os.Create(n.secretBrokerLogPath()); err == nil {
+	if logf, err := os.Create(n.injectLogPath(svc)); err == nil {
 		cmd.Stdout, cmd.Stderr = logf, logf
 	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("native: start secret broker: %w", err)
+		return fmt.Errorf("native: start inject-service plugin %q: %w", svc.plugin, err)
 	}
-	n.r.secretBroker = cmd
+	n.r.injectedPlugins = append(n.r.injectedPlugins, cmd)
+	n.r.injectedCleanup = append(n.r.injectedCleanup, svc.socket)
+	if configFile != "" {
+		n.r.injectedCleanup = append(n.r.injectedCleanup, configFile)
+	}
+	// Fail-closed: wait for the plugin to create its socket; if it never does the
+	// run aborts rather than launch the workload expecting a service it won't get.
 	for i := 0; i < 100; i++ {
-		if _, err := os.Stat(sock); err == nil {
-			n.r.secretBusAddr = sock
+		if _, err := os.Stat(svc.socket); err == nil {
+			// The workload reaches the plugin via a generic unix-domain-socket
+			// address; leash sets only the mapped env var and stays protocol-agnostic.
+			n.r.injectedEnv = append(n.r.injectedEnv, svc.env+"=unix:path="+svc.socket)
 			return nil
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return fmt.Errorf("native: secret broker socket %s did not appear (see %s)", sock, n.secretBrokerLogPath())
+	return fmt.Errorf("native: inject-service plugin %q socket %s did not appear (see %s)", svc.plugin, svc.socket, n.injectLogPath(svc))
 }
 
-// userSessionEnv is the invoking user's D-Bus/runtime env, passed to the broker
-// subprocess so it connects to the user's real keyring.
-func (n nativeLauncher) userSessionEnv() []string {
-	var env []string
-	uid := n.workloadUID()
-	if v := strings.TrimSpace(os.Getenv("DBUS_SESSION_BUS_ADDRESS")); v != "" {
-		env = append(env, "DBUS_SESSION_BUS_ADDRESS="+v)
-	} else if uid != "" {
-		env = append(env, "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/"+uid+"/bus")
+// removeStaleSocket removes a leftover plugin socket so the plugin can bind fresh.
+// It removes the path ONLY when it exists and is a socket; it refuses (errors) on
+// any existing non-socket (regular file, dir, symlink) rather than clobber it, and
+// treats a missing path as success.
+func removeStaleSocket(path string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("native: stat inject-service socket %q: %w", path, err)
 	}
-	if uid != "" {
+	if fi.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("native: refusing to remove %q: exists and is not a socket", path)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("native: remove stale inject-service socket %q: %w", path, err)
+	}
+	return nil
+}
+
+// resolvePlugin locates a helper binary: an absolute path is used directly (when
+// it exists and isn't a dir), otherwise alongside the running leash binary first
+// (release layout ships them together), then on PATH.
+func (n nativeLauncher) resolvePlugin(name string) (string, error) {
+	if filepath.IsAbs(name) {
+		if st, err := os.Stat(name); err == nil && !st.IsDir() {
+			return name, nil
+		}
+	}
+	if self, err := os.Executable(); err == nil {
+		cand := filepath.Join(filepath.Dir(self), name)
+		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+			return cand, nil
+		}
+	}
+	return exec.LookPath(name)
+}
+
+// invokingUserEnv is the invoking user's generic runtime context (XDG base dir),
+// passed to injected plugins so a plugin can find the user's own session
+// resources. leash forwards only XDG_RUNTIME_DIR and leaves any protocol-specific
+// derivation (e.g. a session bus address) to the plugin, staying agnostic.
+func (n nativeLauncher) invokingUserEnv() []string {
+	var env []string
+	if uid := n.workloadUID(); uid != "" {
 		env = append(env, "XDG_RUNTIME_DIR=/run/user/"+uid)
 	}
 	return env
 }
 
-func (n nativeLauncher) secretBrokerLogPath() string {
-	return filepath.Join("/tmp", "leash-native-secretbroker-"+n.netnsName()+".log")
+func (n nativeLauncher) injectLogPath(svc injectService) string {
+	return filepath.Join("/tmp", "leash-native-inject-"+sanitizeNativeName(svc.plugin)+"-"+n.netnsName()+".log")
+}
+
+// writeInjectConfig writes the opaque config payload (svc.config) verbatim to a
+// 0600 file whose PATH is handed to the plugin via injectConfigFileEnv, keeping the
+// config out of `ps`/cmdline. The file is chowned to the dropped user when we spawn
+// the plugin as them, so the plugin can read it. Returns the file path, or "" (no
+// file written) when no config was supplied. leash never interprets the payload.
+func (n nativeLauncher) writeInjectConfig(svc injectService) (string, error) {
+	if svc.config == "" {
+		return "", nil
+	}
+	path := filepath.Join("/tmp", "leash-native-injectcfg-"+sanitizeNativeName(svc.plugin)+"-"+n.netnsName())
+	data := svc.config
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		return "", fmt.Errorf("native: write inject-service config: %w", err)
+	}
+	if n.workloadUser() != "" {
+		if uid, gid := n.workloadUIDGID(); uid >= 0 {
+			if err := os.Chown(path, uid, gid); err != nil {
+				_ = os.Remove(path)
+				return "", fmt.Errorf("native: chown inject-service config %q: %w", path, err)
+			}
+		}
+	}
+	return path, nil
 }
 
 // leashdDied reports whether the reaped leashd process has already exited.
@@ -449,11 +601,28 @@ func (n nativeLauncher) exportCACert(shareDir string) {
 // compiled), not layer2Active, so a run that fell back to LSM-only after a
 // partial egress setup still cleans up.
 func (n nativeLauncher) Remove(ctx context.Context) {
-	if n.r.secretBroker != nil && n.r.secretBroker.Process != nil {
-		// Signal (not kill) so the broker tears down its private dbus-daemon.
-		_ = n.r.secretBroker.Process.Signal(os.Interrupt)
-		_ = n.r.secretBroker.Wait()
-		_ = os.RemoveAll(filepath.Join("/tmp", "leash-secretbus-"+n.netnsName()))
+	for _, cmd := range n.r.injectedPlugins {
+		if cmd == nil || cmd.Process == nil {
+			continue
+		}
+		// Signal (not kill) so the plugin can tear down cleanly, but don't wait
+		// forever: give it a grace period, then force-kill so teardown can't hang.
+		_ = cmd.Process.Signal(os.Interrupt)
+		done := make(chan struct{})
+		go func(c *exec.Cmd) {
+			_ = c.Wait()
+			close(done)
+		}(cmd)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			_ = cmd.Process.Kill()
+			<-done
+		}
+	}
+	// Remove every injected socket / config file regardless of wait outcome.
+	for _, sock := range n.r.injectedCleanup {
+		_ = os.Remove(sock)
 	}
 	if nativeLayer2Enabled && !n.useUserManager() {
 		n.teardownEgress(ctx)
@@ -689,7 +858,7 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 			allowDisplay:    n.r.opts.allowDisplay,
 			allowDBus:       n.r.opts.allowDBus,
 			allowNamespaces: n.r.opts.allowNamespaces,
-			secretBus:       n.r.secretBusAddr,
+			injectedEnv:     n.r.injectedEnv,
 		}
 	}
 	// The leash binary re-execs itself as `--harden-exec` to seccomp the workload;
@@ -725,6 +894,27 @@ func (n nativeLauncher) workloadUID() string {
 	return u
 }
 
+// workloadUIDGID returns the invoking user's numeric uid/gid ($SUDO_UID/$SUDO_GID)
+// for chowning dirs/files the dropped-privilege plugin must own, or (-1, -1) when
+// the uid is unavailable. The gid falls back to the uid when $SUDO_GID is unset.
+func (n nativeLauncher) workloadUIDGID() (int, int) {
+	u := n.workloadUID()
+	if u == "" {
+		return -1, -1
+	}
+	uid, err := strconv.Atoi(u)
+	if err != nil {
+		return -1, -1
+	}
+	gid := uid
+	if g := strings.TrimSpace(os.Getenv("SUDO_GID")); g != "" {
+		if v, err := strconv.Atoi(g); err == nil {
+			gid = v
+		}
+	}
+	return uid, gid
+}
+
 // workloadUser returns the non-root user the workload should run as, or "" to
 // keep the current uid. The eBPF LSM enforces on the cgroup regardless of uid,
 // so when leash runs as root (typical: `sudo leash`) the agent need not — and
@@ -752,13 +942,23 @@ func (n nativeLauncher) workloadUser() string {
 // The allow*/share* flags relax it for GUI/desktop workloads — leash is
 // agnostic, so a container-shaped default must be opt-out-able.
 type hardenOpts struct {
-	enabled         bool   // master (root only); false = rootless/unenforced, no isolation
-	uid             string // validated-numeric $SUDO_UID for the keyring-dir mask
-	shareIPC        bool   // --share-ipc: no IPC ns (X MIT-SHM etc.)
-	allowDisplay    bool   // --allow-display: keep DISPLAY/XAUTHORITY + the X11 socket
-	allowDBus       bool   // --allow-dbus: keep DBUS_SESSION_BUS_ADDRESS + /run/user
-	allowNamespaces bool   // --allow-namespaces: skip the seccomp mount/unshare block
-	secretBus       string // --secret: shadow Secret Service socket to set as DBUS_SESSION_BUS_ADDRESS
+	enabled         bool     // master (root only); false = rootless/unenforced, no isolation
+	uid             string   // validated-numeric $SUDO_UID for the keyring-dir mask
+	shareIPC        bool     // --share-ipc: no IPC ns (X MIT-SHM etc.)
+	allowDisplay    bool     // --allow-display: keep DISPLAY/XAUTHORITY + the X11 socket
+	allowDBus       bool     // --allow-dbus: keep DBUS_SESSION_BUS_ADDRESS + /run/user
+	allowNamespaces bool     // --allow-namespaces: skip the seccomp mount/unshare block
+	injectedEnv     []string // --inject-service: "VAR=value" pairs pointing the workload at each plugin socket
+}
+
+// hasEnvKey reports whether env (a slice of "KEY=VALUE" strings) sets key.
+func hasEnvKey(env []string, key string) bool {
+	for _, e := range env {
+		if k, _, ok := strings.Cut(e, "="); ok && k == key {
+			return true
+		}
+	}
+	return false
 }
 
 func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, self string, h hardenOpts) string {
@@ -784,13 +984,13 @@ func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, 
 	scrub := ""
 	if h.enabled {
 		var unset, set []string
-		switch {
-		case h.secretBus != "":
-			// Point the workload at the shadow Secret Service (not the real bus,
-			// whose /run/user socket stays masked): the broker serves only the
-			// --secret items.
-			set = append(set, "DBUS_SESSION_BUS_ADDRESS=unix:path="+h.secretBus)
-		case !h.allowDBus:
+		// Injected-service env (e.g. a plugin socket address) is set unconditionally
+		// — this is how the workload reaches an --inject-service helper instead of
+		// the real host service, whose /run/user socket stays masked.
+		set = append(set, h.injectedEnv...)
+		// Scrub the real session bus address unless --allow-dbus keeps it, or an
+		// injected variable already overrides it.
+		if !h.allowDBus && !hasEnvKey(h.injectedEnv, "DBUS_SESSION_BUS_ADDRESS") {
 			unset = append(unset, "DBUS_SESSION_BUS_ADDRESS")
 		}
 		if !h.allowDisplay {

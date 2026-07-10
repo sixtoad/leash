@@ -1,21 +1,18 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
-	"os/signal"
 	"syscall"
 
 	"github.com/strongdm/leash/internal/darwind"
 	"github.com/strongdm/leash/internal/hardening"
 	"github.com/strongdm/leash/internal/leashd"
 	"github.com/strongdm/leash/internal/runner"
-	"github.com/strongdm/leash/internal/secretbroker"
 	"github.com/strongdm/leash/internal/telemetry/statsig"
 )
 
@@ -53,11 +50,6 @@ func main() {
 				log.Fatal(err)
 			}
 			return
-		case "--secret-broker": // internal: run the keyring secret broker (spawned as the invoking user).
-			if err := runSecretBroker(args[2:]); err != nil {
-				log.Fatal(err)
-			}
-			return
 		default: // Docker-Leash CLI frontend.
 			runner.SetVersion(version)
 			if err := runner.Main(args); err != nil {
@@ -69,40 +61,6 @@ func main() {
 			}
 		}
 	}
-}
-
-// runSecretBroker runs the keyring secret broker: a shadow D-Bus Secret Service
-// that serves only the --secret services, live-proxying the invoking user's real
-// keyring. It is spawned by the native launcher AS the invoking user (root can't
-// reach the user's session bus), listens on --secret-bus, and blocks until the
-// launcher signals it. Usage: leash --secret-broker --secret-bus <path> --secret <svc>...
-func runSecretBroker(args []string) error {
-	var sockPath string
-	var services []string
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--secret-bus":
-			if i+1 < len(args) {
-				sockPath = args[i+1]
-				i++
-			}
-		case "--secret":
-			if i+1 < len(args) {
-				services = append(services, args[i+1])
-				i++
-			}
-		}
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	b, err := secretbroker.Start(ctx, secretbroker.NewAllowlist(services), sockPath)
-	if err != nil {
-		return err
-	}
-	defer b.Close()
-	fmt.Printf("secret broker: serving %d secret(s) at %s\n", len(services), b.SocketPath())
-	<-ctx.Done()
-	return nil
 }
 
 // hardenExec applies the seccomp/no-new-privs/cap-drop hardening to the current
