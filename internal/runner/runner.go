@@ -95,7 +95,6 @@ type options struct {
 	verbose        bool
 	volumes        []string
 	envVars        []string
-	labels         []string
 	command        []string
 	subcommand     string
 	targetImage    string
@@ -378,7 +377,6 @@ Flags:
   -l, --listen <addr>             Control UI bind address (e.g. :18080, 127.0.0.1:18080; setting this to blank disables the UI).
   -o, --open                      Open Control UI in default browser once ready.
   -v, --volume <src:dst[:ro]>     Bind mount to pass through to the target container (repeatable).
-  --label <key=value>             Add a label to the target container (passed through to docker run --label, repeatable). leash does not interpret it.
   -e, --env <key[=value]>         Set environment variables inside the leash containers (repeatable).
   -p, --publish <[ip:]host:container[/proto]>   Publish a container port to the host (repeatable). Examples: -p 3000, -p 8000:3000, -p 127.0.0.1:3000:3000, -p :3000, -p 3000/udp
   -P, --publish-all               Publish all EXPOSEd ports (host same as container when free, auto-bump on conflicts).
@@ -604,15 +602,6 @@ func parseArgs(args []string) (options, error) {
 				return opts, fmt.Errorf("invalid volume mount %q; expected src:dst[:ro]", value)
 			}
 			opts.volumes = append(opts.volumes, value)
-			i++
-		case "--label":
-			// Generic docker-run label passthrough for the target container.
-			// leash does not interpret labels; callers (e.g. walk) use them for
-			// their own container discovery via `docker ps --filter label=...`.
-			if i+1 >= len(args) {
-				return opts, fmt.Errorf("missing argument for %s", arg)
-			}
-			opts.labels = append(opts.labels, args[i+1])
 			i++
 		case "-V", "--verbose":
 			opts.verbose = true
@@ -2093,9 +2082,6 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 	for _, env := range r.opts.envVars {
 		args = append(args, "-e", env)
 		targetEnv = append(targetEnv, env)
-	}
-	for _, label := range r.opts.labels {
-		args = append(args, "--label", label)
 	}
 	if hash := strings.TrimSpace(r.workspaceHash); hash != "" {
 		value := fmt.Sprintf("LEASH_WORKSPACE_HASH=%s", hash)
