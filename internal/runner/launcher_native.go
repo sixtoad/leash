@@ -368,6 +368,9 @@ func (r *runner) spawnInjectService(ctx context.Context, svc injectService) erro
 	// Fail-closed: wait for the plugin to create its socket; if it never does the
 	// run aborts rather than launch the workload expecting a service it won't get.
 	for i := 0; i < 100; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if _, err := os.Stat(svc.socket); err == nil {
 			return nil
 		}
@@ -495,7 +498,9 @@ func (r *runner) injectBoxName() string {
 }
 
 func (r *runner) injectLogPath(svc injectService) string {
-	return filepath.Join("/tmp", "leash-native-inject-"+sanitizeNativeName(svc.plugin)+"-"+r.injectBoxName()+".log")
+	// leashd's own log dir (root-owned) rather than a predictable /tmp path an
+	// attacker could pre-plant a symlink at to redirect this root-owned create.
+	return filepath.Join(r.cfg.logDir, "inject-"+sanitizeNativeName(svc.plugin)+"-"+r.injectBoxName()+".log")
 }
 
 // writeInjectConfig writes the opaque config payload (svc.config) verbatim to a
@@ -507,10 +512,21 @@ func (r *runner) writeInjectConfig(svc injectService) (string, error) {
 	if svc.config == "" {
 		return "", nil
 	}
-	path := filepath.Join("/tmp", "leash-native-injectcfg-"+sanitizeNativeName(svc.plugin)+"-"+r.injectBoxName())
-	data := svc.config
-	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+	// os.CreateTemp opens with a random name + O_EXCL, so a pre-planted symlink at a
+	// predictable /tmp path can't redirect this root-owned write (0600 like before).
+	f, err := os.CreateTemp("", "leash-native-injectcfg-"+sanitizeNativeName(svc.plugin)+"-*")
+	if err != nil {
+		return "", fmt.Errorf("native: create inject-service config: %w", err)
+	}
+	path := f.Name()
+	if _, err := f.WriteString(svc.config); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
 		return "", fmt.Errorf("native: write inject-service config: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("native: close inject-service config: %w", err)
 	}
 	if r.workloadUser() != "" {
 		if uid, gid := r.workloadUIDGID(); uid >= 0 {
@@ -655,6 +671,9 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 		// stop waiting now (fail-closed below decides the verdict).
 		if n.leashdDied() {
 			return n.notReady("native leashd exited before enforcement was ready")
+		}
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 		time.Sleep(caCertWaitDelay)
 	}
