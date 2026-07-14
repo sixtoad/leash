@@ -23,6 +23,16 @@ if [ ! -s internal/ui/dist/index.html ] || grep -q '>stub<\|<title>stub' interna
   exit 1
 fi
 
+# The leash-entry helper binaries are embedded in the binary (go:generate builds
+# them into bundled_*_gen.go, which are gitignored). Regenerate them fresh so the
+# release never ships empty embeds — otherwise the binary fails at runtime with
+# "embedded binary leash-entry-... missing" (as a fresh-clone build would).
+echo "release: generating embedded leash-entry binaries..." >&2
+go generate ./internal/entrypoint/...
+for f in internal/entrypoint/bundled_linux_amd64_gen.go internal/entrypoint/bundled_linux_arm64_gen.go; do
+  [ -s "$f" ] || { echo "release: $f empty after generate — leash-entry embed failed" >&2; exit 1; }
+done
+
 DIST="$ROOT/dist"
 rm -rf "$DIST"; mkdir -p "$DIST"
 COMMIT="$(git rev-parse --short=7 HEAD)"

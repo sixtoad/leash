@@ -253,7 +253,7 @@ build-ui: precommit ## Build the Control UI. Uses local pnpm if available, other
       $(MAKE) docker-ui; \
 	fi
 
-.PHOME: generate-entrypoint-if-missing
+.PHONY: generate-entrypoint-if-missing
 generate-entrypoint-if-missing: ## Generate entrypoint artifacts only if not already present
 	@set -e; \
 	if ! [ -f internal/entrypoint/bundled_linux_amd64_gen.go ] || ! [ -f internal/entrypoint/bundled_linux_arm64_gen.go ]; then \
