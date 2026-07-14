@@ -88,6 +88,10 @@ func Main(args []string) error {
 		enableHostMode()
 	}
 
+	// Select fail-closed vs degrade-to-proxy for LSM attach failures before any
+	// attach happens.
+	lsm.SetRequireLSM(cfg.RequireLSM)
+
 	if err := preFlight(cfg); err != nil {
 		return err
 	}
@@ -135,6 +139,7 @@ type runtimeConfig struct {
 	BootstrapTimeout time.Duration
 	HostMode         bool
 	LSMOnly          bool
+	RequireLSM       bool
 	MCPConfig        proxy.MCPConfig
 	TelemetryConfig  otel.Config
 }
@@ -167,6 +172,7 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 	policyPath := fs.String("policy", strings.TrimSpace(os.Getenv("LEASH_POLICY")), "Cedar policy file path")
 	hostMode := fs.Bool("host", leashdEnvTruthy("LEASH_HOST"), "Run as a host process (no container): host-appropriate path defaults; enforcement needs CAP_BPF and an active bpf LSM. See docs/LEASHD-HOST-MODE.md")
 	lsmOnly := fs.Bool("lsm-only", leashdEnvTruthy("LEASH_LSM_ONLY"), "Enforce with the eBPF LSM only (file/exec/network-connect); skip the L7 MITM proxy and its netfilter. Used by native until netns egress lands.")
+	requireLSM := fs.Bool("require-lsm", leashdEnvTruthy("LEASH_REQUIRE_LSM"), "Fail closed if the eBPF LSM can't attach (e.g. kernel lacks an active bpf LSM) instead of silently degrading to proxy-only. Refuses to run the workload unenforced.")
 
 	proxyPort := fs.String("proxy-port", "18000", "Proxy port")
 	listenFlag := &stringFlag{}
@@ -237,6 +243,7 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 		BootstrapTimeout: timeout,
 		HostMode:         *hostMode,
 		LSMOnly:          *lsmOnly,
+		RequireLSM:       *requireLSM,
 	}
 	cfg.MCPConfig = loadMCPConfigFromEnv()
 	cfg.TelemetryConfig = otel.LoadConfigFromEnv()

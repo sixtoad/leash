@@ -35,5 +35,8 @@ dist
 # APM dependencies
 apm_modules/
 
+# worktree-agent session worktrees
+.claude/worktrees/
+
 # Local-only native-runtime PoC box repro (dev scratch, not shipped)
 scratch-native-poc/

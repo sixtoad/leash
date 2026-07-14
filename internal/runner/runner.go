@@ -107,12 +107,27 @@ type options struct {
 	openUI         bool
 	publishes      []publishSpec
 	publishAll     bool
-	requireLSM     bool
 
 	// Native session-isolation opt-outs (default: hardened). See launcher_native.go.
-	allowDisplay bool // keep DISPLAY/XAUTHORITY + the X11 socket (GUI apps)
-	allowDBus    bool // keep DBUS_SESSION_BUS_ADDRESS + the keyring/D-Bus runtime dir
-	shareIPC     bool // share the host IPC namespace (e.g. X MIT-SHM)
+	allowDisplay    bool            // keep DISPLAY/XAUTHORITY + the X11 socket (GUI apps)
+	allowDBus       bool            // keep DBUS_SESSION_BUS_ADDRESS + the keyring/D-Bus runtime dir
+	shareIPC        bool            // share the host IPC namespace (e.g. X MIT-SHM)
+	requireLSM      bool            // fail closed if the eBPF LSM can't attach (no proxy-only degrade)
+	allowNamespaces bool            // skip the seccomp mount/unshare block (reopens the userns bind-mount bypass)
+	injectServices  []injectService // --inject-service: helper plugins to spawn and bind into the box
+}
+
+// injectService describes one --inject-service
+// plugin=<bin>,env=<VAR>,socket=<path>[,config=<opaque>] mapping. leash spawns the
+// plugin as the invoking user, binds/exposes its socket to the box, and sets the
+// workload's <env> to point at that socket. The mechanism is protocol-agnostic:
+// leash knows only these fields plus an opaque config payload it never interprets —
+// never the plugin's wire protocol.
+type injectService struct {
+	plugin string // helper binary name (resolved next to leash, then on PATH)
+	env    string // env var set in the workload, mapped to the plugin socket
+	socket string // host socket path the plugin listens on / is exposed to the box
+	config string // opaque config payload handed to the plugin; leash never interprets it
 }
 
 type config struct {
@@ -171,6 +186,28 @@ type runner struct {
 	// during Provision, so StartEnforcement/exec fall back to LSM-only (host
 	// netns) rather than a netns with no route out. Native only.
 	nativeEgressFailed bool
+
+	// leashdExited is closed when the native leashd process exits (StartEnforcement
+	// starts a reaper). WaitReady selects on it to fail fast — instead of waiting
+	// out the full readiness timeout — when leashd died before enforcement went
+	// live (e.g. an LSM attach abort under --require-lsm). Nil until enforcement
+	// starts / on non-native backends.
+	leashdExited chan struct{}
+
+	// injectedPlugins are the --inject-service helper subprocesses (native), run as
+	// the invoking user. injectedEnv are the "VAR=value" pairs that point the
+	// workload at each plugin's socket. injectedCleanup are host paths (sockets) to
+	// remove on teardown. All empty when --inject-service is unused.
+	injectedPlugins []*exec.Cmd
+	injectedEnv     []string
+	injectedCleanup []string
+
+	// injectedDockerArgs are the `-v`/`-e` docker run flags that bind each injected
+	// plugin's socket dir into the workload container and point the workload env var
+	// at it. Built once by spawnInjectServicesContainer (before the launch retry
+	// loop) and appended to the target container's run args. Empty for native /
+	// when --inject-service is unused.
+	injectedDockerArgs []string
 
 	logger        *log.Logger
 	mountState    *mountState
@@ -350,6 +387,9 @@ Flags:
   --allow-display                 (native) Let the workload reach the X11 display (keep DISPLAY; don't mask the X socket). For GUI apps.
   --allow-dbus                    (native) Let the workload reach the session D-Bus/keyring (keep DBUS_SESSION_BUS_ADDRESS; don't mask /run/user).
   --share-ipc                     (native) Share the host IPC namespace (e.g. X MIT-SHM). Default: isolated.
+  --require-lsm                   (native) Fail closed if the eBPF LSM can't attach, instead of silently degrading to proxy-only. Refuses to run the workload unenforced.
+  --allow-namespaces              (native) Let the workload create user/mount namespaces (unshare/mount) — for nested containers or sandbox tools. Reopens the userns bind-mount path-LSM bypass, so default is hardened (off).
+  --inject-service <spec>         (native) Spawn a helper plugin as the invoking user, expose its socket to the box, and set an env var pointing at it. spec is comma-separated: plugin=<binary>,env=<VAR>,socket=<path>[,config=<opaque>]. config is optional and opaque (leash never interprets it). Fail-closed if the plugin can't start. Repeatable.
   --image <name[:tag]>            Override the target container image (defaults to %s).
   --leash-image <name[:tag]>      Override the leash manager image (defaults to %s).
   --container-name <name>         Force the exact agent container name (no sanitization, no collision suffix; leash container becomes <name>-leash).
@@ -393,6 +433,113 @@ func commandName(args []string) string {
 	return filepath.Base(name)
 }
 
+// protectedSocketRoots are host locations an injected plugin socket must never
+// live in: pointing a plugin there could clobber or impersonate a critical host
+// socket (the system/user D-Bus buses, the container runtime, systemd). leash
+// stays protocol-agnostic — it just refuses obviously dangerous socket paths.
+var protectedSocketRoots = []string{
+	"/run/dbus", "/var/run/dbus",
+	"/run/systemd", "/var/run/systemd",
+	"/run/docker.sock", "/var/run/docker.sock",
+	"/run/containerd", "/var/run/containerd",
+	"/run/user", // the invoking user's real session bus lives here
+	"/proc", "/sys", "/dev",
+}
+
+// socketUnderProtectedRoot reports the protected root that a cleaned socket path
+// lands under, or "" if none. Shared so both parse-time validation and native
+// use-time (post symlink-resolution) re-check apply the identical rule.
+func socketUnderProtectedRoot(clean string) string {
+	for _, root := range protectedSocketRoots {
+		if clean == root || strings.HasPrefix(clean, root+"/") {
+			return root
+		}
+	}
+	return ""
+}
+
+// validateInjectSocket sanitizes a plugin socket path: it must be absolute,
+// traversal-free, and outside every protected host location.
+func validateInjectSocket(p string) error {
+	if strings.TrimSpace(p) == "" {
+		return errors.New("socket path is empty")
+	}
+	if !filepath.IsAbs(p) {
+		return fmt.Errorf("socket path %q must be absolute", p)
+	}
+	// Reject only genuine traversal (a ".." path SEGMENT); a filename that merely
+	// contains ".." such as /tmp/a..b/bus is legitimate.
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return fmt.Errorf("socket path %q must not contain a '..' path segment", p)
+		}
+	}
+	clean := filepath.Clean(p)
+	if root := socketUnderProtectedRoot(clean); root != "" {
+		return fmt.Errorf("socket path %q is inside protected host location %q", p, root)
+	}
+	return nil
+}
+
+// parseInjectService parses a --inject-service spec of the form
+// plugin=<binary>,env=<VAR>,socket=<path> into an injectService, validating each
+// field (including the socket path).
+func parseInjectService(spec string) (injectService, error) {
+	var svc injectService
+	seen := make(map[string]bool, 3)
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			return svc, fmt.Errorf("invalid --inject-service segment %q; want key=value", part)
+		}
+		switch k {
+		case "plugin", "env", "socket", "config":
+			if seen[k] {
+				return svc, fmt.Errorf("--inject-service key %q specified more than once", k)
+			}
+			seen[k] = true
+		}
+		switch k {
+		case "plugin":
+			svc.plugin = v
+		case "env":
+			svc.env = v
+		case "socket":
+			svc.socket = v
+		case "config":
+			svc.config = v
+		default:
+			return svc, fmt.Errorf("unknown --inject-service key %q (want plugin, env, socket, config)", k)
+		}
+	}
+	if svc.plugin == "" {
+		return svc, errors.New("--inject-service requires plugin=<binary>")
+	}
+	// The plugin may be a bare binary name (resolved next to the leash binary,
+	// then on PATH) or an absolute path (walk passes the abs path of the plugin it
+	// ships). Reject relative paths with separators (ambiguous / traversal).
+	if strings.ContainsRune(svc.plugin, filepath.Separator) && !filepath.IsAbs(svc.plugin) {
+		return svc, fmt.Errorf("--inject-service plugin %q must be a bare binary name or an absolute path", svc.plugin)
+	}
+	if svc.env == "" {
+		return svc, errors.New("--inject-service requires env=<VAR>")
+	}
+	if strings.ContainsAny(svc.env, "= ") {
+		return svc, fmt.Errorf("--inject-service env %q is not a valid variable name", svc.env)
+	}
+	if svc.socket == "" {
+		return svc, errors.New("--inject-service requires socket=<path>")
+	}
+	if err := validateInjectSocket(svc.socket); err != nil {
+		return svc, fmt.Errorf("--inject-service socket: %w", err)
+	}
+	return svc, nil
+}
+
 func parseArgs(args []string) (options, error) {
 	opts := options{}
 	for i := 0; i < len(args); i++ {
@@ -434,6 +581,20 @@ func parseArgs(args []string) (options, error) {
 			opts.allowDBus = true
 		case "--share-ipc":
 			opts.shareIPC = true
+		case "--require-lsm":
+			opts.requireLSM = true
+		case "--allow-namespaces":
+			opts.allowNamespaces = true
+		case "--inject-service":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for %s", arg)
+			}
+			svc, err := parseInjectService(args[i+1])
+			if err != nil {
+				return opts, err
+			}
+			opts.injectServices = append(opts.injectServices, svc)
+			i++
 		case "-v":
 			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") && strings.Contains(args[i+1], ":") {
 				opts.volumes = append(opts.volumes, args[i+1])
@@ -495,8 +656,6 @@ func parseArgs(args []string) (options, error) {
 			i++
 		case "-o", "--open":
 			opts.openUI = true
-		case "--require-lsm":
-			opts.requireLSM = true
 		case "-h", "--help", "help":
 			return opts, errShowUsage
 		case "--":
@@ -541,6 +700,12 @@ func parseArgs(args []string) (options, error) {
 				}
 			case strings.HasPrefix(arg, "--network="):
 				opts.network = strings.TrimSpace(strings.TrimPrefix(arg, "--network="))
+			case strings.HasPrefix(arg, "--inject-service="):
+				svc, err := parseInjectService(strings.TrimPrefix(arg, "--inject-service="))
+				if err != nil {
+					return opts, err
+				}
+				opts.injectServices = append(opts.injectServices, svc)
 			case strings.HasPrefix(arg, "--runtime="):
 				opts.runtime = strings.TrimSpace(strings.TrimPrefix(arg, "--runtime="))
 			case strings.HasPrefix(arg, "--open="):
@@ -2143,6 +2308,15 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 		if dest := volumeContainerPath(volume); dest != "" {
 			targetMounts = append(targetMounts, dest)
 		}
+	}
+	// Bind each --inject-service plugin's socket dir into the container at the
+	// identical path (so the in-container socket path == the host path the plugin
+	// bound) and set the workload env var pointing at it. The plugins were already
+	// spawned once by spawnInjectServicesContainer before the launch retry loop.
+	args = append(args, r.injectedDockerArgs...)
+	for _, svc := range r.opts.injectServices {
+		targetMounts = append(targetMounts, filepath.Dir(svc.socket))
+		targetEnv = append(targetEnv, svc.env+"=unix:path="+svc.socket)
 	}
 	args = append(args, r.cfg.targetImage)
 	r.logContainerConfig("target", targetMounts, targetEnv)

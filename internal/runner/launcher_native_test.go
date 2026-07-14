@@ -3,6 +3,8 @@ package runner
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -69,10 +71,18 @@ func TestNativeHostLeashdArgv(t *testing.T) {
 
 	argv := n.hostLeashdArgv("/usr/local/bin/leash", "/run/netns/leash-native-x", "/sys/fs/cgroup/scope")
 	joined := strings.Join(argv, " ")
-	// LSM-only: host netns, no nsenter, --lsm-only.
+	// LSM-only: host netns, no nsenter, --lsm-only, and no --require-lsm by default.
 	want := "/usr/local/bin/leash --daemon --host --lsm-only --cgroup /sys/fs/cgroup/scope --proxy-port 18000"
 	if joined != want {
 		t.Fatalf("argv = %q\nwant   %q", joined, want)
+	}
+
+	// --require-lsm on the client propagates to the daemon args (fail-closed).
+	r.opts.requireLSM = true
+	joined = strings.Join(n.hostLeashdArgv("/usr/local/bin/leash", "/run/netns/leash-native-x", "/sys/fs/cgroup/scope"), " ")
+	want = "/usr/local/bin/leash --daemon --host --lsm-only --require-lsm --cgroup /sys/fs/cgroup/scope --proxy-port 18000"
+	if joined != want {
+		t.Fatalf("with --require-lsm argv = %q\nwant   %q", joined, want)
 	}
 }
 
@@ -186,28 +196,34 @@ func TestNativeBoxLifecycle_Integration(t *testing.T) {
 func TestNativeWorkloadScript(t *testing.T) {
 	cg := "/sys/fs/cgroup/system.slice/leash-native-x.service"
 
-	// Unhardened (rootless path): plain placement — no ns/mask/scrub.
-	plain := nativeWorkloadScript(cg, "/wd", "bash", "claude", "", "", hardenOpts{})
+	// Unhardened (rootless path): plain placement — no ns/mask/scrub/harden.
+	plain := nativeWorkloadScript(cg, "/wd", "bash", "claude", "", "", "/opt/leash", hardenOpts{})
 	if !strings.Contains(plain, "cgroup.procs") || !strings.Contains(plain, "exec bash -lc") {
 		t.Fatalf("plain script missing cgroup join / exec: %s", plain)
 	}
-	for _, unexpected := range []string{"unshare", "runuser", "mount -t tmpfs", "NODE_EXTRA_CA_CERTS", "env -u"} {
+	for _, unexpected := range []string{"unshare", "runuser", "mount -t tmpfs", "NODE_EXTRA_CA_CERTS", "env -u", "--harden-exec"} {
 		if strings.Contains(plain, unexpected) {
 			t.Fatalf("plain script must not contain %q: %s", unexpected, plain)
 		}
 	}
 
-	// Hardened default (root): masks + fresh PID+IPC ns + full scrub + CA export.
+	// Hardened default (root): masks + fresh PID+IPC ns + full scrub + CA export +
+	// the seccomp re-exec wrapper (blocks the userns→bind-mount path-LSM bypass).
 	h := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "/share/ca-cert.pem",
-		hardenOpts{enabled: true, uid: "1000"})
+		"/opt/leash", hardenOpts{enabled: true, uid: "1000"})
 	for _, want := range []string{
 		"mount -t tmpfs -o uid=1000,mode=0700 tmpfs /run/user/1000",
 		"/tmp/.X11-unix",
 		"cgroup.procs",
 		"exec unshare --ipc --pid --fork --mount-proc --",
 		"runuser -u alice --",
+		"/opt/leash --harden-exec --",
 		"env -u DBUS_SESSION_BUS_ADDRESS -u DISPLAY -u XAUTHORITY",
-		"export NODE_EXTRA_CA_CERTS=/share/ca-cert.pem; exec claude",
+		// CA trust is exported for every tool family (Node, OpenSSL/curl, python-requests,
+		// git), not just Node — see the MITM-CA-for-non-Node change.
+		"export NODE_EXTRA_CA_CERTS=/share/ca-cert.pem SSL_CERT_FILE=/share/ca-cert.pem " +
+			"CURL_CA_BUNDLE=/share/ca-cert.pem REQUESTS_CA_BUNDLE=/share/ca-cert.pem " +
+			"GIT_SSL_CAINFO=/share/ca-cert.pem; exec claude",
 	} {
 		if !strings.Contains(h, want) {
 			t.Fatalf("hardened script missing %q: %s", want, h)
@@ -216,11 +232,25 @@ func TestNativeWorkloadScript(t *testing.T) {
 	if strings.Index(h, "cgroup.procs") > strings.Index(h, "unshare") {
 		t.Fatalf("cgroup write must come before the unshare: %s", h)
 	}
+	// The seccomp filter must be applied AFTER leash's own unshare/mount (so leash's
+	// setup succeeds) but is inherited by the agent: harden-exec sits inside runuser,
+	// which sits inside unshare.
+	if !(strings.Index(h, "unshare") < strings.Index(h, "runuser") &&
+		strings.Index(h, "runuser") < strings.Index(h, "--harden-exec")) {
+		t.Fatalf("harden-exec must nest inside runuser inside unshare: %s", h)
+	}
+
+	// Hardened but no self path (os.Executable failed): degrade gracefully — the
+	// session isolation still applies, but no seccomp re-exec.
+	noSelf := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "", "", hardenOpts{enabled: true, uid: "1000"})
+	if strings.Contains(noSelf, "--harden-exec") {
+		t.Fatalf("no-self script must not contain harden-exec: %s", noSelf)
+	}
 
 	// GUI opt-outs: --allow-display + --share-ipc → no X11 mask, DISPLAY kept, no
 	// IPC ns; but D-Bus stays masked/scrubbed (not opted out).
 	gui := nativeWorkloadScript(cg, "/wd", "bash", "app", "alice", "",
-		hardenOpts{enabled: true, uid: "1000", allowDisplay: true, shareIPC: true})
+		"/opt/leash", hardenOpts{enabled: true, uid: "1000", allowDisplay: true, shareIPC: true})
 	for _, unexpected := range []string{"/tmp/.X11-unix", "--ipc", "-u DISPLAY", "-u XAUTHORITY"} {
 		if strings.Contains(gui, unexpected) {
 			t.Fatalf("GUI script must not contain %q: %s", unexpected, gui)
@@ -234,6 +264,68 @@ func TestNativeWorkloadScript(t *testing.T) {
 		if !strings.Contains(gui, want) {
 			t.Fatalf("GUI script missing %q: %s", want, gui)
 		}
+	}
+
+	// --allow-namespaces opts out of ONLY the seccomp block: no harden-exec, but
+	// the session isolation (PID/IPC ns, masks, runuser) stays on.
+	ns := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "",
+		"/opt/leash", hardenOpts{enabled: true, uid: "1000", allowNamespaces: true})
+	if strings.Contains(ns, "--harden-exec") {
+		t.Fatalf("allow-namespaces script must not seccomp-harden: %s", ns)
+	}
+	for _, want := range []string{
+		"exec unshare --ipc --pid --fork --mount-proc --", // leash's own isolation still on
+		"runuser -u alice --",
+	} {
+		if !strings.Contains(ns, want) {
+			t.Fatalf("allow-namespaces script missing %q: %s", want, ns)
+		}
+	}
+}
+
+func TestNativeLeashdDied(t *testing.T) {
+	r := &runner{}
+	n := nativeLauncher{r: r}
+	if n.leashdDied() {
+		t.Fatal("nil channel → not died")
+	}
+	ch := make(chan struct{})
+	r.leashdExited = ch
+	if n.leashdDied() {
+		t.Fatal("open channel → not died")
+	}
+	close(ch)
+	if !n.leashdDied() {
+		t.Fatal("closed channel → died")
+	}
+}
+
+// WaitReady must fail closed under --require-lsm when enforcement never confirms,
+// and preserve the historical warn-and-proceed otherwise. Uses the leashd-died
+// fast path so the test doesn't sit through the full readiness timeout.
+func TestNativeWaitReadyFailClosed(t *testing.T) {
+	exited := make(chan struct{})
+	close(exited) // simulate leashd already gone → WaitReady stops on the first poll
+
+	mk := func(require bool) nativeLauncher {
+		r := &runner{}
+		r.cfg.shareDir = t.TempDir() // present but no enforcement-ready marker
+		r.opts.requireLSM = require
+		r.leashdExited = exited
+		r.logger = log.New(io.Discard, "", 0)
+		return nativeLauncher{r: r}
+	}
+
+	err := mk(true).WaitReady(context.Background())
+	if err == nil {
+		t.Fatal("WaitReady must error under --require-lsm when leashd died before ready")
+	}
+	if !strings.Contains(err.Error(), "--require-lsm") {
+		t.Fatalf("error should name --require-lsm: %v", err)
+	}
+
+	if err := mk(false).WaitReady(context.Background()); err != nil {
+		t.Fatalf("WaitReady should warn-and-proceed (nil) without --require-lsm: %v", err)
 	}
 }
 

@@ -81,7 +81,7 @@ lsm-generate: ## Generate LSM eBPF artifacts on the host system
 .PHONY: lsm-generate-docker
 lsm-generate-docker: ## Generate LSM artifacts inside the Docker toolchain
 	@echo "running lsm-generate inside $(LSM_DOCKER_IMAGE)..."
-	@$(DOCKER) run --rm --platform=linux/amd64 \
+	@$(DOCKER) run --rm --platform=linux/amd64 --user 0 \
 	  -e CGO_ENABLED=1 -e GOWORK=off \
 	  -v "$(CURDIR)":/workspace \
 	  -w /workspace \
