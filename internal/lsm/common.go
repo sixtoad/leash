@@ -40,6 +40,16 @@ func notifyEnforcementSettled() {
 // slower file-open one, which would otherwise release the workload early).
 var onLSMAttached func()
 
+// requireLSM, when true, makes a failed LSM attach fatal (fail-closed) rather
+// than degrading to proxy-only. Set once at startup from the --require-lsm flag,
+// before any attach. The default (false) preserves the historical behavior:
+// degrade silently so a kernel without an active bpf LSM still runs the proxy.
+var requireLSM bool
+
+// SetRequireLSM selects fail-closed (true) vs degrade-to-proxy (false) behavior
+// for LSM attach failures. Call once at startup before enforcement begins.
+func SetRequireLSM(v bool) { requireLSM = v }
+
 func notifyLSMAttached() {
 	if h := onLSMAttached; h != nil {
 		h()
@@ -464,7 +474,7 @@ func LoadAndAttachBPFWithSetup(
 	loader func() (*ebpf.CollectionSpec, error),
 	config BPFConfig,
 	customSetup func(*ebpf.Collection) error,
-) error {
+) (retErr error) {
 	// Report this attach attempt as settled exactly once (see onLSMAttached): on
 	// success right after the programs attach — BEFORE the blocking event loop
 	// below — and on any early return (failure) via this defer. Firing it via a
@@ -472,10 +482,20 @@ func LoadAndAttachBPFWithSetup(
 	// shutdown, so the settle would only fire then, hanging a readiness barrier.
 	settled := false
 	settle := func() {
-		if !settled {
-			settled = true
-			notifyLSMAttached()
+		if settled {
+			return
 		}
+		settled = true
+		// Fail-closed: if this attach failed and the operator passed
+		// --require-lsm, exit BEFORE notifying the settle watcher — otherwise the
+		// host launcher would be released to run the workload with file/exec/
+		// connect enforcement silently degraded to proxy-only. Exiting here (not
+		// after notify) closes the release race.
+		if retErr != nil && requireLSM {
+			fmt.Fprintf(os.Stderr, "FATAL: --require-lsm set but LSM enforcement is unavailable; refusing to run unenforced: %v\n", retErr)
+			os.Exit(1)
+		}
+		notifyLSMAttached()
 	}
 	defer settle()
 
@@ -511,11 +531,27 @@ func LoadAndAttachBPFWithSetup(
 		return fmt.Errorf("failed to add descendant cgroups: %w", err)
 	}
 
-	// Set a non-zero value in target_cgroup to enable monitoring
-	key := uint32(0)
-	enable := uint64(1)
-	if err := coll.Maps[config.TargetCgroupMap].Put(&key, &enable); err != nil {
+	// Enable monitoring and describe the box cgroup for the hierarchy check:
+	// target_cgroup[0] = box cgroup id (nonzero = monitoring on), [1] = box depth
+	// from the cgroup root. With the real id in [0], is_target_cgroup can match
+	// descendant cgroups created AFTER the snapshot above (nested/delegated
+	// sub-cgroups can't escape). If the id can't be read, fall back to the legacy
+	// enable flag: snapshot-only, and the in-BPF ancestor check safely no-ops.
+	boxPath := module.getCgroupPath()
+	idVal := uint64(1)
+	levelVal := uint64(0)
+	if id, err := getCgroupID(boxPath); err == nil && id != 0 {
+		idVal = id
+		levelVal = uint64(cgroupLevel(boxPath))
+	}
+	tcMap := coll.Maps[config.TargetCgroupMap]
+	k0, k1 := uint32(0), uint32(1)
+	if err := tcMap.Put(&k0, &idVal); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to enable monitoring: %v\n", err)
+		os.Exit(1)
+	}
+	if err := tcMap.Put(&k1, &levelVal); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to set box cgroup level: %v\n", err)
 		os.Exit(1)
 	}
 

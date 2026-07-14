@@ -138,6 +138,13 @@ func (c containerLauncher) PullImages(ctx context.Context) error {
 }
 
 func (c containerLauncher) Provision(ctx context.Context, stopSignal string) (string, error) {
+	// Spawn the --inject-service plugins exactly once, before the launch retry loop
+	// (a port-conflict retry re-runs launchTargetContainer, which must not respawn
+	// them). Fail-closed: abort the run if any plugin can't start. The resulting
+	// r.injectedDockerArgs are appended to each target-container launch.
+	if err := c.r.spawnInjectServicesContainer(ctx); err != nil {
+		return "", err
+	}
 	for {
 		err := c.r.launchTargetContainer(ctx, stopSignal)
 		if err == nil {
@@ -170,6 +177,9 @@ func (c containerLauncher) WaitReady(ctx context.Context) error {
 }
 
 func (c containerLauncher) Remove(ctx context.Context) {
+	// Stop any injected plugins and remove their sockets/config files before the
+	// containers (mirrors native teardown).
+	c.r.teardownInjectedPlugins()
 	c.r.removeContainer(ctx, c.r.cfg.leashContainer)
 	c.r.removeContainer(ctx, c.r.cfg.targetContainer)
 }

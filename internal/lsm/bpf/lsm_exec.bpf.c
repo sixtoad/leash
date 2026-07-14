@@ -74,9 +74,10 @@ struct {
 } exec_events SEC(".maps");
 
 // Map to store the target cgroup ID for filtering (root of subtree to monitor)
+// [0] = box cgroup id (0 = monitoring off), [1] = box depth from the cgroup root.
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
+    __uint(max_entries, 2);
     __type(key, u32);
     __type(value, u64);
 } exec_target_cgroup SEC(".maps");
@@ -131,7 +132,16 @@ static __always_inline bool is_exec_target_cgroup()
     if (allowed && *allowed == 1) {
         return true;
     }
-    
+
+    // Hierarchy check: cover sub-cgroups created after the attach-time snapshot
+    // (see lsm_open.bpf.c). [1] = box depth; ancestor at that depth == box id
+    // ([0]) iff current is under the box.
+    u32 level_key = 1;
+    u64 *box_level = bpf_map_lookup_elem(&exec_target_cgroup, &level_key);
+    if (box_level && bpf_get_current_ancestor_cgroup_id((int)*box_level) == *target_cgroup_id) {
+        return true;
+    }
+
     return false;
 }
 
