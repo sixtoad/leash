@@ -852,8 +852,10 @@ func (n nativeLauncher) setupEgress(ctx context.Context) error {
 		{"sysctl", "-q", "-w", "net.ipv4.ip_forward=1"},
 	}
 	// NAT + the default-deny egress firewall (see egressNATRules).
+	// -w: wait for the xtables lock rather than failing if a concurrent native
+	// run (or another service) is touching netfilter at the same moment.
 	for _, r := range egressNATRules(e) {
-		steps = append(steps, append([]string{"iptables"}, r...))
+		steps = append(steps, append([]string{"iptables", "-w"}, r...))
 	}
 	for _, s := range steps {
 		if out, err := hostOutput(ctx, s[0], s[1:]...); err != nil {
@@ -874,10 +876,10 @@ func (n nativeLauncher) setupEgress(ctx context.Context) error {
 // partial setup still cleans up). Deleting vethHost removes its netns peer.
 func (n nativeLauncher) teardownEgress(ctx context.Context) {
 	e := n.egress()
-	// Delete each rule setupEgress added (-A → -D), best-effort.
+	// Delete each rule setupEgress added (-A → -D), best-effort; -w waits for the
+	// xtables lock like setup does.
 	for _, r := range egressNATRules(e) {
-		del := make([]string, len(r))
-		copy(del, r)
+		del := append([]string{"-w"}, r...)
 		for i, a := range del {
 			if a == "-A" {
 				del[i] = "-D"
