@@ -359,3 +359,39 @@ func TestNativeLayer2Wrap(t *testing.T) {
 		t.Fatalf("expected `sh -c <script>` tail, got %v", argv[len(argv)-3:])
 	}
 }
+
+// egress must be DEFAULT-DENY: only DNS-to-resolvers and the proxy's :80/:443 out,
+// everything else (SSH :22, arbitrary TCP, non-resolver DNS) dropped. Regression
+// guard for the exfil hole where FORWARD blanket-ACCEPTed the box's egress.
+func TestEgressNATRulesDefaultDeny(t *testing.T) {
+	t.Parallel()
+
+	e := egressNet{ns: "box", vethHost: "lhabc", subnet: "10.123.4", prefix: 30}
+	var lines []string
+	for _, r := range egressNATRules(e) {
+		lines = append(lines, strings.Join(r, " "))
+	}
+	joined := strings.Join(lines, "\n")
+
+	if strings.Contains(joined, "-A FORWARD -i lhabc -j ACCEPT") {
+		t.Fatalf("blanket egress ACCEPT must be gone (that was the exfil hole):\n%s", joined)
+	}
+	if lines[len(lines)-1] != "-A FORWARD -i lhabc -j DROP" {
+		t.Fatalf("the default-deny DROP must be the LAST forward rule:\n%s", joined)
+	}
+	for _, want := range []string{
+		"-t nat -A POSTROUTING -s 10.123.4.0/30 -j MASQUERADE",
+		"-A FORWARD -i lhabc -p tcp --dport 80 -j ACCEPT",
+		"-A FORWARD -i lhabc -p tcp --dport 443 -j ACCEPT",
+		"-A FORWARD -i lhabc -p udp -d 1.1.1.1 --dport 53 -j ACCEPT",
+		"-A FORWARD -i lhabc -p tcp -d 8.8.8.8 --dport 53 -j ACCEPT",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing required rule %q in:\n%s", want, joined)
+		}
+	}
+	// No DNS allowance for a non-resolver.
+	if strings.Contains(joined, "-d 9.9.9.9") {
+		t.Fatalf("DNS must be restricted to the configured resolvers:\n%s", joined)
+	}
+}

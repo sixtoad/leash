@@ -752,11 +752,55 @@ func (n nativeLauncher) addNetns(ctx context.Context) error {
 	return nil
 }
 
+// nativeEgressResolvers are the only DNS servers the workload netns may reach on
+// :53 — both advertised via resolv.conf AND the sole :53 destinations the egress
+// firewall permits (so the box can't query an arbitrary DNS server).
+var nativeEgressResolvers = []string{"1.1.1.1", "8.8.8.8"}
+
 // nativeEgressResolvConf is the resolv.conf bind-mounted into the workload's
 // mount ns. Pop!_OS points /etc/resolv.conf at systemd-resolved's 127.0.0.53
 // stub, which is meaningless inside the netns; use public resolvers reachable
 // via the NAT. (TODO: optionally forward the host's real upstream for split-horizon/LAN DNS.)
-const nativeEgressResolvConf = "nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
+var nativeEgressResolvConf = func() string {
+	var b strings.Builder
+	for _, r := range nativeEgressResolvers {
+		b.WriteString("nameserver " + r + "\n")
+	}
+	return b.String()
+}()
+
+// egressNATRules returns the host netfilter rules (iptables args, sans the leading
+// "iptables") that govern the box's egress. The FORWARD policy is DEFAULT-DENY:
+// only DNS to the configured resolvers and the proxy's HTTP/S egress (:80/:443)
+// are permitted; everything else out of the box is dropped. The workload's own
+// :80/:443 are REDIRECTed to the in-netns MITM proxy before they reach FORWARD,
+// so this cannot be used to bypass SNI filtering — it closes the non-proxied
+// channels (SSH :22, arbitrary TCP, DNS to non-resolvers) a workload could
+// otherwise tunnel out on. Order matters: ACCEPTs precede the trailing DROP.
+func egressNATRules(e egressNet) [][]string {
+	v := e.vethHost
+	src := e.subnet + ".0/" + strconv.Itoa(e.prefix)
+	rules := [][]string{
+		{"-t", "nat", "-A", "POSTROUTING", "-s", src, "-j", "MASQUERADE"},
+		// Return path for anything we allowed out.
+		{"-A", "FORWARD", "-o", v, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"},
+	}
+	for _, dns := range nativeEgressResolvers {
+		rules = append(rules,
+			[]string{"-A", "FORWARD", "-i", v, "-p", "udp", "-d", dns, "--dport", "53", "-j", "ACCEPT"},
+			[]string{"-A", "FORWARD", "-i", v, "-p", "tcp", "-d", dns, "--dport", "53", "-j", "ACCEPT"},
+		)
+	}
+	rules = append(rules,
+		// The in-netns proxy's own upstream HTTP/S (the workload's 80/443 are
+		// REDIRECTed to it before FORWARD, so these only carry proxied traffic).
+		[]string{"-A", "FORWARD", "-i", v, "-p", "tcp", "--dport", "80", "-j", "ACCEPT"},
+		[]string{"-A", "FORWARD", "-i", v, "-p", "tcp", "--dport", "443", "-j", "ACCEPT"},
+		// Default-deny: drop every other egress from the box.
+		[]string{"-A", "FORWARD", "-i", v, "-j", "DROP"},
+	)
+	return rules
+}
 
 // egressNet holds the per-box network parameters, derived deterministically from
 // the netns name so a fresh launcher value agrees with a prior Provision and
@@ -806,9 +850,10 @@ func (n nativeLauncher) setupEgress(ctx context.Context) error {
 		{"ip", "-n", e.ns, "link", "set", e.vethNS, "up"},
 		{"ip", "-n", e.ns, "route", "add", "default", "via", e.hostIP},
 		{"sysctl", "-q", "-w", "net.ipv4.ip_forward=1"},
-		{"iptables", "-t", "nat", "-A", "POSTROUTING", "-s", cidr(e.subnet + ".0"), "-j", "MASQUERADE"},
-		{"iptables", "-A", "FORWARD", "-i", e.vethHost, "-j", "ACCEPT"},
-		{"iptables", "-A", "FORWARD", "-o", e.vethHost, "-j", "ACCEPT"},
+	}
+	// NAT + the default-deny egress firewall (see egressNATRules).
+	for _, r := range egressNATRules(e) {
+		steps = append(steps, append([]string{"iptables"}, r...))
 	}
 	for _, s := range steps {
 		if out, err := hostOutput(ctx, s[0], s[1:]...); err != nil {
@@ -829,10 +874,17 @@ func (n nativeLauncher) setupEgress(ctx context.Context) error {
 // partial setup still cleans up). Deleting vethHost removes its netns peer.
 func (n nativeLauncher) teardownEgress(ctx context.Context) {
 	e := n.egress()
-	cidr := e.subnet + ".0/" + strconv.Itoa(e.prefix)
-	_, _ = hostOutput(ctx, "iptables", "-t", "nat", "-D", "POSTROUTING", "-s", cidr, "-j", "MASQUERADE")
-	_, _ = hostOutput(ctx, "iptables", "-D", "FORWARD", "-i", e.vethHost, "-j", "ACCEPT")
-	_, _ = hostOutput(ctx, "iptables", "-D", "FORWARD", "-o", e.vethHost, "-j", "ACCEPT")
+	// Delete each rule setupEgress added (-A → -D), best-effort.
+	for _, r := range egressNATRules(e) {
+		del := make([]string, len(r))
+		copy(del, r)
+		for i, a := range del {
+			if a == "-A" {
+				del[i] = "-D"
+			}
+		}
+		_, _ = hostOutput(ctx, "iptables", del...)
+	}
 	_, _ = hostOutput(ctx, "ip", "link", "del", e.vethHost)
 	_ = os.RemoveAll(filepath.Join("/etc/netns", e.ns))
 }
