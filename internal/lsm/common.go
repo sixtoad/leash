@@ -443,12 +443,13 @@ func validateEventArrays(arrays ...[]byte) bool {
 
 // BPFConfig holds configuration for BPF program attachment
 type BPFConfig struct {
-	ProgramNames      []string // Names of BPF programs to attach
-	EventMapName      string   // Name of the event ring buffer map
-	AllowedCgroupsMap string   // Name of the allowed cgroups map
-	TargetCgroupMap   string   // Name of the target cgroup map
-	StartMessage      string   // Success message to display
-	ShutdownMessage   string   // Shutdown message to display
+	ProgramNames         []string // Programs to attach; a failure fails enforcement (caller decides degrade vs --require-lsm)
+	OptionalProgramNames []string // Best-effort programs: a failure degrades only that hook, not the whole enforcement
+	EventMapName         string   // Name of the event ring buffer map
+	AllowedCgroupsMap    string   // Name of the allowed cgroups map
+	TargetCgroupMap      string   // Name of the target cgroup map
+	StartMessage         string   // Success message to display
+	ShutdownMessage      string   // Shutdown message to display
 }
 
 // LSMModule interface for modules that can load BPF programs
@@ -574,6 +575,23 @@ func LoadAndAttachBPFWithSetup(
 			// already attached. The most common cause is the kernel not having
 			// "bpf" as an active LSM (see the client-side preflight).
 			return fmt.Errorf("attach %s LSM program (kernel may lack an active bpf LSM): %w", programName, err)
+		}
+		links = append(links, lsmLink)
+	}
+
+	// Optional hooks attach best-effort: a failure (e.g. the kernel lacks
+	// CONFIG_SECURITY_PATH, or the program is incompatible) degrades only that
+	// hook, NOT the whole enforcement — so an added/experimental hook can never
+	// take the sandbox down to proxy-only.
+	for _, programName := range config.OptionalProgramNames {
+		prog := coll.Programs[programName]
+		if prog == nil {
+			continue
+		}
+		lsmLink, err := link.AttachLSM(link.LSMOptions{Program: prog})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "leash: optional LSM hook %q not attached (%v); continuing without it\n", programName, err)
+			continue
 		}
 		links = append(links, lsmLink)
 	}

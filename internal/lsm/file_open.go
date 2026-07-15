@@ -134,12 +134,16 @@ func (l *OpenLsm) LoadPolicies(policies []OpenPolicyRule) error {
 
 func (l *OpenLsm) LoadAndAttach(loader func() (*ebpf.CollectionSpec, error)) error {
 	config := BPFConfig{
-		ProgramNames:      []string{"lsm_open"},
-		EventMapName:      "events",
-		AllowedCgroupsMap: "allowed_cgroups",
-		TargetCgroupMap:   "target_cgroup",
-		StartMessage:      "Successfully started monitoring file opens",
-		ShutdownMessage:   "Shutting down open LSM tracker",
+		ProgramNames: []string{"lsm_open"},
+		// lsm_link (hard-link guard, audit #3) is best-effort: it needs
+		// CONFIG_SECURITY_PATH and rides the same policy maps, but must never
+		// degrade file-open enforcement if it can't attach on some kernel.
+		OptionalProgramNames: []string{"lsm_link"},
+		EventMapName:         "events",
+		AllowedCgroupsMap:    "allowed_cgroups",
+		TargetCgroupMap:      "target_cgroup",
+		StartMessage:         "Successfully started monitoring file opens",
+		ShutdownMessage:      "Shutting down open LSM tracker",
 	}
 	return LoadAndAttachBPF(l, loader, config)
 }

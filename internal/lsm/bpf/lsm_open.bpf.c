@@ -373,3 +373,37 @@ int BPF_PROG(lsm_open, struct file *file)
     // Return policy decision: 0 = allow, negative = deny
     return policy_result ? 0 : -13; // -EACCES = 13
 }
+
+// --- hard-link guard (audit finding #3) -------------------------------------
+// A path-based sandbox is bypassable by hard-linking a forbidden file into an
+// allowed dir and reading it via the allowed path (bpf_d_path returns the link's
+// path; symlink resolution doesn't apply to hard links). Deny creating a hard
+// link whose SOURCE wouldn't be readable by policy — so you can't alias a file
+// you couldn't open directly. Hard links are same-mount, so the source path is
+// (new link's mount + old dentry). Uses path_link for the mount (needs
+// CONFIG_SECURITY_PATH; present when a path-based LSM like AppArmor is active).
+SEC("lsm/path_link")
+int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, struct dentry *new_dentry)
+{
+    if (!is_target_cgroup()) {
+        return 0;
+    }
+
+    struct path src = {};
+    src.mnt = BPF_CORE_READ(new_dir, mnt);
+    src.dentry = old_dentry;
+
+    char path[MAX_PATH_LEN];
+    long ret = bpf_d_path(&src, path, sizeof(path));
+    if (ret < 0) {
+        // Source path unresolved — fail OPEN (don't break legitimate links); the
+        // file-open hook still guards the eventual read by its real path.
+        return 0;
+    }
+
+    // Deny the link if reading the source by its real path would be denied.
+    if (check_path_policy(path, OP_OPEN) != 1) {
+        return -1; // -EPERM: refuse to hard-link a file the box can't read
+    }
+    return 0;
+}
