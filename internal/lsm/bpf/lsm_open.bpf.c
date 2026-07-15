@@ -266,18 +266,20 @@ static __always_inline int check_path_policy(const char *path, u32 file_op_type)
         __u32 len = rule->path_len;
         if (len == 0 || len > 64) continue;
 
-        // Descendant match: the path starts with the rule (a dir rule ends in '/').
-        bool matches = simple_string_starts_with(path, rule->path, len);
-        // A directory rule must ALSO cover the directory itself, whose runtime path
-        // has no trailing slash (rule "/a/b/" must match "/a/b"). Match the chars
-        // before the slash and require the path to END there, so a sibling like
-        // "/a/bc" does not match. Without this, a dir's own path falls through to a
-        // broader parent rule — an allowed dir isn't listable, and a forbidden dir's
-        // entries can be enumerated.
-        if (!matches && rule->is_directory && len >= 1 &&
-            simple_string_starts_with(path, rule->path, len - 1) &&
-            path[len - 1] == '\0') {
-            matches = true;
+        // One prefix pass to len-1, then classify the final char (one hot-path pass
+        // instead of two). Exact match (path[len-1] == rule[len-1]) covers
+        // descendants and file rules; for a directory rule, the directory ITSELF
+        // also matches — its runtime path has no trailing slash, so it ends where
+        // the rule's '/' is (path[len-1] == '\0'). That dir-itself case is why a
+        // forbidden dir's entries could otherwise be enumerated and an allowed dir
+        // wasn't listable.
+        bool matches = false;
+        if (simple_string_starts_with(path, rule->path, len - 1)) {
+            if (path[len - 1] == rule->path[len - 1]) {
+                matches = true;
+            } else if (rule->is_directory && path[len - 1] == '\0') {
+                matches = true;
+            }
         }
         if (matches) {
             // Check if operation types match
