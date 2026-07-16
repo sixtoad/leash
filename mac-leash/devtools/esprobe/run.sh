@@ -6,7 +6,12 @@ set -eu
 cd "$(dirname "$0")"
 
 echo "== compiling =="
-clang -o esprobe esprobe.c -framework EndpointSecurity
+# Full Xcode ships EndpointSecurity as a .framework; Command Line Tools ship it
+# as a plain library (headers in usr/include, stub in usr/lib). Try both so the
+# probe builds under either toolchain without needing full Xcode / an Apple ID.
+if ! clang -o esprobe esprobe.c -framework EndpointSecurity 2>/dev/null; then
+    clang -o esprobe esprobe.c -lEndpointSecurity
+fi
 
 echo "== ad-hoc signing with ES entitlement =="
 codesign --force --sign - --entitlements es.entitlements esprobe
