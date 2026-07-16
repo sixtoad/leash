@@ -80,12 +80,23 @@ hardcoded `W5HSYBBJGA` in `Shared/LeashIdentifiers.swift` is only a last-resort
 default (overridable via `LEASH_TEAM_IDENTIFIER`, or auto-derived from the app's
 `AppIdentifierPrefix` when signed with a real team). So:
 
-1. Set the Xcode targets to **manual signing → "Sign to Run Locally"** (ad-hoc) and
-   **keep the existing `com.strongdm.leash.*` bundle identifiers** (this avoids
-   needing the IDs registered to your team). Do not switch to automatic signing —
-   that forces a team + a bundle-ID change.
-2. Build. Xcode embeds each target's `.entitlements`; the relaxed VM honors them
-   (proven by the esprobe result of 0).
+1. The targets are already configured for this: **manual signing**, `CODE_SIGN_IDENTITY
+   = "-"` (ad-hoc / "Sign to Run Locally"), empty `DEVELOPMENT_TEAM` /
+   `PROVISIONING_PROFILE_SPECIFIER`, and the existing `com.strongdm.leash.*` bundle
+   identifiers are kept (avoids needing the IDs registered to your team). Do not
+   switch to automatic signing — that forces a team + a bundle-ID change.
+2. Build the `Leash` scheme in **Debug**. Note that Xcode will *not* ad-hoc sign the
+   restricted ES / NetworkExtension entitlements inline — with a real identity it
+   demands a provisioning profile ("`LeashES requires a provisioning profile`"). The
+   project works around this **only in Debug**: `CODE_SIGNING_ALLOWED = NO` lets the
+   build finish unsigned, then an **"Ad-hoc Sign (local, no account)"** run-script
+   phase invokes `mac-leash/adhoc-sign.sh` to re-sign the app and nested extensions
+   bottom-up **with** their entitlements. (`ENABLE_USER_SCRIPT_SANDBOXING = NO` in
+   Debug lets that script run.) The result is a one-shot Debug build that produces a
+   fully ad-hoc-signed `Leash.app`; the relaxed VM then honors the entitlements
+   (proven by the esprobe result of `0`). You can also run `adhoc-sign.sh` standalone
+   against an already-built `.app`. The **Release** config is untouched and still
+   expects real signing for when a team/provisioning is available again.
 3. Enable developer mode so ad-hoc sysexts load without notarization / matching team:
    ```
    systemextensionsctl developer on
