@@ -763,8 +763,54 @@ extension FilterDataProvider {
     }
 
     func isIPInRange(_ ip: String, cidr: String) -> Bool {
-        // TODO: Implement proper CIDR matching
+        // cidr is "network/prefix", e.g. "192.168.1.0/24" or "2001:db8::/32".
+        let parts = cidr.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2, let prefixLen = Int(parts[1]), prefixLen >= 0 else {
+            return false
+        }
+        let network = String(parts[0])
+
+        // The address and the network must be the same family. Try IPv4, then IPv6.
+        if let ipBytes = inetBytes(ip, family: AF_INET, length: 4),
+           let netBytes = inetBytes(network, family: AF_INET, length: 4) {
+            guard prefixLen <= 32 else { return false }
+            return prefixMatches(ipBytes, netBytes, bits: prefixLen)
+        }
+        if let ipBytes = inetBytes(ip, family: AF_INET6, length: 16),
+           let netBytes = inetBytes(network, family: AF_INET6, length: 16) {
+            guard prefixLen <= 128 else { return false }
+            return prefixMatches(ipBytes, netBytes, bits: prefixLen)
+        }
         return false
+    }
+
+    /// Parse a numeric IP string into its raw bytes for the given address family
+    /// (4 bytes for AF_INET, 16 for AF_INET6). Returns nil if it doesn't parse.
+    private func inetBytes(_ s: String, family: Int32, length: Int) -> [UInt8]? {
+        var buffer = [UInt8](repeating: 0, count: length)
+        let ok = s.withCString { cstr in
+            buffer.withUnsafeMutableBytes { raw in
+                inet_pton(family, cstr, raw.baseAddress)
+            }
+        }
+        return ok == 1 ? buffer : nil
+    }
+
+    /// True if the first `bits` bits of `a` and `b` are equal.
+    private func prefixMatches(_ a: [UInt8], _ b: [UInt8], bits: Int) -> Bool {
+        guard a.count == b.count, bits <= a.count * 8 else { return false }
+        let fullBytes = bits / 8
+        let remainderBits = bits % 8
+        for i in 0..<fullBytes where a[i] != b[i] {
+            return false
+        }
+        if remainderBits > 0 {
+            let mask = UInt8(truncatingIfNeeded: 0xFF << (8 - remainderBits))
+            if (a[fullBytes] & mask) != (b[fullBytes] & mask) {
+                return false
+            }
+        }
+        return true
     }
 
     func describeSocketProtocol(_ number: Int32) -> String {
