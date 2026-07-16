@@ -55,12 +55,23 @@ fallback"* and it runs **UNENFORCED** by default.
 
 - [x] **CIDR matching** — `isIPInRange` was a stub returning `false`; now real IPv4/IPv6
       prefix matching (`FilterDataProvider+RuleEvaluation.swift`).
-- [ ] **Fail-closed default** — flip default-allow → default-deny in both extensions,
-      gated on daemon-reachable + policy-present so a dead daemon doesn't brick the
-      host. Make the `preflightDarwinEnforcement` hard-stop the default (invert the
-      `LEASH_REQUIRE_ENFORCEMENT` opt-in). Files: `LeashMonitor+Handlers.swift`
-      (`checkPolicyOrAllowDefault`), `FilterDataProvider+FlowHandling.swift`
-      (`evaluateFlow` / `handleNewFlow` fallbacks), `preflight_extensions_darwin.go`.
+- [x] **Fail-closed default (LeashES, exec/file)** — `checkPolicyOrAllowDefault` now
+      default-denies on a rule-miss when connected + a policy snapshot is loaded
+      (`policyLoaded` flag guards the connect→first-snapshot window); degrades to
+      allow + log when daemon/policy unavailable. `LeashMonitor+Handlers.swift`,
+      `LeashCommunicationService(+Handlers).swift`.
+- [ ] **Fail-closed default (LeashNetworkFilter)** — `evaluateFlow` still returns
+      `.allow` on no-match (`FilterDataProvider+RuleEvaluation.swift:321`). DESIGN
+      NEEDED before flipping: it's also called for DNS-query flows (domain rules are
+      skipped for DNS), so a naive default-deny drops name resolution for tracked
+      workloads unless the resolver IP is explicitly allowed. Confirm how the
+      permissive default policy (`Host::"*"`) maps to a mac `NetworkRule`, and whether
+      DNS/L4-to-resolver is exempted, before enforcing default-deny here.
+- [ ] **Require-enforcement hard-fail into the extension** — the "if required, fail"
+      half. Env doesn't reach the system extension; plumb `LEASH_REQUIRE_ENFORCEMENT`
+      via app-group config or a daemon message so daemon-unreachable can fail closed
+      when required. `preflight_extensions_darwin.go` already handles the launch-time
+      gate.
 - [ ] **Interactive decisions** — decide sync vs async. Either make ES block-and-wait
       on a `LeashPolicyDecision` from the daemon, or formally accept async allow +
       retro-kill. Files: `LeashMonitor+Handlers.swift`, `LeashCommunicationService+Handlers.swift`.
