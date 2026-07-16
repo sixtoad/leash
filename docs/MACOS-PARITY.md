@@ -60,13 +60,30 @@ fallback"* and it runs **UNENFORCED** by default.
       (`policyLoaded` flag guards the connect→first-snapshot window); degrades to
       allow + log when daemon/policy unavailable. `LeashMonitor+Handlers.swift`,
       `LeashCommunicationService(+Handlers).swift`.
-- [ ] **Fail-closed default (LeashNetworkFilter)** — `evaluateFlow` still returns
-      `.allow` on no-match (`FilterDataProvider+RuleEvaluation.swift:321`). DESIGN
-      NEEDED before flipping: it's also called for DNS-query flows (domain rules are
-      skipped for DNS), so a naive default-deny drops name resolution for tracked
-      workloads unless the resolver IP is explicitly allowed. Confirm how the
-      permissive default policy (`Host::"*"`) maps to a mac `NetworkRule`, and whether
-      DNS/L4-to-resolver is exempted, before enforcing default-deny here.
+- [ ] **Fail-closed default (LeashNetworkFilter)** — `evaluateFlow` returns `.allow`
+      on no-match (`FilterDataProvider+RuleEvaluation.swift:321`). **Verified blocker:**
+      `Host::"*"` transpiles to `ConnectDefaultAllow=true` and emits *no* concrete
+      connect rule (`cedar_to_leash.go:125-146`), and `ConvertPolicyToMacRules`
+      (`macsync/translator.go`) never propagates that default — so the permissive
+      default policy yields an **empty** mac network rule set. A naive default-deny
+      would therefore brick fresh setups (every tracked flow denied). Implementation
+      required (cross-language, ~7 sites), all mapped:
+      1. `macsync/manager.go`: add `networkDefaultAllow bool` (init true) +
+         `SetNetworkDefaultAllow` / `GetNetworkDefaultAllow` (avoid changing
+         `UpdateNetworkRules` signature so no call-site/test churn).
+      2. `runtime_darwin.go`: at the policy push (~1317) call
+         `SetNetworkDefaultAllow(policies.ConnectDefaultAllow)`; include
+         `network_default_allow` in the query response (~926) and
+         `broadcastNetworkRuleUpdate` (~1114) payload maps.
+      3. Swift `FilterDataProvider+State.swift`: parse `network_default_allow`
+         (default **true** if absent, for backward safety) + a `networkRulesLoaded`
+         flag; store both under `syncQueue`.
+      4. Swift `evaluateFlow`: on no-match — always `.allow` if `isDNSQuery` (DNS is
+         plumbing, not the enforcement point, mirroring Linux); else `.allow` if
+         `networkDefaultAllow`; else `.deny` only when connected + `networkRulesLoaded`
+         (same gating as LeashES); otherwise `.allow` (degrade).
+      Runtime-verify in the VM: DNS still resolves, permissive policy still allows,
+      tightened policy (remove `Host::"*"`) denies unmatched flows.
 - [ ] **Require-enforcement hard-fail into the extension** — the "if required, fail"
       half. Env doesn't reach the system extension; plumb `LEASH_REQUIRE_ENFORCEMENT`
       via app-group config or a daemon message so daemon-unreachable can fail closed
