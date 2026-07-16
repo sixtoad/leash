@@ -139,6 +139,7 @@ extension LeashCommunicationService {
             self.rulesQueue.async {
                 let count = self.cachedRules.count
                 self.cachedRules.removeAll()
+                self.markPolicyLoadedLocked()
                 os_log("Cleared all %d rules per daemon request", log: self.log, type: .info, count)
             }
         }
@@ -185,6 +186,7 @@ extension LeashCommunicationService {
 
             self.rulesQueue.async {
                 self.cachedRules = newRules.sorted(by: Self.ruleSortComparator)
+                self.markPolicyLoadedLocked()
                 os_log("Updated rule cache with %d rules from snapshot", log: self.log, type: .info, newRules.count)
             }
         }

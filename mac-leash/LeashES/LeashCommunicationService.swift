@@ -13,6 +13,21 @@ final class LeashCommunicationService: NSObject {
     var cachedRules: [LeashPolicyRule] = []
     let rulesQueue = DispatchQueue(label: LeashIdentifiers.namespaced("rules-cache"))
 
+    // True once we've received an authoritative rule snapshot from the daemon.
+    // Until then a rule-miss must not fail closed (we simply don't have policy yet).
+    private var policyLoaded = false
+
+    /// Whether the daemon has delivered a policy snapshot at least once.
+    var hasLoadedPolicy: Bool {
+        rulesQueue.sync { policyLoaded }
+    }
+
+    /// Mark policy as loaded. Precondition: caller is already on `rulesQueue`
+    /// (used from the rule snapshot/clear/load sites, which mutate cachedRules there).
+    func markPolicyLoadedLocked() {
+        policyLoaded = true
+    }
+
     override init() {
         super.init()
 
@@ -162,6 +177,7 @@ final class LeashCommunicationService: NSObject {
             case .success(let rules):
                 self.rulesQueue.async {
                     self.cachedRules = rules.sorted(by: Self.ruleSortComparator)
+                    self.policyLoaded = true
                     os_log("Loaded %d rules from daemon", log: self.log, type: .info, rules.count)
                 }
             case .failure(let error):

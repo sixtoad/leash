@@ -287,6 +287,9 @@ extension LeashMonitor {
 
     func checkPolicyOrAllowDefault(for event: LeashPolicyEvent) -> LeashPolicyDecision {
         guard let commService else {
+            // No comm service: policy can't be consulted. Enforcement is only
+            // meaningful with the daemon, so degrade to allow (logged).
+            os_log("No comm service; allowing %{public}@ unenforced", log: log, type: .error, event.processPath)
             return LeashPolicyDecision(eventID: event.id, action: .allow, scope: .once)
         }
 
@@ -294,6 +297,21 @@ extension LeashMonitor {
             return LeashPolicyDecision(eventID: event.id, action: action, scope: .once)
         }
 
+        // No matching rule. Mirror the Linux default-deny posture: when we hold an
+        // authoritative policy snapshot from a connected daemon, a miss fails closed.
+        // (Blast radius is only leash-tracked processes; the shipped permissive Cedar
+        // policy keeps fresh setups working until the user tightens it.)
+        if commService.daemon.isConnected && commService.hasLoadedPolicy {
+            os_log("No policy match for %{public}@ → DENY (default-deny)", log: log, type: .info, event.processPath)
+            return LeashPolicyDecision(eventID: event.id, action: .deny, scope: .once)
+        }
+
+        // Daemon unreachable / policy not yet loaded: this is the Linux "LSM
+        // unavailable but not --require-lsm" case — degrade to allow and log rather
+        // than brick the tracked workload. (Hard-fail-on-required needs the require
+        // flag plumbed into the extension; see docs/MACOS-PARITY.md P0.)
+        os_log("No policy match and daemon/policy unavailable; allowing %{public}@ unenforced (degrade)",
+               log: log, type: .error, event.processPath)
         return LeashPolicyDecision(eventID: event.id, action: .allow, scope: .once)
     }
 
