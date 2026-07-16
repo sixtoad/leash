@@ -71,23 +71,30 @@ anything).
 
 ## 4. Build / sign / run loop
 
-1. **Patch the Team-ID trust anchor first.** `Shared/LeashIdentifiers.swift` pins
-   team `W5HSYBBJGA`, and the ES extension authorizes `leashcli` by matching
-   `team_id`. Ad-hoc binaries have **no** team ID, so this check fails silently and
-   execs won't be authorized. For dev builds, match on `signing_id`/cdhash instead.
-2. Set the Xcode targets to ad-hoc / manual signing (or your own team).
-3. Build, then ad-hoc sign each target with its entitlements:
-   ```
-   codesign --force --sign - --entitlements <target>.entitlements --options runtime <binary>
-   ```
-4. Enable developer mode so self-signed sysexts load from anywhere:
+**No source patch is needed for ad-hoc signing.** The ES extension's `leashcli`
+trust check (`LeashES/LeashMonitor+Handlers.swift` `isLeashExecutable`) already
+degrades correctly: it trusts the binary at `/Leash.app/Contents/Resources/leashcli`
+by path (no signing check), and when matching by `signing_id` it skips the team
+comparison if the process has no `team_id` — which is exactly the ad-hoc case. The
+hardcoded `W5HSYBBJGA` in `Shared/LeashIdentifiers.swift` is only a last-resort
+default (overridable via `LEASH_TEAM_IDENTIFIER`, or auto-derived from the app's
+`AppIdentifierPrefix` when signed with a real team). So:
+
+1. Set the Xcode targets to **manual signing → "Sign to Run Locally"** (ad-hoc) and
+   **keep the existing `com.strongdm.leash.*` bundle identifiers** (this avoids
+   needing the IDs registered to your team). Do not switch to automatic signing —
+   that forces a team + a bundle-ID change.
+2. Build. Xcode embeds each target's `.entitlements`; the relaxed VM honors them
+   (proven by the esprobe result of 0).
+3. Enable developer mode so ad-hoc sysexts load without notarization / matching team:
    ```
    systemextensionsctl developer on
    ```
-5. Launch `Leash.app`, activate both extensions, approve the NE content filter in
+4. Launch `Leash.app`, activate both extensions, approve the NE content filter in
    System Settings, grant Full Disk Access to LeashES.
-6. Iterate — with developer mode on, changed extensions reload without the full
-   uninstall dance.
+5. Iterate — with developer mode on, changed extensions reload without the full
+   uninstall dance. leashcli launched from the embedded Resources path is trusted
+   by ES on the path rule, so exec authorization works with no team ID.
 
 ## Security note
 
