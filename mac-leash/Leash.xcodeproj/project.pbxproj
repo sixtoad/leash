@@ -104,21 +104,21 @@
 			);
 			target = 3E5917F52E9448FE007328DD /* LeashES */;
 		};
-		419FE7922E98AC4500E4D751 /* Exceptions for "leash" folder in "LeashES" target */ = {
+		419FE7922E98AC4500E4D751 /* Exceptions for "Leash" folder in "LeashES" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				SDMLeash.icon,
 			);
 			target = 3E5917F52E9448FE007328DD /* LeashES */;
 		};
-		419FE7932E98AC4500E4D751 /* Exceptions for "leash" folder in "LeashNetworkFilter" target */ = {
+		419FE7932E98AC4500E4D751 /* Exceptions for "Leash" folder in "LeashNetworkFilter" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				SDMLeash.icon,
 			);
 			target = 41CFD5772E9586F500F22D99 /* LeashNetworkFilter */;
 		};
-		41CFD5412E95820100F22D99 /* Exceptions for "leash" folder in "Leash" target */ = {
+		41CFD5412E95820100F22D99 /* Exceptions for "Leash" folder in "Leash" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
@@ -135,14 +135,14 @@
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		3E5917E42E9448D9007328DD /* leash */ = {
+		3E5917E42E9448D9007328DD /* Leash */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				41CFD5412E95820100F22D99 /* Exceptions for "leash" folder in "Leash" target */,
-				419FE7922E98AC4500E4D751 /* Exceptions for "leash" folder in "LeashES" target */,
-				419FE7932E98AC4500E4D751 /* Exceptions for "leash" folder in "LeashNetworkFilter" target */,
+				41CFD5412E95820100F22D99 /* Exceptions for "Leash" folder in "Leash" target */,
+				419FE7922E98AC4500E4D751 /* Exceptions for "Leash" folder in "LeashES" target */,
+				419FE7932E98AC4500E4D751 /* Exceptions for "Leash" folder in "LeashNetworkFilter" target */,
 			);
-			path = leash;
+			path = Leash;
 			sourceTree = "<group>";
 		};
 		3E5917FA2E9448FE007328DD /* LeashES */ = {
@@ -214,7 +214,7 @@
 			isa = PBXGroup;
 			children = (
 				419FE5042E9833A500E4D751 /* Shared */,
-				3E5917E42E9448D9007328DD /* leash */,
+				3E5917E42E9448D9007328DD /* Leash */,
 				3E5917FA2E9448FE007328DD /* LeashES */,
 				3E59180C2E944B76007328DD /* LeashCLI */,
 				41CFD57B2E9586F500F22D99 /* LeashNetworkFilter */,
@@ -246,6 +246,28 @@
 		};
 /* End PBXGroup section */
 
+/* Begin PBXShellScriptBuildPhase section */
+		AD0C5160AD0C5160AD0C5160 /* Ad-hoc Sign (local, no account) */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Ad-hoc Sign (local, no account)";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "# Ad-hoc re-sign nested extensions with their restricted entitlements.\n# Only runs in the local unsigned flow (Debug sets CODE_SIGNING_ALLOWED=NO).\nif [ \"${CODE_SIGNING_ALLOWED}\" = \"NO\" ]; then\n  \"${SRCROOT}/adhoc-sign.sh\" \"${CODESIGNING_FOLDER_PATH}\"\nelse\n  echo \"note: code signing enabled; skipping ad-hoc sign phase\"\nfi\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
 /* Begin PBXNativeTarget section */
 		3E5917E12E9448D9007328DD /* Leash */ = {
 			isa = PBXNativeTarget;
@@ -257,6 +279,7 @@
 				3E9F6A022F123456007328DD /* Embed CLI */,
 				3E5918062E9448FE007328DD /* Embed System Extensions */,
 				3E5918262E944B88007328DD /* Embed XPC Services */,
+				AD0C5160AD0C5160AD0C5160 /* Ad-hoc Sign (local, no account) */,
 			);
 			buildRules = (
 			);
@@ -266,7 +289,7 @@
 				3E9F6A042F123456007328DD /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
-				3E5917E42E9448D9007328DD /* leash */,
+				3E5917E42E9448D9007328DD /* Leash */,
 				419FE5042E9833A500E4D751 /* Shared */,
 			);
 			name = Leash;
@@ -353,7 +376,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 2600;
-				LastUpgradeCheck = 2600;
+				LastUpgradeCheck = 2660;
 				TargetAttributes = {
 					3E5917E12E9448D9007328DD = {
 						CreatedOnToolsVersion = 26.0;
@@ -502,12 +525,13 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = 6BS49F3GLW;
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu17;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -529,8 +553,10 @@
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				CODE_SIGNING_ALLOWED = NO;
 			};
 			name = Debug;
 		};
@@ -568,6 +594,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = 6BS49F3GLW;
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
@@ -587,6 +614,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 			};
 			name = Release;
@@ -596,11 +624,13 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = SDMLeash;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = leash/leash.entitlements;
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_ENTITLEMENTS = Leash/leash.entitlements;
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGN_IDENTITY = "-";
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 20251027.1;
-				DEVELOPMENT_TEAM = W5HSYBBJGA;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -619,6 +649,7 @@
 				MARKETING_VERSION = 1.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -635,11 +666,13 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = SDMLeash;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
-				CODE_SIGN_ENTITLEMENTS = leash/leash.entitlements;
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_ENTITLEMENTS = Leash/leash.entitlements;
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGN_IDENTITY = "-";
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 20251027.1;
-				DEVELOPMENT_TEAM = W5HSYBBJGA;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -658,6 +691,7 @@
 				MARKETING_VERSION = 1.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -673,9 +707,11 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = LeashES/LeashES.entitlements;
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGN_IDENTITY = "-";
 				CURRENT_PROJECT_VERSION = 20251027.1;
-				DEVELOPMENT_TEAM = W5HSYBBJGA;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -692,6 +728,7 @@
 				MARKETING_VERSION = 1.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.LeashES;
 				PRODUCT_NAME = "$(inherited)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
 				SKIP_INSTALL = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -707,9 +744,11 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = LeashES/LeashES.entitlements;
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGN_IDENTITY = "-";
 				CURRENT_PROJECT_VERSION = 20251027.1;
-				DEVELOPMENT_TEAM = W5HSYBBJGA;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -726,6 +765,7 @@
 				MARKETING_VERSION = 1.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.LeashES;
 				PRODUCT_NAME = "$(inherited)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
 				SKIP_INSTALL = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -741,8 +781,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				AUTOMATION_APPLE_EVENTS = NO;
-				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = W5HSYBBJGA;
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGN_IDENTITY = "-";
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_HARDENED_RUNTIME = NO;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
@@ -757,6 +799,7 @@
 				OTHER_CODE_SIGN_FLAGS = "-i com.strongdm.leash.cli";
 				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.cli;
 				PRODUCT_NAME = leashcli;
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
 				RUNTIME_EXCEPTION_ALLOW_JIT = NO;
 				RUNTIME_EXCEPTION_ALLOW_UNSIGNED_EXECUTABLE_MEMORY = NO;
@@ -775,8 +818,10 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				AUTOMATION_APPLE_EVENTS = NO;
-				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = W5HSYBBJGA;
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGN_IDENTITY = "-";
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_HARDENED_RUNTIME = NO;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
@@ -791,6 +836,7 @@
 				OTHER_CODE_SIGN_FLAGS = "-i com.strongdm.leash.cli";
 				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.cli;
 				PRODUCT_NAME = leashcli;
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
 				RUNTIME_EXCEPTION_ALLOW_JIT = NO;
 				RUNTIME_EXCEPTION_ALLOW_UNSIGNED_EXECUTABLE_MEMORY = NO;
@@ -809,9 +855,11 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = LeashNetworkFilter/LeashNetworkFilter.entitlements;
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGN_IDENTITY = "-";
 				CURRENT_PROJECT_VERSION = 20251027.1;
-				DEVELOPMENT_TEAM = W5HSYBBJGA;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -828,6 +876,7 @@
 				MARKETING_VERSION = 1.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.LeashNetworkFilter;
 				PRODUCT_NAME = "$(inherited)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
 				SKIP_INSTALL = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -843,9 +892,11 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = LeashNetworkFilter/LeashNetworkFilter.entitlements;
-				CODE_SIGN_STYLE = Automatic;
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGN_IDENTITY = "-";
 				CURRENT_PROJECT_VERSION = 20251027.1;
-				DEVELOPMENT_TEAM = W5HSYBBJGA;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -862,6 +913,7 @@
 				MARKETING_VERSION = 1.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.LeashNetworkFilter;
 				PRODUCT_NAME = "$(inherited)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
 				SKIP_INSTALL = YES;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
