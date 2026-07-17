@@ -9,7 +9,19 @@ class FilterDataProvider: NEFilterDataProvider {
     var trackedPIDs: [pid_t: TrackedPIDInfo] = [:]
     var networkRules: [NetworkRule] = []
     let syncQueue = DispatchQueue(label: LeashIdentifiers.namespaced("filter.sync"))
+    let persistenceQueue = DispatchQueue(label: LeashIdentifiers.namespaced("filter.persistence"), qos: .utility)
     let daemon = DaemonSync.shared
+
+    /// On-disk location for the resolved-domain cache. Best-effort — nil if the
+    /// Application Support directory can't be resolved; callers must tolerate that.
+    var resolvedDomainsStoreURL: URL? {
+        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        return base
+            .appendingPathComponent(LeashIdentifiers.bundle, isDirectory: true)
+            .appendingPathComponent("resolved-domains.json")
+    }
     var domainResolutionCache: [String: DomainResolution] = [:]
     var pendingInspections: [ObjectIdentifier: PendingInspectionState] = [:]
     var pendingDNSInspections: [ObjectIdentifier: DNSInspectionState] = [:]
@@ -88,6 +100,7 @@ class FilterDataProvider: NEFilterDataProvider {
         }
 
         reloadNetworkRules()
+        reloadResolvedDomains()
 
         completionHandler(nil)
     }

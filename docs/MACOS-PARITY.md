@@ -38,7 +38,7 @@ fallback"* and it runs **UNENFORCED** by default.
 | File-open control | eBPF LSM, default-deny | LeashES AUTH_OPEN (real), default-allow | P0 |
 | Network L4 egress | eBPF LSM IP+port, default-deny | Real drop; **CIDR fixed**; default-allow; UDP only DNS | P0 |
 | Fail-closed posture | default-deny, `--require-lsm` | fail-open (warns, runs unenforced) | P0 |
-| Interactive decisions | daemon/UI | wired but ES doesn't block-and-wait | P0 |
+| Interactive decisions | daemon/UI | async-by-design (ES deadline forbids sync block-and-wait) | P0 ✓ |
 | L7 MITM proxy | transparent redirect + SO_ORIGINAL_DST | proxy exists in daemon, **not in path** | P1 |
 | TLS CA injection | internal CA + env vars | none | P1 |
 | Header rewrite / secret injection | proxy rewriter | not reachable (no proxy path) | P1 |
@@ -84,21 +84,29 @@ fallback"* and it runs **UNENFORCED** by default.
          (same gating as LeashES); otherwise `.allow` (degrade).
       Runtime-verify in the VM: DNS still resolves, permissive policy still allows,
       tightened policy (remove `Host::"*"`) denies unmatched flows.
+- [x] **Interactive decisions — resolved as async-by-design.** ES `AUTH_EXEC`/`AUTH_OPEN`
+      handlers must answer before the kernel message **deadline** (very tight and
+      high-frequency for `AUTH_OPEN`); blocking the handler on a websocket round-trip —
+      let alone a human prompt taking seconds — would blow the deadline and get the ES
+      client killed. So the filter responds immediately from cached policy (now
+      default-deny once loaded) and emits the event to the daemon; a human decision
+      becomes a rule that governs *future* events. Synchronous block-and-wait is not
+      viable on macOS ES; async-with-caching is the correct model.
+- [x] **Domain persistence** — `persistResolvedDomains()` / `reloadResolvedDomains()`
+      implemented (best-effort JSON at `Application Support/<bundle>/resolved-domains.json`,
+      off the hot path, expired entries dropped, gaps-only restore on startup). Silent
+      no-op on any I/O failure (== prior behavior), so no downside.
+- [x] **`queryTrackedPIDs`** — removed (dead code, zero callers; tracked PIDs arrive via
+      the `mac.pid.sync` broadcast).
 - [ ] **Require-enforcement hard-fail into the extension** — the "if required, fail"
-      half. Env doesn't reach the system extension; plumb `LEASH_REQUIRE_ENFORCEMENT`
-      via app-group config or a daemon message so daemon-unreachable can fail closed
-      when required. `preflight_extensions_darwin.go` already handles the launch-time
-      gate.
-- [ ] **Interactive decisions** — decide sync vs async. Either make ES block-and-wait
-      on a `LeashPolicyDecision` from the daemon, or formally accept async allow +
-      retro-kill. Files: `LeashMonitor+Handlers.swift`, `LeashCommunicationService+Handlers.swift`.
-- [ ] **Domain persistence** — `persistResolvedDomains()` / `reloadResolvedDomains()`
-      are empty; the SNI/DNS→IP cache is lost on restart. Files:
-      `FilterDataProvider+RuleEvaluation.swift`, `+State.swift`.
-- [ ] **`queryTrackedPIDs`** returns `[]` ("no query endpoint yet") — add the daemon
-      endpoint or remove the dead path. `DaemonSync+Extensions.swift`.
+      half. Env doesn't reach the system extension, and after the fail-closed fixes the
+      extensions already deny once policy is loaded; this only governs the
+      never-connected-daemon window. Needs app↔extension shared state (app group, or a
+      shared file with a user→root write/read permission story) **plus VM runtime
+      testing** — scoped as a follow-up, not half-built. `preflight_extensions_darwin.go`
+      already handles the launch-time gate.
 - [ ] **NEMachServiceName caveat** (issue #19) — empty team prefix under ad-hoc; verify
-      the network filter registers in the VM, mitigate if not.
+      the network filter registers in the VM, mitigate if not. (VM-only.)
 
 ### P1 — The L7 proxy layer (highest capability payoff)
 

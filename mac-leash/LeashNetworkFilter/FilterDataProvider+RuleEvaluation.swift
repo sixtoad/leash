@@ -439,6 +439,35 @@ extension FilterDataProvider {
     }
 
     func persistResolvedDomains() {
+        guard let url = resolvedDomainsStoreURL else { return }
+        // Snapshot + write off the hot path. Dispatching the whole body (including the
+        // syncQueue snapshot) to a separate queue keeps this deadlock-safe regardless of
+        // whether the caller currently holds syncQueue.
+        persistenceQueue.async { [weak self] in
+            guard let self else { return }
+            let now = Date()
+            var snapshot: [String: DomainResolution] = [:]
+            self.syncQueue.sync { snapshot = self.domainResolutionCache }
+
+            let entries: [[String: Any]] = snapshot.compactMap { domain, res in
+                guard res.expiry > now else { return nil }
+                return [
+                    "domain": domain,
+                    "ips": Array(res.ips),
+                    "expiry": res.expiry.timeIntervalSince1970
+                ]
+            }
+
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                        withIntermediateDirectories: true)
+                let data = try JSONSerialization.data(withJSONObject: ["domains": entries])
+                try data.write(to: url, options: .atomic)
+            } catch {
+                os_log("Failed to persist resolved domains: %{public}@",
+                       log: self.log, type: .error, String(describing: error))
+            }
+        }
     }
 
     func resolveDomainIPs(_ domain: String) -> Set<String> {
