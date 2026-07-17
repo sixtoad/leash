@@ -17,7 +17,8 @@ echo "== ad-hoc signing with ES entitlement =="
 codesign --force --sign - --entitlements es.entitlements esprobe
 
 echo "== running (needs root) =="
-sudo ./esprobe || true
+status=0
+sudo ./esprobe || status=$?
 
 cat <<'EOF'
 
@@ -31,3 +32,6 @@ Result codes:
                         Full Disk Access), then rerun. Should flip to 0.
 --------------------------------------------------------------------
 EOF
+
+# Propagate the probe's result code so callers/CI can branch on it.
+exit "$status"
