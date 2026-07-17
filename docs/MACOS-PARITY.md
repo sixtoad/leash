@@ -60,8 +60,12 @@ fallback"* and it runs **UNENFORCED** by default.
       (`policyLoaded` flag guards the connect→first-snapshot window); degrades to
       allow + log when daemon/policy unavailable. `LeashMonitor+Handlers.swift`,
       `LeashCommunicationService(+Handlers).swift`.
-- [ ] **Fail-closed default (LeashNetworkFilter)** — `evaluateFlow` returns `.allow`
-      on no-match (`FilterDataProvider+RuleEvaluation.swift:321`). **Verified blocker:**
+- [x] **Fail-closed default (LeashNetworkFilter)** — implemented (both sides build;
+      runtime-verify in VM: DNS resolves, permissive allows, tightened policy denies).
+      `evaluateFlow` now default-denies on no-match when the connect default is deny +
+      connected + rules loaded, exempts DNS, and degrades to allow otherwise. The
+      connect default posture is propagated macsync → darwind payloads → Swift.
+      Original **verified blocker:**
       `Host::"*"` transpiles to `ConnectDefaultAllow=true` and emits *no* concrete
       connect rule (`cedar_to_leash.go:125-146`), and `ConvertPolicyToMacRules`
       (`macsync/translator.go`) never propagates that default — so the permissive
