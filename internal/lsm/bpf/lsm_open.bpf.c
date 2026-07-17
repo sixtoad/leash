@@ -244,7 +244,10 @@ static __always_inline u32 get_file_operation_type(struct file *file)
 }
 
 // Clean loop-based policy check for up to 256 rules with BPF verifier compatibility
-static __always_inline int check_path_policy(const char *path, u32 file_op_type)
+// NOT __always_inline: kept as a real BPF-to-BPF subprogram so its 256-rule scan
+// is verified once and CALLED, not duplicated inline into every hook. Inlining it
+// into lsm_link (which also reconstructs the path) blew the verifier's 1M budget.
+static __noinline int check_path_policy(const char *path, u32 file_op_type)
 {
     __u32 key = 0;
     __u32 *nptr = bpf_map_lookup_elem(&num_rules, &key);
@@ -387,15 +390,26 @@ int BPF_PROG(lsm_open, struct file *file)
 // So reconstruct the source path by walking d_parent to the filesystem root
 // (hard links are same-mount, so a single-mount walk yields the absolute path;
 // files under a nested mount resolve relative to that inner mount — a known gap).
-#define HL_MAX_DEPTH 16
-#define HL_MAX_COMP 40
+#define HL_MAX_DEPTH 6
+#define HL_MAX_COMP 24
+// Only the first HL_MATCH_LEN bytes of the reconstructed path are compared
+// (check_path_policy caps rule length at 64); a safe margin over that.
+#define HL_MATCH_LEN 72
 
-// Per-CPU scratch for the two path buffers: two 256-byte buffers on the stack
-// would blow the 512-byte BPF stack limit, so they live in a per-CPU map instead
-// (per-CPU avoids races between concurrent link() calls on different CPUs).
+// CO-RE flavor to reach vfsmount.mnt_root — struct vfsmount isn't fully defined in
+// the BTF header. The ___leash suffix makes libbpf relocate this against the
+// kernel's real struct vfsmount at load time.
+struct vfsmount___leash {
+    struct dentry *mnt_root;
+} __attribute__((preserve_access_index));
+
+// Per-CPU scratch for the path buffers: 256-byte buffers on the stack would blow
+// the 512-byte BPF stack limit, so they live in a per-CPU map instead (per-CPU
+// avoids races between concurrent link() calls on different CPUs).
 struct hl_scratch {
-    char raw[MAX_PATH_LEN];
-    char path[MAX_PATH_LEN];
+    char dest_abs[MAX_PATH_LEN]; // destination dir's absolute path (bpf_d_path)
+    char raw[MAX_PATH_LEN];      // source within-mount path, reverse-built
+    char path[MAX_PATH_LEN];     // assembled absolute source path
 };
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -404,39 +418,75 @@ struct {
     __type(value, struct hl_scratch);
 } hl_scratch_map SEC(".maps");
 
-// hl_build_path reverse-fills buf with the absolute path of `dentry` and returns
-// the start offset into buf (path occupies [start, MAX_PATH_LEN)), or -1 if the
-// path can't be reconstructed within the bounds.
-static __always_inline int hl_build_path(struct dentry *dentry, char *buf)
+// hl_within_len returns the byte length of `dentry`'s within-mount path (walking
+// to mnt_root) WITHOUT building it — cheap, for sizing the shared mount prefix.
+// Returns 1 for the mount root itself ("/"), or -1 on overflow.
+static __always_inline int hl_within_len(struct dentry *dentry, struct dentry *mnt_root)
+{
+    int total = 0;
+    struct dentry *d = dentry;
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < HL_MAX_DEPTH; i++) {
+        if (d == mnt_root) {
+            break;
+        }
+        struct dentry *parent = BPF_CORE_READ(d, d_parent);
+        if (parent == d) {
+            break;
+        }
+        __u32 len = BPF_CORE_READ(d, d_name.len);
+        if (len == 0 || len > HL_MAX_COMP) {
+            return -1;
+        }
+        total += (int)len + 1; // component + leading '/'
+        if (total >= MAX_PATH_LEN) {
+            return -1;
+        }
+        d = parent;
+    }
+    if (total == 0) {
+        total = 1; // "/" — dentry is the mount root
+    }
+    return total;
+}
+
+// hl_build_within reverse-fills buf with `dentry`'s path RELATIVE TO its mount
+// (walking d_parent up to mnt_root), returning the start offset (path occupies
+// [start, MAX_PATH_LEN)), or -1 on overflow. One probe per component keeps it in
+// the verifier's budget. Stopping at mnt_root (not the filesystem root) is what
+// makes bind mounts work: a bind mount shares the source dentry tree, so d_parent
+// would otherwise walk past the mount into the source filesystem.
+static __always_inline int hl_build_within(struct dentry *dentry, struct dentry *mnt_root, char *buf)
 {
     int off = MAX_PATH_LEN; // exclusive write cursor, moves down
     struct dentry *d = dentry;
 
     #pragma clang loop unroll(disable)
     for (int i = 0; i < HL_MAX_DEPTH; i++) {
+        if (d == mnt_root) {
+            break;
+        }
         struct dentry *parent = BPF_CORE_READ(d, d_parent);
         if (parent == d) {
-            break; // filesystem root (self-parented)
+            break; // filesystem root (safety net)
         }
-        struct qstr dn = BPF_CORE_READ(d, d_name);
-        const unsigned char *name = dn.name;
-        __u32 len = dn.len;
+        __u32 len = BPF_CORE_READ(d, d_name.len);
+        const char *name = (const char *)BPF_CORE_READ(d, d_name.name);
         if (len == 0 || len > HL_MAX_COMP) {
             return -1;
         }
-        // Need `len` bytes for the component plus 1 for the leading '/'.
         if (off - (int)len - 1 < 1) {
             return -1;
         }
+        char comp[HL_MAX_COMP];
+        bpf_probe_read_kernel(comp, len, name);
         #pragma clang loop unroll(disable)
         for (int j = 0; j < HL_MAX_COMP; j++) {
             if ((__u32)j >= len) {
                 break;
             }
             int dst = (off - (int)len + j) & (MAX_PATH_LEN - 1);
-            unsigned char c = 0;
-            bpf_probe_read_kernel(&c, 1, name + j);
-            buf[dst] = c;
+            buf[dst] = comp[j];
         }
         off -= (int)len;
         off -= 1;
@@ -445,8 +495,7 @@ static __always_inline int hl_build_path(struct dentry *dentry, char *buf)
     }
 
     if (off >= MAX_PATH_LEN) {
-        // No components consumed (dentry was the root itself) -> "/".
-        off = MAX_PATH_LEN - 1;
+        off = MAX_PATH_LEN - 1; // dentry was the mount root -> "/"
         buf[off & (MAX_PATH_LEN - 1)] = '/';
     }
     return off;
@@ -464,24 +513,64 @@ int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, st
     if (!s) {
         return 0;
     }
-    __builtin_memset(s->raw, 0, sizeof(s->raw));
-    __builtin_memset(s->path, 0, sizeof(s->path));
 
-    int start = hl_build_path(old_dentry, s->raw);
-    if (start < 0 || start >= MAX_PATH_LEN) {
-        // Source path unresolved — fail OPEN (don't break legitimate links); the
-        // file-open hook still guards the eventual read by its real path.
+    // Hard links are same-mount, so source and destination share this mount root.
+    struct vfsmount___leash *vm = (void *)BPF_CORE_READ(new_dir, mnt);
+    struct dentry *mnt_root = BPF_CORE_READ(vm, mnt_root);
+
+    // Destination dir's TRUE absolute path. new_dir is a trusted struct path, so
+    // bpf_d_path is allowed and crosses mount boundaries — giving us the mount's
+    // absolute prefix, which the source (same mount) shares. bpf_d_path returns the
+    // length INCLUDING the trailing NUL, so subtract 1.
+    long dret = bpf_d_path((struct path *)new_dir, s->dest_abs, sizeof(s->dest_abs));
+    if (dret < 1) {
+        return 0; // unresolved -> fail open (file-open hook still guards the read)
+    }
+    int dest_abs_len = (int)dret - 1;
+    if (dest_abs_len < 0 || dest_abs_len >= MAX_PATH_LEN) {
         return 0;
     }
 
-    // Shift to a zero-based, NUL-padded forward path for check_path_policy.
+    // Destination dir's within-mount path LENGTH (no byte-building needed), to
+    // learn how much of dest_abs is the shared mount prefix. When the dir IS the
+    // mount root its within-path is "/", which maps onto the mount point itself
+    // (nothing to strip).
+    int dest_within_len = hl_within_len(BPF_CORE_READ(new_dir, dentry), mnt_root);
+    if (dest_within_len < 0) {
+        return 0;
+    }
+    int strip = (dest_within_len <= 1) ? 0 : dest_within_len;
+    int prefix_len = dest_abs_len - strip;
+    if (prefix_len < 0 || prefix_len >= MAX_PATH_LEN) {
+        return 0;
+    }
+
+    // Source's within-mount path (a file, so always "/..." with len > 1).
+    __builtin_memset(s->raw, 0, sizeof(s->raw));
+    int sstart = hl_build_within(old_dentry, mnt_root, s->raw);
+    if (sstart < 0 || sstart >= MAX_PATH_LEN) {
+        return 0;
+    }
+    int slen = MAX_PATH_LEN - sstart; // source within-mount length
+
+    // Assemble in ONE pass: path = dest_abs[0:prefix_len] + raw[sstart:]. Only the
+    // first HL_MATCH_LEN bytes are ever compared (check_path_policy caps rule
+    // length at 64), so stop there — building the full 256 is wasted verifier
+    // work, and any rule that matches a longer path matches within its prefix.
+    __builtin_memset(s->path, 0, sizeof(s->path));
     #pragma clang loop unroll(disable)
-    for (int i = 0; i < MAX_PATH_LEN; i++) {
-        int src = start + i;
-        if (src >= MAX_PATH_LEN) {
+    for (int i = 0; i < HL_MATCH_LEN; i++) {
+        if (i >= prefix_len + slen) {
             break;
         }
-        s->path[i & (MAX_PATH_LEN - 1)] = s->raw[src & (MAX_PATH_LEN - 1)];
+        char c;
+        if (i < prefix_len) {
+            c = s->dest_abs[i & (MAX_PATH_LEN - 1)];
+        } else {
+            int si = (sstart + (i - prefix_len)) & (MAX_PATH_LEN - 1);
+            c = s->raw[si];
+        }
+        s->path[i & (MAX_PATH_LEN - 1)] = c;
     }
 
     // Deny the link if reading the source by its real path would be denied.
