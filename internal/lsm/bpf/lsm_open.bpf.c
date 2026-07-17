@@ -390,8 +390,14 @@ int BPF_PROG(lsm_open, struct file *file)
 // So reconstruct the source path by walking d_parent to the filesystem root
 // (hard links are same-mount, so a single-mount walk yields the absolute path;
 // files under a nested mount resolve relative to that inner mount — a known gap).
-#define HL_MAX_DEPTH 6
-#define HL_MAX_COMP 24
+// Reconstruction bounds. These are tight because lsm_link inlines the 256-rule
+// check_path_policy, and the two together must stay under the verifier's 1M-insn
+// budget. COMP=40 covers git object filenames (38 hex chars); DEPTH=4 covers
+// .git/objects/ab/<hash> when the box/mount root is the workdir (the common
+// bind-mount case). Sources exceeding these fail OPEN (link allowed) — a residual
+// hard-link-aliasing gap tracked for a tail-call fix that would free the budget.
+#define HL_MAX_DEPTH 4
+#define HL_MAX_COMP 40
 // Only the first HL_MATCH_LEN bytes of the reconstructed path are compared
 // (check_path_policy caps rule length at 64); a safe margin over that.
 #define HL_MATCH_LEN 72
