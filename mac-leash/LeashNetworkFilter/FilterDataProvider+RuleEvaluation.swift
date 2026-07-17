@@ -259,8 +259,12 @@ extension FilterDataProvider {
         isDNSQuery: Bool = false
     ) -> FlowDecision {
         var rules: [NetworkRule] = []
+        var defaultAllowNetwork = true
+        var rulesLoaded = false
         syncQueue.sync {
             rules = networkRules
+            defaultAllowNetwork = networkDefaultAllow
+            rulesLoaded = networkRulesLoaded
         }
 
         for rule in rules where rule.enabled {
@@ -318,7 +322,24 @@ extension FilterDataProvider {
             }
         }
 
-        // No matching rule - default allow
+        // No matching rule.
+        // DNS lookups are plumbing, not the enforcement point — never deny them here
+        // (mirrors Linux, where connections are gated, not name resolution). Otherwise
+        // tightening the policy would break resolution for tracked workloads.
+        if isDNSQuery {
+            return .allow
+        }
+
+        // Honor the connect default posture forwarded from policy. Fail closed only
+        // when the policy default is deny AND we hold a loaded rule set from a
+        // connected daemon; otherwise degrade to allow rather than brick tracked
+        // workloads before policy is available (the Linux "not --require-lsm" case).
+        if defaultAllowNetwork {
+            return .allow
+        }
+        if daemon.isConnected && rulesLoaded {
+            return .deny(reason: "No matching rule (default-deny)")
+        }
         return .allow
     }
 

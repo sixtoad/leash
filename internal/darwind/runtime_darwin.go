@@ -924,7 +924,10 @@ func (rt *runtimeState) dispatchClientEnvelope(clientID string, env *messages.En
 			return
 		}
 		rules := rt.macSync.GetNetworkRules()
-		rt.sendResponse(clientID, env, "ok", "network rules retrieved", map[string]any{"rules": rules})
+		rt.sendResponse(clientID, env, "ok", "network rules retrieved", map[string]any{
+			"rules":                 rules,
+			"network_default_allow": rt.macSync.GetNetworkDefaultAllow(),
+		})
 
 	case messages.TypeMacNetworkRuleUpdate:
 		var payload messages.MacNetworkRuleUpdatePayload
@@ -1111,7 +1114,10 @@ func (rt *runtimeState) broadcastNetworkRuleUpdate() {
 	}
 
 	rules := rt.macSync.GetNetworkRules()
-	payload := map[string]any{"rules": rules}
+	payload := map[string]any{
+		"rules":                 rules,
+		"network_default_allow": rt.macSync.GetNetworkDefaultAllow(),
+	}
 
 	env, err := messages.WrapPayload("", "", messages.TypeMacNetworkRuleUpdate, 1, payload)
 	if err != nil {
@@ -1314,6 +1320,7 @@ func (rt *runtimeState) syncMacPoliciesFrom(policies *lsm.PolicySet) {
 	}
 	rt.broadcastRuleUpdate()
 
+	rt.macSync.SetNetworkDefaultAllow(policies.ConnectDefaultAllow)
 	rt.macSync.UpdateNetworkRules(networkRules)
 	rt.broadcastNetworkRuleUpdate()
 

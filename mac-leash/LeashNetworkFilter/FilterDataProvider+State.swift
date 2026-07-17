@@ -82,7 +82,7 @@ extension FilterDataProvider {
             guard let self else { return }
             switch result {
             case .success(let loaded):
-                self.applyNetworkRules(loaded)
+                self.applyNetworkRules(loaded.rules, defaultAllow: loaded.defaultAllow)
             case .failure(let error):
                 os_log("Failed to query network rules: %{public}@", log: self.log, type: .error, String(describing: error))
             }
@@ -92,11 +92,16 @@ extension FilterDataProvider {
     func handleNetworkRuleBroadcast(_ payload: [String: Any]) {
         guard let rulesData = payload["rules"] as? [[String: Any]] else { return }
         let decoded = rulesData.compactMap { NetworkRule.fromDictionary($0) }
-        applyNetworkRules(decoded)
+        applyNetworkRules(decoded, defaultAllow: payload["network_default_allow"] as? Bool)
     }
 
-    func applyNetworkRules(_ loaded: [NetworkRule]) {
+    func applyNetworkRules(_ loaded: [NetworkRule], defaultAllow: Bool? = nil) {
         syncQueue.async {
+            if let defaultAllow {
+                self.networkDefaultAllow = defaultAllow
+            }
+            self.networkRulesLoaded = true
+
             if loaded.count != self.networkRules.count {
                 os_log("Network rules updated: %{public}d → %{public}d rules",
                        log: self.log, type: .default,

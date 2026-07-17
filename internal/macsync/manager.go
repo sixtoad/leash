@@ -44,6 +44,12 @@ type Manager struct {
 	mitmConfig   *messages.MacMITMConfigPayload
 	mitmSessions map[string]messages.MacMITMSessionPayload
 	mitmVersion  int
+
+	// networkDefaultAllow is the connect default posture (Cedar ConnectDefaultAllow)
+	// forwarded to the Network Extension so a rule-miss can fail closed only when the
+	// policy default is deny. Defaults to true (allow) so the filter never fails closed
+	// before a policy has been applied.
+	networkDefaultAllow bool
 }
 
 // NewManager returns a macOS sync manager backed by the provided logger.
@@ -56,6 +62,8 @@ func NewManager(logger *lsm.SharedLogger) *Manager {
 		networkRules: make(map[string]messages.MacNetworkRule),
 		policyEvents: make(map[string]messages.MacPolicyEventPayload),
 		mitmSessions: make(map[string]messages.MacMITMSessionPayload),
+
+		networkDefaultAllow: true,
 	}
 }
 
@@ -504,6 +512,22 @@ func (m *Manager) UpdateNetworkRules(rules []messages.MacNetworkRule) {
 	}
 
 	log.Printf("macsync: updated network rules: %d total, %d enabled", len(rules), enabledCount)
+}
+
+// SetNetworkDefaultAllow records the connect default posture (from the policy's
+// ConnectDefaultAllow) to forward to the Network Extension.
+func (m *Manager) SetNetworkDefaultAllow(allow bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.networkDefaultAllow = allow
+}
+
+// GetNetworkDefaultAllow returns the connect default posture (true = allow on
+// rule-miss, false = deny).
+func (m *Manager) GetNetworkDefaultAllow() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.networkDefaultAllow
 }
 
 // MARK: - MITM State
