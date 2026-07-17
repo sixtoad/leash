@@ -789,8 +789,9 @@ extension FilterDataProvider {
     private func inetBytes(_ s: String, family: Int32, length: Int) -> [UInt8]? {
         var buffer = [UInt8](repeating: 0, count: length)
         let ok = s.withCString { cstr in
-            buffer.withUnsafeMutableBytes { raw in
-                inet_pton(family, cstr, raw.baseAddress)
+            buffer.withUnsafeMutableBytes { raw -> Int32 in
+                guard let baseAddress = raw.baseAddress else { return 0 }
+                return inet_pton(family, cstr, baseAddress)
             }
         }
         return ok == 1 ? buffer : nil
@@ -798,7 +799,7 @@ extension FilterDataProvider {
 
     /// True if the first `bits` bits of `a` and `b` are equal.
     private func prefixMatches(_ a: [UInt8], _ b: [UInt8], bits: Int) -> Bool {
-        guard a.count == b.count, bits <= a.count * 8 else { return false }
+        guard a.count == b.count, bits >= 0, bits <= a.count * 8 else { return false }
         let fullBytes = bits / 8
         let remainderBits = bits % 8
         for i in 0..<fullBytes where a[i] != b[i] {

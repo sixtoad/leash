@@ -177,7 +177,7 @@ final class LeashCommunicationService: NSObject {
             case .success(let rules):
                 self.rulesQueue.async {
                     self.cachedRules = rules.sorted(by: Self.ruleSortComparator)
-                    self.policyLoaded = true
+                    self.markPolicyLoadedLocked()
                     os_log("Loaded %d rules from daemon", log: self.log, type: .info, rules.count)
                 }
             case .failure(let error):
