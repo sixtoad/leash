@@ -29,6 +29,7 @@ typedef int bool;
 #define BPF_MAP_TYPE_ARRAY 2
 #define BPF_MAP_TYPE_HASH 1
 #define BPF_MAP_TYPE_RINGBUF 27
+#define BPF_MAP_TYPE_PERCPU_ARRAY 6
 #define BPF_ANY 0
 
 char LICENSE[] SEC("license") = "GPL";
@@ -376,12 +377,81 @@ int BPF_PROG(lsm_open, struct file *file)
 
 // --- hard-link guard (audit finding #3) -------------------------------------
 // A path-based sandbox is bypassable by hard-linking a forbidden file into an
-// allowed dir and reading it via the allowed path (bpf_d_path returns the link's
-// path; symlink resolution doesn't apply to hard links). Deny creating a hard
-// link whose SOURCE wouldn't be readable by policy — so you can't alias a file
-// you couldn't open directly. Hard links are same-mount, so the source path is
-// (new link's mount + old dentry). Uses path_link for the mount (needs
-// CONFIG_SECURITY_PATH; present when a path-based LSM like AppArmor is active).
+// allowed dir and reading it via the allowed path (the file-open hook resolves
+// the NEW link's path, not the original; symlink resolution doesn't apply to
+// hard links). Deny creating a hard link whose SOURCE wouldn't be readable by
+// policy — so you can't alias a file you couldn't open directly.
+//
+// bpf_d_path can't help here: it requires a *trusted* struct path from the hook
+// context, and path_link exposes the source only as a bare dentry (old_dentry).
+// So reconstruct the source path by walking d_parent to the filesystem root
+// (hard links are same-mount, so a single-mount walk yields the absolute path;
+// files under a nested mount resolve relative to that inner mount — a known gap).
+#define HL_MAX_DEPTH 16
+#define HL_MAX_COMP 40
+
+// Per-CPU scratch for the two path buffers: two 256-byte buffers on the stack
+// would blow the 512-byte BPF stack limit, so they live in a per-CPU map instead
+// (per-CPU avoids races between concurrent link() calls on different CPUs).
+struct hl_scratch {
+    char raw[MAX_PATH_LEN];
+    char path[MAX_PATH_LEN];
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct hl_scratch);
+} hl_scratch_map SEC(".maps");
+
+// hl_build_path reverse-fills buf with the absolute path of `dentry` and returns
+// the start offset into buf (path occupies [start, MAX_PATH_LEN)), or -1 if the
+// path can't be reconstructed within the bounds.
+static __always_inline int hl_build_path(struct dentry *dentry, char *buf)
+{
+    int off = MAX_PATH_LEN; // exclusive write cursor, moves down
+    struct dentry *d = dentry;
+
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < HL_MAX_DEPTH; i++) {
+        struct dentry *parent = BPF_CORE_READ(d, d_parent);
+        if (parent == d) {
+            break; // filesystem root (self-parented)
+        }
+        struct qstr dn = BPF_CORE_READ(d, d_name);
+        const unsigned char *name = dn.name;
+        __u32 len = dn.len;
+        if (len == 0 || len > HL_MAX_COMP) {
+            return -1;
+        }
+        // Need `len` bytes for the component plus 1 for the leading '/'.
+        if (off - (int)len - 1 < 1) {
+            return -1;
+        }
+        #pragma clang loop unroll(disable)
+        for (int j = 0; j < HL_MAX_COMP; j++) {
+            if ((__u32)j >= len) {
+                break;
+            }
+            int dst = (off - (int)len + j) & (MAX_PATH_LEN - 1);
+            unsigned char c = 0;
+            bpf_probe_read_kernel(&c, 1, name + j);
+            buf[dst] = c;
+        }
+        off -= (int)len;
+        off -= 1;
+        buf[off & (MAX_PATH_LEN - 1)] = '/';
+        d = parent;
+    }
+
+    if (off >= MAX_PATH_LEN) {
+        // No components consumed (dentry was the root itself) -> "/".
+        off = MAX_PATH_LEN - 1;
+        buf[off & (MAX_PATH_LEN - 1)] = '/';
+    }
+    return off;
+}
+
 SEC("lsm/path_link")
 int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, struct dentry *new_dentry)
 {
@@ -389,20 +459,33 @@ int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, st
         return 0;
     }
 
-    struct path src = {};
-    src.mnt = BPF_CORE_READ(new_dir, mnt);
-    src.dentry = old_dentry;
+    u32 zero = 0;
+    struct hl_scratch *s = bpf_map_lookup_elem(&hl_scratch_map, &zero);
+    if (!s) {
+        return 0;
+    }
+    __builtin_memset(s->raw, 0, sizeof(s->raw));
+    __builtin_memset(s->path, 0, sizeof(s->path));
 
-    char path[MAX_PATH_LEN];
-    long ret = bpf_d_path(&src, path, sizeof(path));
-    if (ret < 0) {
+    int start = hl_build_path(old_dentry, s->raw);
+    if (start < 0 || start >= MAX_PATH_LEN) {
         // Source path unresolved — fail OPEN (don't break legitimate links); the
         // file-open hook still guards the eventual read by its real path.
         return 0;
     }
 
+    // Shift to a zero-based, NUL-padded forward path for check_path_policy.
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < MAX_PATH_LEN; i++) {
+        int src = start + i;
+        if (src >= MAX_PATH_LEN) {
+            break;
+        }
+        s->path[i & (MAX_PATH_LEN - 1)] = s->raw[src & (MAX_PATH_LEN - 1)];
+    }
+
     // Deny the link if reading the source by its real path would be denied.
-    if (check_path_policy(path, OP_OPEN) != 1) {
+    if (check_path_policy(s->path, OP_OPEN) != 1) {
         return -1; // -EPERM: refuse to hard-link a file the box can't read
     }
     return 0;
