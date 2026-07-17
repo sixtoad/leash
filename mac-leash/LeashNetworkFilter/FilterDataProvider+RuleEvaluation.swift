@@ -330,14 +330,16 @@ extension FilterDataProvider {
             return .allow
         }
 
-        // Honor the connect default posture forwarded from policy. Fail closed only
-        // when the policy default is deny AND we hold a loaded rule set from a
-        // connected daemon; otherwise degrade to allow rather than brick tracked
-        // workloads before policy is available (the Linux "not --require-lsm" case).
+        // Honor the connect default posture forwarded from policy. Once we hold a
+        // loaded rule set, a miss under a deny default fails closed — and stays closed
+        // even if the daemon later disconnects (the cached rules are the last
+        // authoritative state). Gating on live connectivity would let a local process
+        // bypass the filter by killing the daemon. Before any rules load, degrade to
+        // allow rather than brick tracked workloads (the Linux "not --require-lsm" case).
         if defaultAllowNetwork {
             return .allow
         }
-        if daemon.isConnected && rulesLoaded {
+        if rulesLoaded {
             return .deny(reason: "No matching rule (default-deny)")
         }
         return .allow
