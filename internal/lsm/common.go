@@ -507,6 +507,24 @@ func LoadAndAttachBPFWithSetup(
 	}
 
 	coll, err := ebpf.NewCollection(spec)
+	if err != nil && len(config.OptionalProgramNames) > 0 {
+		// ebpf.NewCollection verifies EVERY program eagerly, so an optional
+		// best-effort hook that fails verification (e.g. a kernel-incompatible
+		// program) would otherwise sink the whole collection — taking the
+		// REQUIRED hooks (e.g. lsm_open) down with it and defeating the
+		// best-effort attach logic below, which never runs. Reload from a fresh
+		// spec with the optional programs stripped so core enforcement survives;
+		// the optional attach loop no-ops when a program is absent.
+		if fresh, lerr := loader(); lerr == nil {
+			for _, name := range config.OptionalProgramNames {
+				delete(fresh.Programs, name)
+			}
+			if coll2, cerr := ebpf.NewCollection(fresh); cerr == nil {
+				fmt.Fprintf(os.Stderr, "leash: optional LSM hook(s) %v failed to load (%v); continuing with core enforcement only\n", config.OptionalProgramNames, err)
+				coll, err = coll2, nil
+			}
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("failed to create BPF collection: %w", err)
 	}
