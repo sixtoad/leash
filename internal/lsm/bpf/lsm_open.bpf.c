@@ -266,8 +266,22 @@ static __always_inline int check_path_policy(const char *path, u32 file_op_type)
         __u32 len = rule->path_len;
         if (len == 0 || len > 64) continue;
 
-        // Simple prefix matching - Go code handles directory expansion
-        if (simple_string_starts_with(path, rule->path, len)) {
+        // One prefix pass to len-1, then classify the final char (one hot-path pass
+        // instead of two). Exact match (path[len-1] == rule[len-1]) covers
+        // descendants and file rules; for a directory rule, the directory ITSELF
+        // also matches — its runtime path has no trailing slash, so it ends where
+        // the rule's '/' is (path[len-1] == '\0'). That dir-itself case is why a
+        // forbidden dir's entries could otherwise be enumerated and an allowed dir
+        // wasn't listable.
+        bool matches = false;
+        if (simple_string_starts_with(path, rule->path, len - 1)) {
+            if (path[len - 1] == rule->path[len - 1]) {
+                matches = true;
+            } else if (rule->is_directory && path[len - 1] == '\0') {
+                matches = true;
+            }
+        }
+        if (matches) {
             // Check if operation types match
             if (rule->operation == OP_OPEN) {
                 // "open" matches any file operation type
