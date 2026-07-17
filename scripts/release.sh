@@ -23,6 +23,30 @@ if [ ! -s internal/ui/dist/index.html ] || grep -q '>stub<\|<title>stub' interna
   exit 1
 fi
 
+# The leash-entry helper binaries are embedded in the binary (go:generate builds
+# them into bundled_*_gen.go, which are gitignored). Regenerate them fresh so the
+# release never ships empty embeds — otherwise the binary fails at runtime with
+# "embedded binary leash-entry-... missing" (as a fresh-clone build would).
+echo "release: generating embedded leash-entry binaries..." >&2
+go generate ./internal/entrypoint/...
+for f in internal/entrypoint/bundled_linux_amd64_gen.go internal/entrypoint/bundled_linux_arm64_gen.go; do
+  [ -s "$f" ] || { echo "release: $f empty after generate — leash-entry embed failed" >&2; exit 1; }
+done
+
+# The eBPF LSM bytecode (internal/lsm/*_bpf*.go, bpf2go output) is likewise
+# gitignored and NOT committed, so a fresh clone can't `go build` the Linux binary
+# without it. Regenerate it too — same fresh-clone-build gap as above. Prefer the
+# host toolchain (fast), fall back to the Docker toolchain if clang/libbpf aren't
+# usable (non-Linux, or a restricted CI box).
+echo "release: generating eBPF LSM bytecode..." >&2
+if ! make lsm-generate >&2; then
+  echo "release: host lsm-generate unavailable; using the Docker toolchain..." >&2
+  make lsm-generate-docker >&2
+fi
+for f in internal/lsm/lsmopen_bpfel.go internal/lsm/lsmexec_bpfel.go internal/lsm/lsmconnect_bpfel.go; do
+  [ -s "$f" ] || { echo "release: $f missing after lsm-generate — bpf2go failed" >&2; exit 1; }
+done
+
 DIST="$ROOT/dist"
 rm -rf "$DIST"; mkdir -p "$DIST"
 COMMIT="$(git rev-parse --short=7 HEAD)"
