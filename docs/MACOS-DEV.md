@@ -42,9 +42,11 @@ SIP is *actually* off, which needs a reboot.
    ```
    sudo nvram boot-args="amfi_get_out_of_my_way=0x1"
    ```
-   If this still says `not permitted` with SIP confirmed disabled, you hit the
-   Apple-Silicon boot-args restriction — lower the guest to Permissive Security in
-   Recovery via `bputil` (`bputil --disable-boot-args-restriction`), then retry.
+   If this still says `not permitted` with SIP confirmed disabled, the guest is
+   above Permissive Security. In Recovery, open **Startup Security Utility** (from
+   the Utilities menu), select the OS, and set **Security Policy → Permissive
+   Security**; reboot and retry the `nvram` write. (`csrutil disable` alone is
+   usually enough in a VM — this step is only needed if boot-args stay restricted.)
 4. **Reboot again** for the boot-arg to take effect.
 
 ## 3. Prove the entitlement is honored (go/no-go gate)
