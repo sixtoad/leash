@@ -77,17 +77,19 @@ struct LeashPolicyRule: Codable, Identifiable, Equatable {
         }
         if let directory {
             let normalizedDirectory = normalizeDirectoryPath(directory)
+            let directoryExact = String(normalizedDirectory.dropLast())
             if kind == .fileAccess {
                 guard let rawPath = event.filePath else { return false }
                 let normalizedPath = normalizeFilePath(rawPath)
-                let directoryExact = String(normalizedDirectory.dropLast())
                 if normalizedPath != directoryExact && !normalizedPath.hasPrefix(normalizedDirectory) {
                     return false
                 }
             } else {
-                guard let cwd = event.currentWorkingDirectory else { return false }
-                let normalizedCWD = normalizeDirectoryPath(cwd)
-                if normalizedCWD != normalizedDirectory {
+                // processExec: a directory rule (e.g. "/") matches by executable path
+                // prefix, so "allow /" covers every binary. (Exact File:: exec rules use
+                // executablePath above, not this branch.)
+                let normalizedPath = normalizeFilePath(event.processPath)
+                if normalizedPath != directoryExact && !normalizedPath.hasPrefix(normalizedDirectory) {
                     return false
                 }
             }
