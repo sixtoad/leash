@@ -30,12 +30,22 @@ func ConvertPolicyToMacRules(policy *lsm.PolicySet) ([]messages.MacPolicyRule, [
 		if path == "" {
 			continue
 		}
-		macRules = append(macRules, messages.MacPolicyRule{
-			ID:             uuid.NewString(),
-			Kind:           "processExec",
-			Action:         action,
-			ExecutablePath: path,
-		})
+		// A directory-scoped exec rule (e.g. Cedar Dir::"/") must match by executable
+		// path PREFIX, not exact path — otherwise "allow /" matches nothing and, under
+		// default-deny, every exec is killed. Carry it as Directory (with a wildcard
+		// executable) exactly like the file-open rules do; a File:: rule stays exact.
+		macRule := messages.MacPolicyRule{
+			ID:     uuid.NewString(),
+			Kind:   "processExec",
+			Action: action,
+		}
+		if rule.IsDirectory != 0 {
+			macRule.ExecutablePath = "*"
+			macRule.Directory = path
+		} else {
+			macRule.ExecutablePath = path
+		}
+		macRules = append(macRules, macRule)
 	}
 
 	for _, rule := range policy.Open {
