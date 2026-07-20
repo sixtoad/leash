@@ -9,6 +9,10 @@ struct leashApp: App {
         extensionIdentifier: LeashIdentifiers.networkFilterExtension,
         autoActivate: false
     )
+    @StateObject private var transparentProxyController = SystemExtensionController(
+        extensionIdentifier: LeashIdentifiers.transparentProxyExtension,
+        autoActivate: false
+    )
     @StateObject private var sparkleUpdater = SparkleUpdater()
     init() {
         let appLog = OSLog(subsystem: LeashIdentifiers.bundle, category: "app")
@@ -24,7 +28,8 @@ struct leashApp: App {
         WindowGroup {
             MainStatusView(
                 endpointSecurityController: endpointSecurityController,
-                networkExtensionController: networkExtensionController
+                networkExtensionController: networkExtensionController,
+                transparentProxyController: transparentProxyController
             )
                 .onAppear {
                     let appLog = OSLog(subsystem: LeashIdentifiers.bundle, category: "app")

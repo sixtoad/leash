@@ -6,6 +6,7 @@ import os.log
 struct MainStatusView: View {
     @ObservedObject var endpointSecurityController: SystemExtensionController
     @ObservedObject var networkExtensionController: SystemExtensionController
+    @ObservedObject var transparentProxyController: SystemExtensionController
     @State var networkFilterStatus: FilterStatus = .loading
     @State var apiStatus: APIStatus = .loading
 
@@ -37,6 +38,7 @@ struct MainStatusView: View {
             Task { @MainActor in
                 endpointSecurityController.ensureExtensionIsActive()
                 networkExtensionController.ensureExtensionIsActive()
+                transparentProxyController.ensureExtensionIsActive()
             }
             refreshNetworkFilterStatus()
             checkAPIStatus()

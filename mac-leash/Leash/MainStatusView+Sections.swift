@@ -281,6 +281,9 @@ extension MainStatusView {
         Task {
             await MainActor.run {
                 networkExtensionController.retryActivation()
+                // Bring up the transparent proxy alongside the content filter so
+                // tracked traffic is routed through the local MITM proxy.
+                transparentProxyController.retryActivation()
             }
             do {
                 try await NetworkFilterManager.shared.activate()
@@ -291,6 +294,15 @@ extension MainStatusView {
                 await MainActor.run {
                     networkFilterStatus = .error(error.localizedDescription)
                 }
+            }
+            // Best-effort: enable the transparent proxy NE config. Logged, not fatal —
+            // the content filter's status shouldn't reflect a proxy-only failure.
+            do {
+                try await TransparentProxyManager.shared.activate()
+            } catch {
+                let log = OSLog(subsystem: LeashIdentifiers.bundle, category: "app")
+                os_log("Transparent proxy activation failed: %{public}@",
+                       log: log, type: .error, error.localizedDescription)
             }
         }
     }
