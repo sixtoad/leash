@@ -476,6 +476,11 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 	var mitmProxy *proxy.MITMProxy
 	if !cfg.SkipCgroup {
 		mitmProxy, err = proxy.NewMITMProxy(cfg.ProxyPort, headerRewriter, policyChecker, logger, proxy.MCPConfig{})
+		// macOS has no SO_ORIGINAL_DST — the transparent proxy provider conveys the
+		// original destination via a PROXY protocol v1 header on each relayed flow.
+		if err == nil && mitmProxy != nil {
+			mitmProxy.SetProxyProtocolIngestion(true)
+		}
 		if err != nil {
 			logger.Close()
 			return nil, fmt.Errorf("failed to create MITM proxy: %w", err)

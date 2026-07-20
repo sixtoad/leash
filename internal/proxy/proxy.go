@@ -46,6 +46,11 @@ type MITMProxy struct {
 	httpClient     *http.Client      // Custom HTTP client with marked connections
 	tlsDialer      func(string) (*tls.Conn, error)
 	mcpObserver    *mcpObserver
+	// useProxyProtocol makes the proxy read the original destination from a PROXY
+	// protocol v1 header instead of SO_ORIGINAL_DST. Used on platforms without a
+	// transparent netfilter redirect (e.g. the macOS NETransparentProxyProvider,
+	// which prepends the header before relaying the flow).
+	useProxyProtocol bool
 }
 
 // sockaddr_in structure for SO_ORIGINAL_DST
@@ -230,8 +235,19 @@ func (p *MITMProxy) Run() error {
 			continue
 		}
 
-		go p.handleTransparentConnection(conn)
+		if p.useProxyProtocol {
+			go p.handleProxyProtocolConnection(conn)
+		} else {
+			go p.handleTransparentConnection(conn)
+		}
 	}
+}
+
+// SetProxyProtocolIngestion selects how the original destination is obtained for
+// each accepted connection: true reads a PROXY protocol v1 header (macOS
+// transparent proxy provider), false uses SO_ORIGINAL_DST (Linux netfilter).
+func (p *MITMProxy) SetProxyProtocolIngestion(enabled bool) {
+	p.useProxyProtocol = enabled
 }
 
 // SetPolicyChecker updates the policy checker used for connect enforcement.
@@ -245,14 +261,39 @@ func (p *MITMProxy) SetPolicyChecker(pc PolicyChecker) {
 func (p *MITMProxy) handleTransparentConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	// Get the original destination
+	// Get the original destination via SO_ORIGINAL_DST (Linux transparent redirect).
 	originalDest, err := getOriginalDest(clientConn)
 	if err != nil {
 		log.Printf("Failed to get original destination: %v", err)
 		return
 	}
 
-	// Peek at the first few bytes to determine if it's HTTP or HTTPS
+	p.serveTransparent(clientConn, originalDest)
+}
+
+// handleProxyProtocolConnection ingests a connection whose original destination is
+// carried in a PROXY protocol v1 header (platforms without SO_ORIGINAL_DST, e.g. the
+// macOS NETransparentProxyProvider prepends it before relaying the flow).
+func (p *MITMProxy) handleProxyProtocolConnection(clientConn net.Conn) {
+	defer clientConn.Close()
+
+	// Buffer the stream so the header is read without a syscall per byte; the same
+	// reader is then handed to serveTransparent so any application bytes the buffer
+	// pulled in past the header aren't lost.
+	rd := bufio.NewReader(clientConn)
+	originalDest, err := readProxyProtocolV1Dest(rd)
+	if err != nil {
+		log.Printf("Failed to read PROXY protocol header: %v", err)
+		return
+	}
+
+	p.serveTransparent(&connWrapper{Conn: clientConn, reader: rd}, originalDest)
+}
+
+// serveTransparent peeks the first bytes to classify HTTP vs TLS and dispatches to
+// the matching handler with the resolved original destination. Shared by both the
+// SO_ORIGINAL_DST and PROXY-protocol ingestion paths.
+func (p *MITMProxy) serveTransparent(clientConn net.Conn, originalDest string) {
 	buf := make([]byte, 1024)
 	n, err := clientConn.Read(buf)
 	if err != nil {
@@ -260,13 +301,58 @@ func (p *MITMProxy) handleTransparentConnection(clientConn net.Conn) {
 		return
 	}
 
-	// Check if it looks like HTTP
 	if isHTTPRequest(buf[:n]) {
 		p.handleTransparentHTTP(clientConn, originalDest, buf[:n])
 	} else {
 		// Assume HTTPS/TLS
 		p.handleTransparentHTTPS(clientConn, originalDest, buf[:n])
 	}
+}
+
+// readProxyProtocolV1Dest reads a HAProxy PROXY protocol v1 header from conn and
+// returns the original destination as "ip:port". It reads only up to the header's
+// terminating CRLF so the next read observes the client's first application bytes.
+func readProxyProtocolV1Dest(rd *bufio.Reader) (string, error) {
+	// "PROXY TCP4 <src> <dst> <sport> <dport>\r\n" — the spec caps v1 at 107 bytes.
+	const maxLen = 107
+	buf := make([]byte, 0, maxLen)
+	for len(buf) < maxLen {
+		b, err := rd.ReadByte()
+		if err != nil {
+			return "", fmt.Errorf("reading PROXY header: %w", err)
+		}
+		buf = append(buf, b)
+		if len(buf) >= 2 && buf[len(buf)-2] == '\r' && buf[len(buf)-1] == '\n' {
+			return parseProxyProtocolV1Line(string(buf[:len(buf)-2]))
+		}
+	}
+	return "", fmt.Errorf("PROXY protocol header exceeded %d bytes without CRLF", maxLen)
+}
+
+// parseProxyProtocolV1Line parses the CRLF-stripped PROXY v1 header line and returns
+// its destination "ip:port".
+func parseProxyProtocolV1Line(line string) (string, error) {
+	fields := strings.Fields(line)
+	// PROXY <proto> <srcip> <dstip> <srcport> <dstport>
+	if len(fields) != 6 || fields[0] != "PROXY" {
+		return "", fmt.Errorf("malformed PROXY v1 header: %q", line)
+	}
+	switch fields[1] {
+	case "TCP4", "TCP6":
+	default:
+		return "", fmt.Errorf("unsupported PROXY protocol family: %q", fields[1])
+	}
+	// The destination may be an IP or, from a macOS transparent-proxy flow that
+	// connected by name, a hostname. We accept either — the proxy dials it directly
+	// (host:port), so a hostname is fine and avoids dropping name-based flows.
+	dstHost, dstPort := fields[3], fields[5]
+	if strings.TrimSpace(dstHost) == "" {
+		return "", fmt.Errorf("empty PROXY destination host")
+	}
+	if n, err := strconv.Atoi(dstPort); err != nil || n < 1 || n > 65535 {
+		return "", fmt.Errorf("invalid PROXY destination port: %q", dstPort)
+	}
+	return net.JoinHostPort(dstHost, dstPort), nil
 }
 
 // checkConnectPolicy validates if a connection should be allowed based on hostname/IP policy
