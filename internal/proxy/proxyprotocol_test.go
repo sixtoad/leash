@@ -19,7 +19,7 @@ func TestParseProxyProtocolV1Line(t *testing.T) {
 		{"missing fields", "PROXY TCP4 10.0.0.1 93.184.216.34 51000", "", true},
 		{"bad prefix", "NOTPROXY TCP4 10.0.0.1 93.184.216.34 51000 443", "", true},
 		{"bad family", "PROXY TCP5 10.0.0.1 93.184.216.34 51000 443", "", true},
-		{"bad ip", "PROXY TCP4 10.0.0.1 not-an-ip 51000 443", "", true},
+		{"hostname dst", "PROXY TCP4 10.0.0.1 example.com 51000 443", "example.com:443", false},
 		{"port too large", "PROXY TCP4 10.0.0.1 93.184.216.34 51000 70000", "", true},
 		{"port zero", "PROXY TCP4 10.0.0.1 93.184.216.34 51000 0", "", true},
 	}

@@ -342,14 +342,17 @@ func parseProxyProtocolV1Line(line string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported PROXY protocol family: %q", fields[1])
 	}
-	dstIP, dstPort := fields[3], fields[5]
-	if net.ParseIP(dstIP) == nil {
-		return "", fmt.Errorf("invalid PROXY destination IP: %q", dstIP)
+	// The destination may be an IP or, from a macOS transparent-proxy flow that
+	// connected by name, a hostname. We accept either — the proxy dials it directly
+	// (host:port), so a hostname is fine and avoids dropping name-based flows.
+	dstHost, dstPort := fields[3], fields[5]
+	if strings.TrimSpace(dstHost) == "" {
+		return "", fmt.Errorf("empty PROXY destination host")
 	}
 	if n, err := strconv.Atoi(dstPort); err != nil || n < 1 || n > 65535 {
 		return "", fmt.Errorf("invalid PROXY destination port: %q", dstPort)
 	}
-	return net.JoinHostPort(dstIP, dstPort), nil
+	return net.JoinHostPort(dstHost, dstPort), nil
 }
 
 // checkConnectPolicy validates if a connection should be allowed based on hostname/IP policy
