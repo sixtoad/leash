@@ -329,7 +329,7 @@ extension DaemonSync {
         }
     }
 
-    func queryNetworkRules(completion: @escaping (Result<[NetworkRule], Error>) -> Void) {
+    func queryNetworkRules(completion: @escaping (Result<(rules: [NetworkRule], defaultAllow: Bool?), Error>) -> Void) {
         queue.async { [weak self] in
             guard let self else { return }
             self.ensureConnection()
@@ -337,14 +337,15 @@ extension DaemonSync {
             self.sendRequest(type: "mac.network_rule.query", payload: [:]) { result in
                 switch result {
                 case .success(let payload):
+                    let defaultAllow = payload["network_default_allow"] as? Bool
                     guard let rulesData = payload["rules"] as? [[String: Any]] else {
-                        completion(.success([]))
+                        completion(.success(([], defaultAllow)))
                         return
                     }
 
                     let rules = rulesData.compactMap { NetworkRule.fromDictionary($0) }
 
-                    completion(.success(rules))
+                    completion(.success((rules, defaultAllow)))
                 case .failure(let error):
                     completion(.failure(error))
                 }

@@ -8,6 +8,12 @@ class FilterDataProvider: NEFilterDataProvider {
     let log = OSLog(subsystem: LeashIdentifiers.bundle, category: "network-filter")
     var trackedPIDs: [pid_t: TrackedPIDInfo] = [:]
     var networkRules: [NetworkRule] = []
+    // Connect default posture forwarded from policy (Cedar ConnectDefaultAllow).
+    // Defaults to allow so we never fail closed before a policy has been applied.
+    var networkDefaultAllow = true
+    // True once the daemon has delivered a network rule set (query or broadcast),
+    // gating default-deny so we don't deny in the connect→first-snapshot window.
+    var networkRulesLoaded = false
     let syncQueue = DispatchQueue(label: LeashIdentifiers.namespaced("filter.sync"))
     let persistenceQueue = DispatchQueue(label: LeashIdentifiers.namespaced("filter.persistence"), qos: .utility)
     let daemon = DaemonSync.shared
