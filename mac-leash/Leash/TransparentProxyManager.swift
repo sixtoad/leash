@@ -26,6 +26,14 @@ final class TransparentProxyManager {
     func activate() async throws {
         let manager = try await loadManager()
 
+        // Skip the save if already configured + enabled — an unconditional
+        // saveToPreferences can trigger a redundant system authorization prompt.
+        if manager.isEnabled,
+           let existing = manager.protocolConfiguration as? NETunnelProviderProtocol,
+           existing.providerBundleIdentifier == LeashIdentifiers.transparentProxyExtension {
+            return
+        }
+
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = LeashIdentifiers.transparentProxyExtension
         // serverAddress is required by the API but unused for a transparent proxy;
@@ -41,9 +49,15 @@ final class TransparentProxyManager {
 
     func deactivate() async throws {
         let managers = try await NETransparentProxyManager.loadAllFromPreferences()
-        for manager in managers where
-            (manager.protocolConfiguration as? NETunnelProviderProtocol)?
-                .providerBundleIdentifier == LeashIdentifiers.transparentProxyExtension {
+        guard let manager = managers.first(where: {
+            ($0.protocolConfiguration as? NETunnelProviderProtocol)?
+                .providerBundleIdentifier == LeashIdentifiers.transparentProxyExtension
+        }) else {
+            return
+        }
+        // Only save when actually changing state (saving in a loop / when already
+        // disabled is redundant and can disturb NE preferences serialization).
+        if manager.isEnabled {
             manager.isEnabled = false
             try await manager.saveToPreferences()
         }

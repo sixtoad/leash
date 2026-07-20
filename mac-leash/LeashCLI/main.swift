@@ -88,7 +88,7 @@ private func resolveLeashCACertPath(env: [String: String]) -> String? {
 /// Env vars that point common toolchains at a custom CA bundle.
 private let caTrustEnvKeys = [
     "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "CURL_CA_BUNDLE",
-    "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO"
+    "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO", "AWS_CA_BUNDLE"
 ]
 
 private func resolveExecutable(_ executable: String, env: [String: String]) -> String? {
