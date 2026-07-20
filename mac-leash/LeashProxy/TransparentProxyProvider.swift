@@ -17,7 +17,8 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
 
     private let proxyHost = "127.0.0.1"
     private let proxyPort: Network.NWEndpoint.Port = 18000
-    private let relayQueue = DispatchQueue(label: LeashIdentifiers.namespaced("proxy.relay"), attributes: .concurrent)
+    // Serial: the Network framework expects a connection's callbacks to be serialized.
+    private let relayQueue = DispatchQueue(label: LeashIdentifiers.namespaced("proxy.relay"))
 
     // MARK: - Lifecycle
 
@@ -135,22 +136,30 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         }
     }
 
+    /// Close both flow directions and cancel the proxy connection.
+    private func teardown(_ flow: NEAppProxyTCPFlow, _ connection: NWConnection, error: Error?) {
+        flow.closeReadWithError(error)
+        flow.closeWriteWithError(error)
+        connection.cancel()
+    }
+
     /// workload → proxy
     private func pumpFlowToConnection(_ flow: NEAppProxyTCPFlow, _ connection: NWConnection) {
         flow.readData { [weak self] data, error in
             guard let self else { return }
             if let error {
-                connection.cancel()
+                self.teardown(flow, connection, error: error)
                 return
             }
             guard let data, !data.isEmpty else {
-                // EOF from the workload.
+                // EOF from the workload — half-close the send side to the proxy.
                 connection.send(content: nil, isComplete: true, completion: .contentProcessed { _ in })
                 return
             }
             connection.send(content: data, completion: .contentProcessed { [weak self] sendError in
-                guard let self, sendError == nil else {
-                    connection.cancel()
+                guard let self else { return }
+                if let sendError {
+                    self.teardown(flow, connection, error: sendError)
                     return
                 }
                 self.pumpFlowToConnection(flow, connection)
@@ -162,19 +171,22 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
     private func pumpConnectionToFlow(_ connection: NWConnection, _ flow: NEAppProxyTCPFlow) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self else { return }
+
             if let data, !data.isEmpty {
                 flow.write(data) { [weak self] writeError in
-                    guard let self, writeError == nil else {
-                        connection.cancel()
-                        return
+                    guard let self else { return }
+                    if let writeError {
+                        self.teardown(flow, connection, error: writeError)
+                    } else if isComplete {
+                        // Only tear down after the final chunk is actually written,
+                        // otherwise the last bytes can be truncated.
+                        self.teardown(flow, connection, error: nil)
+                    } else {
+                        self.pumpConnectionToFlow(connection, flow)
                     }
-                    self.pumpConnectionToFlow(connection, flow)
                 }
-            }
-            if isComplete || error != nil {
-                flow.closeReadWithError(error)
-                flow.closeWriteWithError(error)
-                connection.cancel()
+            } else if isComplete || error != nil {
+                self.teardown(flow, connection, error: error)
             }
         }
     }
