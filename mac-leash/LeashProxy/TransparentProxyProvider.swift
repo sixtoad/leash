@@ -20,9 +20,20 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
     // Serial: the Network framework expects a connection's callbacks to be serialized.
     private let relayQueue = DispatchQueue(label: LeashIdentifiers.namespaced("proxy.relay"))
 
+    private let daemon = DaemonSync.shared
+    private let stateQueue = DispatchQueue(label: LeashIdentifiers.namespaced("proxy.state"))
+    // leash-tracked PIDs (the launched command + its lineage), synced from the ES
+    // extension via the daemon. Only flows from these are routed through the proxy.
+    private var trackedPIDs: Set<pid_t> = []
+
     // MARK: - Lifecycle
 
     override func startProxy(options: [String: Any]? = nil, completionHandler: @escaping (Error?) -> Void) {
+        // Track the same PID set the content filter uses, delivered over the daemon.
+        daemon.subscribe(to: "mac.pid.sync") { [weak self] payload in
+            self?.handlePIDUpdate(payload)
+        }
+
         let settings = NETransparentProxyNetworkSettings(tunnelRemoteAddress: proxyHost)
 
         // Intercept all outbound TCP; per-flow gating (tracked PIDs) happens in
@@ -55,21 +66,56 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         completionHandler()
     }
 
+    // MARK: - Tracked PIDs
+
+    private func handlePIDUpdate(_ payload: [String: Any]) {
+        guard let entries = payload["entries"] as? [[String: Any]] else { return }
+        var pids: Set<pid_t> = []
+        for entry in entries {
+            if let pid = entry["pid"] as? Int {
+                pids.insert(pid_t(pid))
+            }
+        }
+        stateQueue.async { [weak self] in
+            guard let self else { return }
+            self.trackedPIDs = pids
+            os_log("Proxy tracking %{public}d PIDs", log: self.log, type: .default, pids.count)
+        }
+    }
+
+    /// The source PID for a flow, from its audit token (0 if unavailable).
+    private func sourcePID(for flow: NEAppProxyFlow) -> pid_t {
+        guard let tokenData = flow.metaData.sourceAppAuditToken else { return 0 }
+        return tokenData.withUnsafeBytes { buffer in
+            guard let pointer = buffer.baseAddress?.assumingMemoryBound(to: audit_token_t.self) else {
+                return 0
+            }
+            return audit_token_to_pid(pointer.pointee)
+        }
+    }
+
     // MARK: - Flow handling
 
     override func handleNewFlow(_ flow: NEAppProxyFlow) -> Bool {
         guard let tcpFlow = flow as? NEAppProxyTCPFlow else {
             return false // Not TCP — let the system handle it.
         }
-        guard let dest = originalDestination(for: tcpFlow) else {
-            os_log("Dropping flow with no resolvable destination", log: log, type: .error)
+
+        // Only route leash-tracked processes through the proxy; everything else passes
+        // straight through untouched.
+        let pid = sourcePID(for: flow)
+        let isTracked = stateQueue.sync { pid != 0 && trackedPIDs.contains(pid) }
+        guard isTracked else {
             return false
         }
 
-        // TODO(VM): gate on leash-tracked PID lineage via
-        // flow.metaData.sourceAppAuditToken → pid, matching the content filter's
-        // tracked-PID set. For the scaffold we relay every TCP flow we're offered.
+        guard let dest = originalDestination(for: tcpFlow) else {
+            os_log("Tracked flow (pid=%{public}d) has no resolvable destination", log: log, type: .error, pid)
+            return false
+        }
 
+        os_log("Routing tracked flow pid=%{public}d → %{public}@:%{public}d",
+               log: log, type: .default, pid, dest.host, Int(dest.port))
         relay(tcpFlow, originalDest: dest)
         return true
     }
