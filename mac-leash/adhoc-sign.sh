@@ -11,6 +11,7 @@ APP="${1:-$(ls -d /Volumes/sixto_dev/.devcache/DerivedData/Leash-*/Build/Product
 
 ES_ENT="$SRC/LeashES/LeashES.entitlements"
 NF_ENT="$SRC/LeashNetworkFilter/LeashNetworkFilter.entitlements"
+PROXY_ENT="$SRC/LeashProxy/LeashProxy.entitlements"
 APP_ENT="$SRC/Leash/leash.entitlements"
 
 echo ">> Signing app: $APP"
@@ -31,7 +32,13 @@ codesign --force --sign - --entitlements "$ES_ENT" \
 codesign --force --sign - --entitlements "$NF_ENT" \
   "$APP/Contents/Library/SystemExtensions/com.strongdm.leash.LeashNetworkFilter.systemextension"
 
-# 5. Outer app (network extension + system-extension install entitlements)
+# 5. Transparent Proxy system extension (restricted entitlement), if present.
+PROXY_EXT="$APP/Contents/Library/SystemExtensions/com.strongdm.leash.LeashProxy.systemextension"
+if [ -d "$PROXY_EXT" ]; then
+  codesign --force --sign - --entitlements "$PROXY_ENT" "$PROXY_EXT"
+fi
+
+# 6. Outer app (network extension + system-extension install entitlements)
 codesign --force --sign - --entitlements "$APP_ENT" "$APP"
 
 echo ">> Verifying..."
