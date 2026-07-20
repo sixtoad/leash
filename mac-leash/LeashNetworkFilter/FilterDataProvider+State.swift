@@ -143,11 +143,15 @@ extension FilterDataProvider {
             guard !restored.isEmpty else { return }
             self.syncQueue.async {
                 // Only fill gaps — never clobber a mapping already learned since startup.
+                var restoredCount = 0
                 for (domain, res) in restored where self.domainResolutionCache[domain] == nil {
                     self.domainResolutionCache[domain] = res
+                    restoredCount += 1
                 }
-                os_log("Restored %{public}d resolved domains from disk",
-                       log: self.log, type: .default, restored.count)
+                if restoredCount > 0 {
+                    os_log("Restored %{public}d resolved domains from disk",
+                           log: self.log, type: .default, restoredCount)
+                }
             }
         }
     }

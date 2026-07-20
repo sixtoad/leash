@@ -458,6 +458,19 @@ extension FilterDataProvider {
                 ]
             }
 
+            // Reuse the snapshot to evict expired entries from the in-memory cache;
+            // otherwise this long-running extension only drops them on re-query,
+            // leaking memory over time. Re-check under the lock so a mapping that was
+            // refreshed since the snapshot isn't removed.
+            let expiredKeys = snapshot.compactMap { domain, res in res.expiry <= now ? domain : nil }
+            if !expiredKeys.isEmpty {
+                self.syncQueue.async {
+                    for key in expiredKeys where (self.domainResolutionCache[key]?.expiry ?? .distantFuture) <= now {
+                        self.domainResolutionCache.removeValue(forKey: key)
+                    }
+                }
+            }
+
             do {
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                                         withIntermediateDirectories: true)
