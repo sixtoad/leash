@@ -443,12 +443,13 @@ func validateEventArrays(arrays ...[]byte) bool {
 
 // BPFConfig holds configuration for BPF program attachment
 type BPFConfig struct {
-	ProgramNames      []string // Names of BPF programs to attach
-	EventMapName      string   // Name of the event ring buffer map
-	AllowedCgroupsMap string   // Name of the allowed cgroups map
-	TargetCgroupMap   string   // Name of the target cgroup map
-	StartMessage      string   // Success message to display
-	ShutdownMessage   string   // Shutdown message to display
+	ProgramNames         []string // Programs to attach; a failure fails enforcement (caller decides degrade vs --require-lsm)
+	OptionalProgramNames []string // Best-effort programs: a failure degrades only that hook, not the whole enforcement
+	EventMapName         string   // Name of the event ring buffer map
+	AllowedCgroupsMap    string   // Name of the allowed cgroups map
+	TargetCgroupMap      string   // Name of the target cgroup map
+	StartMessage         string   // Success message to display
+	ShutdownMessage      string   // Shutdown message to display
 }
 
 // LSMModule interface for modules that can load BPF programs
@@ -506,6 +507,24 @@ func LoadAndAttachBPFWithSetup(
 	}
 
 	coll, err := ebpf.NewCollection(spec)
+	if err != nil && len(config.OptionalProgramNames) > 0 {
+		// ebpf.NewCollection verifies EVERY program eagerly, so an optional
+		// best-effort hook that fails verification (e.g. a kernel-incompatible
+		// program) would otherwise sink the whole collection — taking the
+		// REQUIRED hooks (e.g. lsm_open) down with it and defeating the
+		// best-effort attach logic below, which never runs. Reload from a fresh
+		// spec with the optional programs stripped so core enforcement survives;
+		// the optional attach loop no-ops when a program is absent.
+		if fresh, lerr := loader(); lerr == nil {
+			for _, name := range config.OptionalProgramNames {
+				delete(fresh.Programs, name)
+			}
+			if coll2, cerr := ebpf.NewCollection(fresh); cerr == nil {
+				fmt.Fprintf(os.Stderr, "leash: optional LSM hook(s) %v failed to load (%v); continuing with core enforcement only\n", config.OptionalProgramNames, err)
+				coll, err = coll2, nil
+			}
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("failed to create BPF collection: %w", err)
 	}
@@ -574,6 +593,23 @@ func LoadAndAttachBPFWithSetup(
 			// already attached. The most common cause is the kernel not having
 			// "bpf" as an active LSM (see the client-side preflight).
 			return fmt.Errorf("attach %s LSM program (kernel may lack an active bpf LSM): %w", programName, err)
+		}
+		links = append(links, lsmLink)
+	}
+
+	// Optional hooks attach best-effort: a failure (e.g. the kernel lacks
+	// CONFIG_SECURITY_PATH, or the program is incompatible) degrades only that
+	// hook, NOT the whole enforcement — so an added/experimental hook can never
+	// take the sandbox down to proxy-only.
+	for _, programName := range config.OptionalProgramNames {
+		prog := coll.Programs[programName]
+		if prog == nil {
+			continue
+		}
+		lsmLink, err := link.AttachLSM(link.LSMOptions{Program: prog})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "leash: optional LSM hook %q not attached (%v); continuing without it\n", programName, err)
+			continue
 		}
 		links = append(links, lsmLink)
 	}
