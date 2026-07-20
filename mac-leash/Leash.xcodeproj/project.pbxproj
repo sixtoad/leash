@@ -7,6 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		AEA1CF032E9586F500F22D99 /* com.strongdm.leash.LeashProxy.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = AEA1CF022E9586F500F22D99 /* com.strongdm.leash.LeashProxy.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		AEA1CF042E9586F500F22D99 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 41CFD5792E9586F500F22D99 /* NetworkExtension.framework */; };
+		AEA1CF052E9586F500F22D99 /* libbsm.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 3E5930002E9450E0007328DD /* libbsm.tbd */; };
 		3E5917F92E9448FE007328DD /* libEndpointSecurity.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 3E5917F82E9448FE007328DD /* libEndpointSecurity.tbd */; };
 		3E5918012E9448FE007328DD /* com.strongdm.leash.LeashES.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = 3E5917F62E9448FE007328DD /* com.strongdm.leash.LeashES.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		3E5930012E9450E0007328DD /* libbsm.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 3E5930002E9450E0007328DD /* libbsm.tbd */; };
@@ -18,6 +21,13 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
+		AEA1CF062E9586F500F22D99 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 3E5917DA2E9448D9007328DD /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = AEA1CF012E9586F500F22D99;
+			remoteInfo = LeashProxy;
+		};
 		3E5917FF2E9448FE007328DD /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 3E5917DA2E9448D9007328DD /* Project object */;
@@ -49,6 +59,7 @@
 			dstSubfolderSpec = 16;
 			files = (
 				41CFD5842E9586F500F22D99 /* com.strongdm.leash.LeashNetworkFilter.systemextension in Embed System Extensions */,
+				AEA1CF032E9586F500F22D99 /* com.strongdm.leash.LeashProxy.systemextension in Embed System Extensions */,
 				3E5918012E9448FE007328DD /* com.strongdm.leash.LeashES.systemextension in Embed System Extensions */,
 			);
 			name = "Embed System Extensions";
@@ -87,6 +98,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		AEA1CF022E9586F500F22D99 /* com.strongdm.leash.LeashProxy.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = com.strongdm.leash.LeashProxy.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
 		3E5917E22E9448D9007328DD /* Leash.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Leash.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		3E5917F62E9448FE007328DD /* com.strongdm.leash.LeashES.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = com.strongdm.leash.LeashES.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
 		3E5917F82E9448FE007328DD /* libEndpointSecurity.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libEndpointSecurity.tbd; path = usr/lib/libEndpointSecurity.tbd; sourceTree = SDKROOT; };
@@ -97,6 +109,13 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		AEA1CF0C2E9586F500F22D99 /* Exceptions for "LeashProxy" folder in "LeashProxy" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = AEA1CF012E9586F500F22D99 /* LeashProxy */;
+		};
 		3E5918022E9448FE007328DD /* Exceptions for "LeashES" folder in "LeashES" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
@@ -135,6 +154,14 @@
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		AEA1CF0B2E9586F500F22D99 /* LeashProxy */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				AEA1CF0C2E9586F500F22D99 /* Exceptions for "LeashProxy" folder in "LeashProxy" target */,
+			);
+			path = LeashProxy;
+			sourceTree = "<group>";
+		};
 		3E5917E42E9448D9007328DD /* Leash */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
@@ -174,6 +201,15 @@
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		AEA1CF092E9586F500F22D99 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AEA1CF042E9586F500F22D99 /* NetworkExtension.framework in Frameworks */,
+				AEA1CF052E9586F500F22D99 /* libbsm.tbd in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		3E5917DF2E9448D9007328DD /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -218,6 +254,7 @@
 				3E5917FA2E9448FE007328DD /* LeashES */,
 				3E59180C2E944B76007328DD /* LeashCLI */,
 				41CFD57B2E9586F500F22D99 /* LeashNetworkFilter */,
+				AEA1CF0B2E9586F500F22D99 /* LeashProxy */,
 				3E5917F72E9448FE007328DD /* Frameworks */,
 				3E5917E32E9448D9007328DD /* Products */,
 			);
@@ -230,6 +267,7 @@
 				3E5917F62E9448FE007328DD /* com.strongdm.leash.LeashES.systemextension */,
 				3E59180B2E944B76007328DD /* leashcli */,
 				41CFD5782E9586F500F22D99 /* com.strongdm.leash.LeashNetworkFilter.systemextension */,
+				AEA1CF022E9586F500F22D99 /* com.strongdm.leash.LeashProxy.systemextension */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -269,6 +307,29 @@
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXNativeTarget section */
+		AEA1CF012E9586F500F22D99 /* LeashProxy */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AEA1CF0F2E9586F500F22D99 /* Build configuration list for PBXNativeTarget "LeashProxy" */;
+			buildPhases = (
+				AEA1CF082E9586F500F22D99 /* Sources */,
+				AEA1CF092E9586F500F22D99 /* Frameworks */,
+				AEA1CF0A2E9586F500F22D99 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				419FE5042E9833A500E4D751 /* Shared */,
+				AEA1CF0B2E9586F500F22D99 /* LeashProxy */,
+			);
+			name = LeashProxy;
+			packageProductDependencies = (
+			);
+			productName = LeashProxy;
+			productReference = AEA1CF022E9586F500F22D99 /* com.strongdm.leash.LeashProxy.systemextension */;
+			productType = "com.apple.product-type.system-extension";
+		};
 		3E5917E12E9448D9007328DD /* Leash */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 3E5917EF2E9448DA007328DD /* Build configuration list for PBXNativeTarget "Leash" */;
@@ -286,6 +347,7 @@
 			dependencies = (
 				3E5918002E9448FE007328DD /* PBXTargetDependency */,
 				41CFD5832E9586F500F22D99 /* PBXTargetDependency */,
+				AEA1CF072E9586F500F22D99 /* PBXTargetDependency */,
 				3E9F6A042F123456007328DD /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
@@ -390,6 +452,9 @@
 					41CFD5772E9586F500F22D99 = {
 						CreatedOnToolsVersion = 26.0;
 					};
+					AEA1CF012E9586F500F22D99 = {
+						CreatedOnToolsVersion = 26.0;
+					};
 				};
 			};
 			buildConfigurationList = 3E5917DD2E9448D9007328DD /* Build configuration list for PBXProject "Leash" */;
@@ -413,11 +478,19 @@
 				3E5917F52E9448FE007328DD /* LeashES */,
 				3E59180A2E944B76007328DD /* LeashCLI */,
 				41CFD5772E9586F500F22D99 /* LeashNetworkFilter */,
+				AEA1CF012E9586F500F22D99 /* LeashProxy */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		AEA1CF0A2E9586F500F22D99 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		3E5917E02E9448D9007328DD /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -442,6 +515,13 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		AEA1CF082E9586F500F22D99 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		3E5917DE2E9448D9007328DD /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -473,6 +553,11 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
+		AEA1CF072E9586F500F22D99 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = AEA1CF012E9586F500F22D99 /* LeashProxy */;
+			targetProxy = AEA1CF062E9586F500F22D99 /* PBXContainerItemProxy */;
+		};
 		3E5918002E9448FE007328DD /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = 3E5917F52E9448FE007328DD /* LeashES */;
@@ -491,6 +576,80 @@
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
+		AEA1CF0D2E9586F500F22D99 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = LeashProxy/LeashProxy.entitlements;
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGN_IDENTITY = "-";
+				CURRENT_PROJECT_VERSION = 20251027.1;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = LeashProxy/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Leash Proxy";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSSystemExtensionUsageDescription = "Leash Proxy routes leash-tracked traffic through the local policy proxy";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.LeashProxy;
+				PRODUCT_NAME = "$(inherited)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				REGISTER_APP_GROUPS = YES;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DISABLE_APP_INTENTS_METADATA = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		AEA1CF0E2E9586F500F22D99 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = LeashProxy/LeashProxy.entitlements;
+				CODE_SIGN_STYLE = Manual;
+				CODE_SIGN_IDENTITY = "-";
+				CURRENT_PROJECT_VERSION = 20251027.1;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = LeashProxy/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Leash Proxy";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSSystemExtensionUsageDescription = "Leash Proxy routes leash-tracked traffic through the local policy proxy";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.LeashProxy;
+				PRODUCT_NAME = "$(inherited)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				REGISTER_APP_GROUPS = YES;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DISABLE_APP_INTENTS_METADATA = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
 		3E5917ED2E9448DA007328DD /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -928,6 +1087,15 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		AEA1CF0F2E9586F500F22D99 /* Build configuration list for PBXNativeTarget "LeashProxy" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AEA1CF0D2E9586F500F22D99 /* Debug */,
+				AEA1CF0E2E9586F500F22D99 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		3E5917DD2E9448D9007328DD /* Build configuration list for PBXProject "Leash" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
