@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"io"
 	"net"
 	"testing"
@@ -56,7 +57,8 @@ func TestReadProxyProtocolV1DestStopsAtCRLF(t *testing.T) {
 		_, _ = client.Write(appData)
 	}()
 
-	dest, err := readProxyProtocolV1Dest(server)
+	rd := bufio.NewReader(server)
+	dest, err := readProxyProtocolV1Dest(rd)
 	if err != nil {
 		t.Fatalf("readProxyProtocolV1Dest: %v", err)
 	}
@@ -64,8 +66,10 @@ func TestReadProxyProtocolV1DestStopsAtCRLF(t *testing.T) {
 		t.Fatalf("dest = %q, want %q", dest, want)
 	}
 
+	// Read app bytes from the SAME buffered reader — the buffer may have pulled
+	// past the header, so reading the raw conn here would lose data.
 	buf := make([]byte, len(appData))
-	if _, err := io.ReadFull(server, buf); err != nil {
+	if _, err := io.ReadFull(rd, buf); err != nil {
 		t.Fatalf("reading app data after header: %v", err)
 	}
 	if string(buf) != string(appData) {
@@ -82,7 +86,7 @@ func TestReadProxyProtocolV1DestMissingCRLF(t *testing.T) {
 		client.Close()
 	}()
 
-	if _, err := readProxyProtocolV1Dest(server); err == nil {
+	if _, err := readProxyProtocolV1Dest(bufio.NewReader(server)); err == nil {
 		t.Fatal("expected error when header lacks CRLF")
 	}
 }

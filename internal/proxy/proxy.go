@@ -277,13 +277,17 @@ func (p *MITMProxy) handleTransparentConnection(clientConn net.Conn) {
 func (p *MITMProxy) handleProxyProtocolConnection(clientConn net.Conn) {
 	defer clientConn.Close()
 
-	originalDest, err := readProxyProtocolV1Dest(clientConn)
+	// Buffer the stream so the header is read without a syscall per byte; the same
+	// reader is then handed to serveTransparent so any application bytes the buffer
+	// pulled in past the header aren't lost.
+	rd := bufio.NewReader(clientConn)
+	originalDest, err := readProxyProtocolV1Dest(rd)
 	if err != nil {
 		log.Printf("Failed to read PROXY protocol header: %v", err)
 		return
 	}
 
-	p.serveTransparent(clientConn, originalDest)
+	p.serveTransparent(&connWrapper{Conn: clientConn, reader: rd}, originalDest)
 }
 
 // serveTransparent peeks the first bytes to classify HTTP vs TLS and dispatches to
@@ -308,16 +312,16 @@ func (p *MITMProxy) serveTransparent(clientConn net.Conn, originalDest string) {
 // readProxyProtocolV1Dest reads a HAProxy PROXY protocol v1 header from conn and
 // returns the original destination as "ip:port". It reads only up to the header's
 // terminating CRLF so the next read observes the client's first application bytes.
-func readProxyProtocolV1Dest(conn net.Conn) (string, error) {
+func readProxyProtocolV1Dest(rd *bufio.Reader) (string, error) {
 	// "PROXY TCP4 <src> <dst> <sport> <dport>\r\n" — the spec caps v1 at 107 bytes.
 	const maxLen = 107
 	buf := make([]byte, 0, maxLen)
-	one := make([]byte, 1)
 	for len(buf) < maxLen {
-		if _, err := io.ReadFull(conn, one); err != nil {
+		b, err := rd.ReadByte()
+		if err != nil {
 			return "", fmt.Errorf("reading PROXY header: %w", err)
 		}
-		buf = append(buf, one[0])
+		buf = append(buf, b)
 		if len(buf) >= 2 && buf[len(buf)-2] == '\r' && buf[len(buf)-1] == '\n' {
 			return parseProxyProtocolV1Line(string(buf[:len(buf)-2]))
 		}
