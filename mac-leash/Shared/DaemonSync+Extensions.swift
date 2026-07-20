@@ -352,20 +352,6 @@ extension DaemonSync {
         }
     }
 
-    // MARK: - Tracked PIDs Query
-
-    func queryTrackedPIDs(completion: @escaping (Result<[PIDEntry], Error>) -> Void) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.ensureConnection()
-
-            // For now, tracked PIDs come via mac.pid.sync broadcasts
-            // We don't have a query endpoint yet, so return empty
-            // The daemon will broadcast when PIDs are synced
-            completion(.success([]))
-        }
-    }
-
     // MARK: - Message Subscriptions
 
     func subscribe(to messageType: String, handler: @escaping MessageHandler) {

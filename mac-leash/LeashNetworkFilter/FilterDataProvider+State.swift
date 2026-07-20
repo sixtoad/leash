@@ -118,6 +118,41 @@ extension FilterDataProvider {
     }
 
     func reloadResolvedDomains() {
-        // Resolved domains are now handled locally
+        guard let url = resolvedDomainsStoreURL else { return }
+        persistenceQueue.async { [weak self] in
+            guard let self else { return }
+            guard let data = try? Data(contentsOf: url),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let entries = root["domains"] as? [[String: Any]] else {
+                return
+            }
+
+            let now = Date()
+            var restored: [String: DomainResolution] = [:]
+            for entry in entries {
+                guard let domain = entry["domain"] as? String,
+                      let ips = entry["ips"] as? [String],
+                      let expiryTS = entry["expiry"] as? TimeInterval else {
+                    continue
+                }
+                let expiry = Date(timeIntervalSince1970: expiryTS)
+                guard expiry > now else { continue }
+                restored[domain] = DomainResolution(ips: Set(ips), expiry: expiry)
+            }
+
+            guard !restored.isEmpty else { return }
+            self.syncQueue.async {
+                // Only fill gaps — never clobber a mapping already learned since startup.
+                var restoredCount = 0
+                for (domain, res) in restored where self.domainResolutionCache[domain] == nil {
+                    self.domainResolutionCache[domain] = res
+                    restoredCount += 1
+                }
+                if restoredCount > 0 {
+                    os_log("Restored %{public}d resolved domains from disk",
+                           log: self.log, type: .default, restoredCount)
+                }
+            }
+        }
     }
 }

@@ -439,6 +439,48 @@ extension FilterDataProvider {
     }
 
     func persistResolvedDomains() {
+        guard let url = resolvedDomainsStoreURL else { return }
+        // Snapshot + write off the hot path. Dispatching the whole body (including the
+        // syncQueue snapshot) to a separate queue keeps this deadlock-safe regardless of
+        // whether the caller currently holds syncQueue.
+        persistenceQueue.async { [weak self] in
+            guard let self else { return }
+            let now = Date()
+            var snapshot: [String: DomainResolution] = [:]
+            self.syncQueue.sync { snapshot = self.domainResolutionCache }
+
+            let entries: [[String: Any]] = snapshot.compactMap { domain, res in
+                guard res.expiry > now else { return nil }
+                return [
+                    "domain": domain,
+                    "ips": Array(res.ips),
+                    "expiry": res.expiry.timeIntervalSince1970
+                ]
+            }
+
+            // Reuse the snapshot to evict expired entries from the in-memory cache;
+            // otherwise this long-running extension only drops them on re-query,
+            // leaking memory over time. Re-check under the lock so a mapping that was
+            // refreshed since the snapshot isn't removed.
+            let expiredKeys = snapshot.compactMap { domain, res in res.expiry <= now ? domain : nil }
+            if !expiredKeys.isEmpty {
+                self.syncQueue.async {
+                    for key in expiredKeys where (self.domainResolutionCache[key]?.expiry ?? .distantFuture) <= now {
+                        self.domainResolutionCache.removeValue(forKey: key)
+                    }
+                }
+            }
+
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                        withIntermediateDirectories: true)
+                let data = try JSONSerialization.data(withJSONObject: ["domains": entries])
+                try data.write(to: url, options: .atomic)
+            } catch {
+                os_log("Failed to persist resolved domains: %{public}@",
+                       log: self.log, type: .error, String(describing: error))
+            }
+        }
     }
 
     func resolveDomainIPs(_ domain: String) -> Set<String> {
