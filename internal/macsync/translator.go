@@ -82,7 +82,47 @@ func ConvertPolicyToMacRules(policy *lsm.PolicySet) ([]messages.MacPolicyRule, [
 		})
 	}
 
+	macRules = append(macRules, firmlinkVariants(macRules)...)
+
 	return macRules, networkRules
+}
+
+// macOS presents firmlinked system directories to Endpoint Security by their
+// canonical /private path (/etc -> /private/etc, /tmp -> /private/tmp,
+// /var -> /private/var), but Cedar policies are written with the short form.
+// For every file/exec rule whose Directory or FilePath is under a firmlink, emit
+// an equivalent rule with the /private prefix so it matches the path ES reports.
+func firmlinkVariants(rules []messages.MacPolicyRule) []messages.MacPolicyRule {
+	var extra []messages.MacPolicyRule
+	for _, r := range rules {
+		if pv, ok := privatePath(r.Directory); ok {
+			v := r
+			v.ID = uuid.NewString()
+			v.Directory = pv
+			extra = append(extra, v)
+		}
+		if pv, ok := privatePath(r.FilePath); ok {
+			v := r
+			v.ID = uuid.NewString()
+			v.FilePath = pv
+			extra = append(extra, v)
+		}
+	}
+	return extra
+}
+
+// privatePath returns the /private-prefixed form of a path that lives under a
+// macOS firmlink (/etc, /tmp, /var), and false otherwise.
+func privatePath(path string) (string, bool) {
+	if path == "" {
+		return "", false
+	}
+	for _, fl := range []string{"/etc", "/tmp", "/var"} {
+		if path == fl || strings.HasPrefix(path, fl+"/") {
+			return "/private" + path, true
+		}
+	}
+	return "", false
 }
 
 func actionString(action int32) string {
