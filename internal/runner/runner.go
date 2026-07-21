@@ -115,6 +115,7 @@ type options struct {
 	requireLSM      bool            // fail closed if the eBPF LSM can't attach (no proxy-only degrade)
 	allowNamespaces bool            // skip the seccomp mount/unshare block (reopens the userns bind-mount bypass)
 	injectServices  []injectService // --inject-service: helper plugins to spawn and bind into the box
+	dropUser        string          // --user <name>: explicit native drop-user (overrides $SUDO_USER; "root" opts in to running as root)
 }
 
 // injectService describes one --inject-service
@@ -163,6 +164,7 @@ type config struct {
 	dockerNetwork       string
 	runtime             string
 	requireLSM          bool
+	dropUser            string
 }
 
 type runner struct {
@@ -388,6 +390,7 @@ Flags:
   --allow-dbus                    (native) Let the workload reach the session D-Bus/keyring (keep DBUS_SESSION_BUS_ADDRESS; don't mask /run/user).
   --share-ipc                     (native) Share the host IPC namespace (e.g. X MIT-SHM). Default: isolated.
   --require-lsm                   (native) Fail closed if the eBPF LSM can't attach, instead of silently degrading to proxy-only. Refuses to run the workload unenforced.
+  --user <name>                   (native) Drop the workload to this user, overriding $SUDO_USER. Use when invoking leash as root without sudo (e.g. a scheduler) so the agent never runs as root by accident. Pass --user root to run as root deliberately.
   --allow-namespaces              (native) Let the workload create user/mount namespaces (unshare/mount) — for nested containers or sandbox tools. Reopens the userns bind-mount path-LSM bypass, so default is hardened (off).
   --inject-service <spec>         (native) Spawn a helper plugin as the invoking user, expose its socket to the box, and set an env var pointing at it. spec is comma-separated: plugin=<binary>,env=<VAR>,socket=<path>[,config=<opaque>]. config is optional and opaque (leash never interprets it). Fail-closed if the plugin can't start. Repeatable.
   --image <name[:tag]>            Override the target container image (defaults to %s).
@@ -647,6 +650,12 @@ func parseArgs(args []string) (options, error) {
 			}
 			opts.runtime = strings.TrimSpace(args[i+1])
 			i++
+		case "--user":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for %s", arg)
+			}
+			opts.dropUser = strings.TrimSpace(args[i+1])
+			i++
 		case "-l", "--listen":
 			if i+1 >= len(args) {
 				return opts, fmt.Errorf("missing argument for %s", arg)
@@ -708,6 +717,8 @@ func parseArgs(args []string) (options, error) {
 				opts.injectServices = append(opts.injectServices, svc)
 			case strings.HasPrefix(arg, "--runtime="):
 				opts.runtime = strings.TrimSpace(strings.TrimPrefix(arg, "--runtime="))
+			case strings.HasPrefix(arg, "--user="):
+				opts.dropUser = strings.TrimSpace(strings.TrimPrefix(arg, "--user="))
 			case strings.HasPrefix(arg, "--open="):
 				return opts, fmt.Errorf("--open does not take a value")
 			case strings.HasPrefix(arg, "-o="):
@@ -1334,6 +1345,11 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 	// Require the eBPF LSM layer (hard-stop instead of proxy-only degrade) when
 	// the flag is set or LEASH_REQUIRE_LSM is truthy.
 	cfg.requireLSM = opts.requireLSM || envTruthy("LEASH_REQUIRE_LSM")
+
+	// Explicit native drop-user. Falls back to $SUDO_USER at spawn time (see
+	// workloadUser); a native root run with neither is refused in Preflight so the
+	// workload never runs as root by accident.
+	cfg.dropUser = strings.TrimSpace(opts.dropUser)
 
 	cleanupTemp = false
 	return cfg, resolvedEnv, nil
