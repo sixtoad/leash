@@ -180,7 +180,7 @@ func TestSpawnInjectServicesContainerDockerArgs(t *testing.T) {
 	plugin := writeStubInjectPlugin(t, dir)
 	sock := filepath.Join(dir, "helper.sock")
 
-	r := &runner{opts: options{injectServices: []injectService{
+	r := &runner{cfg: config{logDir: dir}, opts: options{injectServices: []injectService{
 		{plugin: plugin, env: "HELPER_ADDR", socket: sock},
 	}}}
 	if err := r.spawnInjectServicesContainer(context.Background()); err != nil {
@@ -241,7 +241,7 @@ func TestTeardownInjectedPluginsRemovesSocket(t *testing.T) {
 	plugin := writeStubInjectPlugin(t, dir)
 	sock := filepath.Join(dir, "helper.sock")
 
-	r := &runner{opts: options{injectServices: []injectService{
+	r := &runner{cfg: config{logDir: dir}, opts: options{injectServices: []injectService{
 		{plugin: plugin, env: "HELPER_ADDR", socket: sock},
 	}}}
 	if err := r.spawnInjectServicesContainer(context.Background()); err != nil {

@@ -18,7 +18,6 @@ import (
 var mountStateTestMu sync.Mutex
 
 func TestLaunchTargetContainerAppendsAutoMount(t *testing.T) {
-	t.Parallel()
 	mountStateTestMu.Lock()
 	t.Cleanup(mountStateTestMu.Unlock)
 
@@ -88,7 +87,6 @@ func TestLaunchTargetContainerAppendsAutoMount(t *testing.T) {
 }
 
 func TestLaunchTargetContainerAppendsFileMount(t *testing.T) {
-	t.Parallel()
 	mountStateTestMu.Lock()
 	t.Cleanup(mountStateTestMu.Unlock)
 
@@ -173,7 +171,6 @@ func TestLaunchTargetContainerAppendsFileMount(t *testing.T) {
 }
 
 func TestLaunchTargetContainerSkipsDuplicateMount(t *testing.T) {
-	t.Parallel()
 	mountStateTestMu.Lock()
 	t.Cleanup(mountStateTestMu.Unlock)
 
@@ -331,7 +328,6 @@ func TestInitMountStateCreatesClaudeMountStateWithoutHostDir(t *testing.T) {
 }
 
 func TestLaunchTargetContainerLogsDuplicateSkip(t *testing.T) {
-	t.Parallel()
 	mountStateTestMu.Lock()
 	t.Cleanup(mountStateTestMu.Unlock)
 
@@ -401,7 +397,6 @@ func TestLaunchTargetContainerLogsDuplicateSkip(t *testing.T) {
 }
 
 func TestLaunchTargetContainerWarnsWhenHostNotDirectory(t *testing.T) {
-	t.Parallel()
 	mountStateTestMu.Lock()
 	t.Cleanup(mountStateTestMu.Unlock)
 
