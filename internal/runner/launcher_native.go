@@ -926,6 +926,12 @@ func (n nativeLauncher) execInBox(ctx context.Context, cgroupPath string, argv .
 // Preflight validates that native can enforce here (Linux + systemd + root),
 // failing with actionable advice otherwise — never a silent docker fallback.
 func (n nativeLauncher) Preflight() error {
+	// Never let a native root run silently execute the workload as root. When
+	// invoked directly as root (no sudo -> no $SUDO_USER) and without --user, we
+	// have no non-root target to drop to; refuse with actionable advice instead.
+	if nativeRootWithoutDropTarget(os.Geteuid(), n.r.cfg.dropUser, os.Getenv("SUDO_USER")) {
+		return fmt.Errorf("refusing to run the workload as root: pass --user <name> to drop to a non-root user, or --user root to run as root deliberately. (Invoked directly as root without sudo, so there is no $SUDO_USER to drop to.)")
+	}
 	return decideNativeRuntime(classifyNativeRuntime(goos(), hostHasSystemd(), os.Geteuid()))
 }
 
@@ -1073,14 +1079,43 @@ func (r *runner) workloadUIDGID() (int, int) {
 // as root). We drop to the invoking user ($SUDO_USER); leash and leashd keep
 // root only for enforcement. Non-root leash (rootless box) needs no drop.
 func (r *runner) workloadUser() string {
-	if os.Geteuid() != 0 {
-		return ""
+	user, _ := resolveWorkloadUser(os.Geteuid(), r.cfg.dropUser, os.Getenv("SUDO_USER"))
+	return user
+}
+
+// resolveWorkloadUser decides which user a native workload runs as. It returns
+// the username to drop to ("" means run as the current user — which is root when
+// euid==0) and whether running as root was EXPLICITLY requested. Precedence:
+// --user flag > $SUDO_USER. --user root is an explicit opt-in to run as root; an
+// euid==0 run with no --user and no usable $SUDO_USER returns ("", false), which
+// Preflight refuses rather than silently running the workload as root. Pure.
+func resolveWorkloadUser(euid int, dropUser, sudoUser string) (user string, explicitRoot bool) {
+	if euid != 0 {
+		return "", false // unprivileged: already the (non-root) invoking user
 	}
-	u := strings.TrimSpace(os.Getenv("SUDO_USER"))
-	if u == "" || u == "root" {
-		return ""
+	if d := strings.TrimSpace(dropUser); d != "" {
+		if d == "root" {
+			return "", true // explicit opt-in to run as root
+		}
+		return d, false
 	}
-	return u
+	if s := strings.TrimSpace(sudoUser); s != "" && s != "root" {
+		return s, false // sudo path: drop to the invoking user
+	}
+	return "", false // root with no drop target — Preflight refuses this
+}
+
+// nativeRootWithoutDropTarget reports whether a native run would SILENTLY execute
+// the workload as root: euid==0, no explicit --user (or --user root), and no
+// usable $SUDO_USER. Preflight refuses this to close the "agent accidentally
+// root" gap when leash is invoked directly as root (no sudo, so no $SUDO_USER).
+// Pure.
+func nativeRootWithoutDropTarget(euid int, dropUser, sudoUser string) bool {
+	if euid != 0 {
+		return false
+	}
+	user, explicitRoot := resolveWorkloadUser(euid, dropUser, sudoUser)
+	return user == "" && !explicitRoot
 }
 
 // nativeWorkloadScript builds the shell placed in the box: join the LSM-scoped
