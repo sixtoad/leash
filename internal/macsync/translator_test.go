@@ -85,7 +85,7 @@ forbid (
 			foundDenyDir = true
 		case rule.Action == "allow" && rule.Kind == "processExec" && rule.ExecutablePath == "/usr/bin/python3":
 			foundAllowExec = true
-		case rule.Action == "deny" && rule.Kind == "processExec" && strings.HasPrefix(rule.ExecutablePath, "/usr/bin"):
+		case rule.Action == "deny" && rule.Kind == "processExec" && rule.ExecutablePath == "*" && strings.HasPrefix(rule.Directory, "/usr/bin"):
 			foundDenyExec = true
 		}
 	}
