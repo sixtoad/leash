@@ -32,6 +32,14 @@ final class LeashMonitor {
     var trackedLeashProcesses: [pid_t: TrackedLeashProcess] = [:]
     var authEventsEnabled = false
 
+    // AUTH-subscription teardown is debounced: when the last tracked process exits we
+    // don't unsubscribe immediately (a rapid exec chain — e.g. leashcli -> a short-lived
+    // child — can momentarily empty the set and would otherwise lose file/exec gating
+    // for the next open). We wait a short grace period and only unsubscribe if the set
+    // is still empty. Any new tracked process cancels the pending teardown.
+    var pendingAuthDisable: DispatchWorkItem?
+    let authDisableGracePeriod: TimeInterval = 5.0
+
     let terminalExecutableHints: [String] = [
         "Terminal",
         "iTerm2",

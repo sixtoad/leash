@@ -220,9 +220,25 @@ extension LeashMonitor {
             syncTrackedPIDsToNetwork()
 
             if authEventsEnabled && trackedLeashProcesses.isEmpty {
-                disableAuthEvents()
+                scheduleAuthDisable()
             }
         }
+    }
+
+    /// Debounced teardown: unsubscribe from AUTH events only if the tracked set is
+    /// still empty after a short grace period. Avoids losing gating across a rapid
+    /// exec chain that momentarily empties the set. Runs on callbackQueue (serial).
+    func scheduleAuthDisable() {
+        pendingAuthDisable?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingAuthDisable = nil
+            if self.authEventsEnabled && self.trackedLeashProcesses.isEmpty {
+                self.disableAuthEvents()
+            }
+        }
+        pendingAuthDisable = work
+        callbackQueue.asyncAfter(deadline: .now() + authDisableGracePeriod, execute: work)
     }
 
     func respondAuth(_ message: UnsafeMutablePointer<es_message_t>,
@@ -255,6 +271,9 @@ extension LeashMonitor {
     }
 
     func enableAuthEvents() {
+        // A new tracked leash process arrived — cancel any pending debounced teardown.
+        pendingAuthDisable?.cancel()
+        pendingAuthDisable = nil
         guard let client, !authEventsEnabled else { return }
 
         var events: [es_event_type_t] = [
