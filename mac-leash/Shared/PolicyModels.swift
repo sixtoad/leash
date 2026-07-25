@@ -116,6 +116,18 @@ struct LeashPolicyRule: Codable, Identifiable, Equatable {
     private func normalizeFilePath(_ path: String) -> String {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return trimmed }
-        return URL(fileURLWithPath: trimmed).standardized.path
+        var normalized = URL(fileURLWithPath: trimmed).standardized.path
+        // macOS firmlinks: Endpoint Security reports canonical /private/{etc,tmp,var}
+        // paths, but policies are written as /etc, /tmp, /var. Map the private form
+        // back so a rule like "/tmp/" matches an event path like "/private/tmp/x".
+        for firmlink in ["/etc", "/tmp", "/var"] {
+            let privatePrefix = "/private" + firmlink
+            if normalized == privatePrefix {
+                normalized = firmlink
+            } else if normalized.hasPrefix(privatePrefix + "/") {
+                normalized = firmlink + String(normalized.dropFirst(privatePrefix.count))
+            }
+        }
+        return normalized
     }
 }
