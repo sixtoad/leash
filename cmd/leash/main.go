@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/strongdm/leash/internal/darwind"
+	"github.com/strongdm/leash/internal/doctor"
 	"github.com/strongdm/leash/internal/hardening"
 	"github.com/strongdm/leash/internal/leashd"
 	"github.com/strongdm/leash/internal/runner"
@@ -54,6 +55,8 @@ func main() {
 				log.Fatal(err)
 			}
 			return
+		case "doctor": // node readiness self-check; exits 1 when no runtime can enforce.
+			os.Exit(doctor.Main(args[2:], os.Stdout, os.Stderr))
 		case "--harden-exec": // internal: seccomp-harden this process, then exec the workload.
 			if err := hardenExec(args[2:]); err != nil {
 				log.Fatal(err)

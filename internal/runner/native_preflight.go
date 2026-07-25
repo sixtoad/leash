@@ -67,6 +67,19 @@ func decideNativeRuntime(v nativeViability) error {
 	return fmt.Errorf("native runtime is unavailable, so leash will not start (native never falls back to docker — pass --runtime docker to opt in).\n%s", nativeRuntimeAdvice(v))
 }
 
+// NativeRuntimeAdvice reports why the native runtime cannot enforce on a host
+// described by (goosName, hasSystemd, euid), or "" when it can. It is the
+// exported seam for `leash doctor` (internal/doctor) and stays pure, so the
+// self-check states the same prerequisites — and the same remedies — that a
+// real `--runtime native` start enforces via decideNativeRuntime.
+func NativeRuntimeAdvice(goosName string, hasSystemd bool, euid int) string {
+	return nativeRuntimeAdvice(classifyNativeRuntime(goosName, hasSystemd, euid))
+}
+
+// HostHasSystemd exports the systemd probe for `leash doctor`, so the
+// self-check looks for the same binaries the native launcher needs.
+func HostHasSystemd() bool { return hostHasSystemd() }
+
 func hostHasSystemd() bool {
 	if _, err := exec.LookPath("systemd-run"); err != nil {
 		return false

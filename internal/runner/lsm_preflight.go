@@ -125,6 +125,25 @@ func decideBPFLSM(status bpfLSMStatus, active []string, requireLSM bool) (string
 	return "WARNING: eBPF LSM enforcement (Layer 1) is unavailable; continuing with proxy-only enforcement (Layer 2 is fail-closed). Filesystem/exec/socket policies will NOT be enforced — pass --require-lsm to require Layer 1.\n" + advice, nil
 }
 
+// ProbeBPFLSM reports whether leash's Layer 1 (eBPF LSM) can attach on this
+// host, plus the remedy text when it cannot ("" when it can). It is the
+// exported seam for `leash doctor` (internal/doctor).
+//
+// The classification and the advice deliberately stay here, next to the code a
+// real run uses, so the self-check cannot drift from leash's actual
+// requirement — drift is exactly what issue #23 asks us to eliminate for walk.
+// An unreadable active-LSM list is reported as "not active" with the
+// bpfLSMUnknown advice: doctor answers a yes/no question, so "can't tell" has
+// to fall on the cautious side rather than claim readiness.
+func ProbeBPFLSM() (active bool, advice string) {
+	lsms, err := readActiveLSMs()
+	if err != nil {
+		lsms = nil
+	}
+	status := classifyBPFLSM(lsms, readKernelConfigBPFLSM())
+	return status == bpfLSMActive, bpfLSMAdvice(status, lsms)
+}
+
 func readActiveLSMs() ([]string, error) {
 	data, err := os.ReadFile(activeLSMPath)
 	if err != nil {

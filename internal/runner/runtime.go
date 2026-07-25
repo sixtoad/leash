@@ -78,6 +78,19 @@ var supportedRuntimes = []string{"docker", "podman"}
 // seam can be exercised end to end against a non-cliRuntime backend.
 const nativeRuntimeName = "native"
 
+// DetectContainerEngine returns the first supported container CLI found on
+// PATH, or "" when none is installed. Exported for `leash doctor`
+// (internal/doctor): it walks supportedRuntimes rather than a hardcoded pair so
+// the self-check automatically covers any engine this seam learns to drive.
+func DetectContainerEngine() string {
+	for _, name := range supportedRuntimes {
+		if _, err := exec.LookPath(name); err == nil {
+			return name
+		}
+	}
+	return ""
+}
+
 // newRuntime resolves a runtime name to a Runtime. An empty name defaults to
 // docker. Unsupported names return an error rather than failing later at the
 // first container command.
