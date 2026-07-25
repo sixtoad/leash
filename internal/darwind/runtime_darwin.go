@@ -473,21 +473,20 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 	defaultAllow := connectDefaultAllow(initialPolicy.LSMPolicies)
 	policyChecker := lsm.NewSimplePolicyChecker(connectRules, defaultAllow, initialPolicy.LSMPolicies.MCP)
 
-	var mitmProxy *proxy.MITMProxy
-	if !cfg.SkipCgroup {
-		mitmProxy, err = proxy.NewMITMProxy(cfg.ProxyPort, headerRewriter, policyChecker, logger, proxy.MCPConfig{})
-		// macOS has no SO_ORIGINAL_DST — the transparent proxy provider conveys the
-		// original destination via a PROXY protocol v1 header on each relayed flow.
-		if err == nil && mitmProxy != nil {
-			mitmProxy.SetProxyProtocolIngestion(true)
-		}
-		if err != nil {
-			logger.Close()
-			return nil, fmt.Errorf("failed to create MITM proxy: %w", err)
-		}
-	} else {
-		logPolicyEvent("proxy.mode", map[string]any{"status": "disabled", "reason": "skip-cgroup"})
+	// The MITM proxy is fed by the LeashProxy transparent-proxy system extension
+	// (PROXY-protocol ingestion), NOT by a cgroup/netfilter redirect. So on macOS it
+	// must run regardless of SkipCgroup — which is always true here. Gating it on the
+	// cgroup check (as the Linux path does) left the proxy inert on macOS, so nothing
+	// listened on the proxy port for the extension to relay to.
+	mitmProxy, err := proxy.NewMITMProxy(cfg.ProxyPort, headerRewriter, policyChecker, logger, proxy.MCPConfig{})
+	if err != nil {
+		logger.Close()
+		return nil, fmt.Errorf("failed to create MITM proxy: %w", err)
 	}
+	// macOS has no SO_ORIGINAL_DST — read the original destination from the PROXY
+	// protocol v1 header the transparent proxy provider prepends to each flow.
+	mitmProxy.SetProxyProtocolIngestion(true)
+	logPolicyEvent("proxy.mode", map[string]any{"status": "enabled", "port": cfg.ProxyPort, "ingestion": "proxy-protocol-v1"})
 
 	state := &runtimeState{
 		cfg:            cfg,
