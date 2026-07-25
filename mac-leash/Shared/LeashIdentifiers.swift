@@ -7,7 +7,7 @@ enum LeashIdentifiers {
         }
 
         if let bundleIdentifier = Bundle.main.bundleIdentifier {
-            for suffix in ["LeashES", "LeashNetworkFilter", "cli"] {
+            for suffix in ["LeashES", "LeashNetworkFilter", "LeashProxy", "cli"] {
                 let suffixWithSeparator = ".\(suffix)"
                 if bundleIdentifier.hasSuffix(suffixWithSeparator) {
                     return String(bundleIdentifier.dropLast(suffixWithSeparator.count))
@@ -44,6 +44,7 @@ enum LeashIdentifiers {
 
     static let endpointSecurityExtension = "\(bundle).LeashES"
     static let networkFilterExtension = "\(bundle).LeashNetworkFilter"
+    static let transparentProxyExtension = "\(bundle).LeashProxy"
     static let cli = "\(bundle).cli"
     static let systemWideEnforcementConfigKey = "systemwide_enforcement"
     static let flowDelayEnabledConfigKey = "flow_delay_enabled"

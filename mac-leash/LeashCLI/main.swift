@@ -70,6 +70,27 @@ private func parseArguments(_ arguments: [String]) throws -> CLIConfig {
     return config
 }
 
+/// Locate the leash MITM CA certificate so the launched workload can be told to
+/// trust it. Best-effort: LEASH_CA_CERT overrides, else LEASH_DIR/ca-cert.pem, else
+/// the default. Returns nil if no CA file is present (then no env is injected).
+private func resolveLeashCACertPath(env: [String: String]) -> String? {
+    let candidates: [String]
+    if let explicit = env["LEASH_CA_CERT"], !explicit.isEmpty {
+        candidates = [explicit]
+    } else if let dir = env["LEASH_DIR"], !dir.isEmpty {
+        candidates = ["\(dir)/ca-cert.pem"]
+    } else {
+        candidates = ["/leash/ca-cert.pem"]
+    }
+    return candidates.first { FileManager.default.fileExists(atPath: $0) }
+}
+
+/// Env vars that point common toolchains at a custom CA bundle.
+private let caTrustEnvKeys = [
+    "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO", "AWS_CA_BUNDLE"
+]
+
 private func resolveExecutable(_ executable: String, env: [String: String]) -> String? {
     if executable.contains("/") {
         return executable
@@ -117,7 +138,18 @@ private func runCommand(config: CLIConfig) throws -> Int32 {
     var argv: [UnsafeMutablePointer<CChar>?] = config.command.map { strdup($0) }
     argv.append(nil)
 
-    let env = environment
+    // Trust the leash MITM CA so TLS through the transparent proxy isn't rejected.
+    // Only injected when a CA file is actually present, and never overriding a value
+    // the caller already set. See docs/MACOS-P1-PROXY.md.
+    var env = environment
+    if let caPath = resolveLeashCACertPath(env: environment) {
+        for key in caTrustEnvKeys where env[key] == nil {
+            env[key] = caPath
+        }
+        if config.verbose {
+            FileHandle.standardError.write(Data("[leashcli] trusting leash CA at \(caPath)\n".utf8))
+        }
+    }
 
     let argsTail = config.command.dropFirst().joined(separator: " ")
 
