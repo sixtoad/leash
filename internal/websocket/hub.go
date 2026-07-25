@@ -275,8 +275,13 @@ type WebSocketHub struct {
 const (
 	writeDeadline     = 5 * time.Second
 	heartbeatInterval = 10 * time.Second
-	pongWait          = 30 * time.Second
-	pingInterval      = 30 * time.Second
+	pongWait          = 60 * time.Second
+	// Must be < pongWait so the client's pong can arrive before the read deadline
+	// expires. Previously equal to pongWait (30s == 30s), which meant the keepalive
+	// ping was sent at the exact moment the deadline fired — the pong always landed
+	// too late and every client connection was dropped ~every 30s (breaking mac
+	// extension rule/PID sync and thus enforcement). ~90% of pongWait is the norm.
+	pingInterval = 45 * time.Second
 )
 
 const clientSendBufferSize = 256 * 100
