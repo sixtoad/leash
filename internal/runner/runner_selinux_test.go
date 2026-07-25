@@ -65,7 +65,6 @@ func TestInternalBindMountSpecUsesSELinuxRelabel(t *testing.T) {
 }
 
 func TestLaunchContainersAddSELinuxRelabelToInternalMounts(t *testing.T) {
-	t.Parallel()
 	mountStateTestMu.Lock()
 	t.Cleanup(mountStateTestMu.Unlock)
 

@@ -15,8 +15,6 @@ import (
 var commandOverrideMu sync.Mutex
 
 func TestAssignContainerNamesAddsSuffix(t *testing.T) {
-	t.Parallel()
-
 	commandOverrideMu.Lock()
 	restoreOutput := commandOutput
 	existing := map[string]bool{
@@ -62,8 +60,6 @@ func TestAssignContainerNamesAddsSuffix(t *testing.T) {
 }
 
 func TestAssignContainerNamesKeepsBase(t *testing.T) {
-	t.Parallel()
-
 	commandOverrideMu.Lock()
 	restoreOutput := commandOutput
 	commandOutput = func(ctx context.Context, name string, args ...string) (string, error) {
@@ -102,8 +98,6 @@ func TestAssignContainerNamesKeepsBase(t *testing.T) {
 }
 
 func TestAllocateListenPortAutoIncrement(t *testing.T) {
-	t.Parallel()
-
 	commandOverrideMu.Lock()
 	restoreOutput := commandOutput
 	var psCalls int
@@ -141,8 +135,6 @@ func TestAllocateListenPortAutoIncrement(t *testing.T) {
 }
 
 func TestAllocateListenPortExplicitFailure(t *testing.T) {
-	t.Parallel()
-
 	commandOverrideMu.Lock()
 	restoreOutput := commandOutput
 	commandOutput = func(ctx context.Context, name string, args ...string) (string, error) {

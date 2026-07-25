@@ -5,20 +5,13 @@ import (
 	"testing"
 )
 
-func TestNormalizeTERMForBubbleTeaGhostty(t *testing.T) {
-	t.Parallel()
+// These tests mutate the process-global TERM env var and assert on it, so they
+// must NOT be parallel — two parallel tests racing on the same env var was flaky
+// (one's restore landing between the other's normalize and assert). t.Setenv
+// enforces this: it save/restores TERM and panics if t.Parallel was called.
 
-	prev, existed := os.LookupEnv("TERM")
-	if err := os.Setenv("TERM", "xterm-ghostty"); err != nil {
-		t.Fatalf("set TERM: %v", err)
-	}
-	t.Cleanup(func() {
-		if !existed {
-			_ = os.Unsetenv("TERM")
-			return
-		}
-		_ = os.Setenv("TERM", prev)
-	})
+func TestNormalizeTERMForBubbleTeaGhostty(t *testing.T) {
+	t.Setenv("TERM", "xterm-ghostty")
 
 	restore := normalizeTERMForBubbleTea()
 	defer restore()
@@ -29,20 +22,8 @@ func TestNormalizeTERMForBubbleTeaGhostty(t *testing.T) {
 }
 
 func TestNormalizeTERMForBubbleTeaPassthrough(t *testing.T) {
-	t.Parallel()
-
-	original := "xterm-256color"
-	prev, existed := os.LookupEnv("TERM")
-	if err := os.Setenv("TERM", original); err != nil {
-		t.Fatalf("set TERM: %v", err)
-	}
-	t.Cleanup(func() {
-		if !existed {
-			_ = os.Unsetenv("TERM")
-			return
-		}
-		_ = os.Setenv("TERM", prev)
-	})
+	const original = "xterm-256color"
+	t.Setenv("TERM", original)
 
 	restore := normalizeTERMForBubbleTea()
 	defer restore()
