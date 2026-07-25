@@ -478,7 +478,12 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 	// must run regardless of SkipCgroup — which is always true here. Gating it on the
 	// cgroup check (as the Linux path does) left the proxy inert on macOS, so nothing
 	// listened on the proxy port for the extension to relay to.
-	mitmProxy, err := proxy.NewMITMProxy(cfg.ProxyPort, headerRewriter, policyChecker, logger, proxy.MCPConfig{})
+	// MCP observability mirrors the Linux path (internal/leashd/mcp_config.go):
+	// default Basic, tunable via LEASH_MCP_OBS/LEASH_MCP_SNIFF_LIMIT/
+	// LEASH_MCP_SSE_EVENT_LIMIT. Previously darwin passed proxy.MCPConfig{}, whose
+	// zero-value Mode is MCPModeOff, so MCP tool-call logging never ran on macOS.
+	mcpConfig := loadMCPConfigFromEnv()
+	mitmProxy, err := proxy.NewMITMProxy(cfg.ProxyPort, headerRewriter, policyChecker, logger, mcpConfig)
 	if err != nil {
 		logger.Close()
 		return nil, fmt.Errorf("failed to create MITM proxy: %w", err)
@@ -486,7 +491,12 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 	// macOS has no SO_ORIGINAL_DST — read the original destination from the PROXY
 	// protocol v1 header the transparent proxy provider prepends to each flow.
 	mitmProxy.SetProxyProtocolIngestion(true)
-	logPolicyEvent("proxy.mode", map[string]any{"status": "enabled", "port": cfg.ProxyPort, "ingestion": "proxy-protocol-v1"})
+	logPolicyEvent("proxy.mode", map[string]any{
+		"status":    "enabled",
+		"port":      cfg.ProxyPort,
+		"ingestion": "proxy-protocol-v1",
+		"mcp_mode":  int(mcpConfig.Mode),
+	})
 
 	state := &runtimeState{
 		cfg:            cfg,
