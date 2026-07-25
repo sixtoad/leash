@@ -1,87 +1,81 @@
-// Package version renders leash's build metadata, both as the human lines
-// `leash --version` has always printed and as a machine-readable document for
-// provisioners (notably walk) that install a leash binary and need to verify
-// they got a runtime they can drive.
+// Package version is leash's CLI-side version layer: it turns the link-time
+// build values into the document defined by
+// github.com/strongdm/leash/pkg/leashversion and renders it, either as the three
+// human lines `leash --version` has always printed or as JSON.
 //
-// The build values themselves are injected into cmd/leash at link time
-// (-X main.version/commit/buildDate), so they are passed in here rather than
-// read from a global: this package stays pure and unit-testable.
+// The contract itself — the Info type, the contract bounds, the capability
+// names, and the comparison helpers — deliberately does NOT live here. This is
+// an internal package, so a consumer in another Go module (walk is
+// github.com/sixto/walk) cannot import it; the contract lives in
+// pkg/leashversion, which they can. Everything here is rendering and argument
+// parsing, which only leash itself needs.
+//
+// The build values are injected into cmd/leash at link time
+// (-X main.version/commit/buildDate), so they are passed in rather than read
+// from a global: this package stays pure and unit-testable.
 package version
 
 import (
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"runtime"
+	"strconv"
 	"strings"
+
+	"github.com/strongdm/leash/pkg/leashversion"
 )
 
-// ContractVersion and MinCompatibleContract bound the leash CLI surface an
-// external provisioner can rely on: the `--policy`, `--inject-service`,
-// `--runtime` and `--user` flags, plus the shape of the `version --json`
-// document itself. They are advertised so `walk install leash` can refuse (or
-// warn) up front on a mismatch instead of failing cryptically at run time.
-//
-// ContractVersion is the current surface; MinCompatibleContract is the oldest
-// caller contract this build still serves. A caller written against contract C
-// proceeds iff
-//
-//	minCompatibleContract <= C <= contractVersion
-//
-// Both bounds are load-bearing, which is why a lone `contractVersion >= C`
-// comparison is wrong: the number is bumped precisely when the surface *loses*
-// something, so a leash whose contractVersion is strictly greater than C may
-// have dropped what C depends on. The upper bound catches a leash that is too
-// old (it predates the surface C needs); the lower bound catches a leash that is
-// too new (it dropped the surface C was written against). Info.SupportsCaller
-// and Info.CheckCaller implement the rule so callers never hand-roll it.
-//
-// A leash with no `version --json` subcommand at all — any build from before
-// this feature shipped — is contract 0 by definition. A caller that gets a
-// non-zero exit, an unknown-subcommand error, or unparseable output from
-// `leash version --json` must treat the installed leash as contract 0 rather
-// than as a broken install.
-//
-// Bump ContractVersion when the surface changes in a way an existing caller
-// cannot absorb: a flag is removed or renamed, its argument grammar changes, or
-// its meaning changes. Do NOT bump for additive changes — new flags, new JSON
-// fields, new accepted flag values — those stay compatible by construction,
-// which is why this is a monotonic integer and not a semver string. When a bump
-// *removes* something, raise MinCompatibleContract to the first contract that no
-// longer offers it; otherwise leave MinCompatibleContract alone.
-//
-// MinCompatibleContract is 0 today because contract 1 only added the document:
-// nothing a pre-document caller drives has been taken away. That also makes the
-// field's absence safe to interpret — a document decoded into a typed struct
-// without the field yields 0, which is exactly "nothing has been removed".
+// Re-exports so leash's own code and tests can say version.Info rather than
+// importing both packages. pkg/leashversion is the canonical definition; these
+// are aliases, not copies, so the two can never drift.
+type (
+	// Info is the emitted document. See leashversion.Info.
+	Info = leashversion.Info
+	// Compatibility is a caller-vs-leash verdict. See leashversion.Compatibility.
+	Compatibility = leashversion.Compatibility
+)
+
 const (
-	ContractVersion       = 1
-	MinCompatibleContract = 0
+	// ContractVersion is the current CLI surface. See leashversion.
+	ContractVersion = leashversion.ContractVersion
+	// MinCompatibleContract is the oldest caller contract served. See leashversion.
+	MinCompatibleContract = leashversion.MinCompatibleContract
 )
 
-// Enforcing reports whether a leash built for goos ships leash's in-binary
-// enforcement path — the eBPF LSM hooks plus the intercepting MITM proxy —
-// rather than only observing.
+// Enforcing reports whether a leash built for goos carries an enforcement path
+// in the binary itself, rather than only observing.
 //
-// It is derived from the build's target platform rather than hardcoded: only the
-// Linux build carries the LSM programs and the proxy. The darwin binary is the
-// CLI for an installed Leash.app, whose enforcement lives in separate Endpoint
-// Security and Network Extension components that are not part of this build, so
-// it must not advertise the Linux path.
+// The criterion is "does this binary ship and drive an enforcement mechanism",
+// and it is derived from the build's target platform rather than hardcoded:
+//
+//   - linux: the eBPF LSM programs (file-open / exec / connect) plus the
+//     intercepting MITM proxy.
+//   - darwin: the same MITM proxy — the darwin runtime constructs it and pushes
+//     policy into it (internal/darwind/runtime_darwin.go, NewMITMProxy /
+//     applyPolicyToProxy) — alongside the separately installed Endpoint Security
+//     and Network Extension components it coordinates with.
+//
+// Any other target is a build with no enforcement path at all.
 //
 // This is a statement about the binary, not about the machine: whether a given
-// host can actually enforce (LSM active in the kernel, an engine installed, the
-// right capabilities) is a runtime question a build-time document deliberately
-// does not answer.
+// host can actually enforce (LSM active in the kernel, the system extension
+// approved, the right capabilities) is a runtime question a build-time document
+// deliberately does not answer. That is `leash doctor`'s job.
 func Enforcing(goos string) bool {
-	return goos == "linux"
+	switch goos {
+	case "linux", "darwin":
+		return true
+	default:
+		return false
+	}
 }
 
-// unknown is what the ldflags default to on a plain `go build`, and what we
-// substitute for an empty value so consumers never have to special-case "".
-// It is a documented, machine-detectable sentinel, not an error.
+// unknown is what the ldflags for commit and buildDate default to on a plain
+// `go build`, and what we substitute for an empty value so consumers never have
+// to special-case "". It is a documented, machine-detectable sentinel, not an
+// error. (main.version defaults to "dev", not to this.)
 const unknown = "unknown"
 
 // shortHashLen is how many characters of a commit hash the output has always
@@ -92,94 +86,43 @@ const shortHashLen = 7
 // keeps the call site in main() to a single expression and keeps this package
 // free of globals.
 type Build struct {
-	Version   string // -X main.version
+	Version   string // -X main.version, "dev" when unset
 	Commit    string // -X main.commit, may carry a "-dirty" suffix
 	BuildDate string // -X main.buildDate, RFC 3339 UTC from the Makefile
 }
 
-// Info is the document emitted by `leash version --json`. Field names are part
-// of the contract described by ContractVersion: renaming or removing one is a
-// breaking change, adding one is not.
-type Info struct {
-	Version               string `json:"version"`
-	Commit                string `json:"commit"`
-	BuiltAt               string `json:"builtAt"`
-	Enforcing             bool   `json:"enforcing"`
-	ContractVersion       int    `json:"contractVersion"`
-	MinCompatibleContract int    `json:"minCompatibleContract"`
-	OS                    string `json:"os"`
-	Arch                  string `json:"arch"`
-}
-
-// Compatibility is the verdict of comparing a caller's contract against the
-// range this leash serves. It is a string so a provisioner can log or surface it
-// verbatim.
-type Compatibility string
-
-const (
-	// Compatible: the caller's contract falls inside this leash's range.
-	Compatible Compatibility = "compatible"
-	// LeashTooOld: the installed leash predates the surface the caller needs
-	// (callerContract > contractVersion). Upgrade leash.
-	LeashTooOld Compatibility = "leash-too-old"
-	// LeashTooNew: the installed leash has dropped the surface the caller was
-	// written against (callerContract < minCompatibleContract). Upgrade the
-	// caller.
-	LeashTooNew Compatibility = "leash-too-new"
-)
-
-// CheckCaller decides whether a caller written against contract callerContract
-// can drive this leash, and says which way a mismatch runs so the caller can
-// tell an operator which side to upgrade. Pass 0 for a caller written before
-// `version --json` existed.
-func (i Info) CheckCaller(callerContract int) Compatibility {
-	switch {
-	case callerContract > i.ContractVersion:
-		return LeashTooOld
-	case callerContract < i.MinCompatibleContract:
-		return LeashTooNew
-	default:
-		return Compatible
-	}
-}
-
-// SupportsCaller is the boolean form of CheckCaller: true iff
-// minCompatibleContract <= callerContract <= contractVersion.
-func (i Info) SupportsCaller(callerContract int) bool {
-	return i.CheckCaller(callerContract) == Compatible
-}
-
-// Describe turns link-time build values into the reportable document.
+// Describe turns link-time build values into the reportable document for the
+// platform this binary was built for.
+//
+// It returns the *compiling* program's own constants, so it is not a
+// compatibility check: a provisioner that wants to know about an installed leash
+// must run that binary and decode its stdout (leashversion.Parse). Describe
+// exists to produce the document, not to consume one.
 func Describe(b Build) Info {
+	return describeFor(b, runtime.GOOS, runtime.GOARCH)
+}
+
+// describeFor is Describe with the platform injected, so tests can pin the
+// document for a platform other than the one running them.
+func describeFor(b Build, goos, goarch string) Info {
 	return Info{
 		Version:               orUnknown(b.Version),
 		Commit:                shortCommit(b.Commit),
 		BuiltAt:               orUnknown(b.BuildDate),
-		Enforcing:             Enforcing(runtime.GOOS),
-		ContractVersion:       ContractVersion,
-		MinCompatibleContract: MinCompatibleContract,
-		OS:                    runtime.GOOS,
-		Arch:                  runtime.GOARCH,
+		Enforcing:             Enforcing(goos),
+		ContractVersion:       leashversion.ContractVersion,
+		MinCompatibleContract: leashversion.MinCompatibleContract,
+		Capabilities:          leashversion.Capabilities(),
+		OS:                    goos,
+		Arch:                  goarch,
 	}
-}
-
-// JSON renders the document with a trailing newline so the output is a
-// well-behaved line on a terminal and still parses as a single JSON value.
-func (i Info) JSON() ([]byte, error) {
-	out, err := json.MarshalIndent(i, "", "  ")
-	if err != nil {
-		// Info is a flat struct of strings/bool/int, so this is unreachable in
-		// practice; wrap rather than panic to keep the caller in charge.
-		return nil, fmt.Errorf("marshal version info: %w", err)
-	}
-	return append(out, '\n'), nil
 }
 
 // Human renders the three lines `leash --version` has printed since the
-// beginning. Kept byte-for-byte identical: scripts already grep it, which is
-// also why it shows the bare abbreviated hash and drops any "-dirty" marker the
-// JSON document keeps.
-func (i Info) Human() string {
+// beginning. Kept byte-for-byte identical for every value leash's build paths
+// emit, which is also why it shows the bare abbreviated hash and drops any
+// "-dirty" marker the JSON document keeps.
+func Human(i Info) string {
 	return fmt.Sprintf("version: %s\ngit hash: %s\nbuild date: %s\n",
 		i.Version, humanCommit(i.Commit), i.BuiltAt)
 }
@@ -198,7 +141,7 @@ func Run(args []string, b Build, out io.Writer) error {
 	}
 	info := Describe(b)
 	if !asJSON {
-		_, err := io.WriteString(out, info.Human())
+		_, err := io.WriteString(out, Human(info))
 		return err
 	}
 	encoded, err := info.JSON()
@@ -209,25 +152,74 @@ func Run(args []string, b Build, out io.Writer) error {
 	return err
 }
 
+// formatSpec is one format request as it appeared on the command line, kept so a
+// contradiction can name both sides of itself in the diagnostic.
+type formatSpec struct {
+	spelling string // as the operator wrote it, near enough to be recognisable
+	wantJSON bool
+}
+
+// formatFlag records every occurrence of a format flag, in command-line order,
+// resolving each to a format as it is seen.
+//
+// It exists because flag.FlagSet.Visit cannot express this: a flag repeated on
+// the command line is visited once, with the last value, so `--output json
+// --output text` and `--json --json=false` would silently resolve by
+// last-one-wins — the exact behaviour the subcommand promises not to have.
+type formatFlag struct {
+	isBool  bool
+	parse   func(string) (bool, error)
+	specs   *[]formatSpec
+	display func(raw string) string
+}
+
+func (f *formatFlag) String() string { return "" }
+
+// IsBoolFlag lets `--json` stand alone (and `--json=false` mean what it says),
+// matching flag.Bool.
+func (f *formatFlag) IsBoolFlag() bool { return f.isBool }
+
+func (f *formatFlag) Set(raw string) error {
+	wantJSON, err := f.parse(raw)
+	if err != nil {
+		return err
+	}
+	*f.specs = append(*f.specs, formatSpec{spelling: f.display(raw), wantJSON: wantJSON})
+	return nil
+}
+
 // parseArgs resolves the subcommand's only concern — which output format was
 // asked for — using the same flag package (and therefore the same -h handling
 // and one-or-two-dash spellings) as the sibling subcommands.
 //
-// A format may be specified twice; it may not be specified two different ways.
-// `--json --output text` in either order is a contradiction the caller did not
-// mean, so it is rejected rather than silently resolved by last-one-wins.
+// A format may be specified more than once; every occurrence must agree. Any
+// contradiction is rejected, whether it crosses flags (`--json --output text`)
+// or repeats one (`--output json --output text`, `--json --json=false`), and in
+// either order. Silently taking the last one would make a scripted caller's
+// output depend on argument order it did not think it was choosing.
 func parseArgs(args []string, out io.Writer) (bool, error) {
 	fs := flag.NewFlagSet("leash version", flag.ContinueOnError)
 	// flag's own diagnostics would interleave with the document on stdout and
 	// duplicate the error Run returns to main, so render usage ourselves.
 	fs.SetOutput(io.Discard)
 	fs.Usage = func() {}
-	asJSON := fs.Bool("json", false, "emit the build document as JSON")
-	format := fs.String("output", "text", "output format: json or text")
+
+	var specs []formatSpec
+	fs.Var(&formatFlag{
+		isBool:  true,
+		parse:   parseJSONFlag,
+		specs:   &specs,
+		display: func(raw string) string { return "--json=" + raw },
+	}, "json", "emit the build document as JSON")
+	fs.Var(&formatFlag{
+		parse:   parseFormat,
+		specs:   &specs,
+		display: func(raw string) string { return "--output " + strconv.Quote(raw) },
+	}, "output", "output format: json or text")
 
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			if _, werr := io.WriteString(out, usage(fs)); werr != nil {
+			if _, werr := io.WriteString(out, usage()); werr != nil {
 				return false, werr
 			}
 			return false, flag.ErrHelp
@@ -237,40 +229,43 @@ func parseArgs(args []string, out io.Writer) (bool, error) {
 	if fs.NArg() > 0 {
 		return false, fmt.Errorf("unknown argument %q for version; want --json or --output json|text", fs.Arg(0))
 	}
-
-	// Visit reports only the flags actually present on the command line, which
-	// is what separates "--output text" from the default of the same value.
-	specified := map[string]bool{}
-	fs.Visit(func(f *flag.Flag) { specified[f.Name] = true })
-	if !specified["output"] {
-		return *asJSON, nil
+	if len(specs) == 0 {
+		return false, nil // no format asked for: the historical human lines.
 	}
-	wantJSON, err := parseFormat(*format)
-	if err != nil {
-		return false, err
+	// Booleans, so agreeing with the first is agreeing with all of them.
+	for _, spec := range specs[1:] {
+		if spec.wantJSON != specs[0].wantJSON {
+			return false, fmt.Errorf("conflicting output formats: %s and %s; specify one",
+				specs[0].spelling, spec.spelling)
+		}
 	}
-	if specified["json"] && wantJSON != *asJSON {
-		return false, fmt.Errorf("conflicting output formats: --json=%t and --output %s; specify one", *asJSON, *format)
-	}
-	return wantJSON, nil
+	return specs[0].wantJSON, nil
 }
 
-// usage renders the help text for `version --help`, matching the shape the other
-// subcommands print (a usage line, what the command does, then the flags).
-func usage(fs *flag.FlagSet) string {
+// usage renders the help text for `version --help`.
+//
+// The flag list is written out rather than produced by fs.PrintDefaults, which
+// prints the single-dash spelling (`-json`) and would contradict the usage line
+// and the docs. Both spellings work — that is the flag package — so the help
+// says so once instead of showing the form nobody is told to use.
+func usage() string {
 	var b strings.Builder
 	b.WriteString("usage: leash version [--json | --output json|text]\n\n")
 	b.WriteString("Print this build's metadata: by default the same three lines as\n")
 	b.WriteString("'leash --version', or with --json the machine-readable document a\n")
 	b.WriteString("provisioner reads to decide whether it can drive this leash\n")
-	b.WriteString("(contractVersion and minCompatibleContract).\n\nflags:\n")
-	fs.SetOutput(&b)
-	fs.PrintDefaults()
-	fs.SetOutput(io.Discard)
+	b.WriteString("(contractVersion, minCompatibleContract and capabilities).\n\n")
+	b.WriteString("flags:\n")
+	b.WriteString("  --json                 Emit the build document as JSON (same as --output json).\n")
+	b.WriteString("  --output json|text     Output format. Default: text.\n")
+	b.WriteString("  -h, --help             Print this usage and exit 0.\n\n")
+	b.WriteString("A format may be repeated but not contradicted: --json --output text,\n")
+	b.WriteString("--output json --output text and --json --json=false are all rejected.\n")
+	b.WriteString("Single-dash spellings (-json, -output) are accepted too.\n")
 	return b.String()
 }
 
-// parseFormat reports whether the requested output format is JSON. An empty
+// parseFormat reports whether the requested --output value is JSON. An empty
 // value is a caller bug ("--output=" or `--output ""`), not a request for the
 // default, so it is rejected instead of quietly meaning text.
 func parseFormat(value string) (bool, error) {
@@ -284,6 +279,16 @@ func parseFormat(value string) (bool, error) {
 	default:
 		return false, fmt.Errorf("unsupported output format %q; want json or text", value)
 	}
+}
+
+// parseJSONFlag reports the format implied by a --json occurrence: --json (or
+// --json=true) means JSON, --json=false means the human lines.
+func parseJSONFlag(value string) (bool, error) {
+	on, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("invalid boolean %q for --json; want true or false", value)
+	}
+	return on, nil
 }
 
 // splitCommit separates a commit value into the hash and any build suffix

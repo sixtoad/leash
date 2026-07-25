@@ -5,8 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
-	"fmt"
-	"runtime"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -16,111 +15,25 @@ func testBuild() Build {
 	return Build{Version: "v0.2.0", Commit: "c686025aa1b2c3", BuildDate: "2026-07-21T10:11:12Z"}
 }
 
-// wantInfo is the document testBuild() describes to, with per-case overrides
-// applied by the caller.
-func wantInfo(version, commit, builtAt string) Info {
-	return Info{
-		Version:               version,
-		Commit:                commit,
-		BuiltAt:               builtAt,
-		Enforcing:             Enforcing(runtime.GOOS),
-		ContractVersion:       ContractVersion,
-		MinCompatibleContract: MinCompatibleContract,
-		OS:                    runtime.GOOS,
-		Arch:                  runtime.GOARCH,
-	}
-}
+// wantCapabilities is the surface this build advertises, written out rather than
+// obtained from the package under test so a silent change to the list fails
+// here as well as in pkg/leashversion.
+var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "require-lsm", "version-json"}
 
-func TestContractRangeIsWellFormed(t *testing.T) {
-	t.Parallel()
-
-	// The contract is a monotonic integer walk compares against; zero would be
-	// indistinguishable from "field missing" once decoded into a Go struct.
-	if ContractVersion < 1 {
-		t.Fatalf("ContractVersion = %d, want >= 1", ContractVersion)
-	}
-	// 0 is the contract of a leash with no `version --json` at all, so the floor
-	// is meaningful; a negative floor is not.
-	if MinCompatibleContract < 0 {
-		t.Fatalf("MinCompatibleContract = %d, want >= 0", MinCompatibleContract)
-	}
-	// An empty range would mean this build serves no caller at all.
-	if MinCompatibleContract > ContractVersion {
-		t.Fatalf("MinCompatibleContract = %d > ContractVersion = %d: the supported range is empty",
-			MinCompatibleContract, ContractVersion)
-	}
-}
-
-// TestCheckCallerRange pins the rule the contract documents:
-// minCompatibleContract <= callerContract <= contractVersion. The Info is built
-// by hand rather than from Describe so the range has room on both sides today,
-// while the real constants still only span [0, 1].
-func TestCheckCallerRange(t *testing.T) {
-	t.Parallel()
-
-	leash := Info{MinCompatibleContract: 2, ContractVersion: 4}
-
-	tests := []struct {
-		name           string
-		callerContract int
-		want           Compatibility
-	}{
-		{name: "caller below the floor: leash dropped its surface", callerContract: 1, want: LeashTooNew},
-		{name: "caller at the floor", callerContract: 2, want: Compatible},
-		{name: "caller inside the range", callerContract: 3, want: Compatible},
-		{name: "caller at the ceiling", callerContract: 4, want: Compatible},
-		{name: "caller above the ceiling: leash predates its surface", callerContract: 5, want: LeashTooOld},
-		{name: "pre-feature caller is below this floor too", callerContract: 0, want: LeashTooNew},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			if got := leash.CheckCaller(tt.callerContract); got != tt.want {
-				t.Fatalf("CheckCaller(%d) = %q, want %q", tt.callerContract, got, tt.want)
-			}
-			if got, want := leash.SupportsCaller(tt.callerContract), tt.want == Compatible; got != want {
-				t.Fatalf("SupportsCaller(%d) = %t, want %t", tt.callerContract, got, want)
-			}
-		})
-	}
-}
-
-// TestCheckCallerAgainstThisBuild exercises the same rule against the document
-// this build actually emits, including contract 0 — the contract of a leash that
-// predates `version --json` entirely, which this build still serves because
-// contract 1 removed nothing.
-func TestCheckCallerAgainstThisBuild(t *testing.T) {
-	t.Parallel()
-
-	info := Describe(testBuild())
-
-	tests := []struct {
-		callerContract int
-		want           Compatibility
-	}{
-		{callerContract: 0, want: Compatible},
-		{callerContract: ContractVersion, want: Compatible},
-		{callerContract: ContractVersion + 1, want: LeashTooOld},
-	}
-
-	for _, tt := range tests {
-		if got := info.CheckCaller(tt.callerContract); got != tt.want {
-			t.Fatalf("Describe(...).CheckCaller(%d) = %q, want %q", tt.callerContract, got, tt.want)
-		}
-	}
-}
-
-// TestEnforcingIsDerivedPerPlatform pins the derivation itself: only the Linux
-// build ships the LSM-plus-proxy path, and a darwin build must not advertise it.
+// TestEnforcingIsDerivedPerPlatform pins the criterion: `enforcing` says whether
+// *this binary* carries an enforcement path. Linux ships the eBPF LSM programs
+// plus the MITM proxy; darwin ships and drives the same MITM proxy
+// (internal/darwind/runtime_darwin.go builds it with NewMITMProxy and pushes
+// policy into it via applyPolicyToProxy), so claiming false there would deny
+// enforcement the binary demonstrably performs.
 func TestEnforcingIsDerivedPerPlatform(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]bool{
 		"linux":   true,
-		"darwin":  false,
+		"darwin":  true,
 		"windows": false,
+		"freebsd": false,
 		"":        false,
 	}
 	for goos, want := range tests {
@@ -128,54 +41,106 @@ func TestEnforcingIsDerivedPerPlatform(t *testing.T) {
 			t.Fatalf("Enforcing(%q) = %t, want %t", goos, got, want)
 		}
 	}
-
-	// The document reports the platform this binary was built for.
-	if got, want := Describe(testBuild()).Enforcing, Enforcing(runtime.GOOS); got != want {
-		t.Fatalf("Describe(...).Enforcing = %t on %s, want %t", got, runtime.GOOS, want)
-	}
 }
 
-func TestDescribe(t *testing.T) {
+// TestDescribeForPinsTheDocument writes out the whole expected document for a
+// given build and platform. Nothing on the expected side calls the code under
+// test, so the assertion can actually fail.
+func TestDescribeForPinsTheDocument(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name  string
-		build Build
-		want  Info
+		name   string
+		build  Build
+		goos   string
+		goarch string
+		want   Info
 	}{
 		{
-			name:  "release build",
+			name:  "linux release build",
 			build: testBuild(),
-			want:  wantInfo("v0.2.0", "c686025", "2026-07-21T10:11:12Z"),
+			goos:  "linux", goarch: "amd64",
+			want: Info{
+				Version: "v0.2.0", Commit: "c686025", BuiltAt: "2026-07-21T10:11:12Z",
+				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
+				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
+			},
+		},
+		{
+			name:  "darwin build also carries an enforcement path",
+			build: testBuild(),
+			goos:  "darwin", goarch: "arm64",
+			want: Info{
+				Version: "v0.2.0", Commit: "c686025", BuiltAt: "2026-07-21T10:11:12Z",
+				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
+				Capabilities: wantCapabilities, OS: "darwin", Arch: "arm64",
+			},
+		},
+		{
+			name:  "a target with no enforcement path says so",
+			build: testBuild(),
+			goos:  "windows", goarch: "amd64",
+			want: Info{
+				Version: "v0.2.0", Commit: "c686025", BuiltAt: "2026-07-21T10:11:12Z",
+				Enforcing: false, ContractVersion: 1, MinCompatibleContract: 0,
+				Capabilities: wantCapabilities, OS: "windows", Arch: "amd64",
+			},
 		},
 		{
 			name:  "dirty tree keeps its marker",
 			build: Build{Version: "dev-c686025", Commit: "c686025aa1b2c3-dirty", BuildDate: "2026-07-21T10:11:12Z"},
-			want:  wantInfo("dev-c686025", "c686025-dirty", "2026-07-21T10:11:12Z"),
+			goos:  "linux", goarch: "amd64",
+			want: Info{
+				Version: "dev-c686025", Commit: "c686025-dirty", BuiltAt: "2026-07-21T10:11:12Z",
+				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
+				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
+			},
 		},
 		{
 			// Only the hash component is abbreviated, so a short hash keeps its
 			// marker instead of being cut mid-suffix into "abc-dir".
 			name:  "short hash keeps its whole marker",
 			build: Build{Version: "dev", Commit: "abc-dirty", BuildDate: "unknown"},
-			want:  wantInfo("dev", "abc-dirty", "unknown"),
+			goos:  "linux", goarch: "amd64",
+			want: Info{
+				Version: "dev", Commit: "abc-dirty", BuiltAt: "unknown",
+				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
+				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
+			},
 		},
 		{
 			// A `git describe` value is not a hash: abbreviating it would name a
 			// different build ("v1.2.3-"), so it is reported whole.
 			name:  "git describe value is left intact",
 			build: Build{Version: "v1.2.3-4-gabc1234", Commit: "v1.2.3-4-gabc1234", BuildDate: "unknown"},
-			want:  wantInfo("v1.2.3-4-gabc1234", "v1.2.3-4-gabc1234", "unknown"),
+			goos:  "linux", goarch: "amd64",
+			want: Info{
+				Version: "v1.2.3-4-gabc1234", Commit: "v1.2.3-4-gabc1234", BuiltAt: "unknown",
+				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
+				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
+			},
 		},
 		{
+			// A plain `go build` links main.version = "dev" and the other two as
+			// "unknown"; the document reports exactly that.
 			name:  "plain go build defaults",
 			build: Build{Version: "dev", Commit: "unknown", BuildDate: "unknown"},
-			want:  wantInfo("dev", "unknown", "unknown"),
+			goos:  "linux", goarch: "amd64",
+			want: Info{
+				Version: "dev", Commit: "unknown", BuiltAt: "unknown",
+				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
+				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
+			},
 		},
 		{
 			name:  "empty ldflags degrade to unknown",
 			build: Build{},
-			want:  wantInfo("unknown", "unknown", "unknown"),
+			goos:  "linux", goarch: "amd64",
+			want: Info{
+				Version: "unknown", Commit: "unknown", BuiltAt: "unknown",
+				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
+				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
+			},
 		},
 	}
 
@@ -183,17 +148,43 @@ func TestDescribe(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := Describe(tt.build); got != tt.want {
-				t.Fatalf("Describe(%+v) = %+v, want %+v", tt.build, got, tt.want)
+			if got := describeFor(tt.build, tt.goos, tt.goarch); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("describeFor(%+v, %q, %q) = %+v, want %+v", tt.build, tt.goos, tt.goarch, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestInfoJSONShape(t *testing.T) {
+// TestDescribeReportsTheBuildPlatform checks the one thing describeFor cannot:
+// that Describe feeds it the platform this binary was compiled for. The expected
+// `enforcing` comes from a literal table keyed by the reported OS, so the
+// assertion is against a written-down value rather than a second call to
+// Enforcing.
+func TestDescribeReportsTheBuildPlatform(t *testing.T) {
 	t.Parallel()
 
-	encoded, err := Describe(testBuild()).JSON()
+	enforcingByOS := map[string]bool{"linux": true, "darwin": true, "windows": false}
+
+	got := Describe(testBuild())
+	if got.OS == "" || got.Arch == "" {
+		t.Fatalf("Describe(...) reported os=%q arch=%q, want the build's GOOS/GOARCH", got.OS, got.Arch)
+	}
+	want, ok := enforcingByOS[got.OS]
+	if !ok {
+		t.Fatalf("Describe(...) reported os %q, which this test has no pinned expectation for; add one", got.OS)
+	}
+	if got.Enforcing != want {
+		t.Fatalf("Describe(...).Enforcing = %t on %q, want %t", got.Enforcing, got.OS, want)
+	}
+}
+
+// TestJSONWireShape pins the wire field names and values a provisioner reads.
+// It decodes into a map rather than back into Info, because a struct round-trip
+// would not catch a renamed json tag.
+func TestJSONWireShape(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := describeFor(testBuild(), "linux", "amd64").JSON()
 	if err != nil {
 		t.Fatalf("JSON() error: %v", err)
 	}
@@ -201,8 +192,6 @@ func TestInfoJSONShape(t *testing.T) {
 		t.Fatalf("JSON() = %q, want a trailing newline", encoded)
 	}
 
-	// Decode into a map rather than back into Info: the wire field names are the
-	// part walk depends on, and a struct round-trip would not catch a rename.
 	var decoded map[string]any
 	if err := json.Unmarshal(encoded, &decoded); err != nil {
 		t.Fatalf("unmarshal %q: %v", encoded, err)
@@ -212,61 +201,93 @@ func TestInfoJSONShape(t *testing.T) {
 		"version":               "v0.2.0",
 		"commit":                "c686025",
 		"builtAt":               "2026-07-21T10:11:12Z",
-		"enforcing":             Enforcing(runtime.GOOS),
-		"contractVersion":       float64(ContractVersion), // encoding/json decodes numbers as float64
-		"minCompatibleContract": float64(MinCompatibleContract),
-		"os":                    runtime.GOOS,
-		"arch":                  runtime.GOARCH,
+		"enforcing":             true,
+		"contractVersion":       float64(1), // encoding/json decodes numbers as float64
+		"minCompatibleContract": float64(0),
+		"capabilities":          []any{"policy", "inject-service", "runtime", "user", "require-lsm", "version-json"},
+		"os":                    "linux",
+		"arch":                  "amd64",
 	}
-	if len(decoded) != len(want) {
-		t.Fatalf("JSON() has fields %v, want exactly %v", keys(decoded), keys(want))
-	}
-	for field, expected := range want {
-		got, ok := decoded[field]
-		if !ok {
-			t.Fatalf("JSON() is missing field %q; got %q", field, encoded)
-		}
-		if got != expected {
-			t.Fatalf("JSON() field %q = %v, want %v", field, got, expected)
-		}
+	if !reflect.DeepEqual(decoded, want) {
+		t.Fatalf("JSON() decoded to %v, want %v", decoded, want)
 	}
 }
 
-// legacyGitHash is exactly what cmd/leash's printVersion did before this package
-// existed: truncate the raw -X main.commit value at seven characters.
-func legacyGitHash(commit string) string {
-	if len(commit) > shortHashLen {
-		return commit[:shortHashLen]
-	}
-	return commit
-}
-
-// TestHumanIsByteIdenticalForRealBuildValues is the CAP-4 guarantee: for every
-// commit value leash's build paths actually inject, the new rendering must match
-// the pre-change one byte for byte.
+// TestHumanIsByteIdenticalForRealBuildValues is the CAP-4 guarantee, written as
+// literals: for every commit value leash's build paths actually inject, the
+// rendering must be exactly what `leash --version` printed before this package
+// existed.
+//
+// It covers only the values the build paths emit. `abc-dirty` and a `git
+// describe` string render differently now — deliberately, since the old
+// rendering cut them into fragments naming a build that does not exist — and are
+// pinned separately in TestHumanDeManglesPathologicalValues.
 func TestHumanIsByteIdenticalForRealBuildValues(t *testing.T) {
 	t.Parallel()
 
-	// Makefile, scripts/release.sh and scripts/install-leash.sh all stamp
-	// `git rev-parse --short=7` plus an optional "-dirty"; the ldflags default to
-	// "unknown", and the Makefile falls back to "dev" with no git.
-	commits := []string{
-		"c686025",
-		"c686025-dirty",
-		"c686025aa1b2c3d4e5f60718293a4b5c6d7e8f90",
-		"unknown",
-		"dev",
+	// Makefile, scripts/release.sh, scripts/install-leash.sh, build/publish-docker.sh
+	// and .goreleaser.yaml all stamp a hex hash plus an optional "-dirty"; the
+	// ldflags default to "unknown" for commit and "dev" for version.
+	tests := []struct {
+		commit string
+		want   string
+	}{
+		{commit: "c686025", want: "version: v0.2.0\ngit hash: c686025\nbuild date: 2026-07-21T10:11:12Z\n"},
+		{commit: "c686025-dirty", want: "version: v0.2.0\ngit hash: c686025\nbuild date: 2026-07-21T10:11:12Z\n"},
+		{commit: "c686025aa1b2c3d4e5f60718293a4b5c6d7e8f90", want: "version: v0.2.0\ngit hash: c686025\nbuild date: 2026-07-21T10:11:12Z\n"},
+		{commit: "unknown", want: "version: v0.2.0\ngit hash: unknown\nbuild date: 2026-07-21T10:11:12Z\n"},
+		{commit: "dev", want: "version: v0.2.0\ngit hash: dev\nbuild date: 2026-07-21T10:11:12Z\n"},
 	}
-	for _, commit := range commits {
-		build := Build{Version: "v0.2.0", Commit: commit, BuildDate: "2026-07-21T10:11:12Z"}
-		want := fmt.Sprintf("version: v0.2.0\ngit hash: %s\nbuild date: 2026-07-21T10:11:12Z\n", legacyGitHash(commit))
-		if got := Describe(build).Human(); got != want {
-			t.Fatalf("Human() for commit %q = %q, want the pre-change %q", commit, got, want)
+	for _, tt := range tests {
+		build := Build{Version: "v0.2.0", Commit: tt.commit, BuildDate: "2026-07-21T10:11:12Z"}
+		if got := Human(describeFor(build, "linux", "amd64")); got != tt.want {
+			t.Fatalf("Human() for commit %q = %q, want the pre-change %q", tt.commit, got, tt.want)
 		}
 	}
 }
 
-func TestInfoHuman(t *testing.T) {
+// TestHumanDeManglesPathologicalValues pins the intentional divergence from the
+// pre-change rendering: truncation applies to the hash, never to a composed
+// hash+suffix or to a value that is not a hash at all.
+func TestHumanDeManglesPathologicalValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		build  Build
+		want   string
+		wasCut string // what the pre-change seven-character truncation produced
+	}{
+		{
+			name:   "short hash with a marker is not cut mid-suffix",
+			build:  Build{Version: "dev", Commit: "abc-dirty", BuildDate: "unknown"},
+			want:   "version: dev\ngit hash: abc\nbuild date: unknown\n",
+			wasCut: "abc-dir",
+		},
+		{
+			name:   "git describe value is not mangled",
+			build:  Build{Version: "v1.2.3", Commit: "v1.2.3-4-gabc1234", BuildDate: "unknown"},
+			want:   "version: v1.2.3\ngit hash: v1.2.3-4-gabc1234\nbuild date: unknown\n",
+			wasCut: "v1.2.3-",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := Human(describeFor(tt.build, "linux", "amd64"))
+			if got != tt.want {
+				t.Fatalf("Human() = %q, want %q", got, tt.want)
+			}
+			if strings.Contains(got, "git hash: "+tt.wasCut+"\n") {
+				t.Fatalf("Human() = %q, which is the mangled pre-change fragment %q", got, tt.wasCut)
+			}
+		})
+	}
+}
+
+// TestHumanRendersTheThreeLines covers the ordinary shapes.
+func TestHumanRendersTheThreeLines(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -286,23 +307,14 @@ func TestInfoHuman(t *testing.T) {
 			want:  "version: dev\ngit hash: c686025\nbuild date: unknown\n",
 		},
 		{
-			// Not "abc-dir": truncation applies to the hash, never to the
-			// composed hash+suffix string.
-			name:  "short hash with a marker is not cut mid-suffix",
-			build: Build{Version: "dev", Commit: "abc-dirty", BuildDate: "unknown"},
-			want:  "version: dev\ngit hash: abc\nbuild date: unknown\n",
-		},
-		{
-			// Not "v1.2.3-": a describe value is reported whole rather than
-			// mangled into the name of a different build.
-			name:  "git describe value is not mangled",
-			build: Build{Version: "v1.2.3", Commit: "v1.2.3-4-gabc1234", BuildDate: "unknown"},
-			want:  "version: v1.2.3\ngit hash: v1.2.3-4-gabc1234\nbuild date: unknown\n",
-		},
-		{
 			name:  "short hash is left alone",
 			build: Build{Version: "dev", Commit: "c68602", BuildDate: "unknown"},
 			want:  "version: dev\ngit hash: c68602\nbuild date: unknown\n",
+		},
+		{
+			name:  "empty ldflags degrade to unknown",
+			build: Build{},
+			want:  "version: unknown\ngit hash: unknown\nbuild date: unknown\n",
 		},
 	}
 
@@ -310,41 +322,98 @@ func TestInfoHuman(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := Describe(tt.build).Human(); got != tt.want {
+			if got := Human(describeFor(tt.build, "linux", "amd64")); got != tt.want {
 				t.Fatalf("Human() = %q, want %q", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestRun(t *testing.T) {
+const wantHumanOutput = "version: v0.2.0\ngit hash: c686025\nbuild date: 2026-07-21T10:11:12Z\n"
+
+func TestRunFormatSelection(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		args     []string
+		wantJSON bool
+	}{
+		{name: "no args prints human lines", args: nil},
+		{name: "explicit text output", args: []string{"--output", "text"}},
+		{name: "json disabled explicitly", args: []string{"--json=false"}},
+		{name: "json flag", args: []string{"--json"}, wantJSON: true},
+		{name: "single dash json flag", args: []string{"-json"}, wantJSON: true},
+		{name: "json equals true", args: []string{"--json=true"}, wantJSON: true},
+		{name: "output json", args: []string{"--output", "json"}, wantJSON: true},
+		{name: "output equals json", args: []string{"--output=json"}, wantJSON: true},
+		{name: "case insensitive format", args: []string{"--output", "JSON"}, wantJSON: true},
+		{name: "agreeing duplicate specs", args: []string{"--json", "--output", "json"}, wantJSON: true},
+		{name: "agreeing repeated output", args: []string{"--output", "json", "--output", "json"}, wantJSON: true},
+		{name: "agreeing repeated json", args: []string{"--json", "--json=true"}, wantJSON: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var out bytes.Buffer
+			if err := Run(tt.args, testBuild(), &out); err != nil {
+				t.Fatalf("Run(%v) error: %v", tt.args, err)
+			}
+			if !tt.wantJSON {
+				if got := out.String(); got != wantHumanOutput {
+					t.Fatalf("Run(%v) = %q, want %q", tt.args, got, wantHumanOutput)
+				}
+				return
+			}
+			var decoded Info
+			if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
+				t.Fatalf("Run(%v) output %q is not JSON: %v", tt.args, out.String(), err)
+			}
+			if decoded.Version != "v0.2.0" || decoded.Commit != "c686025" || decoded.BuiltAt != "2026-07-21T10:11:12Z" {
+				t.Fatalf("Run(%v) decoded to %+v, want the testBuild values", tt.args, decoded)
+			}
+			if decoded.ContractVersion != 1 || decoded.MinCompatibleContract != 0 {
+				t.Fatalf("Run(%v) decoded contract range [%d,%d], want [0,1]",
+					tt.args, decoded.MinCompatibleContract, decoded.ContractVersion)
+			}
+			if !reflect.DeepEqual(decoded.Capabilities, wantCapabilities) {
+				t.Fatalf("Run(%v) decoded capabilities %v, want %v", tt.args, decoded.Capabilities, wantCapabilities)
+			}
+		})
+	}
+}
+
+// TestRunRejectsBadFormatSpecs covers every way a caller can ask for a format
+// that is malformed, unknown, or self-contradictory. The repeated-flag cases are
+// the ones flag.FlagSet.Visit cannot see: it reports a repeated flag once, with
+// the last value, so without the occurrence recording these three would silently
+// resolve by last-one-wins.
+func TestRunRejectsBadFormatSpecs(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name       string
 		args       []string
-		wantJSON   bool
 		wantErrSub string
 	}{
-		{name: "no args prints human lines", args: nil},
-		{name: "explicit text output", args: []string{"--output", "text"}},
-		{name: "json flag", args: []string{"--json"}, wantJSON: true},
-		{name: "single dash json flag", args: []string{"-json"}, wantJSON: true},
-		{name: "output json", args: []string{"--output", "json"}, wantJSON: true},
-		{name: "output equals json", args: []string{"--output=json"}, wantJSON: true},
-		{name: "case insensitive format", args: []string{"--output", "JSON"}, wantJSON: true},
-		{name: "agreeing duplicate specs", args: []string{"--json", "--output", "json"}, wantJSON: true},
-
 		{name: "missing output value", args: []string{"--output"}, wantErrSub: "needs an argument"},
 		{name: "unsupported format", args: []string{"--output", "yaml"}, wantErrSub: "unsupported output format"},
 		{name: "unknown flag", args: []string{"--verbose"}, wantErrSub: "not defined"},
 		{name: "positional argument", args: []string{"json"}, wantErrSub: "unknown argument"},
+		{name: "non-boolean json value", args: []string{"--json=maybe"}, wantErrSub: `invalid boolean "maybe"`},
 
-		// Conflicting specs are rejected in either order rather than silently
-		// resolved by last-one-wins.
+		// Cross-flag contradictions, in either order.
 		{name: "json then text", args: []string{"--json", "--output", "text"}, wantErrSub: "conflicting output formats"},
 		{name: "text then json", args: []string{"--output", "text", "--json"}, wantErrSub: "conflicting output formats"},
 		{name: "json then text with equals", args: []string{"--json", "--output=text"}, wantErrSub: "conflicting output formats"},
+
+		// The same flag repeated with contradictory values, in either order.
+		{name: "output json then output text", args: []string{"--output", "json", "--output", "text"}, wantErrSub: "conflicting output formats"},
+		{name: "output text then output json", args: []string{"--output", "text", "--output", "json"}, wantErrSub: "conflicting output formats"},
+		{name: "json then json false", args: []string{"--json", "--json=false"}, wantErrSub: "conflicting output formats"},
+		{name: "json false then json", args: []string{"--json=false", "--json"}, wantErrSub: "conflicting output formats"},
 
 		// An empty format is a caller bug, not a request for the default.
 		{name: "empty output with equals", args: []string{"--output="}, wantErrSub: "empty output format"},
@@ -357,38 +426,19 @@ func TestRun(t *testing.T) {
 
 			var out bytes.Buffer
 			err := Run(tt.args, testBuild(), &out)
-			if tt.wantErrSub != "" {
-				if err == nil || !strings.Contains(err.Error(), tt.wantErrSub) {
-					t.Fatalf("Run(%v) error = %v, want one containing %q", tt.args, err, tt.wantErrSub)
-				}
-				if out.Len() != 0 {
-					t.Fatalf("Run(%v) wrote %q on error, want nothing", tt.args, out.String())
-				}
-				return
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrSub) {
+				t.Fatalf("Run(%v) error = %v, want one containing %q", tt.args, err, tt.wantErrSub)
 			}
-			if err != nil {
-				t.Fatalf("Run(%v) error: %v", tt.args, err)
-			}
-			if tt.wantJSON {
-				var decoded Info
-				if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
-					t.Fatalf("Run(%v) output %q is not JSON: %v", tt.args, out.String(), err)
-				}
-				if decoded != Describe(testBuild()) {
-					t.Fatalf("Run(%v) decoded to %+v, want %+v", tt.args, decoded, Describe(testBuild()))
-				}
-				return
-			}
-			if got, want := out.String(), Describe(testBuild()).Human(); got != want {
-				t.Fatalf("Run(%v) = %q, want %q", tt.args, got, want)
+			if out.Len() != 0 {
+				t.Fatalf("Run(%v) wrote %q on error, want nothing", tt.args, out.String())
 			}
 		})
 	}
 }
 
 // TestRunHelp pins the CLI contract for help: usage on the output stream and
-// flag.ErrHelp, which cmd/leash turns into a clean exit rather than a
-// log.Fatal timestamp and exit 1.
+// flag.ErrHelp, which cmd/leash turns into a clean exit rather than a log.Fatal
+// timestamp and exit 1.
 func TestRunHelp(t *testing.T) {
 	t.Parallel()
 
@@ -399,9 +449,17 @@ func TestRunHelp(t *testing.T) {
 			t.Fatalf("Run(%q) error = %v, want flag.ErrHelp", arg, err)
 		}
 		printed := out.String()
-		for _, want := range []string{"usage: leash version", "--json", "-output", "contractVersion"} {
+		for _, want := range []string{"usage: leash version", "--json", "--output json|text", "capabilities"} {
 			if !strings.Contains(printed, want) {
 				t.Fatalf("Run(%q) usage = %q, want it to mention %q", arg, printed, want)
+			}
+		}
+		// The flag package's own PrintDefaults renders "  -json" / "  -output",
+		// which contradicts the usage line and every doc. We write the block
+		// ourselves precisely so it does not.
+		for _, unwanted := range []string{"\n  -json", "\n  -output"} {
+			if strings.Contains(printed, unwanted) {
+				t.Fatalf("Run(%q) usage = %q, want no single-dash-only flag listing %q", arg, printed, unwanted)
 			}
 		}
 		// Help is help: it must not also emit the document.
@@ -409,12 +467,4 @@ func TestRunHelp(t *testing.T) {
 			t.Fatalf("Run(%q) printed the version document alongside usage: %q", arg, printed)
 		}
 	}
-}
-
-func keys(m map[string]any) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
 }

@@ -22,6 +22,15 @@ builds:
       - CGO_ENABLED=0
     flags:
       - -trimpath
+    # `leash version --json` reports `commit`, and every other build path (the
+    # Makefile `build` target, scripts/release.sh, scripts/install-leash.sh,
+    # build/publish-docker.sh) appends a "-dirty" marker when the tree is
+    # modified. This path has no marker because it is not reachable from a dirty
+    # tree: `goreleaser release` (what .github/workflows/release.yml runs) checks
+    # the git state and aborts before building if the checkout is modified. That
+    # holds only while that validation runs — if this ever gains `--snapshot` or
+    # `--skip=validate`, stamp the marker here, or narrow the claim in
+    # docs/DEVELOPMENT.md § Reporting the version at run time.
     ldflags:
       - -X main.version={{ .Version }}
       - -X main.commit={{ .ShortCommit }}

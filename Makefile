@@ -266,17 +266,29 @@ build: precommit ## Build the leash binary
 	@set -e; \
 	$(MAKE) generate-entrypoint-if-missing; \
 	BASE=$$(git rev-parse --short=7 HEAD 2>/dev/null || true); \
-	if [ -z "$$BASE" ]; then BASE=dev; fi; \
-	DIRTY=''; \
-	if [ -n "$$({ git status --porcelain 2>/dev/null || true; })" ]; then DIRTY="-dirty"; fi; \
-	COMMIT="$$BASE$$DIRTY"; \
+	if [ -z "$$BASE" ]; then \
+	  COMMIT=dev; \
+	else \
+	  COMMIT="$$BASE"; \
+	  git update-index -q --refresh >/dev/null 2>&1 || true; \
+	  DIRTY_RC=0; \
+	  git diff-index --quiet HEAD -- >/dev/null 2>&1 || DIRTY_RC=$$?; \
+	  if [ "$$DIRTY_RC" -ne 0 ]; then \
+	    COMMIT="$$BASE-dirty"; \
+	    if [ "$$DIRTY_RC" -ne 1 ]; then \
+	      echo "build: WARNING: could not read the tree state (git diff-index exit $$DIRTY_RC); assuming modified, stamping $$COMMIT" >&2; \
+	    fi; \
+	  fi; \
+	fi; \
+	VERSION="$$(git describe --tags --always --dirty 2>/dev/null || true)"; \
+	if [ -z "$$VERSION" ]; then VERSION=dev; fi; \
 	BUILD_DATE="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
 	for cmd_dir in cmd/*; do \
 	  if [ -d "$$cmd_dir" ] && ! [[ "$$cmd_dir" =~ leash-entry ]]; then \
 	    name=$${cmd_dir##*/}; \
 	    out="bin/$$name"; \
 	    echo "building $${out}..."; \
-	    CGO_ENABLED=0 go build -trimpath -ldflags "-X main.commit=$$COMMIT -X main.buildDate=$$BUILD_DATE" -o "$$out" "./$$cmd_dir" || exit $$?; \
+	    CGO_ENABLED=0 go build -trimpath -ldflags "-X main.version=$$VERSION -X main.commit=$$COMMIT -X main.buildDate=$$BUILD_DATE" -o "$$out" "./$$cmd_dir" || exit $$?; \
 	  fi; \
 	done
 

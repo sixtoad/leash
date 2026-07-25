@@ -149,23 +149,26 @@ Everything not matching above resolves under `SPAHandler` (`internal/ui/handler.
 
 ## CLI build contract — `leash version --json`
 
-Not an endpoint: this is the document an installed binary emits on stdout, for provisioners (`walk install leash`, CI images) that must decide whether the leash they just installed is one they can drive. Implemented in `internal/version`; `leash version` with no flag prints the historical human lines instead.
+Not an endpoint: this is the document an installed binary emits on stdout, for provisioners (`walk install leash`, CI images) that must decide whether the leash they just installed is one they can drive. The contract type and the comparison helpers live in [`pkg/leashversion`](../pkg/leashversion) — deliberately outside `internal/`, so a consumer in another Go module can import them; `internal/version` is only leash's own CLI and rendering layer. `leash version` with no flag prints the historical human lines instead.
 
 ```jsonc
 {
-  "version": "v0.2.0",              // -X main.version, or "unknown" on a plain `go build`
-  "commit": "c686025-dirty",        // abbreviated hash + "-dirty" when built from a modified tree
+  "version": "v0.2.0",              // -X main.version, or "dev" on a plain `go build`
+  "commit": "c686025-dirty",        // abbreviated hash + "-dirty" when built from a modified tree, or "unknown"
   "builtAt": "2026-07-21T10:11:12Z",// RFC 3339 UTC, or "unknown"
-  "enforcing": true,                // does THIS BUILD ship the in-binary enforcement path
+  "enforcing": true,                // does THIS BUILD carry an enforcement path
   "contractVersion": 1,             // current CLI surface
   "minCompatibleContract": 0,       // oldest caller contract still served
+  "capabilities": [                 // surface elements a provisioner can drive
+    "policy", "inject-service", "runtime", "user", "require-lsm", "version-json"
+  ],
   "os": "linux", "arch": "amd64"    // GOOS / GOARCH
 }
 ```
 
-Field names are camelCase and additive-only: renaming or removing one is a contract break, adding one is not. `unknown` is a documented sentinel, not an error.
+Field names are camelCase and additive-only: renaming or removing one is a contract break, adding one is not. `dev` (for `version`) and `unknown` (for `commit` and `builtAt`) are documented sentinels, not errors — they are the ldflag defaults in `cmd/leash`.
 
-**Compatibility rule.** The contract covers the flags a provisioner drives (`--policy`, `--inject-service`, `--runtime`, `--user`) plus the shape of this document. A caller written against contract `C` proceeds iff:
+**Compatibility rule.** The contract covers the flags a provisioner drives (`--policy`, `--inject-service`, `--runtime`, `--user`, `--require-lsm`) plus the shape of this document. A caller written against contract `C` proceeds iff:
 
 ```
 minCompatibleContract <= C <= contractVersion
@@ -178,11 +181,15 @@ minCompatibleContract <= C <= contractVersion
 | `C < minCompatibleContract` | `leash-too-new` | Leash dropped the surface the caller was written against — upgrade the caller. |
 | `version --json` absent / non-zero exit / unparseable | contract `0` | A leash from before this feature; not an install error. |
 
-A lone `contractVersion >= C` check is **wrong**: the integer is bumped when the surface *loses* something, so a strictly greater value is exactly the incompatible case. Go callers use `version.Info.SupportsCaller(C)` / `CheckCaller(C)` rather than hand-rolling it.
+The rule is the two-sided range above, and `contractVersion >= C` alone is **not** it: that test is necessary but not sufficient, because it also admits a leash whose `contractVersion` is above `C` *and* whose `minCompatibleContract` has since risen past `C` — the leash that dropped `C`'s surface. Both bounds must be checked. Go callers use `leashversion.Info.SupportsCaller(C)` / `CheckCaller(C)` on a document decoded from the installed binary's stdout (`leashversion.Parse`), rather than hand-rolling the comparison or calling a helper that returns their own compiled-in constants.
 
-`enforcing` is derived from the build's `GOOS`: `true` on Linux (eBPF LSM hooks plus the intercepting MITM proxy are in the binary), `false` on darwin, whose enforcement lives in the separately installed Endpoint Security / Network Extension components. It describes the binary, not the host's runtime capability.
+`capabilities` is there because the integer over-refuses. Raising `minCompatibleContract` for one removal turns away every caller below the new floor, including those that never used the removed flag; `Info.HasCapability("policy")` lets such a caller ask about the surface it actually drives. Adding a name is additive (no bump); removing one is a break (bump, and raise the floor). A pre-`capabilities` document decodes with the field empty — fall back to the range.
 
-Full rationale, bump rules, and the `-dirty` provenance guarantee: [`DEVELOPMENT.md § Reporting the version at run time`](DEVELOPMENT.md#reporting-the-version-at-run-time).
+`enforcing` reports whether **this binary carries an enforcement path**, derived from the build's `GOOS`: `true` on linux (the eBPF LSM programs plus the intercepting MITM proxy) and `true` on darwin (the darwin runtime builds and drives the same MITM proxy — `internal/darwind/runtime_darwin.go`, `NewMITMProxy` / `applyPolicyToProxy` — alongside the separately installed Endpoint Security / Network Extension components it coordinates with). Any other target reports `false`. It describes the binary, not the host's runtime capability, which is `leash doctor`'s job.
+
+**Probing an unknown leash has a hazard.** On a build that predates this feature, `version` is not a subcommand: the argument falls through to the workload CLI, which configures telemetry and can begin runtime provisioning. `leash version --json` is a side-effect-free probe only from contract 1 onward. Establish contract 0 some other way where possible — `leash --version` has been in the argument switch of every build and only prints three lines — or probe with `LEASH_DISABLE_TELEMETRY=1` in a disposable directory.
+
+Full rationale, bump rules, consumer example, and the `-dirty` provenance guarantee (including which build paths stamp it): [`DEVELOPMENT.md § Reporting the version at run time`](DEVELOPMENT.md#reporting-the-version-at-run-time).
 
 ## Notable header & error conventions
 
