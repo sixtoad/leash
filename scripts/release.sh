@@ -50,6 +50,15 @@ done
 DIST="$ROOT/dist"
 rm -rf "$DIST"; mkdir -p "$DIST"
 COMMIT="$(git rev-parse --short=7 HEAD)"
+# `leash version --json` promises that a binary built from a modified tree carries
+# a "-dirty" marker instead of advertising the pristine commit it was cut from.
+# Stamp it here too, or the release build would be the one path that breaks the
+# promise. Loud, but not fatal: cutting a release from a dirty tree is the
+# operator's call, misreporting it is not.
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  COMMIT="$COMMIT-dirty"
+  echo "release: WARNING: working tree is modified — stamping commit as $COMMIT" >&2
+fi
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 for pair in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do

@@ -23,6 +23,10 @@ if [ ! -s internal/ui/dist/index.html ] || grep -q '>stub<\|<title>stub' interna
 fi
 
 COMMIT="$(git rev-parse --short=7 HEAD 2>/dev/null || echo dev)"
+# Same "-dirty" marker `git describe --dirty` puts on VERSION below, and the same
+# one the Makefile and scripts/release.sh stamp: `leash version --json` reports
+# `commit`, so a build from a modified tree must not report the bare commit.
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then COMMIT="$COMMIT-dirty"; fi
 VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "install-leash: building $(git branch --show-current 2>/dev/null || echo HEAD) -> $DEST/leash" >&2

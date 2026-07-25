@@ -6,6 +6,41 @@ container-free **native runtime** is developed on the upstream-eligible slice
 `feat/runtime-native-poc` and merged here; walk adds the native-by-default and
 Claude Code handling on top.
 
+## [Unreleased]
+
+### Added — build & compatibility document
+- **`leash version --json`** (also `--output json`): the build metadata as a
+  machine-readable document — `version`, `commit`, `builtAt`, `enforcing`,
+  `contractVersion`, `minCompatibleContract`, `os`, `arch` — so a provisioner
+  (`walk install leash`, a CI image) can verify an installed leash before
+  driving it. `version` and `builtAt` are the literal `unknown` on a plain
+  `go build`: a documented sentinel, not an error.
+- **A checkable compatibility contract.** The document carries both bounds of
+  the CLI surface leash serves: a caller written against contract `C` proceeds
+  iff `minCompatibleContract <= C <= contractVersion`. A leash with no
+  `version --json` at all is contract `0`. `version.Info.SupportsCaller` /
+  `CheckCaller` implement the rule (`compatible` / `leash-too-old` /
+  `leash-too-new`) so callers do not hand-roll it. Documented in
+  [`docs/api-contracts-leash-core.md`](docs/api-contracts-leash-core.md) and
+  [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
+- **`leash version --help` / `-h`**: usage on stdout, exit 0. Contradictory or
+  empty format specs (`--json --output text` in either order, `--output=`) are
+  rejected with a diagnostic instead of silently resolving by last-one-wins.
+
+### Changed
+- **`enforcing` is derived per platform** rather than a compile-time `true`: it
+  reports whether *this build* ships the in-binary enforcement path (eBPF LSM +
+  MITM proxy), so the darwin binary — whose enforcement lives in the separately
+  installed Endpoint Security / Network Extension components — no longer
+  advertises the Linux path.
+- **`scripts/release.sh` and `scripts/install-leash.sh` stamp the `-dirty`
+  marker** on `main.commit` when built from a modified tree, matching the
+  Makefile and making true the provenance guarantee the document states: a
+  binary cut from a dirty tree cannot report the pristine commit.
+- `leash --version` human output is unchanged (byte-for-byte). Only the hash
+  component is abbreviated now, so a `git describe` value or a short
+  `hash-dirty` string is no longer cut into a fragment naming a different build.
+
 ## [native-v0.1.0] — 2026-07-04
 
 First distributed build. Container-free native enforcement on Linux, made the

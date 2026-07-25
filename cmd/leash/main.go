@@ -34,6 +34,9 @@ func main() {
 			return
 		case "version": // `version [--json]`: machine-readable build + contract info.
 			if err := versionpkg.Run(args[2:], buildInfo(), os.Stdout); err != nil {
+				if errors.Is(err, flag.ErrHelp) { // usage already printed: a clean exit, not a failure.
+					return
+				}
 				log.Fatal(err)
 			}
 			return

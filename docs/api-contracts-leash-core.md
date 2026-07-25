@@ -4,6 +4,8 @@ All endpoints are exposed by the daemon (`leashd` in Linux containers, `darwind`
 
 The Next.js Control UI is embedded into the Go binary at `internal/ui/dist` and served by `SPAHandler` (`internal/ui/handler.go`) at `/`. Everything not under a registered API path falls through to the SPA.
 
+One contract here is not an endpoint: [§ CLI build contract](#cli-build-contract--leash-version---json) covers `leash version --json`, the document a provisioner reads from an *installed binary* before it drives anything else.
+
 > **Cross-references:** Cedar policy syntax → [`design/CEDAR.md`](design/CEDAR.md). Completion design → [`design/AUTOCOMPLETE.md`](design/AUTOCOMPLETE.md). Bootstrap lifecycle → [`design/BOOT.md`](design/BOOT.md). CA + secrets boundary → [`design/SECURITY-MODEL.md`](design/SECURITY-MODEL.md).
 
 ## Health & Liveness
@@ -144,6 +146,43 @@ Everything not matching above resolves under `SPAHandler` (`internal/ui/handler.
 - `/_next/static/*` → static file from `embed.FS`, `Cache-Control: public, max-age=31536000, immutable`
 - Other static asset → served from embed.FS
 - Anything else (e.g. `/policies`, `/events`) → `index.html` with `Cache-Control: no-store` and a dynamic `<title>` injected by `injectTitle`.
+
+## CLI build contract — `leash version --json`
+
+Not an endpoint: this is the document an installed binary emits on stdout, for provisioners (`walk install leash`, CI images) that must decide whether the leash they just installed is one they can drive. Implemented in `internal/version`; `leash version` with no flag prints the historical human lines instead.
+
+```jsonc
+{
+  "version": "v0.2.0",              // -X main.version, or "unknown" on a plain `go build`
+  "commit": "c686025-dirty",        // abbreviated hash + "-dirty" when built from a modified tree
+  "builtAt": "2026-07-21T10:11:12Z",// RFC 3339 UTC, or "unknown"
+  "enforcing": true,                // does THIS BUILD ship the in-binary enforcement path
+  "contractVersion": 1,             // current CLI surface
+  "minCompatibleContract": 0,       // oldest caller contract still served
+  "os": "linux", "arch": "amd64"    // GOOS / GOARCH
+}
+```
+
+Field names are camelCase and additive-only: renaming or removing one is a contract break, adding one is not. `unknown` is a documented sentinel, not an error.
+
+**Compatibility rule.** The contract covers the flags a provisioner drives (`--policy`, `--inject-service`, `--runtime`, `--user`) plus the shape of this document. A caller written against contract `C` proceeds iff:
+
+```
+minCompatibleContract <= C <= contractVersion
+```
+
+| Situation | Verdict | Meaning |
+|---|---|---|
+| `minCompatibleContract <= C <= contractVersion` | `compatible` | Drive it. |
+| `C > contractVersion` | `leash-too-old` | Leash predates the surface the caller needs — upgrade leash. |
+| `C < minCompatibleContract` | `leash-too-new` | Leash dropped the surface the caller was written against — upgrade the caller. |
+| `version --json` absent / non-zero exit / unparseable | contract `0` | A leash from before this feature; not an install error. |
+
+A lone `contractVersion >= C` check is **wrong**: the integer is bumped when the surface *loses* something, so a strictly greater value is exactly the incompatible case. Go callers use `version.Info.SupportsCaller(C)` / `CheckCaller(C)` rather than hand-rolling it.
+
+`enforcing` is derived from the build's `GOOS`: `true` on Linux (eBPF LSM hooks plus the intercepting MITM proxy are in the binary), `false` on darwin, whose enforcement lives in the separately installed Endpoint Security / Network Extension components. It describes the binary, not the host's runtime capability.
+
+Full rationale, bump rules, and the `-dirty` provenance guarantee: [`DEVELOPMENT.md § Reporting the version at run time`](DEVELOPMENT.md#reporting-the-version-at-run-time).
 
 ## Notable header & error conventions
 
