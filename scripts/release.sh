@@ -50,29 +50,6 @@ done
 DIST="$ROOT/dist"
 rm -rf "$DIST"; mkdir -p "$DIST"
 COMMIT="$(git rev-parse --short=7 HEAD)"
-# `leash version --json` promises that a binary built from a modified tree carries
-# a "-dirty" marker instead of advertising the pristine commit it was cut from.
-# Stamp it here too, or the release build would be the one path that breaks the
-# promise. Loud, but not fatal: cutting a release from a dirty tree is the
-# operator's call, misreporting it is not.
-#
-# `git diff-index` rather than `git status --porcelain`: tracked files only, the
-# same test `git describe --dirty` runs, so `version` and `commit` cannot
-# disagree because of an untracked file. And it fails CLOSED — a git that errors
-# (index lock, corrupt index, ownership refusal) is stamped dirty, not read as
-# pristine. `[ -n "$(git status --porcelain 2>/dev/null)" ]` failed open: empty
-# stdout from a *failed* command is indistinguishable from a clean tree.
-git update-index -q --refresh >/dev/null 2>&1 || true
-dirty_rc=0
-git diff-index --quiet HEAD -- >/dev/null 2>&1 || dirty_rc=$?
-if [ "$dirty_rc" -ne 0 ]; then
-  COMMIT="$COMMIT-dirty"
-  if [ "$dirty_rc" -eq 1 ]; then
-    echo "release: WARNING: working tree is modified — stamping commit as $COMMIT" >&2
-  else
-    echo "release: WARNING: could not read the tree state (git diff-index exit $dirty_rc); assuming modified, stamping commit as $COMMIT" >&2
-  fi
-fi
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 for pair in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do

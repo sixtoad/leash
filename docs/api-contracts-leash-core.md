@@ -149,12 +149,14 @@ Everything not matching above resolves under `SPAHandler` (`internal/ui/handler.
 
 ## CLI build contract — `leash version --json`
 
-Not an endpoint: this is the document an installed binary emits on stdout, for provisioners (`walk install leash`, CI images) that must decide whether the leash they just installed is one they can drive. The contract type and the comparison helpers live in [`pkg/leashversion`](../pkg/leashversion) — deliberately outside `internal/`, so a consumer in another Go module can import them; `internal/version` is only leash's own CLI and rendering layer. `leash version` with no flag prints the historical human lines instead.
+Not an endpoint: this is the document an installed binary emits on stdout, for provisioners (`walk install leash`, CI images) that must decide whether the leash they just installed is one they can drive. `leash version` with no flag prints the historical human lines instead.
+
+**The document is the contract. There is no package to import.** leash publishes no Go module for this on purpose — the rule below is three lines in any language, and a published package would bind this module (already tagged `v1.1.7`) to a permanent v1 Go API. Decode the JSON into a type of your own.
 
 ```jsonc
 {
   "version": "v0.2.0",              // -X main.version, or "dev" on a plain `go build`
-  "commit": "c686025-dirty",        // abbreviated hash + "-dirty" when built from a modified tree, or "unknown"
+  "commit": "c686025-dirty",        // abbreviated hex hash, optionally "-dirty"; or "dev"; or "unknown"
   "builtAt": "2026-07-21T10:11:12Z",// RFC 3339 UTC, or "unknown"
   "enforcing": true,                // does THIS BUILD carry an enforcement path
   "contractVersion": 1,             // current CLI surface
@@ -166,7 +168,17 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
 }
 ```
 
-Field names are camelCase and additive-only: renaming or removing one is a contract break, adding one is not. `dev` (for `version`) and `unknown` (for `commit` and `builtAt`) are documented sentinels, not errors — they are the ldflag defaults in `cmd/leash`.
+Field names are camelCase and additive-only: renaming or removing one is a contract break, adding one is not.
+
+Value domains a caller must accept rather than reject:
+
+- `version` — a release tag, a `git describe` string (which may end `-dirty`), or the literal `dev`.
+- `commit` — an abbreviated hex hash, optionally suffixed `-dirty`; or the literal `dev`; or the literal `unknown`. All three are legitimate builds.
+- `builtAt` — RFC 3339 UTC, or the literal `unknown`.
+
+`dev` and `unknown` are documented sentinels, not errors: `unknown` is the ldflag default in `cmd/leash`, and `dev` is both `main.version`'s default and what the build paths substitute for `commit` when `git rev-parse` fails.
+
+**The `-dirty` marker is best-effort and not guaranteed on any given path.** Today only the Makefile `build` target appends it; `scripts/release.sh`, `scripts/install-leash.sh`, `build/publish-docker.sh` and `.goreleaser.yaml` stamp the bare hash. Its presence means the tree was modified; **its absence is not proof of a clean tree** and must not be treated as a provenance guarantee.
 
 **Compatibility rule.** The contract covers the flags a provisioner drives (`--policy`, `--inject-service`, `--runtime`, `--user`, `--require-lsm`) plus the shape of this document. A caller written against contract `C` proceeds iff:
 
@@ -181,15 +193,51 @@ minCompatibleContract <= C <= contractVersion
 | `C < minCompatibleContract` | `leash-too-new` | Leash dropped the surface the caller was written against — upgrade the caller. |
 | `version --json` absent / non-zero exit / unparseable | contract `0` | A leash from before this feature; not an install error. |
 
-The rule is the two-sided range above, and `contractVersion >= C` alone is **not** it: that test is necessary but not sufficient, because it also admits a leash whose `contractVersion` is above `C` *and* whose `minCompatibleContract` has since risen past `C` — the leash that dropped `C`'s surface. Both bounds must be checked. Go callers use `leashversion.Info.SupportsCaller(C)` / `CheckCaller(C)` on a document decoded from the installed binary's stdout (`leashversion.Parse`), rather than hand-rolling the comparison or calling a helper that returns their own compiled-in constants.
+The rule is the two-sided range above, and `contractVersion >= C` alone is **not** it: that test is necessary but not sufficient, because it also admits a leash whose `contractVersion` is above `C` *and* whose `minCompatibleContract` has since risen past `C` — the leash that dropped `C`'s surface. Both bounds must be checked.
 
-`capabilities` is there because the integer over-refuses. Raising `minCompatibleContract` for one removal turns away every caller below the new floor, including those that never used the removed flag; `Info.HasCapability("policy")` lets such a caller ask about the surface it actually drives. Adding a name is additive (no bump); removing one is a break (bump, and raise the floor). A pre-`capabilities` document decodes with the field empty — fall back to the range.
+**Implementing it.** Run the *installed* binary, decode its stdout, compare. Language-agnostic:
+
+```
+doc = json_decode(run(leash_path, "version", "--json").stdout)   # non-zero exit or unparseable → contract 0
+require(doc is an object and has "version" and "contractVersion") # else → contract 0
+ok = doc.minCompatibleContract <= C <= doc.contractVersion        # C = the contract you were written against
+```
+
+The same thing in Go, with a struct of your own — no leash import:
+
+```go
+type leashDoc struct {
+	Version               string   `json:"version"`
+	ContractVersion       *int     `json:"contractVersion"` // pointer: absent must not read as 0
+	MinCompatibleContract int      `json:"minCompatibleContract"`
+	Capabilities          []string `json:"capabilities"`
+}
+
+const myContract = 1 // the contract this provisioner was written against
+
+out, err := exec.Command(leashPath, "version", "--json").Output()
+if err != nil {
+	return errContractZero // not an install failure; see the probe hazard below
+}
+var doc leashDoc
+if err := json.Unmarshal(out, &doc); err != nil || doc.Version == "" || doc.ContractVersion == nil {
+	return errContractZero // `null`, `{}` and any non-document land here, not in a false "compatible"
+}
+if myContract < doc.MinCompatibleContract || myContract > *doc.ContractVersion {
+	return fmt.Errorf("incompatible leash: contract %d outside [%d,%d]",
+		myContract, doc.MinCompatibleContract, *doc.ContractVersion)
+}
+```
+
+Two traps that snippet avoids. Decoding straight into value types makes `null`, `{}` and any unrelated JSON object succeed with a zero range `[0,0]`, which a contract-0 caller reads as *compatible* — so require the fields that make it this document before trusting the numbers. And never compare leash against constants compiled into the caller: that compares the caller to itself and can only pass. The installed binary's stdout is the only thing that can disagree with you.
+
+`capabilities` is there because the integer over-refuses. Raising `minCompatibleContract` for one removal turns away every caller below the new floor, including those that never used the removed flag; a caller that drives only `--policy` can test for `"policy"` in the array instead of consulting the range at all. Adding a name is additive (no bump); removing one is a break (bump, and raise the floor). A pre-`capabilities` document decodes with the field empty — fall back to the range. The empty string is never a capability.
 
 `enforcing` reports whether **this binary carries an enforcement path**, derived from the build's `GOOS`: `true` on linux (the eBPF LSM programs plus the intercepting MITM proxy) and `true` on darwin (the darwin runtime builds and drives the same MITM proxy — `internal/darwind/runtime_darwin.go`, `NewMITMProxy` / `applyPolicyToProxy` — alongside the separately installed Endpoint Security / Network Extension components it coordinates with). Any other target reports `false`. It describes the binary, not the host's runtime capability, which is `leash doctor`'s job.
 
 **Probing an unknown leash has a hazard.** On a build that predates this feature, `version` is not a subcommand: the argument falls through to the workload CLI, which configures telemetry and can begin runtime provisioning. `leash version --json` is a side-effect-free probe only from contract 1 onward. Establish contract 0 some other way where possible — `leash --version` has been in the argument switch of every build and only prints three lines — or probe with `LEASH_DISABLE_TELEMETRY=1` in a disposable directory.
 
-Full rationale, bump rules, consumer example, and the `-dirty` provenance guarantee (including which build paths stamp it): [`DEVELOPMENT.md § Reporting the version at run time`](DEVELOPMENT.md#reporting-the-version-at-run-time).
+Full rationale, the bump rules, and which build path stamps what: [`DEVELOPMENT.md § Reporting the version at run time`](DEVELOPMENT.md#reporting-the-version-at-run-time).
 
 ## Notable header & error conventions
 

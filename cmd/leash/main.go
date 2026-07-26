@@ -101,5 +101,5 @@ func buildInfo() versionpkg.Build {
 }
 
 func printVersion() {
-	fmt.Print(versionpkg.Human(versionpkg.Describe(buildInfo())))
+	fmt.Print(versionpkg.Describe(buildInfo()).Human())
 }

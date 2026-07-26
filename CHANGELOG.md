@@ -16,27 +16,26 @@ Claude Code handling on top.
   before driving it. On a plain `go build` with no ldflags, `version` is the
   literal `dev` and `commit`/`builtAt` are the literal `unknown`: documented
   sentinels, not errors.
-- **A checkable compatibility contract, in an importable package.** The
-  contract type and helpers live in
-  [`pkg/leashversion`](pkg/leashversion) — outside `internal/`, so a consumer in
-  another Go module (walk is `github.com/sixto/walk`) can actually import them;
-  Go's internal rule would have forbidden it from `internal/version`, which
-  remains leash's own CLI/rendering layer. The document carries both bounds of
-  the CLI surface leash serves: a caller written against contract `C` proceeds
-  iff `minCompatibleContract <= C <= contractVersion`. A leash with no
-  `version --json` at all is contract `0`. `leashversion.Parse` decodes the
-  installed binary's stdout and `Info.SupportsCaller` / `CheckCaller` return the
-  verdict (`compatible` / `leash-too-old` / `leash-too-new`), so callers neither
-  hand-roll the comparison nor accidentally check their own compiled-in
-  constants. Documented in
-  [`docs/api-contracts-leash-core.md`](docs/api-contracts-leash-core.md) and
-  [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
+- **A checkable compatibility contract, published as a rule rather than as a
+  package.** The document carries both bounds of the CLI surface leash serves: a
+  caller written against contract `C` proceeds iff
+  `minCompatibleContract <= C <= contractVersion`. A leash with no
+  `version --json` at all is contract `0`. The rule, the value domains, the
+  contract-0 handling and a decode-the-installed-binary snippet (with a struct
+  the *consumer* owns — leash exports no Go type for this) are in
+  [`docs/api-contracts-leash-core.md`](docs/api-contracts-leash-core.md), with
+  the bump policy in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md). The
+  implementation stays in `internal/version`: the emitted JSON is the contract,
+  the Go type is not, so leash can refactor it without shipping a `/v2`.
+  Decoding is fail-closed — `null`, `{}` and any object missing `version` /
+  `contractVersion` are rejected rather than yielding a zero contract range that
+  a contract-0 caller would read as compatible.
 - **`capabilities`**, an additive string array naming the CLI surface a
   provisioner drives (`policy`, `inject-service`, `runtime`, `user`,
   `require-lsm`, `version-json`). The integer over-refuses — raising
   `minCompatibleContract` for one removal turns away every older caller,
-  including those that never used the removed flag — so `Info.HasCapability`
-  lets a caller ask about the surface it actually needs. Adding a name is
+  including those that never used the removed flag — so a caller can test the
+  array for the one surface element it actually drives instead. Adding a name is
   non-breaking and does not bump `contractVersion`.
 - **`leash version --help` / `-h`**: usage on stdout, exit 0. Contradictory or
   empty format specs are rejected with a diagnostic instead of silently
@@ -53,22 +52,16 @@ Claude Code handling on top.
   `NewMITMProxy` / `applyPolicyToProxy`) alongside the separately installed
   Endpoint Security / Network Extension components. Any other target reports
   `false`.
-- **Every build path that stamps a commit now appends the `-dirty` marker** when
-  the tree is modified: `scripts/release.sh`, `scripts/install-leash.sh` and
-  `build/publish-docker.sh` join the Makefile `build` target, so the provenance
-  guarantee the document states is one the build system actually implements.
-  (`.goreleaser.yaml` needs no marker: `goreleaser release` refuses to build
-  from a modified tree at all.) The checks now use
-  `git diff-index --quiet HEAD --` rather than `git status --porcelain`, so they
-  count tracked files only — the same semantics as the adjacent
-  `git describe --dirty`, which stops `version` and `commit` disagreeing about
-  one tree over an untracked file — and they fail **closed**: a git that errors
-  is stamped `-dirty` with a warning instead of being read as pristine. The
-  marker is appended only when the commit lookup succeeded, so the `dev`
-  fallback never becomes `dev-dirty`.
-- **`make build` now stamps `-X main.version`** (`git describe --tags --always
-  --dirty`, or `dev`). Locally built binaries previously always reported
-  `version: dev` regardless of the checkout.
+- **The `-dirty` marker is documented as best-effort, not as a guarantee.** The
+  docs previously claimed every build path appends it when the tree is modified;
+  they no longer do, and no build path changed. Only the Makefile `build` target
+  stamps the marker; `scripts/release.sh`, `scripts/install-leash.sh`,
+  `build/publish-docker.sh` and `.goreleaser.yaml` stamp the bare hash. Its
+  presence means the tree was modified — **its absence is not proof of a clean
+  tree**, and a consumer must not treat it as provenance. The documented value
+  domain of `commit` also now names the literal `dev`, which several paths emit
+  when `git rev-parse` fails, so a caller validating against the published set
+  no longer rejects a legitimate build.
 - **`leash version` is now a subcommand.** It previously fell through to the
   workload CLI, where it would have been treated as a command to run in the
   box; `leash version [--json|--output json|text] [--help]` now handles it, and

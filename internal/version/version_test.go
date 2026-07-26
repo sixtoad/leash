@@ -15,9 +15,9 @@ func testBuild() Build {
 	return Build{Version: "v0.2.0", Commit: "c686025aa1b2c3", BuildDate: "2026-07-21T10:11:12Z"}
 }
 
-// wantCapabilities is the surface this build advertises, written out rather than
-// obtained from the package under test so a silent change to the list fails
-// here as well as in pkg/leashversion.
+// wantCapabilities is the surface this build advertises, written out as literals
+// rather than obtained from the code under test, so a silent change to the list
+// fails here.
 var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "require-lsm", "version-json"}
 
 // TestEnforcingIsDerivedPerPlatform pins the criterion: `enforcing` says whether
@@ -237,10 +237,12 @@ func TestHumanIsByteIdenticalForRealBuildValues(t *testing.T) {
 		{commit: "c686025aa1b2c3d4e5f60718293a4b5c6d7e8f90", want: "version: v0.2.0\ngit hash: c686025\nbuild date: 2026-07-21T10:11:12Z\n"},
 		{commit: "unknown", want: "version: v0.2.0\ngit hash: unknown\nbuild date: 2026-07-21T10:11:12Z\n"},
 		{commit: "dev", want: "version: v0.2.0\ngit hash: dev\nbuild date: 2026-07-21T10:11:12Z\n"},
+		// A hash at or below the abbreviation length is left alone.
+		{commit: "c68602", want: "version: v0.2.0\ngit hash: c68602\nbuild date: 2026-07-21T10:11:12Z\n"},
 	}
 	for _, tt := range tests {
 		build := Build{Version: "v0.2.0", Commit: tt.commit, BuildDate: "2026-07-21T10:11:12Z"}
-		if got := Human(describeFor(build, "linux", "amd64")); got != tt.want {
+		if got := describeFor(build, "linux", "amd64").Human(); got != tt.want {
 			t.Fatalf("Human() for commit %q = %q, want the pre-change %q", tt.commit, got, tt.want)
 		}
 	}
@@ -275,55 +277,12 @@ func TestHumanDeManglesPathologicalValues(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := Human(describeFor(tt.build, "linux", "amd64"))
+			got := describeFor(tt.build, "linux", "amd64").Human()
 			if got != tt.want {
 				t.Fatalf("Human() = %q, want %q", got, tt.want)
 			}
 			if strings.Contains(got, "git hash: "+tt.wasCut+"\n") {
 				t.Fatalf("Human() = %q, which is the mangled pre-change fragment %q", got, tt.wasCut)
-			}
-		})
-	}
-}
-
-// TestHumanRendersTheThreeLines covers the ordinary shapes.
-func TestHumanRendersTheThreeLines(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name  string
-		build Build
-		want  string
-	}{
-		{
-			name:  "long hash is truncated to seven",
-			build: testBuild(),
-			want:  "version: v0.2.0\ngit hash: c686025\nbuild date: 2026-07-21T10:11:12Z\n",
-		},
-		{
-			// The human line has never shown the marker; the JSON document does.
-			name:  "dirty marker is dropped, as before",
-			build: Build{Version: "dev", Commit: "c686025aa1b2c3-dirty", BuildDate: "unknown"},
-			want:  "version: dev\ngit hash: c686025\nbuild date: unknown\n",
-		},
-		{
-			name:  "short hash is left alone",
-			build: Build{Version: "dev", Commit: "c68602", BuildDate: "unknown"},
-			want:  "version: dev\ngit hash: c68602\nbuild date: unknown\n",
-		},
-		{
-			name:  "empty ldflags degrade to unknown",
-			build: Build{},
-			want:  "version: unknown\ngit hash: unknown\nbuild date: unknown\n",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			if got := Human(describeFor(tt.build, "linux", "amd64")); got != tt.want {
-				t.Fatalf("Human() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -466,5 +425,280 @@ func TestRunHelp(t *testing.T) {
 		if strings.Contains(printed, "build date:") || strings.Contains(printed, "\"builtAt\"") {
 			t.Fatalf("Run(%q) printed the version document alongside usage: %q", arg, printed)
 		}
+	}
+}
+
+// TestContractBoundsAreTheLiteralsTheDocsPublish pins the two integers to the
+// values CHANGELOG.md, docs/api-contracts-leash-core.md and docs/DEVELOPMENT.md
+// print. It is written as literals on purpose: an assertion phrased against the
+// constants themselves ("ContractVersion >= 1") compares the constant to itself
+// and cannot fail. Changing either number is a contract event — update the docs
+// and this test together, deliberately.
+func TestContractBoundsAreTheLiteralsTheDocsPublish(t *testing.T) {
+	t.Parallel()
+
+	if ContractVersion != 1 {
+		t.Fatalf("ContractVersion = %d, want 1 (the value the docs publish); bumping it is a contract change — update the docs and this test", ContractVersion)
+	}
+	if MinCompatibleContract != 0 {
+		t.Fatalf("MinCompatibleContract = %d, want 0 (contract 1 removed nothing); raising it refuses every older caller — update the docs and this test", MinCompatibleContract)
+	}
+}
+
+// TestCapabilitiesReturnsACopy: the document is read by callers that may hold
+// and mutate the slice; the package's own list must not be reachable through it.
+func TestCapabilitiesReturnsACopy(t *testing.T) {
+	t.Parallel()
+
+	first := Capabilities()
+	first[0] = "clobbered"
+	if got := Capabilities()[0]; got != "policy" {
+		t.Fatalf("Capabilities()[0] = %q after a caller mutated an earlier result, want %q", got, "policy")
+	}
+}
+
+// TestCheckCallerRange pins the rule the contract documents:
+// minCompatibleContract <= callerContract <= contractVersion. The Info is built
+// by hand with a range open on both sides, which the real constants ([0,1]) do
+// not yet have, so both failure directions are exercised.
+func TestCheckCallerRange(t *testing.T) {
+	t.Parallel()
+
+	leash := Info{MinCompatibleContract: 2, ContractVersion: 4}
+
+	tests := []struct {
+		name           string
+		callerContract int
+		want           Compatibility
+	}{
+		{name: "caller below the floor: leash dropped its surface", callerContract: 1, want: "leash-too-new"},
+		{name: "caller at the floor", callerContract: 2, want: "compatible"},
+		{name: "caller inside the range", callerContract: 3, want: "compatible"},
+		{name: "caller at the ceiling", callerContract: 4, want: "compatible"},
+		{name: "caller above the ceiling: leash predates its surface", callerContract: 5, want: "leash-too-old"},
+		{name: "pre-feature caller is below this floor too", callerContract: 0, want: "leash-too-new"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := leash.CheckCaller(tt.callerContract); got != tt.want {
+				t.Fatalf("CheckCaller(%d) = %q, want %q", tt.callerContract, got, tt.want)
+			}
+			if got, want := leash.SupportsCaller(tt.callerContract), tt.want == "compatible"; got != want {
+				t.Fatalf("SupportsCaller(%d) = %t, want %t", tt.callerContract, got, want)
+			}
+		})
+	}
+}
+
+// TestCheckCallerAgainstTheDocumentThisBuildEmits uses the shipped bounds, with
+// the outcomes written as literals rather than derived from the constants.
+// Contract 0 — a caller written before `version --json` existed — is compatible
+// with this build because contract 1 removed nothing.
+func TestCheckCallerAgainstTheDocumentThisBuildEmits(t *testing.T) {
+	t.Parallel()
+
+	info := Info{ContractVersion: ContractVersion, MinCompatibleContract: MinCompatibleContract}
+
+	tests := []struct {
+		callerContract int
+		want           Compatibility
+	}{
+		{callerContract: 0, want: "compatible"},
+		{callerContract: 1, want: "compatible"},
+		{callerContract: 2, want: "leash-too-old"},
+	}
+	for _, tt := range tests {
+		if got := info.CheckCaller(tt.callerContract); got != tt.want {
+			t.Fatalf("CheckCaller(%d) = %q, want %q", tt.callerContract, got, tt.want)
+		}
+	}
+}
+
+// TestHasCapability covers the reason the field exists: a caller that drives one
+// flag can ask for that flag instead of being refused by an integer bumped for
+// an unrelated removal.
+func TestHasCapability(t *testing.T) {
+	t.Parallel()
+
+	// A hypothetical future leash: it dropped --inject-service and raised the
+	// floor past a contract-1 caller, but still offers --policy.
+	future := Info{
+		ContractVersion:       4,
+		MinCompatibleContract: 4,
+		Capabilities:          []string{"policy", "runtime", "user", "require-lsm", "version-json"},
+	}
+	if got := future.CheckCaller(1); got != "leash-too-new" {
+		t.Fatalf("CheckCaller(1) = %q, want %q", got, "leash-too-new")
+	}
+	if !future.HasCapability("policy") {
+		t.Fatal(`HasCapability("policy") = false, want true: the integer over-refuses, the capability is the point`)
+	}
+	if future.HasCapability("inject-service") {
+		t.Fatal(`HasCapability("inject-service") = true, want false: it was removed`)
+	}
+
+	// A document from a leash that predates the field decodes with it empty.
+	var older Info
+	if older.HasCapability("policy") {
+		t.Fatal(`HasCapability on a document with no capabilities = true, want false`)
+	}
+}
+
+// TestHasCapabilityRejectsTheEmptyName: "" is not a capability. A caller that
+// reaches here with an unset constant, or a garbled document carrying an empty
+// entry, must get false rather than an accidental pass.
+func TestHasCapabilityRejectsTheEmptyName(t *testing.T) {
+	t.Parallel()
+
+	if describeFor(testBuild(), "linux", "amd64").HasCapability("") {
+		t.Fatal(`HasCapability("") = true on a real document, want false`)
+	}
+	malformed := Info{Capabilities: []string{""}}
+	if malformed.HasCapability("") {
+		t.Fatal(`HasCapability("") = true against a document carrying an empty entry, want false`)
+	}
+}
+
+// TestParseReadsTheWireDocument is the consumer path: the bytes are a literal of
+// what an installed binary prints, not something this package produced, so a
+// renamed JSON tag fails here.
+func TestParseReadsTheWireDocument(t *testing.T) {
+	t.Parallel()
+
+	stdout := []byte(`{
+  "version": "v0.2.0",
+  "commit": "c686025-dirty",
+  "builtAt": "2026-07-21T10:11:12Z",
+  "enforcing": true,
+  "contractVersion": 3,
+  "minCompatibleContract": 2,
+  "capabilities": [
+    "policy",
+    "runtime"
+  ],
+  "os": "linux",
+  "arch": "amd64"
+}
+`)
+
+	got, err := Parse(stdout)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	want := Info{
+		Version:               "v0.2.0",
+		Commit:                "c686025-dirty",
+		BuiltAt:               "2026-07-21T10:11:12Z",
+		Enforcing:             true,
+		ContractVersion:       3,
+		MinCompatibleContract: 2,
+		Capabilities:          []string{"policy", "runtime"},
+		OS:                    "linux",
+		Arch:                  "amd64",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Parse(...) = %+v, want %+v", got, want)
+	}
+
+	// And the decoded document drives the comparison a provisioner runs.
+	if got.SupportsCaller(1) {
+		t.Fatal("SupportsCaller(1) = true against a leash whose floor is 2, want false")
+	}
+	if !got.SupportsCaller(2) {
+		t.Fatal("SupportsCaller(2) = false against the range [2,3], want true")
+	}
+	if !got.HasCapability("policy") {
+		t.Fatal(`HasCapability("policy") = false, want true`)
+	}
+}
+
+// TestParseRoundTripsWhatThisBuildEmits: the emitted document must satisfy the
+// decoder's own validation, or the install gate would reject a genuine leash.
+func TestParseRoundTripsWhatThisBuildEmits(t *testing.T) {
+	t.Parallel()
+
+	emitted := describeFor(testBuild(), "linux", "amd64")
+	encoded, err := emitted.JSON()
+	if err != nil {
+		t.Fatalf("JSON() error: %v", err)
+	}
+	got, err := Parse(encoded)
+	if err != nil {
+		t.Fatalf("Parse of this build's own document: %v", err)
+	}
+	if !reflect.DeepEqual(got, emitted) {
+		t.Fatalf("Parse(JSON(%+v)) = %+v", emitted, got)
+	}
+}
+
+// TestParseRejectsNonDocuments is the install gate. json.Unmarshal alone accepts
+// `null`, `{}` and `{"foo":1}` without error and leaves a zero Info — contract
+// range [0,0] — which a contract-0 caller reads as `compatible`. That is a
+// fail-open decoder on the one decision that is supposed to refuse, so each of
+// these must be an error rather than a document.
+func TestParseRejectsNonDocuments(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		stdout     string
+		wantErrSub string
+	}{
+		{name: "empty output", stdout: "", wantErrSub: "empty output"},
+		{name: "only whitespace", stdout: "  \n\t ", wantErrSub: "empty output"},
+		{name: "an unknown-subcommand diagnostic", stdout: "leash: unknown command \"version\"\n", wantErrSub: "parse leash version document"},
+		{name: "truncated object", stdout: "{", wantErrSub: "parse leash version document"},
+		{name: "JSON null", stdout: "null", wantErrSub: "want an object"},
+		{name: "JSON array", stdout: `[{"version":"v1","contractVersion":1}]`, wantErrSub: "parse leash version document"},
+		{name: "a bare string", stdout: `"v0.2.0"`, wantErrSub: "parse leash version document"},
+		{name: "a bare number", stdout: `1`, wantErrSub: "parse leash version document"},
+		{name: "a bare bool", stdout: `true`, wantErrSub: "parse leash version document"},
+		{name: "empty object", stdout: `{}`, wantErrSub: `missing required field "version"`},
+		{name: "an unrelated object", stdout: `{"foo":1}`, wantErrSub: `missing required field "version"`},
+		{name: "the doctor document, not this one", stdout: `{"schema_version":1,"checks":[]}`, wantErrSub: `missing required field "version"`},
+		{name: "no contractVersion", stdout: `{"version":"v0.2.0","commit":"c686025"}`, wantErrSub: `missing required field "contractVersion"`},
+		{name: "inverted range", stdout: `{"version":"v0.2.0","contractVersion":1,"minCompatibleContract":2}`, wantErrSub: "inverted contract range"},
+		{name: "negative contractVersion", stdout: `{"version":"v0.2.0","contractVersion":-1}`, wantErrSub: "negative contract range"},
+		{name: "negative floor", stdout: `{"version":"v0.2.0","contractVersion":1,"minCompatibleContract":-3}`, wantErrSub: "negative contract range"},
+		{name: "wrong type for a field", stdout: `{"version":"v0.2.0","contractVersion":"one"}`, wantErrSub: "parse leash version document"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := Parse([]byte(tt.stdout))
+			if err == nil {
+				t.Fatalf("Parse(%q) error = nil, want one; it returned %+v, whose contract range a contract-0 caller reads as %q",
+					tt.stdout, got, got.CheckCaller(0))
+			}
+			if !strings.Contains(err.Error(), tt.wantErrSub) {
+				t.Fatalf("Parse(%q) error = %v, want one containing %q", tt.stdout, err, tt.wantErrSub)
+			}
+			if !reflect.DeepEqual(got, Info{}) {
+				t.Fatalf("Parse(%q) returned %+v alongside its error, want the zero Info", tt.stdout, got)
+			}
+		})
+	}
+}
+
+// TestParseAcceptsAMinimalDocument: the required set is deliberately small, so a
+// document carrying only the two gate fields still decodes. The floor's absence
+// means 0 — "nothing has been removed" — which is why it is not required.
+func TestParseAcceptsAMinimalDocument(t *testing.T) {
+	t.Parallel()
+
+	got, err := Parse([]byte(`{"version":"v0.2.0","contractVersion":1}`))
+	if err != nil {
+		t.Fatalf("Parse of a minimal document: %v", err)
+	}
+	if got.MinCompatibleContract != 0 || got.ContractVersion != 1 {
+		t.Fatalf("Parse(...) range = [%d,%d], want [0,1]", got.MinCompatibleContract, got.ContractVersion)
+	}
+	if !got.SupportsCaller(0) || !got.SupportsCaller(1) {
+		t.Fatalf("Parse(...) document %+v refuses a caller inside [0,1]", got)
 	}
 }

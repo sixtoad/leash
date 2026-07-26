@@ -207,30 +207,8 @@ main() {
         --build-arg BASE_RUNTIME_IMAGE="${base_runtime_image}"
     )
 
-    # This commit is passed to Dockerfile.leash as --build-arg COMMIT and linked
-    # in as -X main.commit, so it is what `leash version --json` reports out of
-    # the published image. Same three rules as the Makefile, scripts/release.sh
-    # and scripts/install-leash.sh: the marker only when the lookup succeeded,
-    # tracked-files semantics (`git diff-index`, matching `git describe --dirty`),
-    # and fail CLOSED — a git that errors is stamped dirty rather than silently
-    # read as a pristine tree.
-    local commit dirty_rc
-    commit="$(git rev-parse --short=7 HEAD 2>/dev/null || true)"
-    if [ -z "${commit}" ]; then
-        commit="dev"
-    else
-        git update-index -q --refresh >/dev/null 2>&1 || true
-        dirty_rc=0
-        git diff-index --quiet HEAD -- >/dev/null 2>&1 || dirty_rc=$?
-        if [ "${dirty_rc}" -ne 0 ]; then
-            commit="${commit}-dirty"
-            if [ "${dirty_rc}" -eq 1 ]; then
-                echo "publish-docker: WARNING: working tree is modified — stamping commit as ${commit}" >&2
-            else
-                echo "publish-docker: WARNING: could not read the tree state (git diff-index exit ${dirty_rc}); assuming modified, stamping commit as ${commit}" >&2
-            fi
-        fi
-    fi
+    local commit
+    commit="$(git rev-parse --short=7 HEAD)"
     local build_date
     build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     local channel="${RELEASE_CHANNEL:-}"
