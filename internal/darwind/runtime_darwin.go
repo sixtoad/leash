@@ -753,6 +753,15 @@ func (rt *runtimeState) startClientMessageLoop() {
 	if rt.wsHub == nil {
 		return
 	}
+	// Prune a client's macsync registration when its WebSocket drops. Without this,
+	// reconnect churn accumulates stale client IDs and PID/rule broadcasts fail with
+	// "client not found", so live extensions (notably the transparent-proxy provider)
+	// miss tracked-PID updates and pass every flow through unintercepted.
+	rt.wsHub.SetDisconnectHandler(func(clientID string) {
+		if rt.macSync != nil {
+			rt.macSync.UnregisterClient(clientID)
+		}
+	})
 	go func() {
 		for msg := range rt.wsHub.Incoming() {
 			rt.handleClientMessage(msg.ClientID, msg.Payload)
@@ -1339,6 +1348,20 @@ func (rt *runtimeState) syncMacPoliciesFrom(policies *lsm.PolicySet) {
 func (rt *runtimeState) pushMacStateToClient(clientID string) {
 	if rt.wsHub == nil || rt.macSync == nil || clientID == "" {
 		return
+	}
+
+	// Replay the current tracked PIDs to the (re)connecting client. broadcastPIDUpdate
+	// only fires when a client SENDS a PID sync, so a client that reconnects after the
+	// last sync (common under connection churn) would otherwise never learn the current
+	// set — leaving the transparent-proxy provider unable to gate flows.
+	pids := rt.macSync.CurrentTrackedPIDs()
+	pidPayload := map[string]any{"entries": pids}
+	if env, err := messages.WrapPayload("", "", messages.TypeMacPIDSync, 1, pidPayload); err == nil {
+		if data, err := json.Marshal(env); err == nil {
+			if err := rt.wsHub.SendToClient(clientID, data); err != nil {
+				log.Printf("macsync: failed to push tracked PIDs to %s: %v", clientID, err)
+			}
+		}
 	}
 
 	rules := rt.macSync.GetPolicyRules()

@@ -8,6 +8,44 @@ package websocket
 
 import "testing"
 
+func TestRemoveClientInvokesDisconnectHandler(t *testing.T) {
+	t.Parallel()
+
+	hub := NewWebSocketHub(nil, 1, 0, 0)
+
+	var gotID string
+	hub.SetDisconnectHandler(func(clientID string) { gotID = clientID })
+
+	client := &client{
+		id:     "disconnect-client",
+		send:   make(chan []byte, 1),
+		closed: make(chan struct{}),
+		hub:    hub,
+	}
+	// Pre-close so removeClient's close() skips the (nil) conn.Close().
+	close(client.closed)
+
+	hub.mutex.Lock()
+	hub.clients[client.id] = client
+	hub.mutex.Unlock()
+
+	hub.removeClient(client.id)
+
+	if gotID != "disconnect-client" {
+		t.Fatalf("disconnect handler not invoked with client id, got %q", gotID)
+	}
+	if _, ok := hub.clients[client.id]; ok {
+		t.Fatalf("client should have been removed from hub")
+	}
+
+	// Removing an unknown id must not invoke the handler again.
+	gotID = ""
+	hub.removeClient("nonexistent")
+	if gotID != "" {
+		t.Fatalf("handler should not fire for unknown client, got %q", gotID)
+	}
+}
+
 func TestHubEnqueueAfterClientClosureDoesNotPanic(t *testing.T) {
 	t.Parallel()
 

@@ -83,6 +83,22 @@ func (m *Manager) RegisterClient(clientID string, payload *messages.ClientHelloP
 	log.Printf("macsync: registered client %s platform=%s caps=%v", clientID, payload.Platform, payload.Capabilities)
 }
 
+// UnregisterClient removes a client from the registry, e.g. when its WebSocket
+// disconnects. Without this, reconnect churn leaves stale client IDs in the map
+// and broadcasts (PID/rule sync) fail with "client not found", so live
+// extensions such as the transparent-proxy provider miss updates.
+func (m *Manager) UnregisterClient(clientID string) {
+	if clientID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.clients[clientID]; ok {
+		delete(m.clients, clientID)
+		log.Printf("macsync: unregistered client %s (%d remaining)", clientID, len(m.clients))
+	}
+}
+
 // GetAllClients returns a snapshot of all connected clients.
 func (m *Manager) GetAllClients() []*ClientState {
 	m.mu.RLock()

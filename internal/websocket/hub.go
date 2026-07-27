@@ -270,6 +270,11 @@ type WebSocketHub struct {
 	// limits for the initial bulk send on new connections
 	bulkMaxEvents int
 	bulkMaxBytes  int
+	// onDisconnect, if set, is invoked with a client's ID after it is removed
+	// (e.g. so the macOS sync manager can prune stale client registrations).
+	// Set once via SetDisconnectHandler before Run(); read after the hub mutex
+	// is released, so it must not be mutated concurrently.
+	onDisconnect func(clientID string)
 }
 
 const (
@@ -433,6 +438,15 @@ func (h *WebSocketHub) removeClient(id string) {
 		client.close()
 	}
 	log.Printf("WebSocket client disconnected. Total clients: %d", len(h.clients))
+	if ok && h.onDisconnect != nil {
+		h.onDisconnect(id)
+	}
+}
+
+// SetDisconnectHandler registers a callback invoked with a client's ID after it
+// disconnects. Call once before Run(); it is read without locking.
+func (h *WebSocketHub) SetDisconnectHandler(fn func(clientID string)) {
+	h.onDisconnect = fn
 }
 
 // getHistoricalEvents returns all buffered events formatted as NDJSON
