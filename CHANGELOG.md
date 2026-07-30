@@ -6,6 +6,75 @@ container-free **native runtime** is developed on the upstream-eligible slice
 `feat/runtime-native-poc` and merged here; walk adds the native-by-default and
 Claude Code handling on top.
 
+## [Unreleased]
+
+### Added — build & compatibility document
+- **`leash version --json`** (also `--output json`): the build metadata as a
+  machine-readable document — `version`, `commit`, `builtAt`, `enforcing`,
+  `contractVersion`, `minCompatibleContract`, `capabilities`, `os`, `arch` — so
+  a provisioner (`walk install leash`, a CI image) can verify an installed leash
+  before driving it. On a plain `go build` with no ldflags, `version` is the
+  literal `dev` and `commit`/`builtAt` are the literal `unknown`: documented
+  sentinels, not errors.
+- **A checkable compatibility contract, published as a rule rather than as a
+  package.** The document carries both bounds of the CLI surface leash serves: a
+  caller written against contract `C` proceeds iff
+  `minCompatibleContract <= C <= contractVersion`. A leash with no
+  `version --json` at all is contract `0`. The rule, the value domains, the
+  contract-0 handling and a decode-the-installed-binary snippet (with a struct
+  the *consumer* owns — leash exports no Go type for this) are in
+  [`docs/api-contracts-leash-core.md`](docs/api-contracts-leash-core.md), with
+  the bump policy in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md). The
+  implementation stays in `internal/version`: the emitted JSON is the contract,
+  the Go type is not, so leash can refactor it without shipping a `/v2`.
+  Decoding is fail-closed — `null`, `{}` and any object missing `version` /
+  `contractVersion` are rejected rather than yielding a zero contract range that
+  a contract-0 caller would read as compatible.
+- **`capabilities`**, an additive string array naming the CLI surface a
+  provisioner drives (`policy`, `inject-service`, `runtime`, `user`,
+  `require-lsm`, `version-json`). The integer over-refuses — raising
+  `minCompatibleContract` for one removal turns away every older caller,
+  including those that never used the removed flag — so a caller can test the
+  array for the one surface element it actually drives instead. Adding a name is
+  non-breaking and does not bump `contractVersion`.
+- **`leash version --help` / `-h`**: usage on stdout, exit 0. Contradictory or
+  empty format specs are rejected with a diagnostic instead of silently
+  resolving by last-one-wins — including a flag *repeated* with contradictory
+  values (`--output json --output text` in either order, `--json --json=false`),
+  which `flag.FlagSet.Visit` cannot see because it reports a repeated flag once,
+  with the last value.
+
+### Changed
+- **`enforcing` is derived per platform** rather than a compile-time `true`. It
+  reports whether *this binary* carries an enforcement path: `true` on linux
+  (eBPF LSM programs + MITM proxy) and `true` on darwin, whose runtime
+  constructs and drives the same MITM proxy (`internal/darwind`,
+  `NewMITMProxy` / `applyPolicyToProxy`) alongside the separately installed
+  Endpoint Security / Network Extension components. Any other target reports
+  `false`.
+- **The `-dirty` marker is documented as best-effort, not as a guarantee.** The
+  docs previously claimed every build path appends it when the tree is modified;
+  they no longer do, and no build path changed. Only the Makefile `build` target
+  stamps the marker; `scripts/release.sh`, `scripts/install-leash.sh`,
+  `build/publish-docker.sh` and `.goreleaser.yaml` stamp the bare hash. Its
+  presence means the tree was modified — **its absence is not proof of a clean
+  tree**, and a consumer must not treat it as provenance. The documented value
+  domain of `commit` also now names the literal `dev`, which several paths emit
+  when `git rev-parse` fails, so a caller validating against the published set
+  no longer rejects a legitimate build.
+- **`leash version` is now a subcommand.** It previously fell through to the
+  workload CLI, where it would have been treated as a command to run in the
+  box; `leash version [--json|--output json|text] [--help]` now handles it, and
+  anything else after `version` is rejected rather than passed through.
+- `leash --version` human output is **unchanged for every value the repo's build
+  paths emit** — 7-hex hashes, `hash-dirty`, full 40-char SHAs, and the `dev` /
+  `unknown` sentinels — verified byte-for-byte against the pre-change rendering.
+  It is *deliberately different* for values those paths do not produce: only the
+  hash component is abbreviated now, so a `git describe` string renders as
+  `v1.2.3-4-gabc1234` instead of the fragment `v1.2.3-`, and a short
+  `abc-dirty` renders as `abc` instead of `abc-dir`. The old output named a
+  build that does not exist; that is the point of the change, not a regression.
+
 ## [native-v0.1.0] — 2026-07-04
 
 First distributed build. Container-free native enforcement on Linux, made the

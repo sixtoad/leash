@@ -377,6 +377,9 @@ Start the coder agent and leash manager containers, then optionally run a
 command inside the target container. If no command is provided, the target image's default
 entrypoint is left running.
 
+Subcommands:
+  version [--json]                Print build metadata. --json adds the contract range provisioners check before driving leash.
+
 Flags:
   -I, --no-interactive            Skip the interactive TTY; run the command non-interactively.
   --policy <path>                 Policy file to mount into the leash runtime.

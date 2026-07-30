@@ -14,6 +14,7 @@ import (
 	"github.com/strongdm/leash/internal/leashd"
 	"github.com/strongdm/leash/internal/runner"
 	"github.com/strongdm/leash/internal/telemetry/statsig"
+	versionpkg "github.com/strongdm/leash/internal/version" // aliased: `version` is the ldflag var below
 )
 
 var (
@@ -30,6 +31,14 @@ func main() {
 		switch args[1] {
 		case "--version":
 			printVersion()
+			return
+		case "version": // `version [--json]`: machine-readable build + contract info.
+			if err := versionpkg.Run(args[2:], buildInfo(), os.Stdout); err != nil {
+				if errors.Is(err, flag.ErrHelp) { // usage already printed: a clean exit, not a failure.
+					return
+				}
+				log.Fatal(err)
+			}
 			return
 		case "--daemon": // "Secret" flag to run leashd.
 			daemonArgs := append([]string{args[0]}, args[2:]...)
@@ -85,12 +94,12 @@ func hardenExec(rest []string) error {
 	return syscall.Exec(path, rest, os.Environ())
 }
 
+// buildInfo bundles the link-time values for internal/version, which does the
+// formatting so it can be unit-tested without these globals.
+func buildInfo() versionpkg.Build {
+	return versionpkg.Build{Version: version, Commit: commit, BuildDate: buildDate}
+}
+
 func printVersion() {
-	shortHash := commit
-	if len(shortHash) > 7 {
-		shortHash = shortHash[:7]
-	}
-	fmt.Printf("version: %s\n", version)
-	fmt.Printf("git hash: %s\n", shortHash)
-	fmt.Printf("build date: %s\n", buildDate)
+	fmt.Print(versionpkg.Describe(buildInfo()).Human())
 }
