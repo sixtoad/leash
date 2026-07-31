@@ -132,3 +132,32 @@ For each Tier 1 check, note: policy used, command, observed decision (log line),
 File issues for any divergence. The NEMachServiceName caveat (#19) is worth an explicit check:
 confirm the **network filter registers at all** under ad-hoc (empty team prefix) — if it doesn't,
 that's the prime suspect.
+
+---
+
+## Debug logging (transparent proxy)
+
+Verbose per-flow diagnostics for the transparent proxy are gated behind
+`LEASH_MAC_DEBUG` on the **daemon**. Off by default; toggling it is a daemon
+restart — no extension re-activation.
+
+Enable:
+
+```
+pkill -f "leash --darwin"        # stop the managed daemon
+LEASH_MAC_DEBUG=1 leash --darwin exec -- true   # restart it with debug on
+```
+
+The daemon pushes the flag to each extension over the websocket on connect
+(message `mac.debug`), and the transparent-proxy provider emits to the daemon
+log (readable via the `--log`/`LEASH_LOG` file):
+
+- `event=proxy.start status=started relay=127.0.0.1:18000` — `startProxy` result.
+- `event=proxy.pids count=N` — each tracked-PID update the provider receives.
+- `event=proxy.flow pid=… tracked=yes|no tracked_count=N dest="ip:port"` — every
+  process-attributed flow offered to `handleNewFlow` and how PID gating resolved.
+
+This is the fastest way to diagnose "the proxy isn't intercepting": confirm the
+flow reaches the provider (`proxy.flow`), that its PID is tracked (`tracked=yes`),
+and the destination resolves. Leave `LEASH_MAC_DEBUG` unset in normal use — the
+per-flow events are suppressed at the source.

@@ -1345,9 +1345,33 @@ func (rt *runtimeState) syncMacPoliciesFrom(policies *lsm.PolicySet) {
 	}
 }
 
+// macDebugEnabled reports whether verbose macOS debug logging is on, from the
+// LEASH_MAC_DEBUG environment variable ("1"/"true"/"yes"/"on", case-insensitive).
+func macDebugEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("LEASH_MAC_DEBUG"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 func (rt *runtimeState) pushMacStateToClient(clientID string) {
 	if rt.wsHub == nil || rt.macSync == nil || clientID == "" {
 		return
+	}
+
+	// Tell the (re)connecting extension whether debug logging is on, so it can gate
+	// verbose diagnostics (e.g. the transparent-proxy per-flow events) at the source.
+	// Controlled by LEASH_MAC_DEBUG on the daemon — toggling is a daemon restart, not
+	// an extension re-activation.
+	debugPayload := map[string]any{"enabled": macDebugEnabled()}
+	if env, err := messages.WrapPayload("", "", messages.TypeMacDebug, 1, debugPayload); err == nil {
+		if data, err := json.Marshal(env); err == nil {
+			if err := rt.wsHub.SendToClient(clientID, data); err != nil {
+				log.Printf("macsync: failed to push debug flag to %s: %v", clientID, err)
+			}
+		}
 	}
 
 	// Replay the current tracked PIDs to the (re)connecting client. broadcastPIDUpdate

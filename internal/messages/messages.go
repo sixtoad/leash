@@ -30,6 +30,10 @@ const (
 	TypeMacMITMSession       = "mac.mitm.session"
 	TypeMacMITMTelemetry     = "mac.mitm.telemetry"
 	TypeMacMITMCertificate   = "mac.mitm.certificate"
+	// TypeMacDebug carries the macOS debug-logging flag from the daemon to the
+	// extensions (payload {"enabled": bool}). Gated by LEASH_MAC_DEBUG on the
+	// daemon; toggling it is a daemon restart, no extension re-activation.
+	TypeMacDebug = "mac.debug"
 )
 
 // DecisionType represents an allow/deny decision for a flow.

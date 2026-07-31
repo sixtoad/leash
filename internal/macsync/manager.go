@@ -372,6 +372,19 @@ func (m *Manager) LogMacEvent(event *messages.MacEventPayload) error {
 	if reason := strings.TrimSpace(detailMap["reason"]); reason != "" {
 		fields = append(fields, fmt.Sprintf("reason=%q", reason))
 	}
+	// Debug/diagnostic telemetry fields (e.g. the transparent-proxy proxy.flow /
+	// proxy.pids / proxy.start events, emitted only when LEASH_MAC_DEBUG is on).
+	for _, k := range []string{"tracked", "tracked_count", "count", "relay"} {
+		if v := strings.TrimSpace(detailMap[k]); v != "" {
+			fields = append(fields, fmt.Sprintf("%s=%s", k, v))
+		}
+	}
+	if dest := strings.TrimSpace(detailMap["dest"]); dest != "" {
+		fields = append(fields, fmt.Sprintf("dest=%q", dest))
+	}
+	if errMsg := strings.TrimSpace(detailMap["error"]); errMsg != "" {
+		fields = append(fields, fmt.Sprintf("error=%q", errMsg))
+	}
 
 	entry := strings.Join(fields, " ")
 	return m.logger.Write(entry)
