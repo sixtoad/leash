@@ -3,7 +3,6 @@ package doctor
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -41,12 +40,11 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "\n%s", usageExitNotes)
 	}
 	if err := fs.Parse(args); err != nil {
-		// Both branches are exitUsage, deliberately: --help is not a readiness
-		// verdict, and returning 0 for it would hand a provisioner gating on
-		// the exit status a free pass from a typo like `leash doctor -help`.
-		if errors.Is(err, flag.ErrHelp) {
-			return exitUsage
-		}
+		// --help lands here too (flag.ErrHelp), and it gets the same code
+		// deliberately: help is not a readiness verdict, and returning 0 for it
+		// would hand a provisioner gating on the exit status a free pass from a
+		// typo like `leash doctor -help`. One branch, because the two used to
+		// be written out separately and read as if they differed.
 		return exitUsage
 	}
 	// A positional argument means the caller asked for something this command

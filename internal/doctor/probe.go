@@ -43,6 +43,11 @@ func Probe() Host {
 		BPFLSM:          lsm,
 		BPFLSMAdvice:    lsmAdvice,
 		ContainerEngine: engine,
+		// Read here, decided in doctor.go. The engine client resolves its
+		// daemon from this the same way `leash run` does, so a set DOCKER_HOST
+		// means the kernel just probed is not the one the workload will get.
+		DockerHost:     strings.TrimSpace(os.Getenv("DOCKER_HOST")),
+		DefaultRuntime: runner.DefaultRuntimeName(),
 	}
 	if engineErr != nil {
 		h.ContainerEngineError = engineErr.Error()

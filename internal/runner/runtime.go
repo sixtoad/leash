@@ -6,9 +6,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // goos reports the target OS; a package var so runtime-selection logic is
@@ -86,17 +89,23 @@ const nativeRuntimeName = "native"
 // seconds; nothing outside tests reassigns it.
 var containerEngineProbeTimeout = 5 * time.Second
 
-// DetectContainerEngine returns the container CLI a `leash run` would use — the
-// first supported engine found on PATH, which is also the order newRuntime
-// resolves — together with an error when that engine's daemon does not answer.
-// It returns ("", nil) when no supported engine is installed.
+// DetectContainerEngine returns the container CLI a container-runtime `leash
+// run` would use — the first supported engine found on PATH, which is also the
+// order newRuntime resolves — together with an error when that engine's daemon
+// does not answer. It returns ("", nil) when no supported engine is installed.
+//
+// It reports the *container* engine, not the runtime a bare `leash run`
+// selects: in this build defaultRuntimeName() is `native` and native never
+// falls back to docker, so reaching this engine takes an explicit
+// `--runtime docker` / `--runtime podman` (or LEASH_RUNTIME). Doctor reports
+// that separately (see DefaultRuntimeName).
 //
 // Exported for `leash doctor` (internal/doctor). It reports on the *first*
-// engine rather than the first *working* one on purpose: that is the engine a
-// default `leash run` drives, and doctor exists so its verdict and a real run
-// cannot disagree. An engine on PATH whose daemon is unreachable is not a
-// runtime leash can enforce with, so the error is part of the answer, not a
-// detail the caller has to go and re-derive.
+// engine rather than the first *working* one on purpose: that is the engine
+// newRuntime resolves for an unqualified container runtime, and doctor exists
+// so its verdict and a real run cannot disagree. An engine on PATH whose daemon
+// is unreachable is not a runtime leash can enforce with, so the error is part
+// of the answer, not a detail the caller has to go and re-derive.
 func DetectContainerEngine() (engine string, err error) {
 	for _, name := range supportedRuntimes {
 		if _, lookErr := exec.LookPath(name); lookErr != nil {
@@ -138,12 +147,26 @@ func containerEngineReachable(bin string) error {
 	return fmt.Errorf("%s info failed: %w", bin, runErr)
 }
 
+// ansiEscape matches the escape sequences container CLIs emit on stderr: the
+// CSI form (colour/SGR, cursor movement), the OSC form (terminal title,
+// hyperlinks, terminated by BEL or ST), and the bare two-byte forms.
+var ansiEscape = regexp.MustCompile("\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)?|\x1b\\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\\\-_]")
+
 // firstLines trims a command's stderr down to something that fits in a doctor
 // issue: engines are chatty and the actionable part is at the top.
+//
+// It also sanitizes. This text is pasted verbatim into a doctor issue, which
+// reaches both a terminal and the JSON document, and engine clients decorate
+// their stderr: ANSI colour, cursor movement, and carriage returns for progress
+// redraws. Passed through, those bytes let a failing daemon's output move the
+// cursor around the readiness report a reader is consulting precisely because
+// they do not trust the machine. Carriage returns become line breaks (that is
+// what they meant on a terminal), escape sequences are removed, and any
+// remaining control character collapses to a space.
 func firstLines(s string, n int) string {
 	var kept []string
-	for _, line := range strings.Split(s, "\n") {
-		line = strings.TrimSpace(line)
+	for _, line := range strings.FieldsFunc(s, func(r rune) bool { return r == '\n' || r == '\r' }) {
+		line = sanitizeControl(line)
 		if line == "" {
 			continue
 		}
@@ -153,6 +176,21 @@ func firstLines(s string, n int) string {
 		}
 	}
 	return strings.Join(kept, " ")
+}
+
+// sanitizeControl strips escape sequences and control characters from one line
+// of command output, collapsing the whitespace it leaves behind. Invalid UTF-8
+// goes too: the report is JSON-encoded, and a replacement character adds
+// nothing a reader can act on.
+func sanitizeControl(s string) string {
+	s = ansiEscape.ReplaceAllString(s, "")
+	s = strings.Map(func(r rune) rune {
+		if r == utf8.RuneError || unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // newRuntime resolves a runtime name to a Runtime. An empty name defaults to

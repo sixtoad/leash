@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 func TestParseArgsRuntimeFlag(t *testing.T) {
@@ -280,5 +282,86 @@ func TestFirstLines(t *testing.T) {
 		if got := firstLines(c.in, c.n); got != c.want {
 			t.Errorf("firstLines(%q, %d) = %q, want %q", c.in, c.n, got, c.want)
 		}
+	}
+}
+
+// This text is pasted verbatim into a doctor issue, so it reaches a terminal.
+// Engine clients colour their stderr and redraw progress with carriage
+// returns; passed through, a failing daemon's output can repaint the readiness
+// report a reader is consulting precisely because they do not trust the
+// machine.
+func TestFirstLinesStripsControlCharacters(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   string
+		n    int
+		want string
+	}{
+		{
+			name: "ANSI colour (SGR)",
+			in:   "\x1b[31mCannot connect to the Docker daemon\x1b[0m\n",
+			n:    3,
+			want: "Cannot connect to the Docker daemon",
+		},
+		{
+			name: "cursor movement and erase-line",
+			in:   "\x1b[2K\x1b[1Gpulling\x1b[A\x1b[Bdone\n",
+			n:    3,
+			want: "pullingdone",
+		},
+		{
+			name: "OSC title sequence",
+			in:   "\x1b]0;docker\x07error: daemon down\n",
+			n:    2,
+			want: "error: daemon down",
+		},
+		{
+			name: "carriage-return progress redraw becomes separate lines",
+			in:   "10%\r50%\r100%\n",
+			n:    2,
+			want: "10% 50%",
+		},
+		{
+			name: "bare control bytes collapse to whitespace",
+			in:   "permission\x00denied\x07 while\tconnecting\n",
+			n:    1,
+			want: "permission denied while connecting",
+		},
+		{
+			name: "invalid UTF-8 does not reach the JSON document",
+			in:   "bad \xff\xfe byte\n",
+			n:    1,
+			want: "bad byte",
+		},
+		{
+			name: "a line that was only escapes is skipped, not counted",
+			in:   "\x1b[2K\x1b[1G\nreal message\n",
+			n:    1,
+			want: "real message",
+		},
+		{
+			name: "ordinary text is untouched",
+			in:   "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.\n",
+			n:    1,
+			want: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock.",
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			got := firstLines(c.in, c.n)
+			if got != c.want {
+				t.Errorf("firstLines(%q, %d) = %q, want %q", c.in, c.n, got, c.want)
+			}
+			for _, r := range got {
+				if unicode.IsControl(r) || r == utf8.RuneError {
+					t.Errorf("control character %U survived in %q", r, got)
+				}
+			}
+		})
 	}
 }

@@ -55,7 +55,7 @@ func main() {
 				log.Fatal(err)
 			}
 			return
-		case "doctor": // node readiness self-check; exits 1 when no runtime can enforce.
+		case "doctor": // node readiness self-check; exit 0 enforces, 3 runs proxy-only, 1 cannot run at all.
 			os.Exit(doctor.Main(args[2:], os.Stdout, os.Stderr))
 		case "--harden-exec": // internal: seccomp-harden this process, then exec the workload.
 			if err := hardenExec(args[2:]); err != nil {

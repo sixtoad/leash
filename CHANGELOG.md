@@ -44,6 +44,62 @@ Claude Code handling on top.
   which `flag.FlagSet.Visit` cannot see because it reports a repeated flag once,
   with the last value.
 
+### Added — node readiness self-check
+- **`leash doctor` / `leash doctor --json`**: one command answering the question
+  a provisioner (`walk install leash`, a CI image) had been guessing at with its
+  own coarse probes — *can this machine actually enforce?* — per runtime. It
+  delegates to the same classifiers a real run uses (`ProbeBPFLSM`,
+  `NativeRuntimeAdvice`, `HostHasSystemd`, `DetectContainerEngine`), so a
+  `ready` from doctor and a successful `leash run` cannot drift apart. The JSON
+  shape, the three states and the exit codes are documented in
+  [`docs/api-contracts-leash-core.md`](docs/api-contracts-leash-core.md).
+- **A third state, `degraded`, because two states lied.** A host whose engine
+  works but whose kernel has no active `bpf` LSM starts workloads with Layer 1
+  (filesystem/exec/socket policy) silently off and only the fail-closed proxy
+  running. That is neither `ready` nor "cannot run", so it has its own state and
+  its own exit code (`3`), with the consequence named in `issues`. `ready` is
+  never widened to include it — and, symmetrically, a Linux host that is
+  degraded only by its kernel is no longer reported as unable to run at all.
+- **An unprobed kernel is never `ready`.** Off Linux, containers run against a
+  VM kernel doctor did not read (Docker Desktop's LinuxKit kernel has no `bpf`
+  LSM), and with `DOCKER_HOST` set they run on a remote daemon's kernel — which
+  is exactly why `preflightHostKernel` already refuses to draw a conclusion
+  there. Both report `degraded` with a `container_kernel` entry in `unchecked`
+  rather than borrowing this host's verdict. No remote topology is modelled.
+- **Capabilities are observed, never inferred.** An unreadable or unparseable
+  `/proc/self/status` yields *unknown, and therefore not ready* — never "root,
+  so it must hold CAP_BPF", which is wrong in precisely the environments that
+  would consult it (darwin; a container with a masked `/proc`).
+- **Prerequisites doctor does not check are named in the output**, not silently
+  omitted: `bpf_lsm_attachable` (the check is list-based, not an attach probe —
+  issue #52), `bpf_d_path_ringbuf`, `netns_iptables`, plus `capabilities` and
+  `container_kernel` when they apply.
+- **`default_runtime` is in the document.** The verdict is the best state any
+  runtime reaches, but a bare `leash run` selects one runtime (`native` here)
+  and never falls back, so a host where only the *other* runtime works would
+  read as unqualified good news. The document names the default and the human
+  output warns when it is not the runtime the verdict is about.
+
+### Fixed — remedy text that could break the host
+- **`leash doctor` could tell an operator to set `lsm=,bpf`** — a leading-comma
+  kernel command line that *replaces* the host's LSM stack, silently disabling
+  AppArmor/SELinux or leaving the machine unbootable. Two separate paths reached
+  it: a read error on `/sys/kernel/security/lsm` swallowed into a nil list, and
+  — reproduced on the development host — a readable but **empty or
+  whitespace-only** list, which `strings.Split` turns into `[]string{""}` with
+  no error at all. The state is now `unknown` whenever the list is unusable, and
+  `bpfLSMAdvice` itself refuses to emit an `lsm=` example it cannot build from a
+  real list, so the run path (`preflightHostKernel`) is covered too.
+- **Engine stderr is sanitized before it reaches the report.** `docker info`
+  output is pasted verbatim into an issue; ANSI escapes and carriage returns in
+  it could repaint the readiness report a reader is consulting precisely because
+  they do not trust the machine.
+- **`doctor.Report` decodes as well as encodes.** It was marshal-only: a Go
+  consumer's `json.Unmarshal` failed, and one that ignored the error held a zero
+  `Report` — which re-encodes as `verdict: unavailable, ready: false` from a
+  document that said `ready`. Round-tripping is now identity, with the derived
+  fields recomputed from the statuses rather than trusted from the document.
+
 ### Changed
 - **`enforcing` is derived per platform** rather than a compile-time `true`. It
   reports whether *this binary* carries an enforcement path: `true` on linux

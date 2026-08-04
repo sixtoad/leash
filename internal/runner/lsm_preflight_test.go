@@ -160,6 +160,106 @@ func TestDecideLSMStateUnreadableListIsUnknownAndSafe(t *testing.T) {
 	}
 }
 
+// CAP-7, the half the first fix missed. readActiveLSMs splits the file on ",",
+// so an EMPTY or whitespace-only /sys/kernel/security/lsm returns
+// ([]string{""}, nil) — a successful read of a list that names nothing. The
+// readErr-only guard let that through to classifyBPFLSM, which answers
+// "compiled but inactive" whenever CONFIG_BPF_LSM=y, and bpfLSMAdvice rendered
+// the empty list as `lsm=,bpf`. Reproduced on the development host.
+func TestDecideLSMStateEmptyListIsUnknownAndSafe(t *testing.T) {
+	t.Parallel()
+
+	// Exactly what readActiveLSMs produces for these file contents.
+	read := func(contents string) []string {
+		return strings.Split(strings.TrimSpace(contents), ",")
+	}
+
+	for _, contents := range []string{"", " ", "\n", "\t\n  ", ",", " , , "} {
+		for _, config := range []string{"y", "m", "n", ""} {
+			state, advice := decideLSMState(read(contents), nil, config)
+			if state != LSMUnknown {
+				t.Errorf("contents %q, config %q: state = %v, want LSMUnknown — reading nothing tells us nothing", contents, config, state)
+			}
+			if strings.TrimSpace(advice) == "" {
+				t.Errorf("contents %q, config %q: unknown state still needs a next step", contents, config)
+			}
+			if strings.Contains(advice, "lsm=") {
+				t.Errorf("contents %q, config %q: advice proposes an lsm= boot parameter built from a list that names nothing — following it REPLACES the host LSM stack:\n%s", contents, config, advice)
+			}
+		}
+	}
+}
+
+// bpfLSMAdvice is shared with the real run path (preflightHostKernel ->
+// decideBPFLSM), which classifies rather than going through decideLSMState. It
+// therefore has to refuse the dangerous template itself, not rely on its
+// callers having guarded first.
+func TestBPFLSMAdviceNeverEmitsAnEmptyLSMList(t *testing.T) {
+	t.Parallel()
+
+	empties := [][]string{nil, {}, {""}, {" "}, {"", ""}, {"", "  ", ""}}
+	statuses := []bpfLSMStatus{bpfLSMInactiveCompiled, bpfLSMNotCompiled, bpfLSMUnknown}
+
+	for _, active := range empties {
+		for _, status := range statuses {
+			advice := bpfLSMAdvice(status, active)
+			if strings.TrimSpace(advice) == "" {
+				t.Errorf("status %d, active %#v: no remedy at all", status, active)
+			}
+			if strings.Contains(advice, "lsm=") {
+				t.Errorf("status %d, active %#v: advice contains an lsm= line:\n%s", status, active, advice)
+			}
+		}
+		// The same guard has to hold on the run path's own decision.
+		warn, err := decideBPFLSM(bpfLSMInactiveCompiled, active, false)
+		if err != nil {
+			t.Fatalf("default degrade should not error: %v", err)
+		}
+		if strings.Contains(warn, "lsm=") {
+			t.Errorf("run-path warning proposes lsm= from an empty list:\n%s", warn)
+		}
+		if _, err := decideBPFLSM(bpfLSMInactiveCompiled, active, true); err == nil {
+			t.Error("require-lsm should still fail")
+		} else if strings.Contains(err.Error(), "lsm=") {
+			t.Errorf("run-path error proposes lsm= from an empty list:\n%v", err)
+		}
+	}
+
+	// Whitespace around real entries is trimmed, not treated as an entry.
+	advice := bpfLSMAdvice(bpfLSMInactiveCompiled, []string{" lockdown ", "", "apparmor"})
+	if !strings.Contains(advice, "lsm=lockdown,apparmor,bpf") {
+		t.Errorf("a real list must still produce a real lsm= line:\n%s", advice)
+	}
+}
+
+// LSMState is decoded by anything parsing `leash doctor --json` into Go, so the
+// marshal/unmarshal pair has to be exact — a half-implemented pair silently
+// yields LSMUnknown for every document.
+func TestLSMStateJSONRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	for _, state := range []LSMState{LSMUnknown, LSMInactive, LSMActive} {
+		out, err := json.Marshal(state)
+		if err != nil {
+			t.Fatalf("marshal %v: %v", state, err)
+		}
+		var got LSMState
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("unmarshal %s: %v", out, err)
+		}
+		if got != state {
+			t.Errorf("round trip %v -> %s -> %v", state, out, got)
+		}
+	}
+
+	for _, bad := range []string{`"enabled"`, `""`, `2`, `null`} {
+		var got LSMState
+		if err := json.Unmarshal([]byte(bad), &got); err == nil {
+			t.Errorf("unmarshal(%s) should fail rather than decode as %v", bad, got)
+		}
+	}
+}
+
 func TestDecideLSMState(t *testing.T) {
 	t.Parallel()
 

@@ -304,3 +304,52 @@ func TestMainJSONIsParseable(t *testing.T) {
 		t.Errorf("verdict %q with exit %d, want exit %d", doc.Verdict, code, wantCode)
 	}
 }
+
+// Item 4: Probe must notice DOCKER_HOST, because the engine client does. This
+// mutates the environment, so (like everything else in this file) it must not
+// run in parallel with anything.
+func TestProbeReadsDockerHost(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "  tcp://build-01.internal:2376  ")
+	if got := Probe().DockerHost; got != "tcp://build-01.internal:2376" {
+		t.Errorf("DockerHost = %q, want the trimmed value", got)
+	}
+
+	t.Setenv("DOCKER_HOST", "   ")
+	if got := Probe().DockerHost; got != "" {
+		t.Errorf("a whitespace-only DOCKER_HOST is not a remote daemon, got %q", got)
+	}
+
+	os.Unsetenv("DOCKER_HOST")
+	if got := Probe().DockerHost; got != "" {
+		t.Errorf("DockerHost = %q with DOCKER_HOST unset", got)
+	}
+}
+
+// A remote daemon means the kernel doctor just probed is not the kernel the
+// workload gets, whatever this host looks like.
+func TestProbeWithDockerHostNeverClaimsAContainerLayer1Verdict(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://build-01.internal:2376")
+
+	h := Probe()
+	h.ContainerEngine = "docker" // stand in for an engine that is installed...
+	h.ContainerEngineError = ""  // ...and whose daemon answers.
+
+	got := Evaluate(h)
+	if got.Container.Ready() {
+		t.Error("a reachable REMOTE daemon must not borrow this host's Layer 1 verdict")
+	}
+	if !hasUnchecked(got.Unchecked, "container_kernel") {
+		t.Errorf("the remote kernel must be declared unchecked, got %v", got.Unchecked)
+	}
+}
+
+// The runtime a bare `leash run` selects has to reach the document, or the
+// report grades two runtimes without saying which one the caller gets.
+func TestProbeReportsTheDefaultRuntime(t *testing.T) {
+	if got, want := Probe().DefaultRuntime, runner.DefaultRuntimeName(); got != want {
+		t.Errorf("DefaultRuntime = %q, want %q", got, want)
+	}
+	if Probe().DefaultRuntime == "" {
+		t.Error("the default runtime must never be empty: doctor cannot say what a bare `leash run` does")
+	}
+}

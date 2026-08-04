@@ -51,14 +51,27 @@ type Host struct {
 	BPFLSM       runner.LSMState
 	BPFLSMAdvice string
 
-	// ContainerEngine is the container CLI a default `leash run` would drive
-	// ("docker", "podman"), or "" when none is installed.
+	// ContainerEngine is the container CLI `leash run --runtime docker/podman`
+	// would drive ("docker", "podman"), or "" when none is installed. It is not
+	// necessarily the runtime a bare `leash run` selects — see DefaultRuntime.
 	ContainerEngine string
 
 	// ContainerEngineError is the daemon-reachability failure for
 	// ContainerEngine, or "" when the daemon answered. Only meaningful when
 	// ContainerEngine is non-empty.
 	ContainerEngineError string
+
+	// DockerHost is $DOCKER_HOST, or "" when unset. When it is set the engine
+	// talks to a daemon somewhere else, so the containers it starts run on that
+	// host's kernel — not the one probed into BPFLSM. The real run path already
+	// refuses to draw a Layer 1 conclusion in that case
+	// (runner.preflightHostKernel), and doctor must not draw one either.
+	DockerHost string
+
+	// DefaultRuntime is runner.DefaultRuntimeName(): the runtime a `leash run`
+	// with neither --runtime nor LEASH_RUNTIME selects. Reported, not graded —
+	// see Report.DefaultRuntime.
+	DefaultRuntime string
 }
 
 // Status is the three-state readiness of one runtime. Two states were not
@@ -96,6 +109,30 @@ func (s Status) String() string {
 // depend on a constant table the consumer does not have.
 func (s Status) MarshalJSON() ([]byte, error) { return json.Marshal(s.String()) }
 
+// UnmarshalJSON is the exact inverse. It exists because a type with only half
+// the pair is a trap: decoding a doctor document into a Report silently left
+// every Status at its zero value, and the zero value is a *verdict*
+// (unavailable). An unrecognised word is an error rather than a fallback, for
+// the same reason — a status this build does not know is not a status it may
+// quietly downgrade.
+func (s *Status) UnmarshalJSON(data []byte) error {
+	var word string
+	if err := json.Unmarshal(data, &word); err != nil {
+		return fmt.Errorf("doctor status must be a JSON string: %w", err)
+	}
+	switch word {
+	case "ready":
+		*s = StatusReady
+	case "degraded":
+		*s = StatusDegraded
+	case "unavailable":
+		*s = StatusUnavailable
+	default:
+		return fmt.Errorf("unknown doctor status %q (want ready, degraded or unavailable)", word)
+	}
+	return nil
+}
+
 // Unchecked names a prerequisite doctor does *not* verify. Issue #23 lists
 // prerequisites (attachability, bpf_d_path/ringbuf, netns+iptables) that this
 // command does not probe; omitting them silently would let a consumer read a
@@ -111,10 +148,23 @@ type Unchecked struct {
 //
 // Verdict and the per-runtime Ready flags are derived, not stored, so the
 // document can never contradict itself — see MarshalJSON.
+//
+// The json tags mirror the wire names even though MarshalJSON/UnmarshalJSON do
+// the work: they are what keeps the mirror honest for a reader, and the
+// TestJSONMirrorCoversEveryReportField guard compares them field by field.
 type Report struct {
-	Native    NativeReport
-	Container ContainerReport
-	Unchecked []Unchecked
+	Native    NativeReport    `json:"native"`
+	Container ContainerReport `json:"container"`
+	Unchecked []Unchecked     `json:"unchecked"`
+
+	// DefaultRuntime is the runtime a bare `leash run` selects on this build
+	// ("native"). It is reported rather than graded: Verdict stays "the best
+	// any runtime reaches", because a machine where `--runtime docker` fully
+	// enforces is not a machine that cannot enforce. But that verdict alone
+	// hides that the caller must pass a flag to reach the runtime that works,
+	// so the document names the default and Text() says so out loud when the
+	// default is not the runtime carrying the verdict.
+	DefaultRuntime string `json:"default_runtime"`
 }
 
 // NativeReport covers the container-free runtime (leashd as a host process in a
@@ -123,18 +173,18 @@ type Report struct {
 // failed. lsm_bpf describes this host's kernel, which is also the kernel a
 // local container shares.
 type NativeReport struct {
-	Status Status
-	LSMBPF runner.LSMState
-	Caps   []string
-	Issues []string
+	Status Status          `json:"status"`
+	LSMBPF runner.LSMState `json:"lsm_bpf"`
+	Caps   []string        `json:"caps"`
+	Issues []string        `json:"issues"`
 }
 
 // ContainerReport covers the docker/podman runtime. Engine is a pointer so an
 // absent engine marshals as JSON null (per issue #23) rather than "".
 type ContainerReport struct {
-	Status Status
-	Engine *string
-	Issues []string
+	Status Status   `json:"status"`
+	Engine *string  `json:"engine"`
+	Issues []string `json:"issues"`
 }
 
 // Ready is true only for a runtime that enforces with both layers. It is
@@ -184,9 +234,10 @@ var alwaysUnchecked = []Unchecked{
 // Host, and the runner helpers it calls are themselves pure classifiers.
 func Evaluate(h Host) Report {
 	return Report{
-		Native:    evaluateNative(h),
-		Container: evaluateContainer(h),
-		Unchecked: unchecked(h),
+		Native:         evaluateNative(h),
+		Container:      evaluateContainer(h),
+		Unchecked:      unchecked(h),
+		DefaultRuntime: strings.TrimSpace(h.DefaultRuntime),
 	}
 }
 
@@ -232,17 +283,35 @@ func evaluateNative(h Host) NativeReport {
 			}
 		}
 	}
+	// Everything appended so far stops the native runtime from starting at all:
+	// classifyNativeRuntime refuses without Linux/systemd/root, and without
+	// readable capabilities leash can attach neither the LSM (Layer 1) nor the
+	// netns the proxy (Layer 2) needs. Layer 1, below, is the one axis that
+	// leaves a runtime that still runs.
+	blockers := len(n.Issues)
+
 	// The LSM question only means something on Linux — elsewhere the "not
 	// linux" issue above already says everything, and a kernel remedy would be
 	// noise.
-	if h.GOOS == "linux" && h.BPFLSM != runner.LSMActive {
-		n.Issues = append(n.Issues, lsmAdvice(h))
+	layer1Down := h.GOOS == "linux" && h.BPFLSM != runner.LSMActive
+	if layer1Down {
+		n.Issues = append(n.Issues, fmt.Sprintf("%s\n%s", layer1Consequence, lsmAdvice(h)))
 	}
 
-	// Native is all-or-nothing: without root there is neither an LSM nor a
-	// netns for the proxy, so decideNativeRuntime refuses to start at all.
-	// There is no partial state to report here.
-	if len(n.Issues) == 0 {
+	// Native gets the same three-state treatment as the container runtime, on
+	// the same axis, because the real code paths behave the same way: an
+	// inactive bpf LSM is a *warning* in decideBPFLSM (only --require-lsm makes
+	// it fatal) and classifyNativeRuntime never consults the LSM at all. So on
+	// a Linux host with systemd, root and no Layer 1, `leash run` starts and
+	// enforces proxy-only. Reporting that as "cannot enforce with ANY runtime"
+	// (which is what the all-or-nothing rule did) is a false negative of
+	// exactly the kind CAP-1 forbids in the other direction.
+	switch {
+	case blockers > 0:
+		n.Status = StatusUnavailable
+	case layer1Down:
+		n.Status = StatusDegraded
+	default:
 		n.Status = StatusReady
 	}
 	return n
@@ -266,17 +335,38 @@ func evaluateContainer(h Host) ContainerReport {
 		return c
 	}
 
-	// The container shares the host kernel, so Layer 1 availability here is the
-	// same fact the native path reports — an engine that runs is not an engine
-	// that enforces. Off Linux the container's kernel is a VM's, not the one
-	// probed, so no Layer 1 claim is made either way (see unchecked()).
-	if h.GOOS == "linux" && h.BPFLSM != runner.LSMActive {
+	// A local Linux container shares the host kernel, so Layer 1 availability
+	// here is the same fact the native path reports — an engine that runs is
+	// not an engine that enforces.
+	//
+	// The other two branches are the cases where the kernel this probe read is
+	// simply not the kernel the workload will get. Neither may reach
+	// StatusReady. "Ready" is a claim that both enforcement layers work, and an
+	// unprobed kernel supports no such claim: Docker Desktop's LinuxKit VM, for
+	// one, does not carry bpf in its active LSM list, so darwin + a reachable
+	// docker used to answer `verdict: ready, exit 0` in the very same document
+	// that listed container_kernel as unchecked. Degraded is the honest floor —
+	// Layer 2 (the fail-closed proxy) runs inside the container either way, so
+	// the workload really is enforced to that extent; what is missing is
+	// evidence for Layer 1, and unchecked() says which evidence.
+	switch {
+	case strings.TrimSpace(h.DockerHost) != "":
+		// Mirrors runner.preflightHostKernel, which bails out on DOCKER_HOST
+		// with "the kernel that matters is not this host's". Doctor had no such
+		// guard, so a reachable remote daemon quietly borrowed the local
+		// kernel's verdict. No remote topology is modelled here (that is an
+		// explicit non-goal) — the claim is simply withheld.
+		c.Status = StatusDegraded
+		c.Issues = append(c.Issues, fmt.Sprintf("DOCKER_HOST is set, so %s starts containers on a remote daemon and they run on that host's kernel, not this one. doctor probed THIS host, so Layer 1 (eBPF LSM) availability where the workload will run is unverified.\nRun leash doctor on the daemon's host to get a Layer 1 verdict for it.", engine))
+	case h.GOOS != "linux":
+		c.Status = StatusDegraded
+		c.Issues = append(c.Issues, fmt.Sprintf("%s can start containers, but on %s they run against a virtual machine's kernel that doctor did not probe, so Layer 1 (eBPF LSM) availability inside them is unverified. In particular Docker Desktop's LinuxKit kernel does not carry \"bpf\" in its active LSM list.\nRun leash doctor on a Linux host (or inside the VM) to get a Layer 1 verdict.", engine, h.GOOS))
+	case h.BPFLSM != runner.LSMActive:
 		c.Status = StatusDegraded
 		c.Issues = append(c.Issues, fmt.Sprintf("%s can start containers, but they share this host's kernel: %s\n%s", engine, layer1Consequence, lsmAdvice(h)))
-		return c
+	default:
+		c.Status = StatusReady
 	}
-
-	c.Status = StatusReady
 	return c
 }
 
@@ -299,7 +389,16 @@ func unchecked(h Host) []Unchecked {
 			Reason: "/proc/self/status could not be read or parsed, so CAP_BPF/CAP_NET_ADMIN were not observed (reported as absent, never assumed).",
 		})
 	}
-	if h.GOOS != "linux" {
+	// container_kernel is declared once, for whichever reason applies: the
+	// remote daemon is named first because it holds even on Linux, where the
+	// platform reason would not have fired at all.
+	switch {
+	case strings.TrimSpace(h.DockerHost) != "":
+		out = append(out, Unchecked{
+			Name:   "container_kernel",
+			Reason: "DOCKER_HOST is set, so containers run on a remote daemon's kernel; doctor probed this host's kernel, which is not the one that will run the workload. (The value is not echoed here: it can carry a user@host.)",
+		})
+	case h.GOOS != "linux":
 		out = append(out, Unchecked{
 			Name:   "container_kernel",
 			Reason: "doctor probed this host's kernel; on this platform containers run against a VM kernel that was not probed, so Layer 1 availability inside them is unverified.",
@@ -317,10 +416,6 @@ func (r Report) Verdict() Status {
 	}
 	return r.Native.Status
 }
-
-// Usable reports whether at least one runtime can run a workload at all,
-// including under degraded (proxy-only) enforcement.
-func (r Report) Usable() bool { return r.Verdict() != StatusUnavailable }
 
 // ExitCode is the script-facing verdict.
 //
@@ -351,10 +446,11 @@ func (r Report) ExitCode() int {
 // empty ones, so even json.Marshal(Report{}) emits a complete, self-consistent
 // document with [] rather than null.
 type jsonReport struct {
-	Verdict   Status        `json:"verdict"`
-	Native    jsonNative    `json:"native"`
-	Container jsonContainer `json:"container"`
-	Unchecked []Unchecked   `json:"unchecked"`
+	Verdict        Status        `json:"verdict"`
+	Native         jsonNative    `json:"native"`
+	Container      jsonContainer `json:"container"`
+	Unchecked      []Unchecked   `json:"unchecked"`
+	DefaultRuntime string        `json:"default_runtime"`
 }
 
 type jsonNative struct {
@@ -389,8 +485,47 @@ func (r Report) MarshalJSON() ([]byte, error) {
 			Engine: r.Container.Engine,
 			Issues: strings0(r.Container.Issues),
 		},
-		Unchecked: unchecked0(r.Unchecked),
+		Unchecked:      unchecked0(r.Unchecked),
+		DefaultRuntime: r.DefaultRuntime,
 	})
+}
+
+// UnmarshalJSON decodes a document this package produced back into a Report.
+//
+// It exists because a marshal-only type is worse than no type at all for the Go
+// consumer this document is aimed at. json.Unmarshal into a Report used to fail
+// outright (the fields carried no tags and the mirror is unexported), and a
+// caller that ignored the error was left holding a zero Report — whose zero
+// values spell `verdict: unavailable, ready: false` even when the document it
+// came from said ready. A fabricated verdict is the one failure mode this
+// command exists to prevent, so the pair is closed.
+//
+// The derived fields in the document (verdict, the two ready flags) are not
+// stored back: they are recomputed by Verdict()/Ready() from the statuses, so a
+// tampered or stale document cannot smuggle in a verdict its own statuses do
+// not support. Round-tripping is therefore identity for any Report this package
+// builds.
+func (r *Report) UnmarshalJSON(data []byte) error {
+	var doc jsonReport
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return err
+	}
+	*r = Report{
+		Native: NativeReport{
+			Status: doc.Native.Status,
+			LSMBPF: doc.Native.LSMBPF,
+			Caps:   strings0(doc.Native.Caps),
+			Issues: strings0(doc.Native.Issues),
+		},
+		Container: ContainerReport{
+			Status: doc.Container.Status,
+			Engine: doc.Container.Engine,
+			Issues: strings0(doc.Container.Issues),
+		},
+		Unchecked:      unchecked0(doc.Unchecked),
+		DefaultRuntime: doc.DefaultRuntime,
+	}
+	return nil
 }
 
 // strings0 turns a nil slice into an empty one so it marshals as [], never
@@ -446,7 +581,48 @@ func (r Report) Text() string {
 	default:
 		b.WriteString("result: this machine cannot enforce with ANY runtime — resolve the issues above.\n")
 	}
+	if note := r.defaultRuntimeNote(); note != "" {
+		b.WriteString(note)
+	}
 	return b.String()
+}
+
+// defaultRuntimeNote spells out the gap between the verdict and what a caller
+// gets by default. Verdict is the best any runtime reaches, which is the right
+// answer to "can this machine enforce" — but `leash run` with no --runtime
+// picks exactly one runtime and never falls back, so on a host where only the
+// *other* runtime works, a bare `leash run` fails on a machine doctor called
+// ready. Naming the default (rather than folding it into the verdict) keeps
+// doctor's per-runtime report intact and still leaves nothing for the reader to
+// infer.
+func (r Report) defaultRuntimeNote() string {
+	name := strings.TrimSpace(r.DefaultRuntime)
+	if name == "" {
+		return ""
+	}
+	status, known := r.statusOf(name)
+	if !known {
+		return fmt.Sprintf("        `leash run` with no --runtime uses %q, which doctor does not grade.\n", name)
+	}
+	if status == r.Verdict() {
+		return fmt.Sprintf("        `leash run` with no --runtime uses the %s runtime (%s above).\n", name, statusShort(status))
+	}
+	return fmt.Sprintf("        NOTE: `leash run` with no --runtime uses the %s runtime, which is %s here — leash never falls back on its own.\n        Pass --runtime (or set LEASH_RUNTIME) to reach the runtime this verdict is about.\n", name, statusShort(status))
+}
+
+// statusOf maps a runtime name to the section of the report that grades it.
+// known is false for a runtime doctor has no section for, which is honest
+// rather than silent: this build's default is per-OS and only the Linux native
+// backend is wired.
+func (r Report) statusOf(name string) (s Status, known bool) {
+	switch name {
+	case "native":
+		return r.Native.Status, true
+	case "docker", "podman":
+		return r.Container.Status, true
+	default:
+		return StatusUnavailable, false
+	}
 }
 
 // writeIssues indents multi-line advice under its bullet so remedies that span
@@ -468,11 +644,22 @@ func writeIssues(b *strings.Builder, issues []string) {
 }
 
 func statusWord(s Status) string {
+	if s == StatusDegraded {
+		// The section header is the one place with room to say what the state
+		// costs, and "degraded" alone has been read as "slightly worse".
+		return "DEGRADED (runs, Layer 1 off)"
+	}
+	return statusShort(s)
+}
+
+// statusShort is the same word without the gloss, for the places that refer
+// back to a section rather than heading one.
+func statusShort(s Status) string {
 	switch s {
 	case StatusReady:
 		return "READY"
 	case StatusDegraded:
-		return "DEGRADED (runs, Layer 1 off)"
+		return "DEGRADED"
 	default:
 		return "NOT USABLE"
 	}
