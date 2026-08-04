@@ -23,3 +23,13 @@ package runner
 // LEASH_RUNTIME is set. It is always native (the low-level newRuntime("")
 // default stays docker for direct-construction callers/tests).
 func defaultRuntimeName() string { return nativeRuntimeName }
+
+// DefaultRuntimeName exports that choice for `leash doctor` (internal/doctor).
+//
+// Doctor grades both runtimes, so its verdict answers "can this machine enforce
+// with *some* runtime" — but the runtime a caller gets from a bare `leash run`
+// is this one, and native never falls back to docker. Without this seam doctor
+// cannot say which of the runtimes it grades is the one the caller will
+// actually be handed, so a host where only the *other* runtime works reads as
+// unqualified good news.
+func DefaultRuntimeName() string { return defaultRuntimeName() }

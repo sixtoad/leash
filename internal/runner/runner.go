@@ -379,6 +379,7 @@ entrypoint is left running.
 
 Subcommands:
   version [--json]                Print build metadata. --json adds the contract range provisioners check before driving leash.
+  doctor [--json]                 Report whether this machine can enforce, per runtime. Exits 0 only when a runtime enforces both layers; 3 when one runs proxy-only; 1 when none runs.
 
 Flags:
   -I, --no-interactive            Skip the interactive TTY; run the command non-interactively.

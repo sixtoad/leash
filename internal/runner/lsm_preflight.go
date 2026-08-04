@@ -3,6 +3,7 @@ package runner
 import (
 	"bufio"
 	"compress/gzip"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -50,10 +51,39 @@ func classifyBPFLSM(activeLSMs []string, configBPFLSM string) bpfLSMStatus {
 	}
 }
 
+// namedLSMs drops the entries that name nothing. It exists because
+// readActiveLSMs splits on "," — so an empty or whitespace-only
+// /sys/kernel/security/lsm yields []string{""}, a one-element list of nothing,
+// which renders into the advice templates below as an empty LSM list. See
+// unusableLSMListAdvice for why that is dangerous rather than merely ugly.
+func namedLSMs(activeLSMs []string) []string {
+	out := make([]string, 0, len(activeLSMs))
+	for _, l := range activeLSMs {
+		if trimmed := strings.TrimSpace(l); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
 // bpfLSMAdvice renders the actionable remedy for a non-active status. It returns
 // "" for bpfLSMActive.
+//
+// It is deliberately hardened against an empty active-LSM list rather than
+// trusting its callers: this function is shared by the doctor seam
+// (decideLSMState) and the real run path (preflightHostKernel → decideBPFLSM),
+// and an `lsm=` example built from a list we do not actually have is a remedy
+// that destroys the host's LSM stack. When the list is empty, no template that
+// embeds it is safe, so none is used.
 func bpfLSMAdvice(status bpfLSMStatus, activeLSMs []string) string {
-	active := strings.Join(activeLSMs, ",")
+	if status == bpfLSMActive {
+		return ""
+	}
+	named := namedLSMs(activeLSMs)
+	if len(named) == 0 {
+		return unusableLSMListAdvice
+	}
+	active := strings.Join(named, ",")
 	switch status {
 	case bpfLSMInactiveCompiled:
 		return fmt.Sprintf(`This kernel supports the eBPF LSM (CONFIG_BPF_LSM=y) but has not enabled it.
@@ -123,6 +153,117 @@ func decideBPFLSM(status bpfLSMStatus, active []string, requireLSM bool) (string
 		return "", fmt.Errorf("eBPF LSM enforcement (Layer 1) is unavailable and --require-lsm is set, so leash will not start.\n%s", advice)
 	}
 	return "WARNING: eBPF LSM enforcement (Layer 1) is unavailable; continuing with proxy-only enforcement (Layer 2 is fail-closed). Filesystem/exec/socket policies will NOT be enforced — pass --require-lsm to require Layer 1.\n" + advice, nil
+}
+
+// LSMState is the tri-state answer to "is leash's Layer 1 (eBPF LSM) available
+// on this kernel?". It is a tri-state because "we could not read the active LSM
+// list" and "we read it and bpf is absent" call for different remedies, and
+// collapsing them is how doctor came to print a remedy that would have
+// dismantled the host's LSM stack (see unusableLSMListAdvice).
+//
+// The zero value is LSMUnknown so a partially-built value never claims more
+// than it knows, and the ordering (unknown < inactive < active) is not
+// meaningful — compare against the constants, not with <.
+type LSMState int
+
+const (
+	LSMUnknown  LSMState = iota // the active-LSM list could not be read
+	LSMInactive                 // read, and "bpf" is not in it
+	LSMActive                   // read, and "bpf" is in it
+)
+
+// String is the wire form used by `leash doctor --json`.
+func (s LSMState) String() string {
+	switch s {
+	case LSMActive:
+		return "active"
+	case LSMInactive:
+		return "inactive"
+	default:
+		return "unknown"
+	}
+}
+
+// MarshalJSON emits the string form, so the doctor payload carries
+// "active"/"inactive"/"unknown" rather than an integer whose meaning would have
+// to be documented separately.
+func (s LSMState) MarshalJSON() ([]byte, error) { return json.Marshal(s.String()) }
+
+// UnmarshalJSON is the inverse, so a Go consumer can decode the doctor document
+// it was handed. Without it the field decodes to the zero value — LSMUnknown —
+// whatever the document said, which is a quiet fabrication in a payload whose
+// whole purpose is to be trusted. An unrecognised word errors rather than
+// falling back to unknown: a state this build does not know about is not one it
+// may reinterpret.
+func (s *LSMState) UnmarshalJSON(data []byte) error {
+	var word string
+	if err := json.Unmarshal(data, &word); err != nil {
+		return fmt.Errorf("lsm state must be a JSON string: %w", err)
+	}
+	switch word {
+	case "active":
+		*s = LSMActive
+	case "inactive":
+		*s = LSMInactive
+	case "unknown":
+		*s = LSMUnknown
+	default:
+		return fmt.Errorf("unknown lsm state %q (want active, inactive or unknown)", word)
+	}
+	return nil
+}
+
+// unusableLSMListAdvice is the remedy whenever the active-LSM list is not
+// something we can build an `lsm=` line from: unreadable, empty, or
+// whitespace-only. It deliberately offers no `lsm=` line at all, because the
+// only safe lsm= value is one built from the host's real LSM list and by
+// definition we do not have it. Emitting `lsm=,bpf` here — which is what an
+// empty list rendered into the bpfLSMInactiveCompiled template produces — tells
+// the operator to *replace* their LSM stack, silently disabling
+// AppArmor/SELinux (or leaving the host unbootable).
+const unusableLSMListAdvice = `the active LSM list (` + activeLSMPath + `) could not be read, or was empty, so eBPF LSM (Layer 1) availability is unknown.
+On Linux, mount securityfs (mount -t securityfs securityfs /sys/kernel/security) and re-run, or read the list as root.
+Do not guess at a boot-time LSM list: that parameter replaces the kernel's list wholesale and can disable AppArmor/SELinux.`
+
+// ProbeBPFLSM reports whether leash's Layer 1 (eBPF LSM) can attach on this
+// host, plus the remedy text when it cannot ("" when it can). It is the
+// exported seam for `leash doctor` (internal/doctor).
+//
+// The classification and the advice deliberately stay here, next to the code a
+// real run uses, so the self-check cannot drift from leash's actual
+// requirement — drift is exactly what issue #23 asks us to eliminate for walk.
+//
+// Note that this is the list-based check (is "bpf" among the active LSMs), not
+// an attachability probe; doctor reports that distinction rather than hiding it
+// (follow-up issue #52).
+func ProbeBPFLSM() (state LSMState, advice string) {
+	lsms, err := readActiveLSMs()
+	return decideLSMState(lsms, err, readKernelConfigBPFLSM())
+}
+
+// decideLSMState is the pure half of ProbeBPFLSM, so the "list unreadable"
+// branch is testable without unmounting securityfs.
+//
+// readErr is threaded in rather than swallowed at the call site: the previous
+// version turned a read failure into an empty list and let classifyBPFLSM run
+// on it, which reports bpfLSMInactiveCompiled whenever CONFIG_BPF_LSM=y — and
+// bpfLSMAdvice then renders that empty list into `lsm=,bpf`.
+//
+// The guard is "the list is unusable", not "the read errored", because those
+// are not the same condition. readActiveLSMs splits the file on ",", so a
+// readable-but-empty or whitespace-only /sys/kernel/security/lsm comes back as
+// ([]string{""}, nil) — no error, and a list that names no LSM. Reading nothing
+// tells us exactly as much about this kernel as failing to read: nothing. Both
+// are LSMUnknown.
+func decideLSMState(activeLSMs []string, readErr error, configBPFLSM string) (LSMState, string) {
+	if readErr != nil || len(namedLSMs(activeLSMs)) == 0 {
+		return LSMUnknown, unusableLSMListAdvice
+	}
+	status := classifyBPFLSM(activeLSMs, configBPFLSM)
+	if status == bpfLSMActive {
+		return LSMActive, ""
+	}
+	return LSMInactive, bpfLSMAdvice(status, activeLSMs)
 }
 
 func readActiveLSMs() ([]string, error) {

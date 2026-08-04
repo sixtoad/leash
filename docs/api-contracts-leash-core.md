@@ -4,7 +4,7 @@ All endpoints are exposed by the daemon (`leashd` in Linux containers, `darwind`
 
 The Next.js Control UI is embedded into the Go binary at `internal/ui/dist` and served by `SPAHandler` (`internal/ui/handler.go`) at `/`. Everything not under a registered API path falls through to the SPA.
 
-One contract here is not an endpoint: [§ CLI build contract](#cli-build-contract--leash-version---json) covers `leash version --json`, the document a provisioner reads from an *installed binary* before it drives anything else.
+Two contracts here are not endpoints. [§ CLI build contract](#cli-build-contract--leash-version---json) covers `leash version --json`, the document a provisioner reads from an *installed binary* before it drives anything else; [§ Node readiness](#node-readiness--leash-doctor---json) covers `leash doctor --json`, which answers the next question — whether the machine that binary is installed on can actually enforce.
 
 > **Cross-references:** Cedar policy syntax → [`design/CEDAR.md`](design/CEDAR.md). Completion design → [`design/AUTOCOMPLETE.md`](design/AUTOCOMPLETE.md). Bootstrap lifecycle → [`design/BOOT.md`](design/BOOT.md). CA + secrets boundary → [`design/SECURITY-MODEL.md`](design/SECURITY-MODEL.md).
 
@@ -238,6 +238,71 @@ Two traps that snippet avoids. Decoding straight into value types makes `null`, 
 **Probing an unknown leash has a hazard.** On a build that predates this feature, `version` is not a subcommand: the argument falls through to the workload CLI, which configures telemetry and can begin runtime provisioning. `leash version --json` is a side-effect-free probe only from contract 1 onward. Establish contract 0 some other way where possible — `leash --version` has been in the argument switch of every build and only prints three lines — or probe with `LEASH_DISABLE_TELEMETRY=1` in a disposable directory.
 
 Full rationale, the bump rules, and which build path stamps what: [`DEVELOPMENT.md § Reporting the version at run time`](DEVELOPMENT.md#reporting-the-version-at-run-time).
+
+## Node readiness — `leash doctor --json`
+
+Also not an endpoint. `leash version --json` describes the *binary*; this describes the *machine*, per runtime, so a provisioner (`walk install leash`, a CI image build) can decide whether the node it just prepared can enforce before it hands an agent to it. `leash doctor` with no flag prints the same facts as human text.
+
+```jsonc
+{
+  "verdict": "degraded",            // best state any runtime reaches: ready | degraded | unavailable
+  "native": {                       // leashd as a host process in a systemd scope
+    "status": "degraded",           //   ready | degraded | unavailable
+    "ready": false,                 //   status == "ready"; never true for degraded
+    "lsm_bpf": "inactive",          //   active | inactive | unknown
+    "caps": ["bpf", "net_admin"],   //   effective caps observed, never inferred; [] when unreadable
+    "issues": ["…"]                 //   one actionable sentence + remedy per blocker
+  },
+  "container": {                    // docker/podman
+    "status": "degraded",
+    "ready": false,
+    "engine": "docker",             //   null when no supported engine is on PATH
+    "issues": ["…"]
+  },
+  "unchecked": [                    // prerequisites doctor did NOT verify (never silently omitted)
+    { "name": "bpf_lsm_attachable", "reason": "…" }
+  ],
+  "default_runtime": "native"       // the runtime a bare `leash run` selects on this build
+}
+```
+
+Field names are snake_case here (they were fixed by issue #23 before the camelCase `version --json` document existed) and additive-only. `caps`, `issues` and `unchecked` are always arrays, never `null`, however the report was produced; `engine` is the only field that can be `null`.
+
+**The three states.** Two were not enough. A host whose container engine works but whose kernel has no active `bpf` LSM *will* start a workload — leash enforces the fail-closed egress proxy (Layer 2) while filesystem, exec and socket policy (Layer 1) is off. `ready` would be a false assurance and `unavailable` would hide a machine that still runs agents:
+
+| `status` | leash will | Layer 1 (eBPF LSM) | Layer 2 (fail-closed proxy) |
+|---|---|---|---|
+| `ready` | run | enforced | enforced |
+| `degraded` | run | **not enforced, or not verifiable** | enforced |
+| `unavailable` | not run | — | — |
+
+`ready` never widens to include `degraded`: it is the field a provisioner gates on.
+
+**Exit codes.** The verdict is in the document *and* in the exit status, and they always agree.
+
+| Code | Meaning | Remedy shape |
+|---|---|---|
+| `0` | a runtime enforces with both layers | none |
+| `1` | no runtime can run a workload at all | install or repair a runtime |
+| `2` | usage error — **including `--help`** | fix the invocation |
+| `3` | a runtime runs, but Layer 1 is unavailable (proxy-only) | the runtime is fine, the kernel is not |
+| `4` | doctor could not render or write its own report | not a verdict; retry / check the pipe |
+
+Exit `0` is the answer to "can this machine enforce?", so `leash doctor && …` fails closed on `3`. `--help` deliberately exits `2`, not `0`: a provisioner gating on the status must not get a free pass from `leash doctor -help`.
+
+**A `degraded` verdict is not always about the kernel.** Three conditions produce it, and the `issues` text says which:
+
+- `bpf` is absent from `/sys/kernel/security/lsm` (`lsm_bpf: "inactive"`), or that list could not be read or was empty (`"unknown"`).
+- The host is not Linux. Containers then run against a VM kernel doctor never probed — Docker Desktop's LinuxKit kernel, for one, does not carry `bpf`. An unprobed kernel is never `ready`.
+- `DOCKER_HOST` is set. The engine's containers run on a remote daemon's kernel, not the one doctor read, so the Layer 1 claim is withheld rather than borrowed. No remote topology is modelled; `unchecked` gains a `container_kernel` entry.
+
+**`default_runtime` is not the verdict.** `verdict` is the best state *any* runtime reaches, but `leash run` with neither `--runtime` nor `LEASH_RUNTIME` selects exactly one runtime and never falls back. On this build that is `native`, so a Linux host with no systemd and a working docker reports `verdict: ready` while a bare `leash run` fails. Compare `default_runtime` against that runtime's `status` (`native` → `native.status`, `docker`/`podman` → `container.status`); the human output prints the same warning in prose.
+
+**What doctor does not check** is in the document, not just in this page: `unchecked` always names `bpf_lsm_attachable` (the check is list-based — it does not load and attach a probe program, leash issue #52), `bpf_d_path_ringbuf`, and `netns_iptables`, plus `capabilities` when `/proc/self/status` was unreadable and `container_kernel` in the two cases above. A `ready` verdict must be read as exactly that list of things unverified.
+
+Two caveats a script should know. Doctor writes its whole report in one `Write`, so a closed stdout (`leash doctor --json | head -1`) is reported as exit `4` — except that Go raises `SIGPIPE` on fd 1, so the process is more likely to die of the signal (`141` from a shell) than to reach that code; doctor does not trap signals to paper over this. And an engine probe that hangs is bounded by a 5 s timeout on `<engine> info`, after which the daemon is reported unreachable — the CLI is killed, but a grandchild the client itself spawned is not process-group-killed and may outlive it.
+
+Decode it the way `version --json` is decoded: with a struct of your own. Go consumers inside this repo can decode into `doctor.Report` (the marshal/unmarshal pair round-trips exactly, and `verdict`/`ready` are recomputed from the statuses rather than trusted from the document), but the package is `internal/` and exports no importable type.
 
 ## Notable header & error conventions
 
