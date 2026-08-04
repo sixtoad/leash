@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -133,5 +135,70 @@ func TestParseArgsRequireLSM(t *testing.T) {
 	}
 	if off.requireLSM {
 		t.Fatal("requireLSM should default to false")
+	}
+}
+
+// CAP-7: the remedy must never be harmful to follow. ProbeBPFLSM used to
+// swallow the readActiveLSMs error into a nil list, which classifies as
+// "compiled but inactive" whenever CONFIG_BPF_LSM=y and then renders the empty
+// list into `lsm=,bpf` — a leading-comma list that REPLACES the host's LSM
+// stack, silently disabling AppArmor/SELinux.
+func TestDecideLSMStateUnreadableListIsUnknownAndSafe(t *testing.T) {
+	t.Parallel()
+
+	for _, config := range []string{"y", "m", "n", ""} {
+		state, advice := decideLSMState(nil, errors.New("no such file or directory"), config)
+		if state != LSMUnknown {
+			t.Errorf("config %q: state = %v, want LSMUnknown", config, state)
+		}
+		if strings.TrimSpace(advice) == "" {
+			t.Errorf("config %q: unknown state still needs a next step", config)
+		}
+		if strings.Contains(advice, "lsm=") {
+			t.Errorf("config %q: advice proposes an lsm= boot parameter built from a list we could not read:\n%s", config, advice)
+		}
+	}
+}
+
+func TestDecideLSMState(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		active    []string
+		config    string
+		want      LSMState
+		wantJSON  string
+		hasAdvice bool
+	}{
+		{"active", []string{"apparmor", "bpf"}, "y", LSMActive, `"active"`, false},
+		{"inactive but compiled", []string{"apparmor"}, "y", LSMInactive, `"inactive"`, true},
+		{"not compiled", []string{"apparmor"}, "n", LSMInactive, `"inactive"`, true},
+		{"inactive, config unreadable", []string{"apparmor"}, "", LSMInactive, `"inactive"`, true},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			state, advice := decideLSMState(tc.active, nil, tc.config)
+			if state != tc.want {
+				t.Fatalf("state = %v, want %v", state, tc.want)
+			}
+			if (strings.TrimSpace(advice) != "") != tc.hasAdvice {
+				t.Errorf("advice = %q, wanted advice: %v", advice, tc.hasAdvice)
+			}
+			out, err := json.Marshal(state)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(out) != tc.wantJSON {
+				t.Errorf("json = %s, want %s", out, tc.wantJSON)
+			}
+		})
+	}
+
+	// The zero value must read as "unknown", never as a claim of availability.
+	if got := LSMState(0).String(); got != "unknown" {
+		t.Errorf("zero LSMState = %q, want %q", got, "unknown")
 	}
 }

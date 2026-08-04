@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // goos reports the target OS; a package var so runtime-selection logic is
@@ -78,17 +79,80 @@ var supportedRuntimes = []string{"docker", "podman"}
 // seam can be exercised end to end against a non-cliRuntime backend.
 const nativeRuntimeName = "native"
 
-// DetectContainerEngine returns the first supported container CLI found on
-// PATH, or "" when none is installed. Exported for `leash doctor`
-// (internal/doctor): it walks supportedRuntimes rather than a hardcoded pair so
-// the self-check automatically covers any engine this seam learns to drive.
-func DetectContainerEngine() string {
+// containerEngineProbeTimeout bounds the daemon reachability check. `docker
+// info` against a dead or hung daemon can block indefinitely (socket accepted,
+// never answered), and doctor must always return a verdict.
+// A var so the timeout path itself is testable in milliseconds rather than
+// seconds; nothing outside tests reassigns it.
+var containerEngineProbeTimeout = 5 * time.Second
+
+// DetectContainerEngine returns the container CLI a `leash run` would use — the
+// first supported engine found on PATH, which is also the order newRuntime
+// resolves — together with an error when that engine's daemon does not answer.
+// It returns ("", nil) when no supported engine is installed.
+//
+// Exported for `leash doctor` (internal/doctor). It reports on the *first*
+// engine rather than the first *working* one on purpose: that is the engine a
+// default `leash run` drives, and doctor exists so its verdict and a real run
+// cannot disagree. An engine on PATH whose daemon is unreachable is not a
+// runtime leash can enforce with, so the error is part of the answer, not a
+// detail the caller has to go and re-derive.
+func DetectContainerEngine() (engine string, err error) {
 	for _, name := range supportedRuntimes {
-		if _, err := exec.LookPath(name); err == nil {
-			return name
+		if _, lookErr := exec.LookPath(name); lookErr != nil {
+			continue
+		}
+		return name, containerEngineReachable(name)
+	}
+	return "", nil
+}
+
+// containerEngineReachable runs `<engine> info` under a bounded timeout. `info`
+// is the cheapest command that requires the daemon to answer — LookPath only
+// proves a client binary exists, which on a machine with a stopped daemon or a
+// socket the user cannot open is exactly the false positive issue #23 asks
+// doctor to stop producing.
+func containerEngineReachable(bin string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), containerEngineProbeTimeout)
+	defer cancel()
+
+	var stderr strings.Builder
+	cmd := exec.CommandContext(ctx, bin, "info")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = &stderr
+	// Without WaitDelay, killing the CLI on timeout is not enough: Wait blocks
+	// until every writer to the stderr pipe closes it, and a docker client that
+	// spawned a helper leaves that pipe open. The timeout has to bound the wait
+	// too, or doctor hangs on exactly the broken daemon it is there to report.
+	cmd.WaitDelay = time.Second
+	runErr := cmd.Run()
+	if runErr == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("%s info did not answer within %s", bin, containerEngineProbeTimeout)
+	}
+	if detail := firstLines(stderr.String(), 3); detail != "" {
+		return fmt.Errorf("%s info failed: %s", bin, detail)
+	}
+	return fmt.Errorf("%s info failed: %w", bin, runErr)
+}
+
+// firstLines trims a command's stderr down to something that fits in a doctor
+// issue: engines are chatty and the actionable part is at the top.
+func firstLines(s string, n int) string {
+	var kept []string
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		kept = append(kept, line)
+		if len(kept) == n {
+			break
 		}
 	}
-	return ""
+	return strings.Join(kept, " ")
 }
 
 // newRuntime resolves a runtime name to a Runtime. An empty name defaults to

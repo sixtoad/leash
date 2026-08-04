@@ -3,7 +3,11 @@ package runner
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseArgsRuntimeFlag(t *testing.T) {
@@ -153,5 +157,128 @@ func TestRunnerDefaultsToDocker(t *testing.T) {
 	}
 	if gotBin != "docker" {
 		t.Fatalf("runtime binary = %q, want docker", gotBin)
+	}
+}
+
+// fakeEngine writes an executable named after a supported runtime into dir.
+func fakeEngine(t *testing.T, dir, name, script string) {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
+		t.Fatalf("write fake %s: %v", name, err)
+	}
+}
+
+// CAP-4: an engine on PATH is not a usable engine. These tests mutate PATH and
+// the probe timeout, so no t.Parallel().
+func TestDetectContainerEngineChecksDaemonReachability(t *testing.T) {
+	t.Run("no engine installed", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir())
+		engine, err := DetectContainerEngine()
+		if engine != "" || err != nil {
+			t.Fatalf("DetectContainerEngine() = (%q, %v), want (\"\", nil)", engine, err)
+		}
+	})
+
+	t.Run("engine present and daemon answers", func(t *testing.T) {
+		dir := t.TempDir()
+		fakeEngine(t, dir, "docker", "exit 0")
+		t.Setenv("PATH", dir)
+
+		engine, err := DetectContainerEngine()
+		if engine != "docker" || err != nil {
+			t.Fatalf("DetectContainerEngine() = (%q, %v), want (\"docker\", nil)", engine, err)
+		}
+	})
+
+	t.Run("engine present but daemon unreachable", func(t *testing.T) {
+		dir := t.TempDir()
+		fakeEngine(t, dir, "docker", `echo "permission denied while trying to connect to the docker API" >&2; exit 1`)
+		t.Setenv("PATH", dir)
+
+		engine, err := DetectContainerEngine()
+		if engine != "docker" {
+			t.Fatalf("the engine must still be named so doctor can report it, got %q", engine)
+		}
+		if err == nil {
+			t.Fatal("an unreachable daemon must be reported as an error, not as a usable engine")
+		}
+		if !strings.Contains(err.Error(), "permission denied") {
+			t.Errorf("the engine's own diagnosis should reach the caller, got %v", err)
+		}
+	})
+
+	t.Run("silent failure still produces an error", func(t *testing.T) {
+		dir := t.TempDir()
+		fakeEngine(t, dir, "docker", "exit 7")
+		t.Setenv("PATH", dir)
+
+		if _, err := DetectContainerEngine(); err == nil {
+			t.Fatal("a non-zero exit with no stderr must still be an error")
+		}
+	})
+
+	t.Run("a hung daemon times out rather than hanging doctor", func(t *testing.T) {
+		dir := t.TempDir()
+		fakeEngine(t, dir, "docker", "sleep 30")
+		// The fake needs a real /bin on PATH to find sleep; LookPath still
+		// resolves docker to the fake because dir comes first.
+		t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		original := containerEngineProbeTimeout
+		t.Cleanup(func() { containerEngineProbeTimeout = original })
+		containerEngineProbeTimeout = 100 * time.Millisecond
+
+		start := time.Now()
+		engine, err := DetectContainerEngine()
+		elapsed := time.Since(start)
+
+		if engine != "docker" {
+			t.Fatalf("engine = %q, want docker", engine)
+		}
+		if err == nil || !strings.Contains(err.Error(), "did not answer") {
+			t.Fatalf("a hung daemon must be reported as a timeout, got %v", err)
+		}
+		if elapsed > 5*time.Second {
+			t.Fatalf("probe took %s; the timeout did not bound it", elapsed)
+		}
+	})
+
+	t.Run("the first supported engine on PATH is the one reported", func(t *testing.T) {
+		// newRuntime defaults to docker, so doctor must report on docker even
+		// when podman would work — otherwise a "ready" verdict describes a
+		// runtime a default `leash run` never touches.
+		dir := t.TempDir()
+		fakeEngine(t, dir, "docker", `echo "daemon down" >&2; exit 1`)
+		fakeEngine(t, dir, "podman", "exit 0")
+		t.Setenv("PATH", dir)
+
+		engine, err := DetectContainerEngine()
+		if engine != "docker" {
+			t.Fatalf("engine = %q, want docker (the default runtime)", engine)
+		}
+		if err == nil {
+			t.Fatal("docker's daemon is down; that must not be masked by podman")
+		}
+	})
+}
+
+func TestFirstLines(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		in   string
+		n    int
+		want string
+	}{
+		{"", 2, ""},
+		{"\n\n  \n", 2, ""},
+		{"one\ntwo\nthree\n", 2, "one two"},
+		{"  padded  \n", 3, "padded"},
+	}
+	for _, c := range cases {
+		if got := firstLines(c.in, c.n); got != c.want {
+			t.Errorf("firstLines(%q, %d) = %q, want %q", c.in, c.n, got, c.want)
+		}
 	}
 }

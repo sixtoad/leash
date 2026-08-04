@@ -13,7 +13,9 @@ import (
 // the probes thin and separate is what lets doctor.go stay pure: every check
 // here is a lookup with no policy in it, and every decision lives there.
 
-const procSelfStatus = "/proc/self/status"
+// procSelfStatus is a var, not a const, so the unreadable-source path (CAP-3's
+// "never fabricate capabilities") can be exercised without root or a container.
+var procSelfStatus = "/proc/self/status"
 
 // Capability bit positions from <linux/capability.h>. Hardcoded rather than
 // pulled from a cgo header so the probe cross-compiles and unit-tests anywhere.
@@ -23,35 +25,46 @@ const (
 )
 
 // Probe reads the live machine into a Host. It never fails: an unreadable
-// source becomes the cautious answer (not ready) with advice, because doctor's
-// job is to report a verdict, not to error out on a missing /proc.
+// source becomes the cautious answer (unknown, and therefore not ready) with
+// advice, because doctor's job is to report a verdict, not to error out on a
+// missing /proc.
 func Probe() Host {
-	lsmActive, lsmAdvice := runner.ProbeBPFLSM()
-	capBPF, capNetAdmin := probeCaps(os.Geteuid())
-	return Host{
+	lsm, lsmAdvice := runner.ProbeBPFLSM()
+	capBPF, capNetAdmin, capsKnown := probeCaps()
+	engine, engineErr := runner.DetectContainerEngine()
+
+	h := Host{
 		GOOS:            runtime.GOOS,
 		HasSystemd:      runner.HostHasSystemd(),
 		EUID:            os.Geteuid(),
 		CapBPF:          capBPF,
 		CapNetAdmin:     capNetAdmin,
-		BPFLSMActive:    lsmActive,
+		CapsKnown:       capsKnown,
+		BPFLSM:          lsm,
 		BPFLSMAdvice:    lsmAdvice,
-		ContainerEngine: runner.DetectContainerEngine(),
+		ContainerEngine: engine,
 	}
+	if engineErr != nil {
+		h.ContainerEngineError = engineErr.Error()
+	}
+	return h
 }
 
-// probeCaps reports the effective capabilities leash cares about. When
-// /proc/self/status is unavailable (non-Linux, or a locked-down /proc) it falls
-// back to euid: uid 0 without a capability bounding restriction has them all,
-// and a non-root process that we cannot inspect must not be assumed privileged.
-func probeCaps(euid int) (capBPF, capNetAdmin bool) {
+// probeCaps reports the effective capabilities leash cares about, and whether
+// they could be observed at all.
+//
+// It never falls back to euid. "Root, so it must hold CAP_BPF" is a guess, and
+// it is wrong in exactly the environments where it would be consulted: on
+// darwin there is no such capability, and in a container with a masked or
+// dropped-capability /proc a root process can be missing both. Inventing
+// capabilities is how a report claims Layer 1 that the kernel will refuse to
+// attach, so an unreadable source is reported as unknown-and-not-ready.
+func probeCaps() (capBPF, capNetAdmin, known bool) {
 	data, err := os.ReadFile(procSelfStatus)
-	if err == nil {
-		if bpf, netAdmin, ok := capsFromStatus(string(data)); ok {
-			return bpf, netAdmin
-		}
+	if err != nil {
+		return false, false, false
 	}
-	return euid == 0, euid == 0
+	return capsFromStatus(string(data))
 }
 
 // capsFromStatus extracts the effective-capability bitmask from a
