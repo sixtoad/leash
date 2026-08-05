@@ -44,6 +44,12 @@ type Host struct {
 	// is not there.
 	CapsKnown bool
 
+	// CapsNamespaced records that the capability set was readable but belongs
+	// to a user namespace, so it says nothing about host capability. Implies
+	// CapsKnown is false; kept separate only so the report can name the reason,
+	// because the remedy differs (setcap cannot help inside a namespace).
+	CapsNamespaced bool
+
 	// BPFLSM and BPFLSMAdvice come from runner.ProbeBPFLSM: the tri-state
 	// availability of leash's Layer 1 (eBPF LSM) on this kernel, and the
 	// kernel-specific remedy when it is not available (which embeds the host's
@@ -272,6 +278,8 @@ func evaluateNative(h Host) NativeReport {
 	// listed above; it is the redundant *issues* we suppress, not the facts.
 	if !rootBlocked {
 		switch {
+		case h.CapsNamespaced:
+			n.Issues = append(n.Issues, "this process is in a user namespace, so its effective capabilities describe that namespace, not the host: CAP_BPF and CAP_NET_ADMIN are unknown and therefore treated as absent.\nCAP_BPF held in a user namespace does not permit loading leash's eBPF LSM programs, so setcap cannot help here — run doctor on the host itself.")
 		case !h.CapsKnown:
 			n.Issues = append(n.Issues, "cannot read this process's effective capabilities (/proc/self/status): CAP_BPF and CAP_NET_ADMIN are unknown and therefore treated as absent.\nRun doctor on the host (not inside a container with a masked /proc) so the capability set can be read.")
 		default:
@@ -386,7 +394,7 @@ func unchecked(h Host) []Unchecked {
 	if !h.CapsKnown {
 		out = append(out, Unchecked{
 			Name:   "capabilities",
-			Reason: "/proc/self/status could not be read or parsed, so CAP_BPF/CAP_NET_ADMIN were not observed (reported as absent, never assumed).",
+			Reason: capsUncheckedReason(h),
 		})
 	}
 	// container_kernel is declared once, for whichever reason applies: the
@@ -670,4 +678,13 @@ func listOrNone(items []string) string {
 		return "(none)"
 	}
 	return strings.Join(items, ", ")
+}
+
+// capsUncheckedReason names why the capability set was not established, so a
+// consumer can tell "masked /proc" from "namespaced and therefore meaningless".
+func capsUncheckedReason(h Host) string {
+	if h.CapsNamespaced {
+		return "this process is in a user namespace, so /proc/self/status reports namespaced capabilities that do not permit loading BPF-LSM programs; CAP_BPF/CAP_NET_ADMIN were not established for the host (reported as absent, never assumed)."
+	}
+	return "/proc/self/status could not be read or parsed, so CAP_BPF/CAP_NET_ADMIN were not observed (reported as absent, never assumed)."
 }
