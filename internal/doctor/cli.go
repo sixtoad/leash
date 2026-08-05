@@ -34,8 +34,14 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("leash doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	asJSON := fs.Bool("json", false, "emit the readiness report as JSON")
+	// Opting *out* of the expensive check, not into it: the honest answer has
+	// to be the default one, or doctor keeps shipping the guess issue #23 asked
+	// leash to replace. --quick is for callers who want the cheap file reads
+	// only (or who cannot afford to load a BPF program), and the report says so
+	// under `not checked by doctor`.
+	quick := fs.Bool("quick", false, "skip the checks that load kernel programs (BPF-LSM attachability); the report declares what was not checked")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "usage: leash doctor [--json]\n\nChecks whether this machine can enforce, per runtime.\n\nflags:\n")
+		fmt.Fprintf(stderr, "usage: leash doctor [--json] [--quick]\n\nChecks whether this machine can enforce, per runtime.\n\nflags:\n")
 		fs.PrintDefaults()
 		fmt.Fprintf(stderr, "\n%s", usageExitNotes)
 	}
@@ -57,7 +63,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	report := Evaluate(Probe())
+	report := Evaluate(ProbeWithOptions(ProbeOptions{Quick: *quick}))
 
 	// Render fully before writing a byte. Encoding straight to stdout would let
 	// a half-written document escape and then be reported as a usage error,

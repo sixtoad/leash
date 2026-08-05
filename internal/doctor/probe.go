@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/runner"
 )
 
@@ -33,12 +34,25 @@ const (
 	capBPFBit      = 39 // CAP_BPF (Linux >= 5.8)
 )
 
-// Probe reads the live machine into a Host. It never fails: an unreadable
-// source becomes the cautious answer (unknown, and therefore not ready) with
-// advice, because doctor's job is to report a verdict, not to error out on a
-// missing /proc.
-func Probe() Host {
-	lsm, lsmAdvice := runner.ProbeBPFLSM()
+// ProbeOptions tunes what Probe touches. The zero value is the default probe,
+// which is the honest one: everything doctor can observe, it observes.
+type ProbeOptions struct {
+	// Quick skips the checks that cost more than a file read — today, the
+	// BPF-LSM attachability probe, which loads and attaches a real program.
+	// Opting *out* is the flag, deliberately: an opt-in would leave the guess
+	// as the default answer, which is the gap issue #52 exists to close.
+	Quick bool
+}
+
+// Probe reads the live machine into a Host, running every check doctor has.
+// It never fails: an unreadable source becomes the cautious answer (unknown,
+// and therefore not ready) with advice, because doctor's job is to report a
+// verdict, not to error out on a missing /proc.
+func Probe() Host { return ProbeWithOptions(ProbeOptions{}) }
+
+// ProbeWithOptions is Probe with the expensive checks made optional.
+func ProbeWithOptions(opts ProbeOptions) Host {
+	lsmState, lsmAdvice := runner.ProbeBPFLSM()
 	capBPF, capNetAdmin, capsKnown := probeCaps()
 	engine, engineErr := runner.DetectContainerEngine()
 
@@ -50,7 +64,7 @@ func Probe() Host {
 		CapNetAdmin:     capNetAdmin,
 		CapsKnown:       capsKnown,
 		CapsNamespaced:  inUserNamespace(),
-		BPFLSM:          lsm,
+		BPFLSM:          lsmState,
 		BPFLSMAdvice:    lsmAdvice,
 		ContainerEngine: engine,
 		// Read here, decided in doctor.go. The engine client resolves its
@@ -62,7 +76,38 @@ func Probe() Host {
 	if engineErr != nil {
 		h.ContainerEngineError = engineErr.Error()
 	}
+	h.BPFLSMAttach = probeAttachable(opts, capBPF, capsKnown)
 	return h
+}
+
+// probeAttachable decides whether to ask the kernel, and asks it. The two
+// reasons not to are the two the report has to be able to name: the caller
+// passed --quick, or this process could not have loaded a BPF program in the
+// first place.
+//
+// The privilege gate is not an optimisation. Without it every unprivileged run
+// would pay for a load that can only end in EPERM, and the reason reaching the
+// report would be the kernel's "operation not permitted" rather than the plain
+// fact that doctor is not running as root.
+func probeAttachable(opts ProbeOptions, capBPF, capsKnown bool) lsm.AttachProbe {
+	if opts.Quick {
+		return lsm.SkippedAttachProbe("--quick was passed, so doctor did not load and attach a probe program")
+	}
+	if !privilegedEnoughToProbe(capBPF, capsKnown) {
+		return lsm.SkippedAttachProbe("this process is not privileged enough to load a BPF LSM program (needs root, or CAP_BPF), so doctor did not attempt the attach")
+	}
+	return lsm.ProbeAttachable()
+}
+
+// privilegedEnoughToProbe reports whether loading a BPF_PROG_TYPE_LSM program
+// could possibly succeed. Capabilities are preferred over euid and euid is only
+// the fallback for a process whose capability set could not be read at all —
+// mirroring probeCaps, which refuses to infer capabilities from being root.
+func privilegedEnoughToProbe(capBPF, capsKnown bool) bool {
+	if capsKnown {
+		return capBPF
+	}
+	return os.Geteuid() == 0
 }
 
 // probeCaps reports the effective capabilities leash cares about, and whether

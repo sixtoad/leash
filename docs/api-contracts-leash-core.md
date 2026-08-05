@@ -249,7 +249,8 @@ Also not an endpoint. `leash version --json` describes the *binary*; this descri
   "native": {                       // leashd as a host process in a systemd scope
     "status": "degraded",           //   ready | degraded | unavailable
     "ready": false,                 //   status == "ready"; never true for degraded
-    "lsm_bpf": "inactive",          //   active | inactive | unknown
+    "lsm_bpf": "inactive",          //   active | inactive | unknown — the active-LSM list read
+    "lsm_bpf_attachable": "unknown",//   attachable | unattachable | unknown — observed, never inferred
     "caps": ["bpf", "net_admin"],   //   effective caps observed, never inferred; [] when unreadable
     "issues": ["…"]                 //   one actionable sentence + remedy per blocker
   },
@@ -267,6 +268,14 @@ Also not an endpoint. `leash version --json` describes the *binary*; this descri
 ```
 
 Field names are snake_case here (they were fixed by issue #23 before the camelCase `version --json` document existed) and additive-only. `caps`, `issues` and `unchecked` are always arrays, never `null`, however the report was produced; `engine` is the only field that can be `null`.
+
+**`lsm_bpf_attachable` is the observed answer; `lsm_bpf` is the proxy for it.** Reading `bpf` out of `/sys/kernel/security/lsm` is cheap and it is a guess: a kernel can list `bpf` and still refuse leash's programs — the verifier can reject `bpf_d_path`, BTF can be absent, ring buffer creation can fail, or a program can exceed the instruction limit (leash's own hard-link guard hit that ceiling in issue #29). So doctor loads leash's *real* LSM programs, lets the kernel verify them, attaches one, and detaches it immediately (issue #52).
+
+- `attachable` — verified and attached. Layer 1 works here, whatever `lsm_bpf` said.
+- `unattachable` — the kernel was asked and said no. Layer 1 does not work here, whatever `lsm_bpf` said, and `issues` carries the kernel's own text plus the remedy for the step that failed (a **verifier** rejection means the kernel cannot run these programs at all; an **attach** rejection means the programs are fine and the kernel is not accepting BPF LSM attachments).
+- `unknown` — nothing was observed, so `lsm_bpf` remains the answer and nothing about the verdict changes. `unchecked` then carries `bpf_lsm_attachable` with the reason: `--quick` was passed, the process lacks CAP_BPF (loading a BPF LSM program needs root or `CAP_BPF`), the platform is not Linux, or the probe did not settle.
+
+`--quick` skips it. The opt-out is the flag rather than an opt-in, so the honest answer is the default one; the report always declares what a `--quick` run did not check. The probe leaves nothing attached and does not disturb a leash already enforcing on the host.
 
 **The three states.** Two were not enough. A host whose container engine works but whose kernel has no active `bpf` LSM *will* start a workload — leash enforces the fail-closed egress proxy (Layer 2) while filesystem, exec and socket policy (Layer 1) is off. `ready` would be a false assurance and `unavailable` would hide a machine that still runs agents:
 
@@ -290,9 +299,10 @@ Field names are snake_case here (they were fixed by issue #23 before the camelCa
 
 Exit `0` is the answer to "can this machine enforce?", so `leash doctor && …` fails closed on `3`. `--help` deliberately exits `2`, not `0`: a provisioner gating on the status must not get a free pass from `leash doctor -help`.
 
-**A `degraded` verdict is not always about the kernel.** Three conditions produce it, and the `issues` text says which:
+**A `degraded` verdict is not always about the kernel.** Four conditions produce it, and the `issues` text says which:
 
-- `bpf` is absent from `/sys/kernel/security/lsm` (`lsm_bpf: "inactive"`), or that list could not be read or was empty (`"unknown"`).
+- leash's LSM programs were loaded and the kernel refused them (`lsm_bpf_attachable: "unattachable"`). This one overrides the list read in both directions — including the case the flag exists for, where `lsm_bpf` is `"active"` and the kernel still says no.
+- `bpf` is absent from `/sys/kernel/security/lsm` (`lsm_bpf: "inactive"`), or that list could not be read or was empty (`"unknown"`), and attachability was not observed.
 - The host is not Linux. Containers then run against a VM kernel doctor never probed — Docker Desktop's LinuxKit kernel, for one, does not carry `bpf`. An unprobed kernel is never `ready`.
 - `DOCKER_HOST` is set. The engine's containers run on a remote daemon's kernel, not the one doctor read, so the Layer 1 claim is withheld rather than borrowed. No remote topology is modelled; `unchecked` gains a `container_kernel` entry.
 
