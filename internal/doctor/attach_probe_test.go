@@ -97,20 +97,169 @@ func TestAttachRefusedWithBPFListedDoesNotAdviseAddingBPF(t *testing.T) {
 	}
 }
 
-// The other direction of "supersedes when observed": programs that actually
-// loaded and attached are Layer 1 working, even if the list read did not say so.
-func TestObservedAttachOverridesTheListReading(t *testing.T) {
+// THE REGRESSION GUARD (CAP-1a). Read this one before changing
+// layer1Unavailable.
+//
+// This exact combination — the active LSM list says bpf is NOT there, and the
+// probe reports the programs attached anyway — shipped as `ready`, exit 0, zero
+// issues on a real Proxmox host (PVE 9.1.8, kernel 6.17.13-3-pve, active LSMs
+// "lockdown,capability,yama,apparmor,ima,evm"), where the build before the
+// probe correctly said `degraded`, exit 3. The first version of the spec said
+// an observation "supersedes the list reading in both directions"; it does not.
+//
+// A BPF_PROG_TYPE_LSM program loads and attaches perfectly well on a
+// CONFIG_BPF_LSM=y kernel with no "bpf" in the active LSM list. The attach
+// succeeds and the hook is never invoked, because the bpf LSM is not registered
+// in the active stack. "attachable" there is true and operationally meaningless,
+// so it must not be able to move the verdict.
+//
+// No unit test caught the original defect because every test encoded the same
+// wrong premise the spec did. This one exists so that cannot happen twice.
+func TestAttachableCannotResurrectAnInactiveLSMList(t *testing.T) {
 	h := readyHost()
-	h.BPFLSM = runner.LSMUnknown
-	h.BPFLSMAdvice = "the active LSM list could not be read"
+	h.BPFLSM = runner.LSMInactive
+	h.BPFLSMAdvice = "add bpf to the lsm= boot parameter"
+	// The probe genuinely succeeded. It still means nothing here.
 	h.BPFLSMAttach = lsm.AttachProbe{State: lsm.AttachAttachable}
 
 	got := Evaluate(h)
-	if !got.Native.Ready() {
-		t.Errorf("leash's programs attached on this kernel; that is Layer 1 working: %v", got.Native.Issues)
+
+	if got.Native.Ready() {
+		t.Error("bpf is not in the active LSM list, so the hooks are never invoked: this host does NOT enforce Layer 1, whatever attached")
+	}
+	if got.Native.Status != StatusDegraded {
+		t.Errorf("native status = %v, want degraded (the runtime still runs proxy-only)", got.Native.Status)
+	}
+	if got.Container.Status != StatusDegraded {
+		t.Errorf("container status = %v, want degraded: a local container shares this kernel", got.Container.Status)
+	}
+	if got.Verdict() != StatusDegraded {
+		t.Errorf("verdict = %v, want degraded", got.Verdict())
+	}
+	if got.ExitCode() != exitDegraded {
+		t.Errorf("exit = %d, want %d — a provisioner gating on `leash doctor && …` must fail closed here", got.ExitCode(), exitDegraded)
+	}
+	if len(got.Native.Issues) == 0 {
+		t.Fatal("a degraded host with no issue text is the false assurance in a new costume")
+	}
+
+	// The document carries both signals, and they look contradictory to a reader
+	// who is not told why. Say why.
+	joined := strings.Join(got.Native.Issues, "\n")
+	if !strings.Contains(joined, "lsm=") {
+		t.Errorf("the remedy is the boot parameter, and it must survive the probe's success:\n%s", joined)
+	}
+	if !strings.Contains(joined, "never invoked") {
+		t.Errorf("explain the attachable-but-not-enforcing combination rather than leaving the reader to reconcile it:\n%s", joined)
+	}
+	// The observation itself is still reported — it was made, and CAP-4 says an
+	// observed prerequisite leaves the unchecked list. What it must not do is
+	// change the verdict.
+	if got.Native.LSMBPFAttachable != lsm.AttachAttachable {
+		t.Errorf("attachable = %v: the observation is reported honestly, it just does not decide", got.Native.LSMBPFAttachable)
 	}
 	if hasUnchecked(got.Unchecked, "bpf_lsm_attachable") {
 		t.Error("attachability was observed, so it must leave the unchecked list")
+	}
+}
+
+// CAP-1a in full: every cell of the truth table, in both directions. The
+// relation between the list and the probe is conjunctive — the probe may only
+// narrow what the list allows.
+func TestLayer1TruthTable(t *testing.T) {
+	attachable := lsm.AttachProbe{State: lsm.AttachAttachable}
+	unknown := lsm.SkippedAttachProbe("this process is not privileged enough")
+
+	cases := []struct {
+		name     string
+		list     runner.LSMState
+		probe    lsm.AttachProbe
+		wantDown bool // Layer 1 unavailable
+	}{
+		// An inactive list is decisive: no observation widens it.
+		{"inactive list, attachable", runner.LSMInactive, attachable, true},
+		{"inactive list, unattachable (verify)", runner.LSMInactive, verifierRejected("no BTF"), true},
+		{"inactive list, unattachable (attach)", runner.LSMInactive, attachRefused("attach lsm: invalid argument"), true},
+		{"inactive list, unknown", runner.LSMInactive, unknown, true},
+
+		// An unreadable list is not an active one, and never was.
+		{"unreadable list, attachable", runner.LSMUnknown, attachable, true},
+		{"unreadable list, unknown", runner.LSMUnknown, unknown, true},
+
+		// An active list is the only one the probe gets to narrow.
+		{"active list, attachable", runner.LSMActive, attachable, false},
+		{"active list, unattachable (verify)", runner.LSMActive, verifierRejected("program too large"), true},
+		{"active list, unattachable (attach)", runner.LSMActive, attachRefused("attach lsm: invalid argument"), true},
+		{"active list, unknown", runner.LSMActive, unknown, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := readyHost()
+			h.BPFLSM = c.list
+			if c.list != runner.LSMActive {
+				h.BPFLSMAdvice = "add bpf to the lsm= boot parameter"
+			}
+			h.BPFLSMAttach = c.probe
+
+			// The function under test, directly...
+			down, remedy := layer1Unavailable(h)
+			if down != c.wantDown {
+				t.Errorf("layer1Unavailable = %v, want %v", down, c.wantDown)
+			}
+			if down && strings.TrimSpace(remedy) == "" {
+				t.Error("an unavailable Layer 1 is never reported without a next step")
+			}
+			if !down && remedy != "" {
+				t.Errorf("an available Layer 1 carries no remedy, got %q", remedy)
+			}
+
+			// ...and through the report both runtimes read it from, because the
+			// regression was only visible there.
+			got := Evaluate(h)
+			wantStatus := StatusReady
+			if c.wantDown {
+				wantStatus = StatusDegraded
+			}
+			if got.Native.Status != wantStatus {
+				t.Errorf("native status = %v, want %v", got.Native.Status, wantStatus)
+			}
+			if got.Container.Status != wantStatus {
+				t.Errorf("container status = %v, want %v (a local container shares this kernel)", got.Container.Status, wantStatus)
+			}
+			if got.Native.Ready() == c.wantDown {
+				t.Errorf("native ready = %v with Layer 1 down = %v", got.Native.Ready(), c.wantDown)
+			}
+		})
+	}
+}
+
+// The narrowing is one-way by construction, not by coincidence: for every
+// active-list answer, no probe result may produce a *better* verdict than the
+// list alone would have. Stated as a property so a future fourth attach state
+// cannot quietly reintroduce the widening.
+func TestAttachabilityOnlyEverNarrows(t *testing.T) {
+	probes := map[string]lsm.AttachProbe{
+		"attachable":   {State: lsm.AttachAttachable},
+		"unattachable": attachRefused("attach lsm: invalid argument"),
+		"unknown":      lsm.SkippedAttachProbe("not privileged enough"),
+	}
+	for _, list := range []runner.LSMState{runner.LSMActive, runner.LSMInactive, runner.LSMUnknown} {
+		base := readyHost()
+		base.BPFLSM = list
+		if list != runner.LSMActive {
+			base.BPFLSMAdvice = "add bpf to the lsm= boot parameter"
+		}
+		// What the merged build (list only, no probe) said.
+		listOnly, _ := layer1Unavailable(base)
+
+		for name, probe := range probes {
+			h := base
+			h.BPFLSMAttach = probe
+			down, _ := layer1Unavailable(h)
+			if listOnly && !down {
+				t.Errorf("list %v alone said Layer 1 unavailable; probe %q widened it to available", list, name)
+			}
+		}
 	}
 }
 

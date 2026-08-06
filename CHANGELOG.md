@@ -54,6 +54,16 @@ Claude Code handling on top.
   can exceed the instruction limit (leash's own hard-link guard hit that ceiling
   in issue #29). Such a host used to report `lsm_bpf: active` and `ready`; it now
   reports `degraded` and names the kernel's reason (issue #52).
+- **Attachability narrows the Layer 1 verdict; it never widens it.** The two
+  signals are conjunctive: `bpf` must be in the active LSM list *and* the
+  programs must attach. An `inactive` list is decisive whatever the probe saw,
+  because `attachable` does not mean what it looks like there — a
+  `BPF_PROG_TYPE_LSM` program loads and attaches perfectly well on a
+  `CONFIG_BPF_LSM=y` kernel that was not booted with `bpf` in `lsm=`, and the
+  hook is then never invoked, so the successful attach enforces nothing. Where
+  that combination occurs the `issues` text says it out loud rather than leaving
+  a reader to reconcile `lsm_bpf: inactive` with
+  `lsm_bpf_attachable: attachable`.
 - **The probe uses the shipped programs, not a stand-in.** It goes through the
   same `loadLsmOpen` → `ebpf.NewCollection` → `link.AttachLSM` path a real run
   takes, including the optional-hook handling, so what doctor tests cannot drift
@@ -103,8 +113,8 @@ Claude Code handling on top.
   so it must hold CAP_BPF", which is wrong in precisely the environments that
   would consult it (darwin; a container with a masked `/proc`).
 - **Prerequisites doctor does not check are named in the output**, not silently
-  omitted: `bpf_lsm_attachable` (since superseded by the attachability probe
-  above, and still declared whenever that probe did not settle it),
+  omitted: `bpf_lsm_attachable` (now answered by the attachability probe above,
+  and still declared whenever that probe did not settle it),
   `bpf_d_path_ringbuf`, `netns_iptables`, plus `capabilities` and
   `container_kernel` when they apply.
 - **`default_runtime` is in the document.** The verdict is the best state any

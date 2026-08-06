@@ -59,11 +59,11 @@ type Host struct {
 	BPFLSMAdvice string
 
 	// BPFLSMAttach is what the kernel said when leash's real LSM programs were
-	// loaded, verified and attached (lsm.ProbeAttachable). BPFLSM above is a
-	// proxy for this — a kernel can list "bpf" and still refuse the programs —
-	// so an observation here supersedes the list, and only when there is one:
-	// the state is unknown whenever the probe was skipped or could not reach a
-	// verdict, and Detail then names which.
+	// loaded, verified and attached (lsm.ProbeAttachable). It is a second,
+	// *conjunctive* signal beside BPFLSM, not a replacement for it: an
+	// observation here can only narrow the Layer 1 verdict the list gives, never
+	// widen it (see layer1Unavailable). The state is unknown whenever the probe
+	// was skipped or could not reach a verdict, and Detail then names which.
 	BPFLSMAttach lsm.AttachProbe
 
 	// ContainerEngine is the container CLI `leash run --runtime docker/podman`
@@ -404,38 +404,76 @@ func evaluateContainer(h Host) ContainerReport {
 }
 
 // layer1Unavailable is the single Layer 1 verdict both runtimes read, and the
-// only place the observation is weighed against the guess.
+// only place the observation is weighed against the list.
 //
-// An observation supersedes the active-LSM list, in both directions: a kernel
-// that lists "bpf" and still refuses leash's programs is not enforcing (the
-// case issue #52 exists for), and a kernel that actually attached them is
-// enforcing whatever the list said. An unknown observation changes nothing —
-// the list stays the answer, exactly as before this probe existed.
+// The two signals are CONJUNCTIVE, and the direction matters — getting it wrong
+// is a regression this function was already shipped with once. An attach
+// observation may only NARROW the list's answer:
+//
+//	active list | attachability            | Layer 1
+//	------------+--------------------------+-------------------
+//	inactive    | anything, incl attachable| unavailable
+//	active      | attachable               | available
+//	active      | unattachable             | unavailable  (issue #52)
+//	active      | unknown                  | fall back to the list
+//
+// An inactive (or unreadable) list is decisive, because "attachable" does not
+// mean what it looks like there: a BPF_PROG_TYPE_LSM program loads and attaches
+// perfectly well on a CONFIG_BPF_LSM=y kernel whose active LSM list has no
+// "bpf" in it — the bpf LSM is simply not registered in the active stack, so
+// the hook is never invoked and the successful attach enforces nothing. Letting
+// that observation override the list turned a correctly `degraded`/exit 3
+// Proxmox host into `ready`/exit 0 with zero issues, which is precisely the
+// false assurance this command exists to prevent.
+//
+// The other direction is the reason the probe exists: a kernel that lists "bpf"
+// and still refuses leash's programs is not enforcing. An unknown observation
+// changes nothing — the list stays the answer, exactly as before this probe
+// existed.
 func layer1Unavailable(h Host) (down bool, remedy string) {
+	// The list first, and decisively: nothing the probe can observe makes an
+	// unregistered bpf LSM enforce.
+	if h.BPFLSM != runner.LSMActive {
+		return true, inactiveListAdvice(h)
+	}
+	if h.BPFLSMAttach.State == lsm.AttachUnattachable {
+		return true, attachAdvice(h)
+	}
+	return false, ""
+}
+
+// inactiveListAdvice renders the remedy for a Layer 1 the active-LSM list has
+// already settled. The probe's observation cannot change that verdict, but it
+// is in the same document under lsm_bpf_attachable, so the text has to account
+// for it: a reader who sees "attachable" beside "not enforcing" and is left to
+// reconcile the two on their own will reconcile them wrongly.
+func inactiveListAdvice(h Host) string {
+	advice := lsmAdvice(h)
 	switch h.BPFLSMAttach.State {
 	case lsm.AttachAttachable:
-		return false, ""
+		return fmt.Sprintf(`NOTE: doctor's probe DID load and attach leash's LSM programs (this kernel is built with CONFIG_BPF_LSM=y), but "bpf" is not in the active LSM list, so the bpf LSM is not registered in the active stack and those hooks are never invoked. A successful attach here enforces nothing, which is why it does not change this verdict.
+%s`, advice)
 	case lsm.AttachUnattachable:
-		return true, attachAdvice(h)
+		detail := attachDetail(h)
+		return fmt.Sprintf(`doctor loaded leash's own eBPF LSM programs and this kernel refused them (observed, not inferred):
+  %s
+%s`, detail, advice)
 	default:
-		if h.BPFLSM == runner.LSMActive {
-			return false, ""
-		}
-		return true, lsmAdvice(h)
+		return advice
 	}
 }
 
-// attachAdvice renders the remedy for an observed attach failure. The stage is
-// what selects it: a verifier rejection means this kernel cannot run leash's
+// attachAdvice renders the remedy for an observed attach failure on a host
+// whose active-LSM list says "bpf" — the case issue #52 exists for, and the
+// only one that reaches here (an inactive list is answered by
+// inactiveListAdvice, which has a different root cause to name). The stage
+// selects the text: a verifier rejection means this kernel cannot run leash's
 // programs at all, while an attach rejection means the programs are fine and
 // the kernel is not accepting BPF LSM attachments. Different fixes, so they are
 // never collapsed into one sentence. The kernel's own text is quoted in both,
 // because it is the part that actually says which helper or limit was hit.
 func attachAdvice(h Host) string {
-	detail := strings.TrimSpace(h.BPFLSMAttach.Detail)
-	if detail == "" {
-		detail = "(the kernel gave no reason)"
-	}
+	detail := attachDetail(h)
 	if h.BPFLSMAttach.Stage == lsm.AttachStageVerify {
 		return fmt.Sprintf(`doctor loaded leash's own eBPF LSM programs and this kernel's verifier rejected them (observed, not inferred):
   %s
@@ -453,6 +491,16 @@ Boot a kernel built with CONFIG_BPF_LSM=y and CONFIG_DEBUG_INFO_BTF=y (Linux >= 
 	return fmt.Sprintf(`doctor loaded leash's own eBPF LSM programs — they verified, and this kernel refused to attach them (observed, not inferred):
   %s
 %s`, detail, remedy)
+}
+
+// attachDetail is the kernel's own words about a refusal, which are the
+// actionable part of an unattachable verdict — never summarised, and never
+// silently absent.
+func attachDetail(h Host) string {
+	if detail := strings.TrimSpace(h.BPFLSMAttach.Detail); detail != "" {
+		return detail
+	}
+	return "(the kernel gave no reason)"
 }
 
 // lsmAdvice picks the probe's kernel-specific remedy, falling back to a generic

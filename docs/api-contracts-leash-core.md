@@ -269,11 +269,22 @@ Also not an endpoint. `leash version --json` describes the *binary*; this descri
 
 Field names are snake_case here (they were fixed by issue #23 before the camelCase `version --json` document existed) and additive-only. `caps`, `issues` and `unchecked` are always arrays, never `null`, however the report was produced; `engine` is the only field that can be `null`.
 
-**`lsm_bpf_attachable` is the observed answer; `lsm_bpf` is the proxy for it.** Reading `bpf` out of `/sys/kernel/security/lsm` is cheap and it is a guess: a kernel can list `bpf` and still refuse leash's programs — the verifier can reject `bpf_d_path`, BTF can be absent, ring buffer creation can fail, or a program can exceed the instruction limit (leash's own hard-link guard hit that ceiling in issue #29). So doctor loads leash's *real* LSM programs, lets the kernel verify them, attaches one, and detaches it immediately (issue #52).
+**`lsm_bpf_attachable` is a second, observed signal beside `lsm_bpf`, not a replacement for it.** Reading `bpf` out of `/sys/kernel/security/lsm` is cheap, and on its own it is a guess: a kernel can list `bpf` and still refuse leash's programs — the verifier can reject `bpf_d_path`, BTF can be absent, ring buffer creation can fail, or a program can exceed the instruction limit (leash's own hard-link guard hit that ceiling in issue #29). So doctor loads leash's *real* LSM programs, lets the kernel verify them, attaches one, and detaches it immediately (issue #52).
 
-- `attachable` — verified and attached. Layer 1 works here, whatever `lsm_bpf` said.
-- `unattachable` — the kernel was asked and said no. Layer 1 does not work here, whatever `lsm_bpf` said, and `issues` carries the kernel's own text plus the remedy for the step that failed (a **verifier** rejection means the kernel cannot run these programs at all; an **attach** rejection means the programs are fine and the kernel is not accepting BPF LSM attachments).
-- `unknown` — nothing was observed, so `lsm_bpf` remains the answer and nothing about the verdict changes. `unchecked` then carries `bpf_lsm_attachable` with the reason: `--quick` was passed, the process lacks CAP_BPF (loading a BPF LSM program needs root or `CAP_BPF`), the platform is not Linux, or the probe did not settle.
+- `attachable` — the programs verified, attached and were detached again.
+- `unattachable` — the kernel was asked and said no, and `issues` carries the kernel's own text plus the remedy for the step that failed (a **verifier** rejection means the kernel cannot run these programs at all; an **attach** rejection means the programs are fine and the kernel is not accepting BPF LSM attachments).
+- `unknown` — nothing was observed. `unchecked` then carries `bpf_lsm_attachable` with the reason: `--quick` was passed, the process lacks CAP_BPF (loading a BPF LSM program needs root or `CAP_BPF`), the platform is not Linux, or the probe did not settle.
+
+**The two signals are conjunctive: attachability only ever narrows the Layer 1 verdict, never widens it.** Both must be good for Layer 1 to count as available:
+
+| `lsm_bpf` | `lsm_bpf_attachable` | Layer 1 |
+|---|---|---|
+| `inactive` / `unknown` | anything, **including `attachable`** | unavailable |
+| `active` | `attachable` | available |
+| `active` | `unattachable` | unavailable (the case the probe exists for) |
+| `active` | `unknown` | falls back to the list: available |
+
+`attachable` on a host whose list has no `bpf` does **not** mean Layer 1 works, and doctor does not report it that way. A `BPF_PROG_TYPE_LSM` program loads and attaches perfectly well on a `CONFIG_BPF_LSM=y` kernel that was not booted with `bpf` in `lsm=` — the attach succeeds, and the hook is never invoked, because the bpf LSM is not registered in the active stack. The `issues` text says so explicitly when the combination occurs, so the two fields never have to be reconciled by the reader.
 
 `--quick` skips it. The opt-out is the flag rather than an opt-in, so the honest answer is the default one; the report always declares what a `--quick` run did not check. The probe leaves nothing attached and does not disturb a leash already enforcing on the host.
 
@@ -301,14 +312,14 @@ Exit `0` is the answer to "can this machine enforce?", so `leash doctor && …` 
 
 **A `degraded` verdict is not always about the kernel.** Four conditions produce it, and the `issues` text says which:
 
-- leash's LSM programs were loaded and the kernel refused them (`lsm_bpf_attachable: "unattachable"`). This one overrides the list read in both directions — including the case the flag exists for, where `lsm_bpf` is `"active"` and the kernel still says no.
-- `bpf` is absent from `/sys/kernel/security/lsm` (`lsm_bpf: "inactive"`), or that list could not be read or was empty (`"unknown"`), and attachability was not observed.
+- `bpf` is absent from `/sys/kernel/security/lsm` (`lsm_bpf: "inactive"`), or that list could not be read or was empty (`"unknown"`). This holds whatever the attach probe observed — see the conjunctive table above.
+- The list says `bpf` is there and leash's LSM programs were loaded and refused anyway (`lsm_bpf: "active"`, `lsm_bpf_attachable: "unattachable"`) — the case the probe exists for.
 - The host is not Linux. Containers then run against a VM kernel doctor never probed — Docker Desktop's LinuxKit kernel, for one, does not carry `bpf`. An unprobed kernel is never `ready`.
 - `DOCKER_HOST` is set. The engine's containers run on a remote daemon's kernel, not the one doctor read, so the Layer 1 claim is withheld rather than borrowed. No remote topology is modelled; `unchecked` gains a `container_kernel` entry.
 
 **`default_runtime` is not the verdict.** `verdict` is the best state *any* runtime reaches, but `leash run` with neither `--runtime` nor `LEASH_RUNTIME` selects exactly one runtime and never falls back. On this build that is `native`, so a Linux host with no systemd and a working docker reports `verdict: ready` while a bare `leash run` fails. Compare `default_runtime` against that runtime's `status` (`native` → `native.status`, `docker`/`podman` → `container.status`); the human output prints the same warning in prose.
 
-**What doctor does not check** is in the document, not just in this page: `unchecked` always names `bpf_lsm_attachable` (the check is list-based — it does not load and attach a probe program, leash issue #52), `bpf_d_path_ringbuf`, and `netns_iptables`, plus `capabilities` when `/proc/self/status` was unreadable and `container_kernel` in the two cases above. A `ready` verdict must be read as exactly that list of things unverified.
+**What doctor does not check** is in the document, not just in this page: `unchecked` always names `bpf_d_path_ringbuf` and `netns_iptables`, plus `bpf_lsm_attachable` whenever the attach probe did not settle it (`--quick`, insufficient privilege, non-Linux, timeout), `capabilities` when `/proc/self/status` was unreadable and `container_kernel` in the two cases above. A `ready` verdict must be read as exactly that list of things unverified.
 
 Two caveats a script should know. Doctor writes its whole report in one `Write`, so a closed stdout (`leash doctor --json | head -1`) is reported as exit `4` — except that Go raises `SIGPIPE` on fd 1, so the process is more likely to die of the signal (`141` from a shell) than to reach that code; doctor does not trap signals to paper over this. And an engine probe that hangs is bounded by a 5 s timeout on `<engine> info`, after which the daemon is reported unreachable — the CLI is killed, but a grandchild the client itself spawned is not process-group-killed and may outlive it.
 
