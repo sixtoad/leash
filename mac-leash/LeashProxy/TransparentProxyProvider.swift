@@ -25,6 +25,11 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
     // leash-tracked PIDs (the launched command + its lineage), synced from the ES
     // extension via the daemon. Only flows from these are routed through the proxy.
     private var trackedPIDs: Set<pid_t> = []
+    // Verbose per-flow debug diagnostics gate, delivered from the daemon via the
+    // "mac.debug" message (controlled by LEASH_MAC_DEBUG). Off in normal operation;
+    // when on, the proxy emits proxy.start/proxy.pids/proxy.flow to the daemon log.
+    // Accessed only on stateQueue.
+    private var debugEnabled = false
 
     // MARK: - Lifecycle
 
@@ -32,6 +37,18 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         // Track the same PID set the content filter uses, delivered over the daemon.
         daemon.subscribe(to: "mac.pid.sync") { [weak self] payload in
             self?.handlePIDUpdate(payload)
+        }
+
+        // Debug-logging flag from the daemon (LEASH_MAC_DEBUG). Toggling it is a
+        // daemon restart — no extension re-activation.
+        daemon.subscribe(to: "mac.debug") { [weak self] payload in
+            guard let self else { return }
+            let enabled = (payload["enabled"] as? Bool) ?? false
+            self.stateQueue.async {
+                self.debugEnabled = enabled
+                os_log("Proxy debug logging %{public}@", log: self.log, type: .default,
+                       enabled ? "enabled" : "disabled")
+            }
         }
 
         let settings = NETransparentProxyNetworkSettings(tunnelRemoteAddress: proxyHost)
@@ -53,11 +70,24 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             if let error {
                 os_log("Failed to apply transparent proxy settings: %{public}@",
                        log: self.log, type: .error, String(describing: error))
+                self.debugEvent("proxy.start", ["status": "error", "error": String(describing: error)])
             } else {
                 os_log("Transparent proxy started (relaying to %{public}@:%{public}d)",
                        log: self.log, type: .default, self.proxyHost, self.proxyPort.rawValue)
+                self.debugEvent("proxy.start", ["status": "started",
+                                                "relay": "\(self.proxyHost):\(self.proxyPort.rawValue)"])
             }
             completionHandler(error)
+        }
+    }
+
+    /// Emit a verbose diagnostic to the daemon (visible in the readable daemon log)
+    /// only when debug logging is enabled. Consolidates the transparent-proxy
+    /// instrumentation behind the single LEASH_MAC_DEBUG-controlled gate.
+    private func debugEvent(_ name: String, _ details: [String: String]) {
+        stateQueue.async { [weak self] in
+            guard let self, self.debugEnabled else { return }
+            self.daemon.sendEvent(name: name, details: details, severity: "info", source: "leash.proxy")
         }
     }
 
@@ -80,6 +110,10 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
             guard let self else { return }
             self.trackedPIDs = pids
             os_log("Proxy tracking %{public}d PIDs", log: self.log, type: .default, pids.count)
+            if self.debugEnabled {
+                self.daemon.sendEvent(name: "proxy.pids", details: ["count": String(pids.count)],
+                                      severity: "info", source: "leash.proxy")
+            }
         }
     }
 
@@ -104,12 +138,28 @@ final class TransparentProxyProvider: NETransparentProxyProvider {
         // Only route leash-tracked processes through the proxy; everything else passes
         // straight through untouched.
         let pid = sourcePID(for: flow)
-        let isTracked = stateQueue.sync { pid != 0 && trackedPIDs.contains(pid) }
+        let dest = originalDestination(for: tcpFlow)
+        let (isTracked, trackedCount, debug) = stateQueue.sync {
+            (pid != 0 && trackedPIDs.contains(pid), trackedPIDs.count, debugEnabled)
+        }
+
+        // Verbose per-flow diagnostic (LEASH_MAC_DEBUG): shows whether leash-tracked
+        // flows reach the provider and how PID gating resolves. Details are only built
+        // when debug is on, so the normal path stays allocation-free here.
+        if debug && pid != 0 {
+            daemon.sendEvent(name: "proxy.flow", details: [
+                "pid": String(pid),
+                "tracked": isTracked ? "yes" : "no",
+                "tracked_count": String(trackedCount),
+                "dest": dest.map { "\($0.host):\($0.port)" } ?? "unresolved",
+            ], severity: "info", source: "leash.proxy")
+        }
+
         guard isTracked else {
             return false
         }
 
-        guard let dest = originalDestination(for: tcpFlow) else {
+        guard let dest else {
             os_log("Tracked flow (pid=%{public}d) has no resolvable destination", log: log, type: .error, pid)
             return false
         }
