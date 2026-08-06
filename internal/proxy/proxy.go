@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -76,6 +77,16 @@ func createMarkedDialer() *net.Dialer {
 		Timeout:   30 * time.Second,
 		KeepAlive: 30 * time.Second,
 		Control: func(network, address string, c syscall.RawConn) error {
+			// SO_MARK is Linux-only — it marks the proxy's own upstream connections
+			// so the netfilter REDIRECT rule skips them (iptables loop-avoidance). On
+			// macOS setsockopt(SO_MARK) fails with ENOPROTOOPT ("protocol not
+			// available") and returning that error breaks the upstream dial entirely.
+			// The macOS path uses the NETransparentProxyProvider, which only intercepts
+			// leash-tracked PIDs; the proxy's upstream comes from the untracked daemon
+			// process, so there is no loop to avoid and nothing to mark.
+			if runtime.GOOS != "linux" {
+				return nil
+			}
 			var err error
 			c.Control(func(fd uintptr) {
 				// Set SO_MARK on the socket to mark proxy traffic

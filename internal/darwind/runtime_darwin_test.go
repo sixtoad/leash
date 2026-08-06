@@ -295,3 +295,37 @@ func TestPreFlightRepairsPrivateKeyPermissions(t *testing.T) {
 		t.Fatalf("expected new=0600 in log, got %q", output)
 	}
 }
+
+func TestExecEnvWithCACert(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("LEASH_DIR", dir)
+	t.Setenv("LEASH_CA_CERT", "")
+	base := []string{"PATH=/usr/bin"}
+
+	// No CA file yet: nothing injected.
+	if got := execEnvWithCACert(base); len(got) != len(base) {
+		t.Fatalf("expected no injection before CA exists, got %v", got)
+	}
+
+	// CA present: LEASH_CA_CERT injected; LEASH_DIR already set so not duplicated.
+	caPath := filepath.Join(dir, "ca-cert.pem")
+	if err := os.WriteFile(caPath, []byte("cert"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := execEnvWithCACert(base)
+	var haveCA, dirCount int
+	for _, kv := range got {
+		if kv == "LEASH_CA_CERT="+caPath {
+			haveCA++
+		}
+		if strings.HasPrefix(kv, "LEASH_DIR=") {
+			dirCount++
+		}
+	}
+	if haveCA != 1 {
+		t.Fatalf("expected LEASH_CA_CERT=%s injected once, got %v", caPath, got)
+	}
+	if dirCount != 0 {
+		t.Fatalf("LEASH_DIR already set in env; function should not re-append it, got %v", got)
+	}
+}

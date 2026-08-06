@@ -147,7 +147,37 @@ func runExec(args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
+	cmd.Env = execEnvWithCACert(os.Environ())
 	return cmd.Run()
+}
+
+// execEnvWithCACert augments the leashcli environment so it can locate the leash
+// MITM CA certificate and inject it into the launched workload's trust store
+// (SSL_CERT_FILE / CURL_CA_BUNDLE / NODE_EXTRA_CA_CERTS / ...). The daemon writes
+// the CA to $LEASH_DIR/ca-cert.pem (default $TMPDIR/leash). The `leash --darwin
+// exec` client is a separate process that does not run the daemon's runtime setup,
+// so it lacks LEASH_DIR; without this, leashcli falls back to /leash/ca-cert.pem
+// (a Linux container path that doesn't exist on macOS) and injects nothing —
+// leaving HTTPS flows through the MITM proxy untrusted (curl: "self signed
+// certificate in certificate chain").
+func execEnvWithCACert(base []string) []string {
+	publicDir := strings.TrimSpace(os.Getenv("LEASH_DIR"))
+	if publicDir == "" {
+		publicDir = filepath.Join(os.TempDir(), "leash")
+	}
+	caPath := filepath.Join(publicDir, "ca-cert.pem")
+	if _, err := os.Stat(caPath); err != nil {
+		// No CA yet (proxy hasn't generated one) — inject nothing.
+		return base
+	}
+	env := append([]string(nil), base...)
+	if strings.TrimSpace(os.Getenv("LEASH_DIR")) == "" {
+		env = append(env, "LEASH_DIR="+publicDir)
+	}
+	if strings.TrimSpace(os.Getenv("LEASH_CA_CERT")) == "" {
+		env = append(env, "LEASH_CA_CERT="+caPath)
+	}
+	return env
 }
 
 func parseExecCLIArgs(args []string) (string, []string, error) {
