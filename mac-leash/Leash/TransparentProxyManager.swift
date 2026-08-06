@@ -41,14 +41,38 @@ final class TransparentProxyManager {
 
         let manager = try await loadManager()
 
-        // Skip the save if already configured + enabled — an unconditional
-        // saveToPreferences can trigger a redundant system authorization prompt.
-        if manager.isEnabled,
+        // Skip the save only if the provider is genuinely running. isEnabled alone is
+        // unreliable — loadAllFromPreferences can return a stale isEnabled=true while
+        // the provider is not actually running (e.g. after a sysext replacement), so we
+        // also require the connection to be connected before short-circuiting.
+        if manager.isEnabled, manager.connection.status == .connected,
            let existing = manager.protocolConfiguration as? NETunnelProviderProtocol,
            existing.providerBundleIdentifier == LeashIdentifiers.transparentProxyExtension {
             return
         }
 
+        try await applyEnabledConfig(manager)
+    }
+
+    /// (Re)start the provider by forcing an off->on transition. Re-saving an already-
+    /// (stale-)enabled config is a no-op the system ignores — it only (re)launches the
+    /// provider on an actual isEnabled false->true edge. So if it currently reads
+    /// enabled, disable+save first, then enable+save. This mirrors what toggling "Leash
+    /// Proxy" off then on in System Settings does.
+    private func forceRestart(_ manager: NETransparentProxyManager) async throws {
+        if manager.isEnabled {
+            manager.isEnabled = false
+            try await manager.saveToPreferences()
+            try await manager.loadFromPreferences()
+        }
+        try await applyEnabledConfig(manager)
+    }
+
+    /// Build the enabled LeashProxy config on `manager`, save it, and reload so the
+    /// change takes effect. NE requires a reload after every save to sync the in-memory
+    /// manager with what was persisted; without it isEnabled can fail to apply and the
+    /// provider won't (re)start.
+    private func applyEnabledConfig(_ manager: NETransparentProxyManager) async throws {
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = LeashIdentifiers.transparentProxyExtension
         // serverAddress is required by the API but unused for a transparent proxy;
@@ -60,6 +84,19 @@ final class TransparentProxyManager {
         manager.isEnabled = true
 
         try await manager.saveToPreferences()
+        try await manager.loadFromPreferences()
+
+        // Explicitly start the provider session. The system auto-starts it on a fresh
+        // enable, but after a sysext replacement the session stays disconnected until
+        // started — save alone doesn't launch the provider. Best-effort: throws e.g. if
+        // already connected, which is fine.
+        do {
+            try manager.connection.startVPNTunnel()
+        } catch {
+            DaemonSync.shared.sendEvent(name: "proxy.reconcile",
+                                        details: ["start_error": "\(error)"],
+                                        severity: "error", source: "leash.app")
+        }
     }
 
     func deactivate() async throws {
@@ -75,6 +112,7 @@ final class TransparentProxyManager {
         if manager.isEnabled {
             manager.isEnabled = false
             try await manager.saveToPreferences()
+            try await manager.loadFromPreferences() // reload so the disable takes effect
         }
         // The user turned the proxy off; don't resurrect it on the next launch.
         userIntendsEnabled = false
@@ -92,12 +130,33 @@ final class TransparentProxyManager {
     /// so a Settings-side disable is overridden on next launch. Use the app's own
     /// disable control (deactivate) to turn the proxy off persistently.
     func reconcileOnLaunch() async {
-        guard userIntendsEnabled else { return }
-        switch await currentState() {
-        case .configuredEnabled:
+        let intent = userIntendsEnabled
+        guard intent else {
+            DaemonSync.shared.sendEvent(name: "proxy.reconcile", details: ["intent": "no"],
+                                        severity: "info", source: "leash.app")
             return
-        case .configuredDisabled, .notConfigured:
-            try? await activate()
+        }
+        do {
+            let manager = try await loadManager()
+            let enabled = manager.isEnabled
+            let status = manager.connection.status
+            // Report the reconcile decision to the daemon log (app os_log doesn't
+            // surface in the dev VM). One event per launch.
+            DaemonSync.shared.sendEvent(name: "proxy.reconcile",
+                                        details: ["intent": "yes", "enabled": enabled ? "yes" : "no",
+                                                  "status": "\(status.rawValue)"],
+                                        severity: "info", source: "leash.app")
+            // Truly running only if enabled AND the provider session is connected.
+            // isEnabled alone is stale after a sysext replacement (reads true while the
+            // provider is dead), so restart to (re)bind and start the provider.
+            if enabled, status == .connected { return }
+            try await forceRestart(manager)
+            DaemonSync.shared.sendEvent(name: "proxy.reconcile", details: ["result": "restarted"],
+                                        severity: "info", source: "leash.app")
+        } catch {
+            DaemonSync.shared.sendEvent(name: "proxy.reconcile",
+                                        details: ["result": "error", "error": "\(error)"],
+                                        severity: "error", source: "leash.app")
         }
     }
 

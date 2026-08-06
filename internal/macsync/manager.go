@@ -372,9 +372,9 @@ func (m *Manager) LogMacEvent(event *messages.MacEventPayload) error {
 	if reason := strings.TrimSpace(detailMap["reason"]); reason != "" {
 		fields = append(fields, fmt.Sprintf("reason=%q", reason))
 	}
-	// Debug/diagnostic telemetry fields (e.g. the transparent-proxy proxy.flow /
-	// proxy.pids / proxy.start events, emitted only when LEASH_MAC_DEBUG is on).
-	for _, k := range []string{"tracked", "tracked_count", "count", "relay"} {
+	// Debug/diagnostic telemetry fields (transparent-proxy proxy.flow / proxy.pids /
+	// proxy.start under LEASH_MAC_DEBUG, and the app's proxy.reconcile launch check).
+	for _, k := range []string{"tracked", "tracked_count", "count", "relay", "intent", "enabled", "status", "result", "new_status"} {
 		if v := strings.TrimSpace(detailMap[k]); v != "" {
 			fields = append(fields, fmt.Sprintf("%s=%s", k, v))
 		}
@@ -382,8 +382,10 @@ func (m *Manager) LogMacEvent(event *messages.MacEventPayload) error {
 	if dest := strings.TrimSpace(detailMap["dest"]); dest != "" {
 		fields = append(fields, fmt.Sprintf("dest=%q", dest))
 	}
-	if errMsg := strings.TrimSpace(detailMap["error"]); errMsg != "" {
-		fields = append(fields, fmt.Sprintf("error=%q", errMsg))
+	for _, k := range []string{"error", "start_error"} {
+		if v := strings.TrimSpace(detailMap[k]); v != "" {
+			fields = append(fields, fmt.Sprintf("%s=%q", k, v))
+		}
 	}
 
 	entry := strings.Join(fields, " ")
