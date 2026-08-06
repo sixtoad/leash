@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
+
+	"github.com/cilium/ebpf"
 )
 
 // An attach that succeeds on a kernel where "bpf" is absent from the active LSM
@@ -77,5 +80,26 @@ func TestAttachInertWireForm(t *testing.T) {
 func TestInertIsDistinctFromBothVerdicts(t *testing.T) {
 	if AttachInert == AttachAttachable || AttachInert == AttachUnattachable || AttachInert == AttachUnknown {
 		t.Fatal("AttachInert must be its own state: the kernel accepted the attach (not unattachable) but nothing enforces (not attachable)")
+	}
+}
+
+// The kernel returns EACCES for a verifier rejection as well as for a missing
+// CAP_BPF. Classifying the former as a privilege problem reports a genuine
+// "unattachable" as "unknown" — the one case the probe exists to catch.
+// Observed as root with caps held: a bounds rejection ("R2 unbounded memory
+// access") was filed as insufficient privilege.
+func TestVerifierRejectionIsNotAPermissionError(t *testing.T) {
+	// A VerifierError wrapping EACCES: exactly the shape the kernel produces.
+	verifier := &ebpf.VerifierError{Cause: syscall.EACCES}
+	if isProbePermissionError(verifier) {
+		t.Fatal("a VerifierError is the kernel rejecting the program, not a privilege problem — it must yield unattachable, not unknown")
+	}
+
+	// A bare EACCES with no verifier context is still a privilege problem.
+	if !isProbePermissionError(syscall.EACCES) {
+		t.Fatal("a bare EACCES must still be treated as a privilege problem")
+	}
+	if !isProbePermissionError(syscall.EPERM) {
+		t.Fatal("a bare EPERM must still be treated as a privilege problem")
 	}
 }

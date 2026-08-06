@@ -337,6 +337,18 @@ func isProbePermissionError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// The kernel returns EACCES for a verifier REJECTION as well as for a
+	// missing CAP_BPF, so errno alone cannot tell them apart — and getting it
+	// wrong reports a genuine "unattachable" as "could not tell", which is the
+	// single case this probe exists to catch (#29's instruction-limit scenario).
+	// Observed as root, caps held: "load program: permission denied: 495: (85)
+	// call bpf_probe_read_kernel#113: R2 unbounded memory access" was filed as
+	// insufficient privilege. A VerifierError means the kernel read the program
+	// and said no, whatever errno it chose to say it with.
+	var verifierErr *ebpf.VerifierError
+	if errors.As(err, &verifierErr) {
+		return false
+	}
 	// syscall.EPERM/EACCES and golang.org/x/sys/unix.EPERM/EACCES are the same
 	// syscall.Errno values, so matching the syscall constants matches both.
 	if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) ||
