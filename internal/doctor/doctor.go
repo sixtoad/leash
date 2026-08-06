@@ -436,7 +436,12 @@ func layer1Unavailable(h Host) (down bool, remedy string) {
 	if h.BPFLSM != runner.LSMActive {
 		return true, inactiveListAdvice(h)
 	}
-	if h.BPFLSMAttach.State == lsm.AttachUnattachable {
+	// AttachInert is grouped with unattachable on purpose: the attach succeeded
+	// but the hook is never invoked, so Layer 1 does not enforce. Reachable only
+	// when the list is already inactive (which the branch above catches), so this
+	// is belt-and-braces — but the grouping is what keeps it correct if the
+	// probe ever observes inert on a host the list called active.
+	if h.BPFLSMAttach.State == lsm.AttachUnattachable || h.BPFLSMAttach.State == lsm.AttachInert {
 		return true, attachAdvice(h)
 	}
 	return false, ""
@@ -450,7 +455,10 @@ func layer1Unavailable(h Host) (down bool, remedy string) {
 func inactiveListAdvice(h Host) string {
 	advice := lsmAdvice(h)
 	switch h.BPFLSMAttach.State {
-	case lsm.AttachAttachable:
+	// AttachInert is what the probe now reports for this shape; AttachAttachable
+	// is kept alongside it so an older or injected observation renders the same
+	// explanation rather than falling through to the bare remedy.
+	case lsm.AttachInert, lsm.AttachAttachable:
 		return fmt.Sprintf(`NOTE: doctor's probe DID load and attach leash's LSM programs (this kernel is built with CONFIG_BPF_LSM=y), but "bpf" is not in the active LSM list, so the bpf LSM is not registered in the active stack and those hooks are never invoked. A successful attach here enforces nothing, which is why it does not change this verdict.
 %s`, advice)
 	case lsm.AttachUnattachable:

@@ -68,6 +68,13 @@ const (
 	// AttachAttachable means the programs verified, attached, and were detached
 	// again. This is the only state that reports an observation of success.
 	AttachAttachable
+	// AttachInert means the programs verified and attached, but "bpf" is not in
+	// the kernel's active LSM stack, so the hooks are never invoked. The attach
+	// syscall succeeding says nothing about enforcement here: leash would load
+	// cleanly and enforce nothing. Reported distinctly rather than as
+	// "attachable" (which reads as usable) or "unattachable" (which reads as a
+	// kernel refusal that never happened).
+	AttachInert
 )
 
 // String is the wire form used by `leash doctor --json`.
@@ -77,6 +84,8 @@ func (s AttachState) String() string {
 		return "attachable"
 	case AttachUnattachable:
 		return "unattachable"
+	case AttachInert:
+		return "inert"
 	default:
 		return "unknown"
 	}
@@ -101,10 +110,12 @@ func (s *AttachState) UnmarshalJSON(data []byte) error {
 		*s = AttachAttachable
 	case "unattachable":
 		*s = AttachUnattachable
+	case "inert":
+		*s = AttachInert
 	case "unknown":
 		*s = AttachUnknown
 	default:
-		return fmt.Errorf("unknown attach state %q (want attachable, unattachable or unknown)", word)
+		return fmt.Errorf("unknown attach state %q (want attachable, inert, unattachable or unknown)", word)
 	}
 	return nil
 }
@@ -275,7 +286,47 @@ func runAttachProbe() AttachProbe {
 	// a squatter, and doctor must leave the kernel exactly as it found it.
 	defer lnk.Close()
 
+	// The attach succeeded — but on a kernel where "bpf" is absent from the
+	// active LSM stack it attaches to a hook that is never invoked. Observed on
+	// PVE 9.1.8 (lsm=lockdown,capability,yama,apparmor,ima,evm): the probe
+	// attached cleanly and enforcement was impossible. Reporting "attachable"
+	// there is the same false assurance that caused the regression in #55, so
+	// the probe answers for itself rather than relying on every consumer to
+	// cross-check the LSM list.
+	if active, known := bpfInActiveLSMStack(); known && !active {
+		return AttachProbe{
+			State: AttachInert,
+			Stage: AttachStageNone,
+			Detail: "the programs verified and attached, but \"bpf\" is not in the kernel's active LSM stack (" +
+				activeLSMPathForMessages + "), so the hooks are never invoked and nothing is enforced",
+		}
+	}
 	return AttachProbe{State: AttachAttachable, Stage: AttachStageNone}
+}
+
+// activeLSMPath is a var so the inert-detection path is testable without a
+// kernel. internal/lsm deliberately reads this itself rather than importing
+// internal/runner: the two packages are siblings today and neither depends on
+// the other, and this is a fact read, not a re-implementation of runner's
+// classification.
+var activeLSMPath = "/sys/kernel/security/lsm"
+
+const activeLSMPathForMessages = "/sys/kernel/security/lsm"
+
+// bpfInActiveLSMStack reports whether "bpf" is an active LSM, and whether that
+// could be determined at all. An unreadable list yields known=false, which
+// leaves the attach verdict untouched — never downgrade on a guess.
+func bpfInActiveLSMStack() (active, known bool) {
+	data, err := os.ReadFile(activeLSMPath)
+	if err != nil {
+		return false, false
+	}
+	for _, name := range strings.Split(strings.TrimSpace(string(data)), ",") {
+		if strings.TrimSpace(name) == "bpf" {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 // isProbePermissionError reports whether err is the kernel refusing *this
@@ -284,6 +335,18 @@ func runAttachProbe() AttachProbe {
 // report a kernel as unattachable.
 func isProbePermissionError(err error) bool {
 	if err == nil {
+		return false
+	}
+	// The kernel returns EACCES for a verifier REJECTION as well as for a
+	// missing CAP_BPF, so errno alone cannot tell them apart — and getting it
+	// wrong reports a genuine "unattachable" as "could not tell", which is the
+	// single case this probe exists to catch (#29's instruction-limit scenario).
+	// Observed as root, caps held: "load program: permission denied: 495: (85)
+	// call bpf_probe_read_kernel#113: R2 unbounded memory access" was filed as
+	// insufficient privilege. A VerifierError means the kernel read the program
+	// and said no, whatever errno it chose to say it with.
+	var verifierErr *ebpf.VerifierError
+	if errors.As(err, &verifierErr) {
 		return false
 	}
 	// syscall.EPERM/EACCES and golang.org/x/sys/unix.EPERM/EACCES are the same

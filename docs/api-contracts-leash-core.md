@@ -250,7 +250,7 @@ Also not an endpoint. `leash version --json` describes the *binary*; this descri
     "status": "degraded",           //   ready | degraded | unavailable
     "ready": false,                 //   status == "ready"; never true for degraded
     "lsm_bpf": "inactive",          //   active | inactive | unknown — the active-LSM list read
-    "lsm_bpf_attachable": "unknown",//   attachable | unattachable | unknown — observed, never inferred
+    "lsm_bpf_attachable": "unknown",//   attachable | unattachable | unknown — observed, never inferred Values: `attachable` (verified, attached, and `bpf` is in the active LSM stack), `inert` (verified and attached, but `bpf` is absent from the active stack so the hooks are never invoked and nothing is enforced), `unattachable` (the kernel refused), `unknown` (could not be established).
     "caps": ["bpf", "net_admin"],   //   effective caps observed, never inferred; [] when unreadable
     "issues": ["…"]                 //   one actionable sentence + remedy per blocker
   },
