@@ -14,6 +14,17 @@ final class TransparentProxyManager {
         case configuredEnabled
     }
 
+    // Persisted user intent. macOS drops the transparent-proxy NE config to disabled
+    // when the LeashProxy sysext is replaced (a version bump / app update), and the
+    // launch path only re-activates the sysext — not the config. We record whether the
+    // user last enabled the proxy so reconcileOnLaunch() can restore it, without
+    // auto-enabling a proxy the user never turned on.
+    private let userIntentKey = "leash.proxy.userEnabled"
+    private var userIntendsEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: userIntentKey) }
+        set { UserDefaults.standard.set(newValue, forKey: userIntentKey) }
+    }
+
     /// Load the existing LeashProxy manager, or a fresh one if none is configured.
     private func loadManager() async throws -> NETransparentProxyManager {
         let managers = try await NETransparentProxyManager.loadAllFromPreferences()
@@ -24,6 +35,10 @@ final class TransparentProxyManager {
     }
 
     func activate() async throws {
+        // Any explicit activation records that the user wants the proxy on, so a
+        // later sysext replacement can restore it (reconcileOnLaunch).
+        userIntendsEnabled = true
+
         let manager = try await loadManager()
 
         // Skip the save if already configured + enabled — an unconditional
@@ -60,6 +75,29 @@ final class TransparentProxyManager {
         if manager.isEnabled {
             manager.isEnabled = false
             try await manager.saveToPreferences()
+        }
+        // The user turned the proxy off; don't resurrect it on the next launch.
+        userIntendsEnabled = false
+    }
+
+    /// Restore the transparent proxy on app launch if the user previously enabled it.
+    /// macOS disables the NE config when the LeashProxy sysext is replaced (version
+    /// bump / update); the launch path re-activates the sysext but not the config, so
+    /// without this the user must re-enable "Leash Proxy" in System Settings after every
+    /// update. Acts only on a recorded prior enable, and no-ops when already enabled
+    /// (so it won't trigger a redundant authorization prompt in the common case).
+    ///
+    /// Note: it cannot distinguish a config disabled by a sysext replacement from one
+    /// the user disabled directly in System Settings (both read as configuredDisabled),
+    /// so a Settings-side disable is overridden on next launch. Use the app's own
+    /// disable control (deactivate) to turn the proxy off persistently.
+    func reconcileOnLaunch() async {
+        guard userIntendsEnabled else { return }
+        switch await currentState() {
+        case .configuredEnabled:
+            return
+        case .configuredDisabled, .notConfigured:
+            try? await activate()
         }
     }
 
