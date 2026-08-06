@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/runner"
 )
 
@@ -56,6 +57,14 @@ type Host struct {
 	// actual LSM list, so it has to be probed rather than derived here).
 	BPFLSM       runner.LSMState
 	BPFLSMAdvice string
+
+	// BPFLSMAttach is what the kernel said when leash's real LSM programs were
+	// loaded, verified and attached (lsm.ProbeAttachable). It is a second,
+	// *conjunctive* signal beside BPFLSM, not a replacement for it: an
+	// observation here can only narrow the Layer 1 verdict the list gives, never
+	// widen it (see layer1Unavailable). The state is unknown whenever the probe
+	// was skipped or could not reach a verdict, and Detail then names which.
+	BPFLSMAttach lsm.AttachProbe
 
 	// ContainerEngine is the container CLI `leash run --runtime docker/podman`
 	// would drive ("docker", "podman"), or "" when none is installed. It is not
@@ -181,8 +190,15 @@ type Report struct {
 type NativeReport struct {
 	Status Status          `json:"status"`
 	LSMBPF runner.LSMState `json:"lsm_bpf"`
-	Caps   []string        `json:"caps"`
-	Issues []string        `json:"issues"`
+
+	// LSMBPFAttachable is the observed answer to the question lsm_bpf only
+	// approximates: attachable / unattachable / unknown. It is additive — the
+	// list-based lsm_bpf stays, because it is the cheap signal and the --quick
+	// answer — and it is "unknown" unless the kernel was actually asked.
+	LSMBPFAttachable lsm.AttachState `json:"lsm_bpf_attachable"`
+
+	Caps   []string `json:"caps"`
+	Issues []string `json:"issues"`
 }
 
 // ContainerReport covers the docker/podman runtime. Engine is a pointer so an
@@ -223,10 +239,6 @@ const layer1Consequence = "eBPF LSM enforcement (Layer 1) is unavailable, so fil
 // rather than silently omitted, so "ready" is read for exactly what it means.
 var alwaysUnchecked = []Unchecked{
 	{
-		Name:   "bpf_lsm_attachable",
-		Reason: "doctor reads the active LSM list (/sys/kernel/security/lsm); it does not load and attach a probe program, so an active-but-unattachable BPF LSM would still report active (leash issue #52).",
-	},
-	{
 		Name:   "bpf_d_path_ringbuf",
 		Reason: "availability of the bpf_d_path helper and BPF ring buffer, which leash's LSM programs need, is not probed.",
 	},
@@ -249,9 +261,10 @@ func Evaluate(h Host) Report {
 
 func evaluateNative(h Host) NativeReport {
 	n := NativeReport{
-		LSMBPF: h.BPFLSM,
-		Caps:   []string{},
-		Issues: []string{},
+		LSMBPF:           h.BPFLSM,
+		LSMBPFAttachable: h.BPFLSMAttach.State,
+		Caps:             []string{},
+		Issues:           []string{},
 	}
 	if h.CapsKnown {
 		if h.CapBPF {
@@ -301,9 +314,13 @@ func evaluateNative(h Host) NativeReport {
 	// The LSM question only means something on Linux — elsewhere the "not
 	// linux" issue above already says everything, and a kernel remedy would be
 	// noise.
-	layer1Down := h.GOOS == "linux" && h.BPFLSM != runner.LSMActive
-	if layer1Down {
-		n.Issues = append(n.Issues, fmt.Sprintf("%s\n%s", layer1Consequence, lsmAdvice(h)))
+	layer1Down := false
+	if h.GOOS == "linux" {
+		var remedy string
+		layer1Down, remedy = layer1Unavailable(h)
+		if layer1Down {
+			n.Issues = append(n.Issues, fmt.Sprintf("%s\n%s", layer1Consequence, remedy))
+		}
 	}
 
 	// Native gets the same three-state treatment as the container runtime, on
@@ -369,13 +386,121 @@ func evaluateContainer(h Host) ContainerReport {
 	case h.GOOS != "linux":
 		c.Status = StatusDegraded
 		c.Issues = append(c.Issues, fmt.Sprintf("%s can start containers, but on %s they run against a virtual machine's kernel that doctor did not probe, so Layer 1 (eBPF LSM) availability inside them is unverified. In particular Docker Desktop's LinuxKit kernel does not carry \"bpf\" in its active LSM list.\nRun leash doctor on a Linux host (or inside the VM) to get a Layer 1 verdict.", engine, h.GOOS))
-	case h.BPFLSM != runner.LSMActive:
-		c.Status = StatusDegraded
-		c.Issues = append(c.Issues, fmt.Sprintf("%s can start containers, but they share this host's kernel: %s\n%s", engine, layer1Consequence, lsmAdvice(h)))
 	default:
-		c.Status = StatusReady
+		// A local container shares this host's kernel, so it inherits the same
+		// Layer 1 answer the native runtime got — including an *observed*
+		// attach failure, which is the whole point of probing: a kernel that
+		// lists "bpf" but refuses leash's programs must not be reported as
+		// enforcing here either.
+		down, remedy := layer1Unavailable(h)
+		if !down {
+			c.Status = StatusReady
+			break
+		}
+		c.Status = StatusDegraded
+		c.Issues = append(c.Issues, fmt.Sprintf("%s can start containers, but they share this host's kernel: %s\n%s", engine, layer1Consequence, remedy))
 	}
 	return c
+}
+
+// layer1Unavailable is the single Layer 1 verdict both runtimes read, and the
+// only place the observation is weighed against the list.
+//
+// The two signals are CONJUNCTIVE, and the direction matters — getting it wrong
+// is a regression this function was already shipped with once. An attach
+// observation may only NARROW the list's answer:
+//
+//	active list | attachability            | Layer 1
+//	------------+--------------------------+-------------------
+//	inactive    | anything, incl attachable| unavailable
+//	active      | attachable               | available
+//	active      | unattachable             | unavailable  (issue #52)
+//	active      | unknown                  | fall back to the list
+//
+// An inactive (or unreadable) list is decisive, because "attachable" does not
+// mean what it looks like there: a BPF_PROG_TYPE_LSM program loads and attaches
+// perfectly well on a CONFIG_BPF_LSM=y kernel whose active LSM list has no
+// "bpf" in it — the bpf LSM is simply not registered in the active stack, so
+// the hook is never invoked and the successful attach enforces nothing. Letting
+// that observation override the list turned a correctly `degraded`/exit 3
+// Proxmox host into `ready`/exit 0 with zero issues, which is precisely the
+// false assurance this command exists to prevent.
+//
+// The other direction is the reason the probe exists: a kernel that lists "bpf"
+// and still refuses leash's programs is not enforcing. An unknown observation
+// changes nothing — the list stays the answer, exactly as before this probe
+// existed.
+func layer1Unavailable(h Host) (down bool, remedy string) {
+	// The list first, and decisively: nothing the probe can observe makes an
+	// unregistered bpf LSM enforce.
+	if h.BPFLSM != runner.LSMActive {
+		return true, inactiveListAdvice(h)
+	}
+	if h.BPFLSMAttach.State == lsm.AttachUnattachable {
+		return true, attachAdvice(h)
+	}
+	return false, ""
+}
+
+// inactiveListAdvice renders the remedy for a Layer 1 the active-LSM list has
+// already settled. The probe's observation cannot change that verdict, but it
+// is in the same document under lsm_bpf_attachable, so the text has to account
+// for it: a reader who sees "attachable" beside "not enforcing" and is left to
+// reconcile the two on their own will reconcile them wrongly.
+func inactiveListAdvice(h Host) string {
+	advice := lsmAdvice(h)
+	switch h.BPFLSMAttach.State {
+	case lsm.AttachAttachable:
+		return fmt.Sprintf(`NOTE: doctor's probe DID load and attach leash's LSM programs (this kernel is built with CONFIG_BPF_LSM=y), but "bpf" is not in the active LSM list, so the bpf LSM is not registered in the active stack and those hooks are never invoked. A successful attach here enforces nothing, which is why it does not change this verdict.
+%s`, advice)
+	case lsm.AttachUnattachable:
+		detail := attachDetail(h)
+		return fmt.Sprintf(`doctor loaded leash's own eBPF LSM programs and this kernel refused them (observed, not inferred):
+  %s
+%s`, detail, advice)
+	default:
+		return advice
+	}
+}
+
+// attachAdvice renders the remedy for an observed attach failure on a host
+// whose active-LSM list says "bpf" — the case issue #52 exists for, and the
+// only one that reaches here (an inactive list is answered by
+// inactiveListAdvice, which has a different root cause to name). The stage
+// selects the text: a verifier rejection means this kernel cannot run leash's
+// programs at all, while an attach rejection means the programs are fine and
+// the kernel is not accepting BPF LSM attachments. Different fixes, so they are
+// never collapsed into one sentence. The kernel's own text is quoted in both,
+// because it is the part that actually says which helper or limit was hit.
+func attachAdvice(h Host) string {
+	detail := attachDetail(h)
+	if h.BPFLSMAttach.Stage == lsm.AttachStageVerify {
+		return fmt.Sprintf(`doctor loaded leash's own eBPF LSM programs and this kernel's verifier rejected them (observed, not inferred):
+  %s
+That is a kernel capability gap rather than a configuration one — typically missing BTF, no bpf_d_path helper, or a program over the verifier's instruction limit.
+Boot a kernel built with CONFIG_BPF_LSM=y and CONFIG_DEBUG_INFO_BTF=y (Linux >= 5.7); the message above names what was actually missing.`, detail)
+	}
+	remedy := strings.TrimSpace(h.BPFLSMAdvice)
+	if remedy == "" {
+		// The active-LSM list said "bpf" is there and the kernel still refused,
+		// so no remedy derived from that list is trustworthy here. Say so
+		// rather than printing the generic "add bpf to lsm=" advice, which
+		// would tell the operator to add something already present.
+		remedy = `"bpf" IS in the active LSM list (/sys/kernel/security/lsm), so the list is not the whole story on this kernel and the message above is the authoritative reason.`
+	}
+	return fmt.Sprintf(`doctor loaded leash's own eBPF LSM programs — they verified, and this kernel refused to attach them (observed, not inferred):
+  %s
+%s`, detail, remedy)
+}
+
+// attachDetail is the kernel's own words about a refusal, which are the
+// actionable part of an unattachable verdict — never summarised, and never
+// silently absent.
+func attachDetail(h Host) string {
+	if detail := strings.TrimSpace(h.BPFLSMAttach.Detail); detail != "" {
+		return detail
+	}
+	return "(the kernel gave no reason)"
 }
 
 // lsmAdvice picks the probe's kernel-specific remedy, falling back to a generic
@@ -390,7 +515,18 @@ func lsmAdvice(h Host) string {
 // unchecked lists the prerequisites this run did not verify: the fixed ones
 // issue #23 names, plus whatever this particular host hid from the probes.
 func unchecked(h Host) []Unchecked {
-	out := append([]Unchecked{}, alwaysUnchecked...)
+	out := []Unchecked{}
+	// Attachability leaves this list only when the kernel was actually asked
+	// and answered. Anything else — skipped, not privileged enough, timed out —
+	// is still an unverified prerequisite, and the entry names which. It stays
+	// first, where it has always been.
+	if h.BPFLSMAttach.State == lsm.AttachUnknown {
+		out = append(out, Unchecked{
+			Name:   "bpf_lsm_attachable",
+			Reason: attachUncheckedReason(h),
+		})
+	}
+	out = append(out, alwaysUnchecked...)
 	if !h.CapsKnown {
 		out = append(out, Unchecked{
 			Name:   "capabilities",
@@ -462,11 +598,12 @@ type jsonReport struct {
 }
 
 type jsonNative struct {
-	Status Status          `json:"status"`
-	Ready  bool            `json:"ready"`
-	LSMBPF runner.LSMState `json:"lsm_bpf"`
-	Caps   []string        `json:"caps"`
-	Issues []string        `json:"issues"`
+	Status           Status          `json:"status"`
+	Ready            bool            `json:"ready"`
+	LSMBPF           runner.LSMState `json:"lsm_bpf"`
+	LSMBPFAttachable lsm.AttachState `json:"lsm_bpf_attachable"`
+	Caps             []string        `json:"caps"`
+	Issues           []string        `json:"issues"`
 }
 
 type jsonContainer struct {
@@ -481,11 +618,12 @@ func (r Report) MarshalJSON() ([]byte, error) {
 	return json.Marshal(jsonReport{
 		Verdict: r.Verdict(),
 		Native: jsonNative{
-			Status: r.Native.Status,
-			Ready:  r.Native.Ready(),
-			LSMBPF: r.Native.LSMBPF,
-			Caps:   strings0(r.Native.Caps),
-			Issues: strings0(r.Native.Issues),
+			Status:           r.Native.Status,
+			Ready:            r.Native.Ready(),
+			LSMBPF:           r.Native.LSMBPF,
+			LSMBPFAttachable: r.Native.LSMBPFAttachable,
+			Caps:             strings0(r.Native.Caps),
+			Issues:           strings0(r.Native.Issues),
 		},
 		Container: jsonContainer{
 			Status: r.Container.Status,
@@ -520,10 +658,11 @@ func (r *Report) UnmarshalJSON(data []byte) error {
 	}
 	*r = Report{
 		Native: NativeReport{
-			Status: doc.Native.Status,
-			LSMBPF: doc.Native.LSMBPF,
-			Caps:   strings0(doc.Native.Caps),
-			Issues: strings0(doc.Native.Issues),
+			Status:           doc.Native.Status,
+			LSMBPF:           doc.Native.LSMBPF,
+			LSMBPFAttachable: doc.Native.LSMBPFAttachable,
+			Caps:             strings0(doc.Native.Caps),
+			Issues:           strings0(doc.Native.Issues),
 		},
 		Container: ContainerReport{
 			Status: doc.Container.Status,
@@ -562,6 +701,7 @@ func (r Report) Text() string {
 
 	fmt.Fprintf(&b, "\nnative runtime:    %s\n", statusWord(r.Native.Status))
 	fmt.Fprintf(&b, "  bpf LSM:         %s\n", r.Native.LSMBPF)
+	fmt.Fprintf(&b, "  attachable:      %s\n", r.Native.LSMBPFAttachable)
 	fmt.Fprintf(&b, "  capabilities:    %s\n", listOrNone(r.Native.Caps))
 	writeIssues(&b, r.Native.Issues)
 
@@ -687,4 +827,17 @@ func capsUncheckedReason(h Host) string {
 		return "this process is in a user namespace, so /proc/self/status reports namespaced capabilities that do not permit loading BPF-LSM programs; CAP_BPF/CAP_NET_ADMIN were not established for the host (reported as absent, never assumed)."
 	}
 	return "/proc/self/status could not be read or parsed, so CAP_BPF/CAP_NET_ADMIN were not observed (reported as absent, never assumed)."
+}
+
+// attachUncheckedReason explains why attachability is still a guess on this
+// run. The base sentence is the one doctor has always printed — the active-LSM
+// list is a proxy, and an active-but-unattachable BPF LSM would read as active —
+// followed by the specific reason the probe did not settle it.
+func attachUncheckedReason(h Host) string {
+	const base = "doctor fell back to the active LSM list (/sys/kernel/security/lsm), which is a proxy: an active-but-unattachable BPF LSM still reads as active (leash issue #52)."
+	reason := strings.TrimSpace(h.BPFLSMAttach.Detail)
+	if reason == "" {
+		reason = "the attachability probe did not reach a verdict"
+	}
+	return base + " " + strings.TrimRight(reason, ".") + "."
 }

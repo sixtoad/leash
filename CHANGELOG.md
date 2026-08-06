@@ -44,6 +44,48 @@ Claude Code handling on top.
   which `flag.FlagSet.Visit` cannot see because it reports a repeated flag once,
   with the last value.
 
+### Added — doctor probes BPF-LSM attachability instead of guessing
+- **`lsm_bpf_attachable` in `leash doctor --json`**: doctor now loads leash's
+  *real* LSM programs, lets the kernel's verifier judge them, attaches one and
+  detaches it immediately — `attachable` / `unattachable` / `unknown`. Reading
+  `bpf` out of `/sys/kernel/security/lsm` is a proxy for that question, and a
+  kernel can list `bpf` and still refuse the programs: the verifier can reject
+  `bpf_d_path`, BTF can be absent, ring buffer creation can fail, or a program
+  can exceed the instruction limit (leash's own hard-link guard hit that ceiling
+  in issue #29). Such a host used to report `lsm_bpf: active` and `ready`; it now
+  reports `degraded` and names the kernel's reason (issue #52).
+- **Attachability narrows the Layer 1 verdict; it never widens it.** The two
+  signals are conjunctive: `bpf` must be in the active LSM list *and* the
+  programs must attach. An `inactive` list is decisive whatever the probe saw,
+  because `attachable` does not mean what it looks like there — a
+  `BPF_PROG_TYPE_LSM` program loads and attaches perfectly well on a
+  `CONFIG_BPF_LSM=y` kernel that was not booted with `bpf` in `lsm=`, and the
+  hook is then never invoked, so the successful attach enforces nothing. Where
+  that combination occurs the `issues` text says it out loud rather than leaving
+  a reader to reconcile `lsm_bpf: inactive` with
+  `lsm_bpf_attachable: attachable`.
+- **The probe uses the shipped programs, not a stand-in.** It goes through the
+  same `loadLsmOpen` → `ebpf.NewCollection` → `link.AttachLSM` path a real run
+  takes, including the optional-hook handling, so what doctor tests cannot drift
+  from what leash runs. A toy program that verifies while the real ones do not is
+  the exact failure this replaces.
+- **A verifier rejection and an attach rejection are told apart**, because the
+  remedies do not overlap: the first means this kernel cannot run leash's
+  programs at all (BTF, `bpf_d_path`, the instruction limit), the second means
+  the programs are fine and the kernel is not accepting BPF LSM attachments.
+- **`EPERM`/`EACCES` is `unknown`, never `unattachable`.** That is a statement
+  about doctor's own privileges, not about the kernel; an unprivileged run can no
+  more condemn a host than bless one, and the verdict falls back to the list read
+  exactly as before.
+- **`--quick` opts out; there is no `--deep` to opt in.** The honest answer is
+  the default answer. A skipped or unsettled probe leaves `bpf_lsm_attachable` in
+  `unchecked` with the reason named (`--quick`, or insufficient privilege).
+- **It leaves nothing behind.** Independent collection, every descriptor and link
+  released on every path including panic, bounded in time, and fail-soft: any
+  outcome that is not a clean verdict degrades to `unknown` rather than erroring,
+  hanging, or taking the report down with it. Running it while leash is enforcing
+  does not touch the live programs.
+
 ### Added — node readiness self-check
 - **`leash doctor` / `leash doctor --json`**: one command answering the question
   a provisioner (`walk install leash`, a CI image) had been guessing at with its
@@ -71,8 +113,9 @@ Claude Code handling on top.
   so it must hold CAP_BPF", which is wrong in precisely the environments that
   would consult it (darwin; a container with a masked `/proc`).
 - **Prerequisites doctor does not check are named in the output**, not silently
-  omitted: `bpf_lsm_attachable` (the check is list-based, not an attach probe —
-  issue #52), `bpf_d_path_ringbuf`, `netns_iptables`, plus `capabilities` and
+  omitted: `bpf_lsm_attachable` (now answered by the attachability probe above,
+  and still declared whenever that probe did not settle it),
+  `bpf_d_path_ringbuf`, `netns_iptables`, plus `capabilities` and
   `container_kernel` when they apply.
 - **`default_runtime` is in the document.** The verdict is the best state any
   runtime reaches, but a bare `leash run` selects one runtime (`native` here)
