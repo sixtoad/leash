@@ -2,12 +2,21 @@ name: leash
 version: 1.0.0
 description: APM project for leash
 author: Sixto Cantolla Sanchez
+targets:
+  - claude
+  - copilot
 dependencies:
   apm:
   - git: gitea.cantolla.casa/sixto/skills
-    ref: 2f267a5
+    ref: 03f24e0468cd6ce25504bf4486ce45ae9872efaa
     skills:
+    - leash-macos-vm
+    - leash-testing
+    - cantolla-proxmox-testbed
+    - worktree-agent
     - stacked-branches
+    - code-indexer-init
+    - code-indexer-query
   mcp: []
 includes: auto
 scripts: {}

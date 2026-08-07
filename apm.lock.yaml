@@ -1,15 +1,70 @@
 lockfile_version: '1'
-generated_at: '2026-05-27T20:37:37.912344+00:00'
-apm_version: 0.10.0
+generated_at: '2026-08-07T12:22:37.794647+00:00'
+apm_version: 0.21.0
 dependencies:
 - repo_url: sixto/skills
   host: gitea.cantolla.casa
-  resolved_commit: 2f267a55e58c5125e6ab18f0e8bf24ac21748827
-  resolved_ref: 2f267a5
+  resolved_commit: 03f24e0468cd6ce25504bf4486ce45ae9872efaa
+  resolved_ref: 03f24e0468cd6ce25504bf4486ce45ae9872efaa
   package_type: skill_bundle
   deployed_files:
+  - .agents/skills/cantolla-proxmox-testbed
+  - .agents/skills/cantolla-proxmox-testbed/SKILL.md
+  - .agents/skills/code-indexer-init
+  - .agents/skills/code-indexer-init/SKILL.md
+  - .agents/skills/code-indexer-query
+  - .agents/skills/code-indexer-query/SKILL.md
+  - .agents/skills/leash-macos-vm
+  - .agents/skills/leash-macos-vm/SKILL.md
+  - .agents/skills/leash-macos-vm/vmtest.sh
+  - .agents/skills/leash-testing
+  - .agents/skills/leash-testing/SKILL.md
+  - .agents/skills/stacked-branches
+  - .agents/skills/stacked-branches/SKILL.md
+  - .agents/skills/worktree-agent
+  - .agents/skills/worktree-agent/SKILL.md
+  - .agents/skills/worktree-agent/session.sh
+  - .claude/skills/cantolla-proxmox-testbed
+  - .claude/skills/cantolla-proxmox-testbed/SKILL.md
+  - .claude/skills/code-indexer-init
+  - .claude/skills/code-indexer-init/SKILL.md
+  - .claude/skills/code-indexer-query
+  - .claude/skills/code-indexer-query/SKILL.md
+  - .claude/skills/leash-macos-vm
+  - .claude/skills/leash-macos-vm/SKILL.md
+  - .claude/skills/leash-macos-vm/vmtest.sh
+  - .claude/skills/leash-testing
+  - .claude/skills/leash-testing/SKILL.md
   - .claude/skills/stacked-branches
-  - .github/skills/stacked-branches
-  content_hash: sha256:662accf246e33901942f52a052ecd10ecda9b15f83ea6baded7e50fdf52878e1
+  - .claude/skills/stacked-branches/SKILL.md
+  - .claude/skills/worktree-agent
+  - .claude/skills/worktree-agent/SKILL.md
+  - .claude/skills/worktree-agent/session.sh
+  deployed_file_hashes:
+    .agents/skills/cantolla-proxmox-testbed/SKILL.md: sha256:8c72e5ba9471d8153b5445e8410b444ed4ac0fce02c33f457ea22a5569340ce1
+    .agents/skills/code-indexer-init/SKILL.md: sha256:6e16c23fd660a1339b7495a5655e2820bcc5c4b0d56f9d7d42e1ca2a729d36b7
+    .agents/skills/code-indexer-query/SKILL.md: sha256:dd5ce4031c9f8bcbf582b814ed9acf5b07c4faa1276225ccb81b36c3bebe30dd
+    .agents/skills/leash-macos-vm/SKILL.md: sha256:5e05069ad48f87dd8d8f1a0840920c0eae9f120c24748f80893976612d7c3ff5
+    .agents/skills/leash-macos-vm/vmtest.sh: sha256:accad7b712b77b0ecce3c6661dc07d0001f5a937d088e8785bfefa359b2a79e1
+    .agents/skills/leash-testing/SKILL.md: sha256:66af153a741c3a28dd2d61674703853eb5f702aef94d7a8149fdfce391ef909b
+    .agents/skills/stacked-branches/SKILL.md: sha256:baf8a96f8a1b9e1d1882c7b4c27cf053ef62140619840db9117a2156698313a2
+    .agents/skills/worktree-agent/SKILL.md: sha256:9afeb21f376c76edb3af8cd4314195794109c60ad36d43b40aff2ebcecfd9240
+    .agents/skills/worktree-agent/session.sh: sha256:b4b7935f46380aa8ecf95f3e056706e7c9c94f504b35e1cf2a416016f65e7e42
+    .claude/skills/cantolla-proxmox-testbed/SKILL.md: sha256:8c72e5ba9471d8153b5445e8410b444ed4ac0fce02c33f457ea22a5569340ce1
+    .claude/skills/code-indexer-init/SKILL.md: sha256:6e16c23fd660a1339b7495a5655e2820bcc5c4b0d56f9d7d42e1ca2a729d36b7
+    .claude/skills/code-indexer-query/SKILL.md: sha256:dd5ce4031c9f8bcbf582b814ed9acf5b07c4faa1276225ccb81b36c3bebe30dd
+    .claude/skills/leash-macos-vm/SKILL.md: sha256:5e05069ad48f87dd8d8f1a0840920c0eae9f120c24748f80893976612d7c3ff5
+    .claude/skills/leash-macos-vm/vmtest.sh: sha256:accad7b712b77b0ecce3c6661dc07d0001f5a937d088e8785bfefa359b2a79e1
+    .claude/skills/leash-testing/SKILL.md: sha256:66af153a741c3a28dd2d61674703853eb5f702aef94d7a8149fdfce391ef909b
+    .claude/skills/stacked-branches/SKILL.md: sha256:baf8a96f8a1b9e1d1882c7b4c27cf053ef62140619840db9117a2156698313a2
+    .claude/skills/worktree-agent/SKILL.md: sha256:9afeb21f376c76edb3af8cd4314195794109c60ad36d43b40aff2ebcecfd9240
+    .claude/skills/worktree-agent/session.sh: sha256:b4b7935f46380aa8ecf95f3e056706e7c9c94f504b35e1cf2a416016f65e7e42
+  content_hash: sha256:c0efd877c5972a9b5de1c23bcffce3e94ea72a20d3be1632495e2a9be3df7a0d
   skill_subset:
+  - cantolla-proxmox-testbed
+  - code-indexer-init
+  - code-indexer-query
+  - leash-macos-vm
+  - leash-testing
   - stacked-branches
+  - worktree-agent
