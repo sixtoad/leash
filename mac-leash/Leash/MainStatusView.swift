@@ -39,6 +39,10 @@ struct MainStatusView: View {
                 endpointSecurityController.ensureExtensionIsActive()
                 networkExtensionController.ensureExtensionIsActive()
                 transparentProxyController.ensureExtensionIsActive()
+                // Restore the transparent-proxy NE config if the user had it enabled;
+                // a sysext replacement (version bump) drops it to disabled and the
+                // sysext re-activation above does not re-enable the config. See #58.
+                await TransparentProxyManager.shared.reconcileOnLaunch()
             }
             refreshNetworkFilterStatus()
             checkAPIStatus()
