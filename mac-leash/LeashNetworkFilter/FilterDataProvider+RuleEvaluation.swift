@@ -256,8 +256,26 @@ extension FilterDataProvider {
         pid: pid_t,
         socketProtocol: Int32,
         allowInspection: Bool = true,
-        isDNSQuery: Bool = false
+        isDNSQuery: Bool = false,
+        direction: NETrafficDirection = .outbound
     ) -> FlowDecision {
+        // Fail closed: a flow in the filter's enforcement scope is denied while
+        // the policy that governs it is missing or stale, rather than falling
+        // through to the default-allow below (#62).
+        //
+        // Explicitly-outbound flows only. Leash enforces egress; a filter that
+        // lost its daemon must not become a host firewall that refuses new
+        // connections to the machine — that would cut the remote access you'd
+        // use to fix it. Requiring `.outbound` rather than merely excluding
+        // `.inbound` costs no enforcement (outbound socket flows do report
+        // `.outbound`) and keeps anything the system reports ambiguously on the
+        // safe side of that line.
+        if direction == .outbound,
+           case .unavailable(let reason) = policyAvailability(),
+           !isFailClosedExempt(hostname: hostname) {
+            return .deny(reason: "Policy unavailable: \(reason)")
+        }
+
         var rules: [NetworkRule] = []
         syncQueue.sync {
             rules = networkRules

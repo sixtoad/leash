@@ -95,7 +95,11 @@ extension FilterDataProvider {
         applyNetworkRules(decoded)
     }
 
+    /// Applies a rule set received from the daemon. Every caller is daemon-sourced
+    /// (initial query or broadcast), so this is also the point where the policy
+    /// becomes authoritative and fail-closed can lift.
     func applyNetworkRules(_ loaded: [NetworkRule]) {
+        markRulesAuthoritative()
         syncQueue.async {
             if loaded.count != self.networkRules.count {
                 os_log("Network rules updated: %{public}d → %{public}d rules",

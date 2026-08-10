@@ -20,6 +20,7 @@ import (
 	"time"
 
 	gws "github.com/gorilla/websocket"
+	"github.com/strongdm/leash/internal/macsync"
 	"github.com/strongdm/leash/internal/messages"
 )
 
@@ -386,8 +387,12 @@ func probeDarwinWebsocket(addr string) bool {
 	}
 	defer conn.Close()
 
+	// Labelled so the connect/disconnect this probe leaves in the macsync log is
+	// obviously a health check, not an extension dropping off (#62 misread that
+	// churn as the content filter losing its connection).
 	hello := messages.ClientHelloPayload{
 		Platform:     "darwin",
+		Component:    macsync.ComponentProbe,
 		Capabilities: []string{"pid-sync", "rule-sync", "event", "policy", "network-rules"},
 		Version:      "probe",
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,12 +16,29 @@ import (
 
 // ClientState tracks connected macOS clients and their advertised capabilities.
 type ClientState struct {
-	ID           string
+	ID string
+	// Component is the leash process behind the connection, e.g.
+	// ComponentNetworkFilter. "unknown" when the client's hello omitted it.
+	Component    string
 	Platform     string
 	Capabilities map[string]bool
 	Version      string
 	LastSeen     time.Time
 }
+
+// Known component names reported in client.hello. They mirror the `source`
+// tags the extensions already use on events.
+const (
+	ComponentEndpointSecurity = "leash.es"
+	ComponentNetworkFilter    = "leash.netfilter"
+	ComponentTransparentProxy = "leash.proxy"
+	ComponentApp              = "leash.app"
+	ComponentCLI              = "leash.cli"
+	// ComponentProbe is the daemon's own websocket health probe: it connects,
+	// says hello and disconnects, so it shows up as register/unregister churn.
+	ComponentProbe   = "leash.probe"
+	ComponentUnknown = "unknown"
+)
 
 // RuleSnapshot represents the latest macOS rule set delivered over the websocket.
 type RuleSnapshot struct {
@@ -72,15 +90,21 @@ func (m *Manager) RegisterClient(clientID string, payload *messages.ClientHelloP
 		caps[strings.ToLower(strings.TrimSpace(cap))] = true
 	}
 
+	component := strings.ToLower(strings.TrimSpace(payload.Component))
+	if component == "" {
+		component = ComponentUnknown
+	}
+
 	m.clients[clientID] = &ClientState{
 		ID:           clientID,
+		Component:    component,
 		Platform:     strings.ToLower(strings.TrimSpace(payload.Platform)),
 		Capabilities: caps,
 		Version:      payload.Version,
 		LastSeen:     time.Now(),
 	}
 
-	log.Printf("macsync: registered client %s platform=%s caps=%v", clientID, payload.Platform, payload.Capabilities)
+	log.Printf("macsync: registered client %s component=%s platform=%s caps=%v", clientID, component, payload.Platform, payload.Capabilities)
 }
 
 // UnregisterClient removes a client from the registry, e.g. when its WebSocket
@@ -93,10 +117,35 @@ func (m *Manager) UnregisterClient(clientID string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.clients[clientID]; ok {
+	if client, ok := m.clients[clientID]; ok {
 		delete(m.clients, clientID)
-		log.Printf("macsync: unregistered client %s (%d remaining)", clientID, len(m.clients))
+		log.Printf("macsync: unregistered client %s component=%s (%d remaining: %s)",
+			clientID, client.Component, len(m.clients), strings.Join(m.connectedComponentsLocked(), ","))
 	}
+}
+
+// ConnectedComponents returns the sorted, de-duplicated component names of the
+// currently connected clients. A leash component missing from this list is not
+// receiving PID/rule broadcasts — for the content filter that means it is
+// enforcing nothing (see #62).
+func (m *Manager) ConnectedComponents() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.connectedComponentsLocked()
+}
+
+func (m *Manager) connectedComponentsLocked() []string {
+	seen := make(map[string]bool, len(m.clients))
+	out := make([]string, 0, len(m.clients))
+	for _, client := range m.clients {
+		if seen[client.Component] {
+			continue
+		}
+		seen[client.Component] = true
+		out = append(out, client.Component)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // GetAllClients returns a snapshot of all connected clients.
@@ -374,7 +423,9 @@ func (m *Manager) LogMacEvent(event *messages.MacEventPayload) error {
 	}
 	// Debug/diagnostic telemetry fields (transparent-proxy proxy.flow / proxy.pids /
 	// proxy.start under LEASH_MAC_DEBUG, and the app's proxy.reconcile launch check).
-	for _, k := range []string{"tracked", "tracked_count", "count", "relay", "intent", "enabled", "status", "result", "new_status"} {
+	for _, k := range []string{"tracked", "tracked_count", "count", "relay", "intent", "enabled", "status", "result", "new_status",
+		// filter.reconcile (app launch check / degraded-filter repair, #62)
+		"state", "extension_replaced", "health", "components"} {
 		if v := strings.TrimSpace(detailMap[k]); v != "" {
 			fields = append(fields, fmt.Sprintf("%s=%s", k, v))
 		}

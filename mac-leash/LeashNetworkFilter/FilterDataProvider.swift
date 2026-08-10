@@ -33,6 +33,18 @@ class FilterDataProvider: NEFilterDataProvider {
     var flowDelayEnabled = false
     var flowDelayRange: ClosedRange<TimeInterval>?
 
+    /// Fail-closed state (#62). `rulesAreAuthoritative` distinguishes "the daemon
+    /// says there are no matching rules" from "no policy ever arrived" — without
+    /// it a provider that never reached the daemon looks exactly like an empty
+    /// allow-all policy. Guarded by `syncQueue`; see
+    /// FilterDataProvider+PolicyAvailability. (How long the daemon has been gone
+    /// is owned by DaemonSync, which stamps the actual moment of the drop.)
+    var rulesAreAuthoritative = false
+    var failClosedEngaged = false
+    var filterStartTime = Date()
+    let policyStartupGrace: TimeInterval = 15
+    let policyDisconnectGrace: TimeInterval = 30
+
     enum FlowDelayDefaults {
         static let min: TimeInterval = 0.1
         static let max: TimeInterval = 0.5
@@ -63,6 +75,7 @@ class FilterDataProvider: NEFilterDataProvider {
         var socketType: String
         var socketProtocolName: String
         var socketProtocolNumber: Int32
+        var direction: NETrafficDirection
         var buffer: Data
     }
 
@@ -84,11 +97,20 @@ class FilterDataProvider: NEFilterDataProvider {
         let socketType: String
         let socketProtocolNumber: Int32
         let isDNSQuery: Bool
+        let direction: NETrafficDirection
         let enqueueTime: Date
     }
 
     override func startFilter(completionHandler: @escaping (Error?) -> Void) {
         os_log("Network filter starting...", log: log, type: .default)
+
+        // Anchor the fail-closed startup grace at the moment the provider
+        // actually starts, not at object construction.
+        syncQueue.sync {
+            filterStartTime = Date()
+            rulesAreAuthoritative = false
+            failClosedEngaged = false
+        }
 
         daemon.subscribe(to: "mac.pid.sync") { [weak self] payload in
             self?.handlePIDUpdate(payload)
@@ -112,6 +134,9 @@ class FilterDataProvider: NEFilterDataProvider {
         syncQueue.sync {
             trackedPIDs.removeAll()
             networkRules.removeAll()
+            // The rules we just dropped must not be treated as an authoritative
+            // empty policy if the provider is started again.
+            rulesAreAuthoritative = false
         }
 
         completionHandler()

@@ -46,6 +46,30 @@ enum LeashIdentifiers {
     static let networkFilterExtension = "\(bundle).LeashNetworkFilter"
     static let transparentProxyExtension = "\(bundle).LeashProxy"
     static let cli = "\(bundle).cli"
+
+    /// Component names reported to the daemon in `client.hello`. They match the
+    /// `source` tags the extensions already put on events, so daemon logs read
+    /// consistently. The daemon uses them to tell which of the three system
+    /// extensions is actually connected — a loaded-but-disconnected content
+    /// filter enforces nothing (#62).
+    enum Component {
+        static let endpointSecurity = "leash.es"
+        static let networkFilter = "leash.netfilter"
+        static let transparentProxy = "leash.proxy"
+        static let app = "leash.app"
+        static let cli = "leash.cli"
+    }
+
+    /// Derived from the running bundle identifier rather than set by each entry
+    /// point, so a new target can't silently ship an unlabelled hello.
+    static let component: String = {
+        guard let identifier = Bundle.main.bundleIdentifier else { return Component.app }
+        if identifier.hasSuffix(".LeashES") { return Component.endpointSecurity }
+        if identifier.hasSuffix(".LeashNetworkFilter") { return Component.networkFilter }
+        if identifier.hasSuffix(".LeashProxy") { return Component.transparentProxy }
+        if identifier.hasSuffix(".cli") { return Component.cli }
+        return Component.app
+    }()
     static let systemWideEnforcementConfigKey = "systemwide_enforcement"
     static let flowDelayEnabledConfigKey = "flow_delay_enabled"
     static let flowDelayMinConfigKey = "flow_delay_min_seconds"

@@ -80,7 +80,8 @@ extension FilterDataProvider {
                     port: port,
                     socketType: socketType,
                     socketProtocolNumber: socketProtocolNumber,
-                    isDNSQuery: isDNSQuery
+                    isDNSQuery: isDNSQuery,
+                    direction: socketFlow.direction
                 )
             } else {
                 os_log("NET flow bypassed: pid=%{public}d %{public}@:%{public}@ (system-wide enforcement disabled, metadata missing)",
@@ -103,7 +104,8 @@ extension FilterDataProvider {
             pid: pid,
             socketProtocol: socketProtocolNumber,
             allowInspection: true,
-            isDNSQuery: isDNSQuery
+            isDNSQuery: isDNSQuery,
+            direction: socketFlow.direction
         )
 
         switch decision {
@@ -119,6 +121,7 @@ extension FilterDataProvider {
                         socketType: socketType,
                         socketProtocolName: socketProtocol,
                         socketProtocolNumber: socketFlow.socketProtocol,
+                        direction: socketFlow.direction,
                         buffer: Data()
                     )
                 }
@@ -218,6 +221,7 @@ extension FilterDataProvider {
                     socketType: socketType,
                     socketProtocolName: socketProtocol,
                     socketProtocolNumber: socketProtocolNumber,
+                    direction: socketFlow.direction,
                     buffer: Data()
                 )
             }
@@ -290,7 +294,8 @@ extension FilterDataProvider {
                 pidInfo: state.pidInfo,
                 pid: state.pid,
                 socketProtocol: state.socketProtocolNumber,
-                allowInspection: false
+                allowInspection: false,
+                direction: state.direction
             )
 
             emitNetworkEvent(
