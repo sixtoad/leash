@@ -14,7 +14,8 @@ extension FilterDataProvider {
         port: String,
         socketType: String,
         socketProtocolNumber: Int32,
-        isDNSQuery: Bool
+        isDNSQuery: Bool,
+        direction: NETrafficDirection
     ) {
         guard pid > 0 else { return }
         let allowQueue = syncQueue.sync { systemWideEnforcementEnabled }
@@ -28,6 +29,7 @@ extension FilterDataProvider {
             socketType: socketType,
             socketProtocolNumber: socketProtocolNumber,
             isDNSQuery: isDNSQuery,
+            direction: direction,
             enqueueTime: Date()
         )
 
@@ -104,7 +106,8 @@ extension FilterDataProvider {
                     pid: flow.pid,
                     socketProtocol: flow.socketProtocolNumber,
                     allowInspection: false,
-                    isDNSQuery: flow.isDNSQuery
+                    isDNSQuery: flow.isDNSQuery,
+                    direction: flow.direction
                 )
 
                 let finalDecision: FlowDecision

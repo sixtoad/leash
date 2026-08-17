@@ -15,13 +15,53 @@ final class DaemonSync: NSObject {
     }()
 
     var task: URLSessionWebSocketTask?
-    var isConnected = false
+
+    /// Lock-guarded so the network filter can read it from a flow-handling
+    /// thread without hopping onto `queue` — a `queue.sync` from inside
+    /// `handleNewFlow` would stall every outbound connection behind whatever
+    /// the sync queue is doing.
+    private let connectionStateLock = NSLock()
+    private var connectionState = false
+    private var connectionLostAt: Date?
+    var isConnected: Bool {
+        get {
+            connectionStateLock.lock()
+            defer { connectionStateLock.unlock() }
+            return connectionState
+        }
+        set {
+            connectionStateLock.lock()
+            if newValue {
+                connectionLostAt = nil
+            } else if connectionLostAt == nil, connectionState {
+                // Stamp the first transition to disconnected, not every failed
+                // reconnect attempt, so callers can measure a real outage.
+                connectionLostAt = Date()
+            }
+            connectionState = newValue
+            connectionStateLock.unlock()
+        }
+    }
+
+    /// When the connection was lost, or nil if connected (or never connected).
+    /// Recorded at the moment of the drop: a consumer that only samples this
+    /// while handling traffic would otherwise start its clock at the first
+    /// request after the outage and see an idle machine as freshly disconnected.
+    var disconnectedSince: Date? {
+        connectionStateLock.lock()
+        defer { connectionStateLock.unlock() }
+        return connectionLostAt
+    }
+
     var reconnectWorkItem: DispatchWorkItem?
 
     let sessionID = UUID().uuidString
     var shimID = UUID().uuidString
 
     var capabilities: [String] = ["pid-sync", "rule-sync", "event", "policy", "network-rules"]
+    /// Which leash process this connection belongs to; reported in client.hello
+    /// so the daemon (and the app's health check) can name a missing extension.
+    var component: String = LeashIdentifiers.component
     var connectAttempts = 0
 
     var pendingRequests: [String: (Result<[String: Any], Error>) -> Void] = [:]

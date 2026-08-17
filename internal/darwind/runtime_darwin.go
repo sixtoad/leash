@@ -979,6 +979,27 @@ func (rt *runtimeState) dispatchClientEnvelope(clientID string, env *messages.En
 		rules := rt.macSync.GetNetworkRules()
 		rt.sendResponse(clientID, env, "ok", "network rules retrieved", map[string]any{"rules": rules})
 
+	case messages.TypeMacClientQuery:
+		if rt.macSync == nil {
+			rt.sendResponse(clientID, env, "error", "macsync not available", nil)
+			return
+		}
+		clients := rt.macSync.GetAllClients()
+		entries := make([]map[string]any, 0, len(clients))
+		for _, client := range clients {
+			entries = append(entries, map[string]any{
+				"id":        client.ID,
+				"component": client.Component,
+				"platform":  client.Platform,
+				"version":   client.Version,
+				"last_seen": client.LastSeen.UTC().Format(time.RFC3339),
+			})
+		}
+		rt.sendResponse(clientID, env, "ok", "clients retrieved", map[string]any{
+			"clients":    entries,
+			"components": rt.macSync.ConnectedComponents(),
+		})
+
 	case messages.TypeMacNetworkRuleUpdate:
 		var payload messages.MacNetworkRuleUpdatePayload
 		if err := messages.UnmarshalPayload(env, &payload); err != nil {

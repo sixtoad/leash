@@ -7,24 +7,29 @@ import (
 
 // Type names for message envelopes.
 const (
-	TypePendingRequest       = "pending.request"
-	TypeVerdict              = "verdict"
-	TypeRuleUpdate           = "rule.update"
-	TypeEvent                = "event"
-	TypeClientHello          = "client.hello"
-	TypeMacPIDSync           = "mac.pid.sync"
-	TypeMacRuleSync          = "mac.rule.sync"
-	TypeMacEvent             = "mac.event"
-	TypeMacAck               = "mac.ack"
-	TypeShimHello            = "shim.hello"
-	TypeShimHeartbeat        = "shim.heartbeat"
-	TypeMacPolicyEvent       = "mac.policy.event"
-	TypeMacPolicyDecision    = "mac.policy.decision"
-	TypeMacRuleQuery         = "mac.rule.query"
-	TypeMacRuleAdd           = "mac.rule.add"
-	TypeMacRuleRemove        = "mac.rule.remove"
-	TypeMacRuleClear         = "mac.rule.clear"
-	TypeMacNetworkRuleQuery  = "mac.network_rule.query"
+	TypePendingRequest      = "pending.request"
+	TypeVerdict             = "verdict"
+	TypeRuleUpdate          = "rule.update"
+	TypeEvent               = "event"
+	TypeClientHello         = "client.hello"
+	TypeMacPIDSync          = "mac.pid.sync"
+	TypeMacRuleSync         = "mac.rule.sync"
+	TypeMacEvent            = "mac.event"
+	TypeMacAck              = "mac.ack"
+	TypeShimHello           = "shim.hello"
+	TypeShimHeartbeat       = "shim.heartbeat"
+	TypeMacPolicyEvent      = "mac.policy.event"
+	TypeMacPolicyDecision   = "mac.policy.decision"
+	TypeMacRuleQuery        = "mac.rule.query"
+	TypeMacRuleAdd          = "mac.rule.add"
+	TypeMacRuleRemove       = "mac.rule.remove"
+	TypeMacRuleClear        = "mac.rule.clear"
+	TypeMacNetworkRuleQuery = "mac.network_rule.query"
+	// TypeMacClientQuery asks the daemon which leash components are currently
+	// connected (response payload: {"clients": [...], "components": [...]}).
+	// The app uses it to detect a system extension that is loaded but not
+	// talking to the daemon, and repair it.
+	TypeMacClientQuery       = "mac.client.query"
 	TypeMacNetworkRuleUpdate = "mac.network_rule.update"
 	TypeMacMITMConfig        = "mac.mitm.config"
 	TypeMacMITMSession       = "mac.mitm.session"
@@ -138,8 +143,16 @@ type EventPayload struct {
 }
 
 // ClientHelloPayload identifies a websocket client and advertised capabilities.
+//
+// Component names the leash process behind the connection ("leash.es",
+// "leash.netfilter", "leash.proxy", "leash.app", "leash.cli"). Without it every
+// macOS system extension says the same thing in its hello, so a missing
+// extension can only be inferred by counting connected clients — which is how
+// the degraded content filter in #62 went unnoticed. Optional: older clients
+// that don't send it are recorded as "unknown".
 type ClientHelloPayload struct {
 	Platform     string   `json:"platform"`
+	Component    string   `json:"component,omitempty"`
 	Capabilities []string `json:"capabilities,omitempty"`
 	Version      string   `json:"version,omitempty"`
 }

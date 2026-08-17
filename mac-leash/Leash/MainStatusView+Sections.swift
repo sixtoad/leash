@@ -497,12 +497,30 @@ class NetworkFilterManager {
 
     private init() {}
 
+    // Persisted user intent, mirroring TransparentProxyManager. Lets
+    // reconcileOnLaunch tell "the user never turned the filter on" apart from
+    // "the filter was on and something knocked it over", without ever
+    // auto-enabling a filter the user didn't ask for.
+    private var userIntentKey: String { "leash.filter.userEnabled" }
+    private var userIntendsEnabled: Bool {
+        get { UserDefaults.standard.bool(forKey: userIntentKey) }
+        set { UserDefaults.standard.set(newValue, forKey: userIntentKey) }
+    }
+
     func activate() async throws {
+        userIntendsEnabled = true
+
         let manager = NEFilterManager.shared()
 
         try await manager.loadFromPreferences()
 
-        let config = NEFilterProviderConfiguration()
+        applyEnabledConfig(manager)
+
+        try await manager.saveToPreferences()
+    }
+
+    private func applyEnabledConfig(_ manager: NEFilterManager) {
+        let config = manager.providerConfiguration ?? NEFilterProviderConfiguration()
         config.filterDataProviderBundleIdentifier = LeashIdentifiers.networkFilterExtension
         config.filterSockets = true
         config.filterPackets = false
@@ -510,8 +528,28 @@ class NetworkFilterManager {
         manager.providerConfiguration = config
         manager.localizedDescription = "Leash Network Filter"
         manager.isEnabled = true
+    }
 
+    /// Restart the filter provider by forcing an off→on transition.
+    ///
+    /// Re-saving an already-enabled config is a no-op the system ignores — it
+    /// only (re)launches the provider on an actual isEnabled false→true edge.
+    /// This is the programmatic equivalent of toggling "Leash Network Filter"
+    /// off and on in System Settings, which is what recovered the degraded
+    /// filter by hand in #62.
+    func forceRestart() async throws {
+        let manager = NEFilterManager.shared()
+        try await manager.loadFromPreferences()
+
+        if manager.isEnabled {
+            manager.isEnabled = false
+            try await manager.saveToPreferences()
+            try await manager.loadFromPreferences()
+        }
+
+        applyEnabledConfig(manager)
         try await manager.saveToPreferences()
+        try await manager.loadFromPreferences()
     }
 
     func currentState() async -> State {
@@ -612,6 +650,9 @@ class NetworkFilterManager {
     }
 
     func deactivate() async throws {
+        // The user turned the filter off; don't resurrect it on the next launch.
+        userIntendsEnabled = false
+
         let manager = NEFilterManager.shared()
 
         try await manager.loadFromPreferences()
@@ -620,5 +661,111 @@ class NetworkFilterManager {
 
         manager.isEnabled = false
         try await manager.saveToPreferences()
+    }
+
+    // MARK: - Launch Reconcile / Degraded-Filter Repair (#62)
+
+    /// How long to let the system-extension activation settle before touching
+    /// the NE config, and how long to give a (re)started provider to reach the
+    /// daemon before judging it degraded.
+    private var settleDelay: Duration { .seconds(5) }
+    private var connectDelay: Duration { .seconds(12) }
+
+    /// Restore and health-check the content filter on app launch.
+    ///
+    /// Two failure modes, both observed in #62 after a system-extension version
+    /// replacement: the NE config is left disabled, or it reads enabled while
+    /// the provider is not actually connected to the daemon — in which case it
+    /// holds no network rules and (before the fail-closed change) passed
+    /// everything. The first is visible in the config; the second is only
+    /// visible by asking the daemon which components are connected.
+    ///
+    /// Repairs at most once per launch, and only when the user previously
+    /// enabled the filter.
+    func reconcileOnLaunch(extensionReplaced: Bool) async {
+        guard userIntendsEnabled else {
+            report(["intent": "no"])
+            return
+        }
+
+        try? await Task.sleep(for: settleDelay)
+
+        do {
+            let state = await currentState()
+            report(["intent": "yes",
+                    "state": "\(state)",
+                    "extension_replaced": extensionReplaced ? "yes" : "no"])
+
+            if state != .configuredEnabled {
+                try await activate()
+                report(["result": "config_restored"])
+            } else if extensionReplaced {
+                // An in-place sysext replacement leaves the provider degraded;
+                // a clean off→on cycle is what actually reconnects it.
+                try await forceRestart()
+                report(["result": "restarted_after_version_change"])
+            }
+        } catch {
+            report(["result": "error", "error": "\(error)"], severity: "error")
+            return
+        }
+
+        await verifyProviderConnected()
+    }
+
+    /// Confirm the provider reached the daemon; restart it once if it didn't.
+    private func verifyProviderConnected() async {
+        try? await Task.sleep(for: connectDelay)
+
+        guard let components = await connectedComponents() else {
+            // No usable answer: the daemon isn't running, or it predates
+            // mac.client.query. Either way we can't tell a degraded filter from
+            // a healthy one, so don't restart on a guess — the filter's own
+            // fail-closed posture covers the enforcement gap meanwhile.
+            report(["health": "unknown"])
+            return
+        }
+
+        if components.contains(LeashIdentifiers.Component.networkFilter) {
+            report(["health": "connected"])
+            return
+        }
+
+        report(["health": "degraded", "components": components.sorted().joined(separator: ",")],
+               severity: "error")
+
+        do {
+            try await forceRestart()
+        } catch {
+            report(["health": "repair_failed", "error": "\(error)"], severity: "error")
+            return
+        }
+
+        try? await Task.sleep(for: connectDelay)
+        let after = await connectedComponents()
+        let recovered = after?.contains(LeashIdentifiers.Component.networkFilter) ?? false
+        report(["health": recovered ? "repaired" : "still_degraded"],
+               severity: recovered ? "info" : "error")
+    }
+
+    private func connectedComponents() async -> Set<String>? {
+        await withCheckedContinuation { continuation in
+            DaemonSync.shared.queryConnectedComponents { result in
+                switch result {
+                case .success(let components):
+                    continuation.resume(returning: components)
+                case .failure:
+                    continuation.resume(returning: nil)
+                }
+            }
+        }
+    }
+
+    /// Report to the daemon log — the app's os_log doesn't surface in the dev VM.
+    private func report(_ details: [String: String], severity: String = "info") {
+        DaemonSync.shared.sendEvent(name: "filter.reconcile",
+                                    details: details,
+                                    severity: severity,
+                                    source: LeashIdentifiers.Component.app)
     }
 }

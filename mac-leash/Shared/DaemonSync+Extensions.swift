@@ -352,11 +352,53 @@ extension DaemonSync {
         }
     }
 
+    /// Ask the daemon which leash components currently hold a websocket
+    /// connection (see LeashIdentifiers.Component). Used by the app to spot a
+    /// system extension that is loaded but not talking to the daemon — the
+    /// content filter in that state enforces nothing (#62).
+    func queryConnectedComponents(timeout: TimeInterval = 10.0,
+                                  completion: @escaping (Result<Set<String>, Error>) -> Void) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.ensureConnection()
+
+            self.sendRequest(type: "mac.client.query", payload: [:], timeout: timeout) { result in
+                switch result {
+                case .success(let payload):
+                    guard let components = payload["components"] as? [String] else {
+                        // A daemon older than this message type answers with an
+                        // "unsupported message type" ack. That is "can't tell",
+                        // not "nothing is connected" — reporting an empty set
+                        // here would make the app declare a healthy filter
+                        // degraded and restart it for nothing.
+                        completion(.failure(NSError(
+                            domain: LeashIdentifiers.namespaced("daemon-sync"),
+                            code: -3,
+                            userInfo: [NSLocalizedDescriptionKey: "daemon does not report connected components"])))
+                        return
+                    }
+                    completion(.success(Set(components)))
+                case .failure(let error):
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
     // MARK: - Message Subscriptions
 
     func subscribe(to messageType: String, handler: @escaping MessageHandler) {
         queue.async { [weak self] in
             guard let self else { return }
+            // Subscribing is a statement of intent to receive broadcasts, so it
+            // must bring the connection up. The websocket was previously
+            // established only by send paths: the transparent proxy provider
+            // subscribes to mac.pid.sync and (with debug logging off) never
+            // sends anything, so it never connected, never registered with the
+            // daemon, and never received a single PID update — leaving it unable
+            // to route tracked flows. Same failure shape as #62, permanent
+            // rather than post-update.
+            self.ensureConnection()
             if self.messageHandlers[messageType] == nil {
                 self.messageHandlers[messageType] = []
             }
@@ -420,7 +462,11 @@ extension DaemonSync {
                 }
             case .success(let message):
                 self.queue.async {
+                    // Bytes from the daemon: the connection is real. This is also
+                    // where the reconnect backoff resets, so a socket that opens
+                    // and immediately dies keeps backing off.
                     self.isConnected = true
+                    self.connectAttempts = 0
                 }
                 switch message {
                 case .string(let text):
@@ -446,13 +492,19 @@ extension DaemonSync {
     func sendHello() {
         let helloPayload: [String: Any] = [
             "platform": "darwin",
+            "component": component,
             "capabilities": capabilities,
             "version": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
         ]
         sendEnvelope(type: "client.hello", payload: helloPayload, requestID: nil)
-        isConnected = true
-        connectAttempts = 0
-        os_log("Websocket hello sent (capabilities=%{public}@)", log: log, type: .info, capabilities.joined(separator: ","))
+        // Deliberately NOT marking the connection live here. Sending the hello
+        // proves nothing — with the daemon down, every reconnect attempt would
+        // flip isConnected true for a moment, which both hides real outages from
+        // anything watching the flag (the filter's fail-closed check) and resets
+        // the reconnect backoff on failure. `listen()` sets it once bytes
+        // actually arrive from the daemon, which is the real signal.
+        os_log("Websocket hello sent (component=%{public}@ capabilities=%{public}@)",
+               log: log, type: .info, component, capabilities.joined(separator: ","))
     }
 
     func scheduleReconnect() {
@@ -534,10 +586,19 @@ extension DaemonSync {
             return
         }
 
-        // Try to decode as envelope first
+        // Try to decode as envelope first.
+        //
+        // No .convertFromSnakeCase here: IncomingEnvelope already maps the
+        // snake_case wire names in its CodingKeys, and the strategy is applied
+        // to the JSON keys *before* they are matched against those keys — so
+        // "request_id" arrived as "requestId", matched nothing, and every
+        // response decoded with requestID == nil. Requests were therefore never
+        // correlated with their responses and every sendRequest() sat until its
+        // timeout. It went unnoticed because the daemon also pushes rules and
+        // PIDs unsolicited on each hello, which is what actually kept the
+        // extensions in sync.
         do {
             let decoder = JSONDecoder()
-            decoder.keyDecodingStrategy = .convertFromSnakeCase
             let envelope = try decoder.decode(IncomingEnvelope.self, from: data)
 
             os_log("Received message type=%{public}@ requestID=%{public}@", log: log, type: .debug, envelope.type, envelope.requestID ?? "none")
