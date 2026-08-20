@@ -29,6 +29,7 @@ import (
 	"github.com/strongdm/leash/internal/httpserver"
 	"github.com/strongdm/leash/internal/leashd/listen"
 	"github.com/strongdm/leash/internal/lsm"
+	"github.com/strongdm/leash/internal/macext"
 	"github.com/strongdm/leash/internal/macsync"
 	"github.com/strongdm/leash/internal/messages"
 	"github.com/strongdm/leash/internal/openflag"
@@ -667,6 +668,14 @@ func (rt *runtimeState) startFrontend() error {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ready"))
 	})
+	// The macOS readiness facts `leash doctor` reads from outside; see
+	// darwinHealthHandler for why they can only come from this process.
+	mux.HandleFunc("/health/darwin", darwinHealthHandler(func() macext.DaemonHealth {
+		if rt.macSync == nil {
+			return macext.DaemonHealth{}
+		}
+		return rt.macSync.Health()
+	}))
 	title := ui.ComposeTitle(os.Getenv("LEASH_PROJECT"), os.Getenv("LEASH_COMMAND"))
 	mux.Handle("/", ui.NewSPAHandlerWithTitle(http.FS(uiFS), title))
 

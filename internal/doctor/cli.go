@@ -13,18 +13,19 @@ import (
 // runs degraded — has to be distinguishable from it and from each other. A
 // provisioner gating on `leash doctor && ...` fails closed on all of them.
 const (
-	exitReady     = 0 // at least one runtime enforces with both layers
+	exitReady     = 0 // at least one runtime enforces with every layer it has
 	exitNoRuntime = 1 // no runtime can run a workload at all
 	exitUsage     = 2 // bad invocation (also --help: not a verdict)
-	exitDegraded  = 3 // a runtime runs, but Layer 1 is unavailable
+	exitDegraded  = 3 // a runtime runs, but not every enforcement layer is active
 	exitInternal  = 4 // doctor could not render or deliver its own report
 )
 
 const usageExitNotes = `exit codes:
-  0  a runtime enforces with both layers
+  0  a runtime enforces with every layer it has
   1  no runtime can run a workload
   2  usage error, or --help (never a readiness verdict)
-  3  a runtime runs, but eBPF LSM (Layer 1) is unavailable — proxy-only
+  3  a runtime runs, but not every layer enforces
+     (Linux: eBPF LSM / Layer 1 off, proxy-only. macOS: see the macOS section.)
   4  doctor could not render or write its report
 `
 
@@ -40,8 +41,16 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	// only (or who cannot afford to load a BPF program), and the report says so
 	// under `not checked by doctor`.
 	quick := fs.Bool("quick", false, "skip the checks that load kernel programs (BPF-LSM attachability); the report declares what was not checked")
+	// The two macOS seams. They are flags rather than probed guesses because
+	// both have a legitimate non-default value during development — a locally
+	// built leashcli outside the app bundle, and a daemon on another port — and
+	// reporting the default path as missing would be true but useless. They are
+	// accepted on every platform so a script does not have to branch on GOOS;
+	// off macOS they simply have nothing to configure.
+	leashCLI := fs.String("leash-cli-path", "", "macOS: `path` to the companion leashcli binary (default "+DefaultLeashCLIPath+")")
+	daemonAddr := fs.String("darwin-daemon", "", "macOS: `address` of the running \"leash --darwin\" daemon (default $LEASH_LISTEN, else "+DefaultDarwinDaemonAddr+")")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "usage: leash doctor [--json] [--quick]\n\nChecks whether this machine can enforce, per runtime.\n\nflags:\n")
+		fmt.Fprintf(stderr, "usage: leash doctor [--json] [--quick] [--leash-cli-path PATH] [--darwin-daemon ADDR]\n\nChecks whether this machine can enforce, per runtime.\n\nflags:\n")
 		fs.PrintDefaults()
 		fmt.Fprintf(stderr, "\n%s", usageExitNotes)
 	}
@@ -63,7 +72,11 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	report := Evaluate(ProbeWithOptions(ProbeOptions{Quick: *quick}))
+	report := Evaluate(ProbeWithOptions(ProbeOptions{
+		Quick:            *quick,
+		LeashCLIPath:     *leashCLI,
+		DarwinDaemonAddr: *daemonAddr,
+	}))
 
 	// Render fully before writing a byte. Encoding straight to stdout would let
 	// a half-written document escape and then be reported as a usage error,

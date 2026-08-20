@@ -60,6 +60,25 @@ enum LeashIdentifiers {
         static let cli = "leash.cli"
     }
 
+    /// Capability tags reported alongside the component in `client.hello`.
+    ///
+    /// `fullDiskAccess` is the answer to a question macOS refuses to answer any
+    /// other way: no API lets one process read another's TCC grant, and probing
+    /// a TCC-gated path only tells you about the prober. LeashES knows, because
+    /// `es_new_client` returns ES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED without
+    /// the grant — so it advertises it here once that call has succeeded.
+    ///
+    /// It lives in the hello rather than in a one-off event because the hello is
+    /// re-sent on EVERY reconnect. The event LeashES emits at startup is sent
+    /// once per process launch, so a daemon started after the extension — the
+    /// normal case, since macOS launches extensions at boot — never saw it, and
+    /// `leash doctor` could never confirm the grant. Carrying it in the hello
+    /// makes the signal self-healing: it reappears within one reconnect of any
+    /// daemon restart, and it disappears with the client if LeashES dies.
+    enum Capability {
+        static let fullDiskAccess = "full-disk-access"
+    }
+
     /// Derived from the running bundle identifier rather than set by each entry
     /// point, so a new target can't silently ship an unlabelled hello.
     static let component: String = {

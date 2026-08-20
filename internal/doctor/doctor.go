@@ -11,7 +11,11 @@
 // The split in this package is deliberate: doctor.go is pure — it turns an
 // already-probed Host into a Report and never touches the filesystem, PATH, or
 // the process's identity — while probe.go does the touching. That keeps the
-// whole readiness matrix unit-testable without a real kernel or root.
+// whole readiness matrix unit-testable without a real kernel or root. darwin.go
+// and probe_darwin.go are the same split for macOS enforcement, which is graded
+// as a runtime of its own (issue #61) rather than as a branch inside the Linux
+// one: `leash --darwin` enforces through system extensions and a daemon, and
+// shares no layer with the eBPF/proxy pair the rest of this file is about.
 package doctor
 
 import (
@@ -20,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/strongdm/leash/internal/lsm"
+	"github.com/strongdm/leash/internal/macext"
 	"github.com/strongdm/leash/internal/runner"
 )
 
@@ -87,6 +92,12 @@ type Host struct {
 	// with neither --runtime nor LEASH_RUNTIME selects. Reported, not graded —
 	// see Report.DefaultRuntime.
 	DefaultRuntime string
+
+	// Darwin holds the macOS enforcement facts (`leash --darwin`): system
+	// extension activation, the daemon those extensions talk to, and Full Disk
+	// Access. It is filled only on macOS, and its Checked field says so — see
+	// darwin.go, which is where every macOS decision lives.
+	Darwin DarwinHost
 }
 
 // Status is the three-state readiness of one runtime. Two states were not
@@ -161,6 +172,12 @@ type Unchecked struct {
 // Report is the `leash doctor --json` document. The field names are the
 // contract consumers parse, so treat them as API: additive changes only.
 //
+// Every runtime gets a section on every platform, including the ones that do
+// not apply here — a consumer parsing the document should never have to know
+// which fields this host's GOOS happens to emit. The inapplicable ones report
+// unavailable with a single "wrong platform" issue, and (for darwin) a
+// `checked: false` that tells the two cases apart.
+//
 // Verdict and the per-runtime Ready flags are derived, not stored, so the
 // document can never contradict itself — see MarshalJSON.
 //
@@ -170,6 +187,7 @@ type Unchecked struct {
 type Report struct {
 	Native    NativeReport    `json:"native"`
 	Container ContainerReport `json:"container"`
+	Darwin    DarwinReport    `json:"darwin"`
 	Unchecked []Unchecked     `json:"unchecked"`
 
 	// DefaultRuntime is the runtime a bare `leash run` selects on this build
@@ -254,6 +272,7 @@ func Evaluate(h Host) Report {
 	return Report{
 		Native:         evaluateNative(h),
 		Container:      evaluateContainer(h),
+		Darwin:         evaluateDarwin(h),
 		Unchecked:      unchecked(h),
 		DefaultRuntime: strings.TrimSpace(h.DefaultRuntime),
 	}
@@ -541,6 +560,7 @@ func unchecked(h Host) []Unchecked {
 			Reason: capsUncheckedReason(h),
 		})
 	}
+	out = append(out, darwinUnchecked(h)...)
 	// container_kernel is declared once, for whichever reason applies: the
 	// remote daemon is named first because it holds even on Linux, where the
 	// platform reason would not have fired at all.
@@ -562,11 +582,21 @@ func unchecked(h Host) []Unchecked {
 // Verdict is the best state any runtime reaches. It is in the JSON document
 // (CAP-8) so a consumer never re-implements leash's own readiness policy and
 // then drifts from it.
+//
+// "Best of all" is what lets a Mac answer exit 0: on darwin the native section
+// is unavailable (it grades the Linux backend) and the container section can
+// only ever be degraded (an unprobed VM kernel), so a machine that really does
+// enforce through the system extensions would otherwise be reported as one that
+// cannot. The gap between this verdict and what a bare `leash run` selects is
+// named separately, by defaultRuntimeNote.
 func (r Report) Verdict() Status {
-	if r.Container.Status > r.Native.Status {
-		return r.Container.Status
+	best := r.Native.Status
+	for _, s := range []Status{r.Container.Status, r.Darwin.Status} {
+		if s > best {
+			best = s
+		}
 	}
-	return r.Native.Status
+	return best
 }
 
 // ExitCode is the script-facing verdict.
@@ -601,6 +631,7 @@ type jsonReport struct {
 	Verdict        Status        `json:"verdict"`
 	Native         jsonNative    `json:"native"`
 	Container      jsonContainer `json:"container"`
+	Darwin         jsonDarwin    `json:"darwin"`
 	Unchecked      []Unchecked   `json:"unchecked"`
 	DefaultRuntime string        `json:"default_runtime"`
 }
@@ -621,6 +652,23 @@ type jsonContainer struct {
 	Issues []string `json:"issues"`
 }
 
+// jsonDarwin mirrors DarwinReport. Same rule as the other two mirrors: Ready is
+// derived at encode time so the document cannot contradict its own status.
+type jsonDarwin struct {
+	Checked         bool         `json:"checked"`
+	Status          Status       `json:"status"`
+	Ready           bool         `json:"ready"`
+	ESExtension     macext.State `json:"es_extension"`
+	FilterExtension macext.State `json:"filter_extension"`
+	ProxyExtension  macext.State `json:"proxy_extension"`
+	FullDiskAccess  macext.FDA   `json:"full_disk_access"`
+	DaemonUp        bool         `json:"daemon_up"`
+	Daemon          string       `json:"daemon"`
+	Components      []string     `json:"components"`
+	LeashCLI        string       `json:"leash_cli"`
+	Issues          []string     `json:"issues"`
+}
+
 // MarshalJSON renders the document consumers parse.
 func (r Report) MarshalJSON() ([]byte, error) {
 	return json.Marshal(jsonReport{
@@ -638,6 +686,20 @@ func (r Report) MarshalJSON() ([]byte, error) {
 			Ready:  r.Container.Ready(),
 			Engine: r.Container.Engine,
 			Issues: strings0(r.Container.Issues),
+		},
+		Darwin: jsonDarwin{
+			Checked:         r.Darwin.Checked,
+			Status:          r.Darwin.Status,
+			Ready:           r.Darwin.Ready(),
+			ESExtension:     r.Darwin.ESExtension,
+			FilterExtension: r.Darwin.FilterExtension,
+			ProxyExtension:  r.Darwin.ProxyExtension,
+			FullDiskAccess:  r.Darwin.FullDiskAccess,
+			DaemonUp:        r.Darwin.DaemonUp,
+			Daemon:          r.Darwin.Daemon,
+			Components:      strings0(r.Darwin.Components),
+			LeashCLI:        r.Darwin.LeashCLI,
+			Issues:          strings0(r.Darwin.Issues),
 		},
 		Unchecked:      unchecked0(r.Unchecked),
 		DefaultRuntime: r.DefaultRuntime,
@@ -676,6 +738,19 @@ func (r *Report) UnmarshalJSON(data []byte) error {
 			Status: doc.Container.Status,
 			Engine: doc.Container.Engine,
 			Issues: strings0(doc.Container.Issues),
+		},
+		Darwin: DarwinReport{
+			Checked:         doc.Darwin.Checked,
+			Status:          doc.Darwin.Status,
+			ESExtension:     doc.Darwin.ESExtension,
+			FilterExtension: doc.Darwin.FilterExtension,
+			ProxyExtension:  doc.Darwin.ProxyExtension,
+			FullDiskAccess:  doc.Darwin.FullDiskAccess,
+			DaemonUp:        doc.Darwin.DaemonUp,
+			Daemon:          doc.Darwin.Daemon,
+			Components:      strings0(doc.Darwin.Components),
+			LeashCLI:        doc.Darwin.LeashCLI,
+			Issues:          strings0(doc.Darwin.Issues),
 		},
 		Unchecked:      unchecked0(doc.Unchecked),
 		DefaultRuntime: doc.DefaultRuntime,
@@ -721,6 +796,8 @@ func (r Report) Text() string {
 	fmt.Fprintf(&b, "  engine:          %s\n", engine)
 	writeIssues(&b, r.Container.Issues)
 
+	writeDarwinSection(&b, r.Darwin)
+
 	if len(r.Unchecked) > 0 {
 		b.WriteString("\nnot checked by doctor:\n")
 		for _, u := range r.Unchecked {
@@ -733,7 +810,7 @@ func (r Report) Text() string {
 	case StatusReady:
 		b.WriteString("result: this machine can enforce with at least one runtime.\n")
 	case StatusDegraded:
-		b.WriteString("result: DEGRADED — this machine can run workloads, but no runtime enforces Layer 1.\n        " + layer1Consequence + "\n")
+		b.WriteString(degradedResult(r))
 	default:
 		b.WriteString("result: this machine cannot enforce with ANY runtime — resolve the issues above.\n")
 	}
@@ -741,6 +818,24 @@ func (r Report) Text() string {
 		b.WriteString(note)
 	}
 	return b.String()
+}
+
+// degradedResult summarises a degraded verdict by naming what is actually off,
+// which now depends on which runtime carried the verdict. The Linux sentence is
+// about Layer 1 (the eBPF LSM); the macOS one cannot be, because macOS has no
+// Layer 1/Layer 2 split and its degradations are a different set of things.
+// Printing the kernel sentence under a Mac's verdict was the first thing this
+// section got wrong, and it reads as authoritative — so each is printed only
+// when a runtime it describes is the one degrading.
+func degradedResult(r Report) string {
+	lines := []string{"result: DEGRADED — this machine can run workloads, but no runtime enforces every layer."}
+	if r.Native.Status == StatusDegraded || r.Container.Status == StatusDegraded {
+		lines = append(lines, "        "+layer1Consequence)
+	}
+	if r.Darwin.Status == StatusDegraded {
+		lines = append(lines, "        "+darwinDegradedConsequence)
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 // defaultRuntimeNote spells out the gap between the verdict and what a caller
@@ -776,6 +871,8 @@ func (r Report) statusOf(name string) (s Status, known bool) {
 		return r.Native.Status, true
 	case "docker", "podman":
 		return r.Container.Status, true
+	case "darwin":
+		return r.Darwin.Status, true
 	default:
 		return StatusUnavailable, false
 	}
@@ -804,6 +901,17 @@ func statusWord(s Status) string {
 		// The section header is the one place with room to say what the state
 		// costs, and "degraded" alone has been read as "slightly worse".
 		return "DEGRADED (runs, Layer 1 off)"
+	}
+	return statusShort(s)
+}
+
+// darwinStatusWord is statusWord for the macOS section. It needs its own gloss
+// because "Layer 1 off" is a statement about the eBPF LSM, and a macOS section
+// that borrowed it would be naming a layer that does not exist on the platform
+// it is grading.
+func darwinStatusWord(s Status) string {
+	if s == StatusDegraded {
+		return "DEGRADED (runs, not fully enforcing)"
 	}
 	return statusShort(s)
 }

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/strongdm/leash/internal/lsm"
+	"github.com/strongdm/leash/internal/macext"
 	"github.com/strongdm/leash/internal/messages"
 )
 
@@ -28,16 +29,20 @@ type ClientState struct {
 
 // Known component names reported in client.hello. They mirror the `source`
 // tags the extensions already use on events.
+//
+// The strings live in internal/macext because `leash doctor` grades the same
+// names from outside this process; these aliases keep the daemon's own call
+// sites reading as before.
 const (
-	ComponentEndpointSecurity = "leash.es"
-	ComponentNetworkFilter    = "leash.netfilter"
-	ComponentTransparentProxy = "leash.proxy"
-	ComponentApp              = "leash.app"
-	ComponentCLI              = "leash.cli"
+	ComponentEndpointSecurity = macext.ComponentEndpointSecurity
+	ComponentNetworkFilter    = macext.ComponentNetworkFilter
+	ComponentTransparentProxy = macext.ComponentTransparentProxy
+	ComponentApp              = macext.ComponentApp
+	ComponentCLI              = macext.ComponentCLI
 	// ComponentProbe is the daemon's own websocket health probe: it connects,
 	// says hello and disconnects, so it shows up as register/unregister churn.
-	ComponentProbe   = "leash.probe"
-	ComponentUnknown = "unknown"
+	ComponentProbe   = macext.ComponentProbe
+	ComponentUnknown = macext.ComponentUnknown
 )
 
 // RuleSnapshot represents the latest macOS rule set delivered over the websocket.
@@ -62,6 +67,12 @@ type Manager struct {
 	mitmConfig   *messages.MacMITMConfigPayload
 	mitmSessions map[string]messages.MacMITMSessionPayload
 	mitmVersion  int
+
+	// fda/fdaAt are the Full Disk Access grant LeashES last reported, and when.
+	// See readiness.go: this is the only signal for a permission macOS will not
+	// let one process read on another's behalf.
+	fda   macext.FDA
+	fdaAt time.Time
 }
 
 // NewManager returns a macOS sync manager backed by the provided logger.
@@ -236,6 +247,11 @@ func (m *Manager) LogMacEvent(event *messages.MacEventPayload) error {
 	if event == nil {
 		return nil
 	}
+
+	// Before the logger check: a daemon started without a log file still has to
+	// know whether LeashES got Full Disk Access, or `leash doctor` would report
+	// it as unknown purely because logging was off.
+	m.noteReadinessEvent(event)
 
 	if m.logger == nil {
 		return fmt.Errorf("logger not configured")

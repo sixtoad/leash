@@ -22,6 +22,38 @@ This is a native alternative to the Linux container path and does not launch the
 
 ## Verify Status
 
+Start with `leash doctor`, which grades the whole macOS stack in one shot and
+exits `0` (enforcing), `3` (running, but not fully enforcing) or `1` (cannot
+enforce). `leash doctor --json` emits the same facts as a machine-readable
+document — see [API contracts](api-contracts-leash-core.md#node-readiness--leash-doctor---json)
+for the `darwin` section's fields.
+
+```console
+$ leash doctor
+macOS enforcement: DEGRADED (runs, not fully enforcing)
+  ES extension:     active
+  content filter:   active
+  proxy extension:  missing
+  full disk access: granted
+  daemon:           up (127.0.0.1:18080)
+  connected:        leash.es, leash.netfilter
+```
+
+It checks the three system extensions' activation, whether each is actually
+*connected* to the daemon (an activated extension that never connected holds no
+rules and enforces nothing), Full Disk Access, the daemon on `:18080`, and the
+companion `leashcli` binary.
+
+If it reports **"a connected client that does not identify itself"**, the
+installed extensions predate the `component` field in `client.hello` (through
+Leash.app `1.1.0/20251027.1`): they register as `unknown`, so doctor can see that
+something is connected but not which extension. Rebuild and re-activate the
+extensions from this tree to get a per-extension answer. Two flags cover the development seams:
+`--leash-cli-path` for a locally built `leashcli`, `--darwin-daemon` for a daemon
+on another port.
+
+The panes below are what doctor is reading, when you want to check by eye:
+
 1. System Settings -> General -> Login Items & Extensions -> Extensions
    - Network Extensions -> “Leash (Leash Network Filter)”
    - Endpoint Security Extensions -> “Leash (LeashES)”
@@ -33,6 +65,19 @@ This is a native alternative to the Linux container path and does not launch the
 The ES extension needs Full Disk Access to observe events:
 
 System Settings -> Privacy & Security -> Full Disk Access -> enable for “LeashES”.
+
+Without it, `es_new_client` returns `ES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED`,
+LeashES reports the failure to the daemon and exits — so the extension looks
+activated while delivering no file events at all. macOS exposes no API for
+reading another process's TCC grant, so `leash doctor` relays LeashES's own
+verdict from the daemon rather than guessing.
+
+LeashES advertises the grant as a `full-disk-access` capability in every
+`client.hello`, so it re-arrives on each reconnect and survives a daemon restart.
+It also emits `es.full_disk_access.ready` at startup, which covers its very first
+connection. If doctor still reports `unknown` — which never counts as ready —
+either the extension has not reconnected since the daemon started (wait a few
+seconds), or it predates the capability and Leash.app needs rebuilding.
 
 ## Darwin-Specific Commands
 
@@ -101,14 +146,16 @@ By default it **warns** that the agent will run unenforced and continues; set
 `LEASH_REQUIRE_ENFORCEMENT=1` to make a missing/inactive extension a **hard
 stop** (the macOS analog of Linux's `--require-lsm`).
 
-This is a scaffold to be finished and verified on a real Mac — see the
-`TODO(macOS agent)` block in `preflight_extensions_darwin.go`:
+Full Disk Access and "is the extension actually receiving rules" are answered by
+`leash doctor` rather than by this preflight — see [Verify Status](#verify-status).
+Both come from the running daemon (`GET /health/darwin`), because neither can be
+observed from outside the processes that hold them.
+
+Still open — see the `TODO(macOS agent)` block in
+`preflight_extensions_darwin.go`:
 - verify `systemextensionsctl list` parsing against captured output (the parser
-  in `extension_state.go` is ported from the Swift `interpretExtensionEntry` and
-  is unit‑tested, but the live format should be confirmed);
-- add **Full Disk Access** detection for the ES extension (no public API);
-- decide whether the NE content filter's *enabled* state needs a deeper check
-  than extension activation (`NEFilterManager.isEnabled`);
+  in `internal/macext` is ported from the Swift `interpretExtensionEntry` and is
+  unit‑tested, but the live format should be confirmed);
 - decide the **default**: warn‑and‑continue (current) vs. hard‑stop. Because
   native macOS has no proxy fallback, hard‑stop is a defensible default here even
   though Linux degrades to proxy‑only.
