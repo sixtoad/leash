@@ -162,7 +162,7 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
   "contractVersion": 1,             // current CLI surface
   "minCompatibleContract": 0,       // oldest caller contract still served
   "capabilities": [                 // surface elements a provisioner can drive
-    "policy", "inject-service", "runtime", "user", "require-lsm", "version-json"
+    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json"
   ],
   "os": "linux", "arch": "amd64"    // GOOS / GOARCH
 }
@@ -180,7 +180,7 @@ Value domains a caller must accept rather than reject:
 
 **The `-dirty` marker is best-effort and not guaranteed on any given path.** Today only the Makefile `build` target appends it; `scripts/release.sh`, `scripts/install-leash.sh`, `build/publish-docker.sh` and `.goreleaser.yaml` stamp the bare hash. Its presence means the tree was modified; **its absence is not proof of a clean tree** and must not be treated as a provenance guarantee.
 
-**Compatibility rule.** The contract covers the flags a provisioner drives (`--policy`, `--inject-service`, `--runtime`, `--user`, `--require-lsm`) plus the shape of this document. A caller written against contract `C` proceeds iff:
+**Compatibility rule.** The contract covers the flags a provisioner drives (`--policy`, `--inject-service`, `--runtime`, `--user`, `--require-lsm`, `--machine-output`) plus the shape of this document. A caller written against contract `C` proceeds iff:
 
 ```
 minCompatibleContract <= C <= contractVersion
@@ -232,6 +232,22 @@ if myContract < doc.MinCompatibleContract || myContract > *doc.ContractVersion {
 Two traps that snippet avoids. Decoding straight into value types makes `null`, `{}` and any unrelated JSON object succeed with a zero range `[0,0]`, which a contract-0 caller reads as *compatible* — so require the fields that make it this document before trusting the numbers. And never compare leash against constants compiled into the caller: that compares the caller to itself and can only pass. The installed binary's stdout is the only thing that can disagree with you.
 
 `capabilities` is there because the integer over-refuses. Raising `minCompatibleContract` for one removal turns away every caller below the new floor, including those that never used the removed flag; a caller that drives only `--policy` can test for `"policy"` in the array instead of consulting the range at all. Adding a name is additive (no bump); removing one is a break (bump, and raise the floor). A pre-`capabilities` document decodes with the field empty — fall back to the range. The empty string is never a capability.
+
+### Machine-output fd ownership — `leash --machine-output`
+
+An orchestrator that needs the governed command's stdout as a machine-readable result first probes `leash version --json` and requires the `machine-output` capability. It then invokes either supported launcher shape normally, adding the flag before the workload separator:
+
+```sh
+leash --machine-output --runtime native -- agent --json
+leash --machine-output --runtime docker -- agent --json
+leash --machine-output --runtime podman -- agent --json
+```
+
+`--machine-output` is an fd-ownership contract, not an output format. It implies `--no-interactive` but leaves stdin open and directly attached. The governed workload inherits Leash's stdin, stdout, and stderr directly: workload fd 1 is Leash fd 1 byte-for-byte, and workload fd 2 remains Leash fd 2. Leash does not parse, buffer, recognize, normalize, or re-encode either workload stream, so arbitrary binary bytes and a final unterminated result are valid. Numeric workload exit codes still propagate exactly after best-effort cleanup; signal handling retains the runner's existing semantics.
+
+Every Leash-owned policy, UI, bootstrap, image, port-forward, prompt, and lifecycle message is written to fd 2 in this mode. Docker and Podman command progress is also Leash-owned and goes to fd 2; native launcher diagnostics follow the same rule. With the flag absent, historical interactive behavior remains unchanged, including TTY allocation and operational-output destinations.
+
+The capability is additive under contract version 1. A caller that requires pure stdout must require the literal `machine-output` capability rather than infer support from `contractVersion == 1`; older contract-1 builds do not carry this flag.
 
 `enforcing` reports whether **this binary carries an enforcement path**, derived from the build's `GOOS`: `true` on linux (the eBPF LSM programs plus the intercepting MITM proxy) and `true` on darwin (the darwin runtime builds and drives the same MITM proxy — `internal/darwind/runtime_darwin.go`, `NewMITMProxy` / `applyPolicyToProxy` — alongside the separately installed Endpoint Security / Network Extension components it coordinates with). Any other target reports `false`. It describes the binary, not the host's runtime capability, which is `leash doctor`'s job.
 

@@ -96,6 +96,67 @@ func TestParseArgsSubcommandAfterDoubleDash(t *testing.T) {
 	}
 }
 
+func TestParseArgsMachineOutputImpliesNonInteractive(t *testing.T) {
+	t.Parallel()
+
+	opts, err := parseArgs([]string{"--machine-output", "--", "agent", "--json"})
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+	if !opts.machineOutput {
+		t.Fatal("expected machineOutput to be set")
+	}
+	if !opts.noInteractive {
+		t.Fatal("expected --machine-output to imply noInteractive")
+	}
+	want := []string{"agent", "--json"}
+	if len(opts.command) != len(want) || opts.command[0] != want[0] || opts.command[1] != want[1] {
+		t.Fatalf("command = %v, want %v", opts.command, want)
+	}
+}
+
+func TestParseArgsMachineOutputRejectsValue(t *testing.T) {
+	t.Parallel()
+
+	if _, err := parseArgs([]string{"--machine-output=true", "agent"}); err == nil {
+		t.Fatal("expected --machine-output with a value to fail")
+	}
+}
+
+func TestParseArgsDefaultRemainsInteractive(t *testing.T) {
+	t.Parallel()
+
+	opts, err := parseArgs([]string{"agent"})
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+	if opts.machineOutput || opts.noInteractive {
+		t.Fatalf("default options = machineOutput:%t noInteractive:%t, want both false", opts.machineOutput, opts.noInteractive)
+	}
+}
+
+func TestMachineOutputRequestedStopsAtWorkloadBoundary(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "before help", args: []string{"--machine-output", "--help"}, want: true},
+		{name: "after help", args: []string{"--help", "--machine-output"}, want: true},
+		{name: "after separator", args: []string{"--help", "--", "--machine-output"}, want: false},
+		{name: "workload argument", args: []string{"agent", "--machine-output"}, want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := machineOutputRequested(tt.args); got != tt.want {
+				t.Fatalf("machineOutputRequested(%v) = %t, want %t", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseArgsEnvironmentFlags(t *testing.T) {
 	t.Parallel()
 

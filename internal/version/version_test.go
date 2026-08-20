@@ -18,7 +18,7 @@ func testBuild() Build {
 // wantCapabilities is the surface this build advertises, written out as literals
 // rather than obtained from the code under test, so a silent change to the list
 // fails here.
-var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "require-lsm", "version-json"}
+var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json"}
 
 // TestEnforcingIsDerivedPerPlatform pins the criterion: `enforcing` says whether
 // *this binary* carries an enforcement path. Linux ships the eBPF LSM programs
@@ -204,7 +204,7 @@ func TestJSONWireShape(t *testing.T) {
 		"enforcing":             true,
 		"contractVersion":       float64(1), // encoding/json decodes numbers as float64
 		"minCompatibleContract": float64(0),
-		"capabilities":          []any{"policy", "inject-service", "runtime", "user", "require-lsm", "version-json"},
+		"capabilities":          []any{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json"},
 		"os":                    "linux",
 		"arch":                  "amd64",
 	}

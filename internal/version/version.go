@@ -87,6 +87,8 @@ const (
 	CapabilityUser = "user"
 	// CapabilityRequireLSM is the `--require-lsm` fail-closed flag.
 	CapabilityRequireLSM = "require-lsm"
+	// CapabilityMachineOutput is the `--machine-output` fd-ownership contract.
+	CapabilityMachineOutput = "machine-output"
 	// CapabilityVersionJSON is this document itself, emitted by
 	// `leash version --json`.
 	CapabilityVersionJSON = "version-json"
@@ -100,6 +102,7 @@ var capabilities = []string{
 	CapabilityRuntime,
 	CapabilityUser,
 	CapabilityRequireLSM,
+	CapabilityMachineOutput,
 	CapabilityVersionJSON,
 }
 

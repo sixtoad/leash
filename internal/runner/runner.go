@@ -91,6 +91,7 @@ var autoEnvForCommand = func() map[string][]string {
 
 type options struct {
 	noInteractive  bool
+	machineOutput  bool
 	policyOverride string
 	verbose        bool
 	volumes        []string
@@ -212,6 +213,7 @@ type runner struct {
 	injectedDockerArgs []string
 
 	logger        *log.Logger
+	diagnostics   io.Writer
 	mountState    *mountState
 	sessionID     string
 	workspaceHash string
@@ -247,7 +249,11 @@ func execute(cmdName string, args []string) error {
 	opts, err := parseArgs(args)
 	if err != nil {
 		if errors.Is(err, errShowUsage) {
-			fmt.Println(usage(cmdName))
+			out := io.Writer(os.Stdout)
+			if opts.machineOutput || machineOutputRequested(args) {
+				out = os.Stderr
+			}
+			fmt.Fprintln(out, usage(cmdName))
 			return nil
 		}
 		return err
@@ -383,6 +389,7 @@ Subcommands:
 
 Flags:
   -I, --no-interactive            Skip the interactive TTY; run the command non-interactively.
+  --machine-output                Reserve stdout for the command's exact output; send Leash diagnostics to stderr and run non-interactively.
   --policy <path>                 Policy file to mount into the leash runtime.
   -l, --listen <addr>             Control UI bind address (e.g. :18080, 127.0.0.1:18080; setting this to blank disables the UI).
   -o, --open                      Open Control UI in default browser once ready.
@@ -554,6 +561,8 @@ func parseArgs(args []string) (options, error) {
 		switch arg {
 		case "-I", "--no-interactive":
 			opts.noInteractive = true
+		case "--machine-output":
+			opts.machineOutput = true
 		case "-e", "--env":
 			if i+1 >= len(args) {
 				return opts, fmt.Errorf("missing argument for %s", arg)
@@ -729,6 +738,8 @@ func parseArgs(args []string) (options, error) {
 				return opts, fmt.Errorf("-o does not take a value")
 			case strings.HasPrefix(arg, "--require-lsm="):
 				return opts, fmt.Errorf("--require-lsm does not take a value")
+			case strings.HasPrefix(arg, "--machine-output="):
+				return opts, fmt.Errorf("--machine-output does not take a value")
 			case strings.HasPrefix(arg, "-v="):
 				volume := strings.TrimPrefix(arg, "-v=")
 				if volume == "" {
@@ -779,7 +790,27 @@ func parseArgs(args []string) (options, error) {
 }
 
 func finalizeOptions(opts options) (options, error) {
+	if opts.machineOutput {
+		opts.noInteractive = true
+	}
 	return opts, nil
+}
+
+// machineOutputRequested recognizes the runner flag before the workload
+// boundary even when an earlier --help stopped normal option parsing. Once the
+// workload begins, an identically named argument belongs to the workload.
+func machineOutputRequested(args []string) bool {
+	for _, arg := range args {
+		switch {
+		case arg == "--":
+			return false
+		case arg == "--machine-output":
+			return true
+		case !strings.HasPrefix(arg, "-"):
+			return false
+		}
+	}
+	return false
 }
 
 func applyOpenEnv(opts *options) {
@@ -1438,6 +1469,27 @@ func (r *runner) debugf(format string, args ...interface{}) {
 	}
 }
 
+// diagnosticWriter owns every runner lifecycle message. Human runs retain the
+// historical stdout destination; machine mode reserves stdout exclusively for
+// the governed workload and moves diagnostics to stderr.
+func (r *runner) diagnosticWriter() io.Writer {
+	if r.diagnostics != nil {
+		return r.diagnostics
+	}
+	if r.opts.machineOutput {
+		return os.Stderr
+	}
+	return os.Stdout
+}
+
+func (r *runner) diagnosticf(format string, args ...interface{}) {
+	fmt.Fprintf(r.diagnosticWriter(), format, args...)
+}
+
+func (r *runner) diagnosticln(args ...interface{}) {
+	fmt.Fprintln(r.diagnosticWriter(), args...)
+}
+
 func (r *runner) logDevImageSelections() {
 	r.logDevImage("target", r.cfg.targetImageSource, r.cfg.targetImageDevFile, r.cfg.targetImage)
 	r.logDevImage("leash", r.cfg.leashImageSource, r.cfg.leashImageDevFile, r.cfg.leashImage)
@@ -1472,10 +1524,16 @@ func (r *runner) runDocker(ctx context.Context, args ...string) error {
 // rt returns the configured container runtime, defaulting to docker so runners
 // constructed directly (e.g. in tests) work without explicit wiring.
 func (r *runner) rt() Runtime {
+	rt := r.runtime
 	if r.runtime == nil {
-		return cliRuntime{bin: defaultRuntime}
+		rt = cliRuntime{bin: defaultRuntime}
 	}
-	return r.runtime
+	stdout := r.diagnosticWriter()
+	stderr := io.Writer(os.Stderr)
+	if r.opts.machineOutput {
+		stderr = stdout
+	}
+	return withRuntimeWriters(rt, stdout, stderr)
 }
 
 func (r *runner) startContainers(ctx context.Context) error {
@@ -1562,26 +1620,26 @@ func (r *runner) startContainers(ctx context.Context) error {
 	}
 
 	if err := r.launcher().InstallPromptAssets(ctx); err != nil {
-		fmt.Printf("Warning: failed to install leash prompt: %v\n", err)
-		if r.logger != nil {
+		r.diagnosticf("Warning: failed to install leash prompt: %v\n", err)
+		if r.logger != nil && !r.opts.machineOutput {
 			r.logger.Printf("Warning: failed to install leash prompt: %v", err)
 		}
 	}
 
 	if r.cfg.listenCfg.Disable {
-		fmt.Println()
+		r.diagnosticln()
 	} else {
 		url := r.launcher().ControlUIURL(r.cfg.listenCfg)
-		fmt.Printf("\nLeash UI (Control UI): %s\n", url)
+		r.diagnosticf("\nLeash UI (Control UI): %s\n", url)
 		if r.opts.openUI {
 			if err := listen.OpenURL(url); err != nil {
 				r.logger.Printf("Failed to open Control UI in browser: %v", err)
 			}
 		}
 	}
-	fmt.Printf("Target logs: docker logs -f %s\n", r.cfg.targetContainer)
-	fmt.Printf("Leash logs: docker logs -f %s\n", r.cfg.leashContainer)
-	fmt.Printf("Stop everything with: docker rm -f %s %s\n\n", r.cfg.targetContainer, r.cfg.leashContainer)
+	r.diagnosticf("Target logs: docker logs -f %s\n", r.cfg.targetContainer)
+	r.diagnosticf("Leash logs: docker logs -f %s\n", r.cfg.leashContainer)
+	r.diagnosticf("Stop everything with: docker rm -f %s %s\n\n", r.cfg.targetContainer, r.cfg.leashContainer)
 
 	runCmd := shellQuote(r.opts.command)
 
@@ -1591,7 +1649,11 @@ func (r *runner) startContainers(ctx context.Context) error {
 	}
 
 	if r.opts.noInteractive {
-		fmt.Printf("Running non-interactive command (--no-interactive): %s\n", runCmd)
+		reason := "--no-interactive"
+		if r.opts.machineOutput {
+			reason = "--machine-output"
+		}
+		r.diagnosticf("Running non-interactive command (%s): %s\n", reason, runCmd)
 		exitCode, err := r.execNonInteractive(ctx, shellBin, runCmd)
 		return r.finishLifecycle(ctx, exitCode, err)
 	}
@@ -1612,7 +1674,7 @@ func (r *runner) startContainers(ctx context.Context) error {
 		return r.finishLifecycle(ctx, exitCode, err)
 	}
 
-	fmt.Printf("Interactive session exited (code=%d). Stopping containers...\n", exitCode)
+	r.diagnosticf("Interactive session exited (code=%d). Stopping containers...\n", exitCode)
 	return r.finishLifecycle(ctx, exitCode, nil)
 }
 
@@ -1951,7 +2013,7 @@ func (r *runner) syncPolicyFile() error {
 	if err := os.WriteFile(dest, data, 0o644); err != nil {
 		return fmt.Errorf("copy Cedar policy: %w", err)
 	}
-	fmt.Printf("Updated Cedar policy from %s\n", source)
+	r.diagnosticf("Updated Cedar policy from %s\n", source)
 	return nil
 }
 
@@ -2346,13 +2408,13 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 	// Print final port mappings
 	for _, ps := range r.opts.publishes {
 		if ps.Proto == "udp" {
-			fmt.Printf("Forwarded %s:%s -> container:%s (udp)\n", ps.HostIP, ps.HostPort, ps.ContainerPort)
+			r.diagnosticf("Forwarded %s:%s -> container:%s (udp)\n", ps.HostIP, ps.HostPort, ps.ContainerPort)
 		} else {
 			host := ps.HostIP
 			if host == "" {
 				host = "127.0.0.1"
 			}
-			fmt.Printf("Forwarded http://%s:%s -> container:%s (tcp)\n", host, ps.HostPort, ps.ContainerPort)
+			r.diagnosticf("Forwarded http://%s:%s -> container:%s (tcp)\n", host, ps.HostPort, ps.ContainerPort)
 		}
 	}
 	return nil
@@ -2681,9 +2743,9 @@ func (r *runner) waitForBootstrap(ctx context.Context) error {
 		if _, err := os.Stat(marker); err == nil {
 			if r.verbose {
 				if info := describeBootstrapMarker(marker); info != "" {
-					fmt.Printf("Bootstrap complete (%s)\n", info)
+					r.diagnosticf("Bootstrap complete (%s)\n", info)
 				} else {
-					fmt.Println("Bootstrap complete.")
+					r.diagnosticln("Bootstrap complete.")
 				}
 			}
 			return nil
@@ -2827,9 +2889,14 @@ func describeBootstrapMarker(path string) string {
 
 func (r *runner) execNonInteractive(ctx context.Context, shellBin, cmd string) (int, error) {
 	execCmd := r.launcher().ExecCommand(ctx, shellBin, cmd, false)
-	execCmd.Stdin = os.Stdin
-	execCmd.Stdout = os.Stdout
-	execCmd.Stderr = os.Stderr
+	return runWorkloadCommand(execCmd)
+}
+
+// runWorkloadCommand deliberately binds the governed process directly to the
+// host descriptors. In particular, machine mode must not insert a pipe, parser,
+// buffer, or re-encoder between the workload and stdout.
+func runWorkloadCommand(execCmd *exec.Cmd) (int, error) {
+	attachWorkloadStdio(execCmd)
 	if err := execCmd.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return exitErr.ExitCode(), nil
@@ -2837,6 +2904,12 @@ func (r *runner) execNonInteractive(ctx context.Context, shellBin, cmd string) (
 		return 0, err
 	}
 	return 0, nil
+}
+
+func attachWorkloadStdio(execCmd *exec.Cmd) {
+	execCmd.Stdin = os.Stdin
+	execCmd.Stdout = os.Stdout
+	execCmd.Stderr = os.Stderr
 }
 
 func (r *runner) precheckInteractiveContainer(ctx context.Context, shellBin, runCmd string) error {
@@ -2984,12 +3057,12 @@ func (r *runner) showStatus(ctx context.Context) error {
 	var printed bool
 	for _, line := range lines {
 		if strings.Contains(line, r.cfg.targetContainer) || strings.Contains(line, r.cfg.leashContainer) {
-			fmt.Println(line)
+			r.diagnosticln(line)
 			printed = true
 		}
 	}
 	if !printed {
-		fmt.Println("No leash-related containers are running.")
+		r.diagnosticln("No leash-related containers are running.")
 	}
 	return nil
 }
@@ -3092,10 +3165,10 @@ func (r *runner) execShellInTargetWithInput(ctx context.Context, command string,
 var runCommand = runCommandImpl
 var execWithInput = execWithInputImpl
 
-func runCommandImpl(ctx context.Context, name string, args ...string) error {
+func runCommandImpl(ctx context.Context, stdout, stderr io.Writer, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	return cmd.Run()
 }
 
@@ -3133,7 +3206,7 @@ func isNoSuchImageError(err error) bool {
 func (r *runner) ensureLocalImage(ctx context.Context, image string) error {
 	if _, err := r.rt().Output(ctx, "image", "inspect", image); err != nil {
 		if isNoSuchObjectError(err) || isNoSuchImageError(err) {
-			fmt.Printf("Pulling container image %s...\n", image)
+			r.diagnosticf("Pulling container image %s...\n", image)
 			if pullErr := r.rt().Run(ctx, "pull", image); pullErr != nil {
 				return fmt.Errorf("pull image %s: %w", image, pullErr)
 			}
