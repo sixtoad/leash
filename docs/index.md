@@ -56,6 +56,7 @@ These are the authoritative deep-dives; the generated architecture docs above li
 - [`design/BOOT.md`](design/BOOT.md) — Bootstrap-Oriented OrchesTration sequence (target ↔ manager handshake)
 - [`design/SECURITY-MODEL.md`](design/SECURITY-MODEL.md) — Trust boundaries, deny-by-default, public/private CA split
 - [`design/AUTOCOMPLETE.md`](design/AUTOCOMPLETE.md) — Cedar editor autocomplete round-trip (Monaco ↔ daemon ↔ engine)
+- [`BUBBLEWRAP-COMPATIBILITY.md`](BUBBLEWRAP-COMPATIBILITY.md) — Investigation of native-runtime composition, injected D-Bus/token compatibility, and the decision not to integrate bubblewrap
 
 ### Operator-facing docs
 
