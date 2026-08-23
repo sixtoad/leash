@@ -31,6 +31,13 @@ do {
     DistributedNotificationCenter.default().post(name: LeashNotifications.fullDiskAccessReady,
                                                  object: nil,
                                                  userInfo: nil)
+    // Two channels on purpose, because they cover different daemons. The event
+    // tells the daemon we are connected to right now; the capability tells every
+    // daemon we connect to later, since the hello is re-sent on each reconnect.
+    // With only the event, a daemon started after this extension (the normal
+    // case — macOS launches extensions at boot) never learns the grant, and
+    // `leash doctor` reports Full Disk Access as unverified forever.
+    DaemonSync.shared.advertiseFullDiskAccess()
     DaemonSync.shared.sendEvent(name: "es.full_disk_access.ready",
                                 details: nil,
                                 severity: "info",

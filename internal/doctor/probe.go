@@ -42,6 +42,16 @@ type ProbeOptions struct {
 	// Opting *out* is the flag, deliberately: an opt-in would leave the guess
 	// as the default answer, which is the gap issue #52 exists to close.
 	Quick bool
+
+	// LeashCLIPath overrides where the macOS probe looks for the companion
+	// leashcli binary, mirroring `leash --darwin exec --leash-cli-path`: a
+	// locally built leashcli is the normal case during development, and doctor
+	// reporting the app-bundle path as missing would be true but useless.
+	LeashCLIPath string
+
+	// DarwinDaemonAddr overrides where the macOS probe looks for the running
+	// `leash --darwin` daemon. Empty means LEASH_LISTEN, then the default.
+	DarwinDaemonAddr string
 }
 
 // Probe reads the live machine into a Host, running every check doctor has.
@@ -77,6 +87,7 @@ func ProbeWithOptions(opts ProbeOptions) Host {
 		h.ContainerEngineError = engineErr.Error()
 	}
 	h.BPFLSMAttach = probeAttachable(opts, capBPF, capsKnown)
+	h.Darwin = probeDarwin(opts)
 	return h
 }
 

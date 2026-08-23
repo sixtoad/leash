@@ -130,6 +130,17 @@ func TestProbeCapsNeverFabricates(t *testing.T) {
 	original := procSelfStatus
 	t.Cleanup(func() { procSelfStatus = original })
 
+	// probeCaps consults the uid map first, and an unreadable one is treated as
+	// namespaced (the cautious direction). That is correct behaviour and it is
+	// also what a macOS host looks like, where there is no /proc at all — so
+	// without pinning the map to an initial-namespace fixture this table can
+	// only ever observe "unknown", and the case that matters (a readable,
+	// privileged capability set) never runs. Pinned rather than skipped: the
+	// bit math is pure, and it should be exercised wherever leash is developed.
+	originalUIDMap := procSelfUIDMap
+	t.Cleanup(func() { procSelfUIDMap = originalUIDMap })
+	procSelfUIDMap = write("uid_map", "         0          0 4294967295\n")
+
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			procSelfStatus = c.path

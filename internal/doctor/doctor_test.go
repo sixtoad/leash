@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/strongdm/leash/internal/macext"
 	"github.com/strongdm/leash/internal/runner"
 )
 
@@ -1019,6 +1020,24 @@ func TestReportJSONRoundTrip(t *testing.T) {
 		"darwin unverified":    hostAxes{goos: "darwin", euid: 501, lsm: runner.LSMUnknown, engine: "docker"}.host(),
 		"nothing works":        hostAxes{goos: "windows", euid: 0, lsm: runner.LSMUnknown}.host(),
 		"remote docker daemon": hostAxes{goos: "linux", systemd: true, euid: 0, capBPF: true, capNetAdmin: true, capsKnown: true, lsm: runner.LSMActive, engine: "docker", dockerHost: "tcp://elsewhere:2376"}.host(),
+		// The macOS section has states (and two enum types) of its own, so it
+		// gets its own round trips rather than riding on the Linux hosts.
+		"mac ready": macHost(),
+		"mac degraded": func() Host {
+			h := macHost()
+			h.Darwin.ProxyExtension = macext.StateDisabled
+			h.Darwin.FullDiskAccess = macext.FDAUnknown
+			return h
+		}(),
+		"mac unavailable": func() Host {
+			h := macHost()
+			h.Darwin.ESExtension = macext.StateUnknown
+			h.Darwin.LeashCLIPresent = false
+			h.Darwin.DaemonUp = false
+			h.Darwin.ComponentsKnown = false
+			h.Darwin.Components = nil
+			return h
+		}(),
 	}
 
 	for name, h := range hosts {
@@ -1083,6 +1102,7 @@ func TestJSONMirrorCoversEveryReportField(t *testing.T) {
 		{reflect.TypeOf(Report{}), reflect.TypeOf(jsonReport{}), []string{"Verdict"}},
 		{reflect.TypeOf(NativeReport{}), reflect.TypeOf(jsonNative{}), []string{"Ready"}},
 		{reflect.TypeOf(ContainerReport{}), reflect.TypeOf(jsonContainer{}), []string{"Ready"}},
+		{reflect.TypeOf(DarwinReport{}), reflect.TypeOf(jsonDarwin{}), []string{"Ready"}},
 	}
 
 	for _, c := range cases {

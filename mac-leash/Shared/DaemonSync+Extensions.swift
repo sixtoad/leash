@@ -489,6 +489,26 @@ extension DaemonSync {
         }
     }
 
+    /// Record that this process holds Full Disk Access, so every future
+    /// `client.hello` says so.
+    ///
+    /// Deliberately only affects FUTURE hellos: the caller (LeashES's main)
+    /// already emits `es.full_disk_access.ready` on the connection it is holding
+    /// right now, which covers this daemon. What the capability adds is every
+    /// connection AFTER this one — reconnects, and above all the reconnect that
+    /// follows a daemon restart, where the startup event is long gone.
+    ///
+    /// Idempotent, and hopped onto `queue` because `capabilities` is read there
+    /// by sendHello.
+    func advertiseFullDiskAccess() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard !self.capabilities.contains(LeashIdentifiers.Capability.fullDiskAccess) else { return }
+            self.capabilities.append(LeashIdentifiers.Capability.fullDiskAccess)
+            os_log("Advertising Full Disk Access in future hellos", log: self.log, type: .info)
+        }
+    }
+
     func sendHello() {
         let helloPayload: [String: Any] = [
             "platform": "darwin",

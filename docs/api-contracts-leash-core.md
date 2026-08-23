@@ -14,6 +14,28 @@ Two contracts here are not endpoints. [§ CLI build contract](#cli-build-contrac
 |---|---|---|---|
 | `GET` | `/healthz` | Liveness | `200 ok` |
 | `GET` | `/health/policy` | Policy ready (post-bootstrap, post-activation) | `200 ready` or `503 not ready` |
+| `GET` | `/health/darwin` | macOS enforcement facts only the daemon can see | `200` + JSON (always) |
+
+`/health/darwin` is served by the `--darwin` runtime (`internal/darwind`) and read by `leash doctor` from outside the process. It reports observations, never verdicts — the daemon says what it has been told, doctor decides what it means, so a daemon and a doctor from different builds still agree on the facts.
+
+```jsonc
+{
+  "components": ["leash.es", "leash.netfilter", "leash.proxy"],  // clients currently holding a websocket
+  "full_disk_access": "granted",        // granted | denied | unknown — as LeashES last reported it
+  "full_disk_access_at": "2026-08-19T09:12:44Z"  // omitted when nothing has been reported
+}
+```
+
+Both fields answer questions nothing outside the daemon can. **`components`** is stronger than extension activation: an extension that is activated but absent here receives no PID or rule broadcasts, so it holds no policy and enforces nothing (#62). **`full_disk_access`** exists because macOS exposes no API for reading another process's TCC grant — `es_new_client` returns `ES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED` without Full Disk Access, so only LeashES knows.
+
+LeashES reports it two ways, and both are needed:
+
+- **In every `client.hello`**, as the `full-disk-access` capability, added once `es_new_client` has succeeded. The hello is re-sent on each reconnect, so this survives a daemon restart.
+- **As an event at startup** (`es.full_disk_access.ready`, or `es.full_disk_access.missing` immediately before it exits).
+
+The event alone was not enough, and the gap was measured on the validation VM: it fires once per extension *process* launch, so a daemon started after the extensions — the normal case, since macOS launches extensions at boot — saw **zero** FDA events across 139 `leash.es` reconnects, and `leash doctor` could never confirm the grant. The daemon therefore prefers a connected `leash.es` client advertising the capability (live evidence that cannot outlive the process it describes) and falls back to the last recorded event, which still covers the very first connection, the denial case, and extensions too old to advertise. `unknown` remains a real state for those older builds.
+
+It always answers `200`, including before anything is known: "the daemon is up and has heard nothing" is itself the answer doctor needs, and a `503` would be indistinguishable from the daemon being down — a completely different remedy. `components` is always an array, never `null`.
 
 ## Cedar Policy CRUD — `policyAPI`
 
@@ -260,6 +282,20 @@ Also not an endpoint. `leash version --json` describes the *binary*; this descri
     "engine": "docker",             //   null when no supported engine is on PATH
     "issues": ["…"]
   },
+  "darwin": {                       // macOS enforcement — `leash --darwin` (ES + NE extensions)
+    "checked": false,               //   false off macOS: the probes never ran (≠ "macOS is broken")
+    "status": "unavailable",        //   ready | degraded | unavailable
+    "ready": false,
+    "es_extension": "unknown",      //   active | disabled | missing | unknown — systemextensionsctl
+    "filter_extension": "unknown",  //   the NE content filter
+    "proxy_extension": "unknown",   //   the NETransparentProxyProvider that feeds the MITM proxy
+    "full_disk_access": "unknown",  //   granted | denied | unknown — as LeashES reported it
+    "daemon_up": false,             //   the `leash --darwin` daemon answered /healthz
+    "daemon": "127.0.0.1:18080",    //   where doctor looked for it
+    "components": [],               //   extensions actually connected to that daemon
+    "leash_cli": "/Applications/Leash.app/Contents/Resources/leashcli",
+    "issues": ["…"]
+  },
   "unchecked": [                    // prerequisites doctor did NOT verify (never silently omitted)
     { "name": "bpf_lsm_attachable", "reason": "…" }
   ],
@@ -267,7 +303,7 @@ Also not an endpoint. `leash version --json` describes the *binary*; this descri
 }
 ```
 
-Field names are snake_case here (they were fixed by issue #23 before the camelCase `version --json` document existed) and additive-only. `caps`, `issues` and `unchecked` are always arrays, never `null`, however the report was produced; `engine` is the only field that can be `null`.
+Field names are snake_case here (they were fixed by issue #23 before the camelCase `version --json` document existed) and additive-only. `caps`, `issues`, `components` and `unchecked` are always arrays, never `null`, however the report was produced; `engine` is the only field that can be `null`.
 
 **`lsm_bpf_attachable` is a second, observed signal beside `lsm_bpf`, not a replacement for it.** Reading `bpf` out of `/sys/kernel/security/lsm` is cheap, and on its own it is a guess: a kernel can list `bpf` and still refuse leash's programs — the verifier can reject `bpf_d_path`, BTF can be absent, ring buffer creation can fail, or a program can exceed the instruction limit (leash's own hard-link guard hit that ceiling in issue #29). So doctor loads leash's *real* LSM programs, lets the kernel verify them, attaches one, and detaches it immediately (issue #52).
 
@@ -298,6 +334,60 @@ Field names are snake_case here (they were fixed by issue #23 before the camelCa
 
 `ready` never widens to include `degraded`: it is the field a provisioner gates on.
 
+### The `darwin` section (issue #61)
+
+`native` and `container` grade the Linux runtimes; `darwin` grades macOS enforcement, which is a different mechanism wearing the same word. `--runtime native` on Linux means leashd plus eBPF LSM programs; the macOS path is `leash --darwin`, which enforces through three system extensions and a daemon they talk to. It is always present in the document — on Linux with `checked: false` and a single "this host is not macOS" issue, which is why it never drags the verdict down there.
+
+**Two signals per extension, and neither substitutes for the other.**
+
+| Signal | Source | Says |
+|---|---|---|
+| activation | `systemextensionsctl list` | the user approved it, so macOS will let the code run |
+| connection | the daemon's `/health/darwin` `components` | it is running **and** receiving PID/rule broadcasts |
+
+Neither is authoritative alone, but they fail in opposite directions, so doctor combines them:
+
+| activation | connected | verdict |
+|---|---|---|
+| `active` | yes | running and holding rules |
+| `active` | no | activated but enforcing nothing — a fault |
+| `active` | *unknown* (daemon down) | no separate fault; the daemon's own issue says why |
+| `unknown` | yes | running — the websocket is proof, so the unreadable table does not matter |
+| `unknown` | *unknown* | unverified: an issue, never a blocker |
+| `missing` / `disabled` | — | macOS is not running it — a fault |
+
+The two `unknown` rows are the ones that matter. `systemextensionsctl` exits `EX_NOPERM` without admin rights, and grading that as a definite negative would report a perfectly healthy Mac as unable to enforce; a connected extension is running whatever the table says, so the *stronger* signal wins rather than the more pessimistic one. When neither signal is available the state is reported unverified — an issue and an `unchecked` entry (`macos_extension_activation`), but never a blocker, because doctor established nothing is wrong, only that it could not tell.
+
+**Presence and absence are not equally trustworthy, and the code treats them differently.** A name in `components` is positive evidence: a client claimed it. Absence only means "not connected" if *every* client in the list could be identified — so two things suppress the negative conclusion:
+
+- the daemon is down or did not serve `/health/darwin`, so the list is silence rather than evidence;
+- the list contains `unknown`, i.e. a client connected without a `component` in its `client.hello`. Extensions built before that field existed (through Leash.app `1.1.0/20251027.1`) do exactly this, and treating their anonymity as absence reported a Mac with both extensions genuinely connected as `unavailable`, telling the operator to re-activate two working extensions.
+
+In both cases doctor reports the gap as its own degradation (`unchecked` gains `macos_extension_connectivity`, whose reason names *which* gap) rather than blaming any extension. A positively named component still counts, so a new-build extension beside an old one remains provably connected.
+
+**Full Disk Access has no external probe.** macOS exposes no API for reading another process's TCC grant, and the tempting substitutes answer a different question (probing a TCC-gated path tells you about whoever ran doctor). The signal is LeashES's own report to the daemon, relayed through `/health/darwin` — see that endpoint above for why `unknown` is common. **`unknown` never reaches `ready`.** Without FDA, LeashES observes no file events at all while looking perfectly healthy from the outside, so an unverified grant is treated the way an unread capability set is on Linux: reported as absent, never assumed. `unchecked` gains `macos_full_disk_access`.
+
+**What makes a Mac `unavailable`** — enforcement cannot work at all, and there is no macOS equivalent of Linux's proxy-only fallback:
+
+- the ES extension is definitively not activated, or is activated but not connected to the daemon (no file/exec policy, and nothing else gates them),
+- Full Disk Access was reported **denied**,
+- the companion `leashcli` binary is missing (`--leash-cli-path` overrides where doctor looks).
+
+All blockers are reported together, not one at a time.
+
+**What makes it `degraded`** — it enforces, but not everything:
+
+- the content filter or transparent-proxy extension is not activated or not connected (socket policy / HTTPS inspection off),
+- the daemon is unreachable, so the extensions are blind (they hold no rules),
+- the daemon answered but predates `/health/darwin`, so connectivity and FDA could not be read,
+- FDA was never reported,
+- an extension's activation state could not be read and it is not connected either, so it is unverified rather than known-bad,
+- a connected client did not identify itself, so no extension's connectivity can be confirmed.
+
+**Four things doctor does not read directly**, all declared in `unchecked`: `macos_ne_configuration` (the `NEFilterManager` / `NETransparentProxyManager` installed-and-enabled state — inferred from activation plus connection, which is the stronger signal), `macos_extension_activation` (when `systemextensionsctl` could not be consulted), `macos_extension_connectivity` (when the daemon could not be asked) and `macos_full_disk_access` (when nothing was reported). SIP/AMFI are out of scope: a production signed build does not need relaxed security.
+
+**Two flags exist for the macOS seams**, both accepted on every platform so a script need not branch on `GOOS`: `--leash-cli-path PATH` (default `/Applications/Leash.app/Contents/Resources/leashcli`) and `--darwin-daemon ADDR` (default `$LEASH_LISTEN`, else `127.0.0.1:18080`; a bare port or `:18080` is completed to loopback). Both have a legitimate non-default value during development, and reporting the app-bundle path as missing would be true but useless.
+
 **Exit codes.** The verdict is in the document *and* in the exit status, and they always agree.
 
 | Code | Meaning | Remedy shape |
@@ -305,21 +395,21 @@ Field names are snake_case here (they were fixed by issue #23 before the camelCa
 | `0` | a runtime enforces with both layers | none |
 | `1` | no runtime can run a workload at all | install or repair a runtime |
 | `2` | usage error — **including `--help`** | fix the invocation |
-| `3` | a runtime runs, but Layer 1 is unavailable (proxy-only) | the runtime is fine, the kernel is not |
+| `3` | a runtime runs, but not every layer enforces (Linux: Layer 1 off, proxy-only; macOS: see the `darwin` section) | the runtime is fine, the kernel or the extension stack is not |
 | `4` | doctor could not render or write its own report | not a verdict; retry / check the pipe |
 
 Exit `0` is the answer to "can this machine enforce?", so `leash doctor && …` fails closed on `3`. `--help` deliberately exits `2`, not `0`: a provisioner gating on the status must not get a free pass from `leash doctor -help`.
 
-**A `degraded` verdict is not always about the kernel.** Four conditions produce it, and the `issues` text says which:
+**A `degraded` verdict is not always about the kernel.** These conditions produce it, and the `issues` text says which (the macOS ones are listed under the `darwin` section above):
 
 - `bpf` is absent from `/sys/kernel/security/lsm` (`lsm_bpf: "inactive"`), or that list could not be read or was empty (`"unknown"`). This holds whatever the attach probe observed — see the conjunctive table above.
 - The list says `bpf` is there and leash's LSM programs were loaded and refused anyway (`lsm_bpf: "active"`, `lsm_bpf_attachable: "unattachable"`) — the case the probe exists for.
 - The host is not Linux. Containers then run against a VM kernel doctor never probed — Docker Desktop's LinuxKit kernel, for one, does not carry `bpf`. An unprobed kernel is never `ready`.
 - `DOCKER_HOST` is set. The engine's containers run on a remote daemon's kernel, not the one doctor read, so the Layer 1 claim is withheld rather than borrowed. No remote topology is modelled; `unchecked` gains a `container_kernel` entry.
 
-**`default_runtime` is not the verdict.** `verdict` is the best state *any* runtime reaches, but `leash run` with neither `--runtime` nor `LEASH_RUNTIME` selects exactly one runtime and never falls back. On this build that is `native`, so a Linux host with no systemd and a working docker reports `verdict: ready` while a bare `leash run` fails. Compare `default_runtime` against that runtime's `status` (`native` → `native.status`, `docker`/`podman` → `container.status`); the human output prints the same warning in prose.
+**`default_runtime` is not the verdict.** `verdict` is the best state *any* runtime reaches, but `leash run` with neither `--runtime` nor `LEASH_RUNTIME` selects exactly one runtime and never falls back. On this build that is `native`, so a Linux host with no systemd and a working docker reports `verdict: ready` while a bare `leash run` fails. Compare `default_runtime` against that runtime's `status` (`native` → `native.status`, `docker`/`podman` → `container.status`, `darwin` → `darwin.status`); the human output prints the same warning in prose. This matters most on macOS today: the default is `native`, which is `unavailable` there, so a Mac that enforces reports `verdict: ready` while a bare `leash run` stops with guidance — dispatching macOS to `--darwin` by default is tracked separately (sixtoad/leash#2).
 
-**What doctor does not check** is in the document, not just in this page: `unchecked` always names `bpf_d_path_ringbuf` and `netns_iptables`, plus `bpf_lsm_attachable` whenever the attach probe did not settle it (`--quick`, insufficient privilege, non-Linux, timeout), `capabilities` when `/proc/self/status` was unreadable and `container_kernel` in the two cases above. A `ready` verdict must be read as exactly that list of things unverified.
+**What doctor does not check** is in the document, not just in this page: `unchecked` always names `bpf_d_path_ringbuf` and `netns_iptables`, plus `bpf_lsm_attachable` whenever the attach probe did not settle it (`--quick`, insufficient privilege, non-Linux, timeout), `capabilities` when `/proc/self/status` was unreadable, `container_kernel` in the two cases above, and the `macos_*` entries on a Mac. A `ready` verdict must be read as exactly that list of things unverified.
 
 Two caveats a script should know. Doctor writes its whole report in one `Write`, so a closed stdout (`leash doctor --json | head -1`) is reported as exit `4` — except that Go raises `SIGPIPE` on fd 1, so the process is more likely to die of the signal (`141` from a shell) than to reach that code; doctor does not trap signals to paper over this. And an engine probe that hangs is bounded by a 5 s timeout on `<engine> info`, after which the daemon is reported unreachable — the CLI is killed, but a grandchild the client itself spawned is not process-group-killed and may outlive it.
 
