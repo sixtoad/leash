@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -457,6 +459,42 @@ func stubDarwinProbes(t *testing.T, list func() (string, error), get func(string
 	origList, origGet, origStat := systemExtensionsList, darwinHTTPGet, statFile
 	t.Cleanup(func() { systemExtensionsList, darwinHTTPGet, statFile = origList, origGet, origStat })
 	systemExtensionsList, darwinHTTPGet, statFile = list, get, stat
+}
+
+func TestProbeDarwinSkipsEverySeamOnNonDarwin(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("probeDarwin executes the macOS seams on Darwin")
+	}
+
+	calls := [3]int{}
+	stubDarwinProbes(t,
+		func() (string, error) {
+			calls[0]++
+			t.Error("probeDarwin called systemExtensionsList off Darwin")
+			return "", errors.New("poisoned system extension seam")
+		},
+		func(string) (int, []byte, error) {
+			calls[1]++
+			t.Error("probeDarwin called darwinHTTPGet off Darwin")
+			return 0, nil, errors.New("poisoned HTTP seam")
+		},
+		func(string) error {
+			calls[2]++
+			t.Error("probeDarwin called statFile off Darwin")
+			return errors.New("poisoned stat seam")
+		},
+	)
+
+	got := probeDarwin(ProbeOptions{})
+	if got.Checked {
+		t.Error("probeDarwin must leave macOS facts unchecked off Darwin")
+	}
+	if !reflect.DeepEqual(got, DarwinHost{}) {
+		t.Errorf("probeDarwin = %#v, want zero DarwinHost", got)
+	}
+	if calls != [3]int{} {
+		t.Errorf("probeDarwin seam calls = %v, want none", calls)
+	}
 }
 
 const activeExtensionList = `3 extension(s)

@@ -20,11 +20,12 @@ import (
 // machine. Same rule as the rest of the package — every check here is a lookup
 // with no policy in it, and darwin.go decides what the answers mean.
 //
-// There is no build tag. The probes are ordinary exec/HTTP/stat calls that
-// compile everywhere, and gating them on runtime.GOOS instead keeps the whole
-// file reachable from tests on any host — which matters more here than usual,
-// because the interesting states (extension activated but disconnected, FDA
-// denied) cannot be produced on a developer's Mac on demand.
+// There is no build tag, and this file must not use a _darwin.go suffix: Go
+// treats that suffix as an implicit build constraint. The probes are ordinary
+// exec/HTTP/stat calls that compile everywhere, and gating them on runtime.GOOS
+// instead keeps the whole file reachable from tests on any host — which matters
+// more here than usual, because the interesting states (extension activated but
+// disconnected, FDA denied) cannot be produced on a developer's Mac on demand.
 
 // DefaultDarwinDaemonAddr is where the `leash --darwin` daemon listens by
 // default (internal/darwind: --ws-port 18080).
