@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -26,7 +27,7 @@ func TestLaunchTargetContainerAppendsAutoMount(t *testing.T) {
 
 	var captured []string
 	restoreRun := runCommand
-	runCommand = func(_ context.Context, name string, args ...string) error {
+	runCommand = func(_ context.Context, _, _ io.Writer, name string, args ...string) error {
 		captured = append([]string{name}, args...)
 		return nil
 	}
@@ -95,7 +96,7 @@ func TestLaunchTargetContainerAppendsFileMount(t *testing.T) {
 
 	var captured []string
 	restoreRun := runCommand
-	runCommand = func(_ context.Context, name string, args ...string) error {
+	runCommand = func(_ context.Context, _, _ io.Writer, name string, args ...string) error {
 		captured = append([]string{name}, args...)
 		return nil
 	}
@@ -180,7 +181,7 @@ func TestLaunchTargetContainerSkipsDuplicateMount(t *testing.T) {
 
 	var captured []string
 	restoreRun := runCommand
-	runCommand = func(_ context.Context, name string, args ...string) error {
+	runCommand = func(_ context.Context, _, _ io.Writer, name string, args ...string) error {
 		captured = append([]string{name}, args...)
 		return nil
 	}
@@ -344,7 +345,7 @@ func TestLaunchTargetContainerLogsDuplicateSkip(t *testing.T) {
 
 	var captured []string
 	restoreRun := runCommand
-	runCommand = func(_ context.Context, name string, args ...string) error {
+	runCommand = func(_ context.Context, _, _ io.Writer, name string, args ...string) error {
 		captured = append([]string{name}, args...)
 		return nil
 	}
@@ -410,7 +411,7 @@ func TestLaunchTargetContainerWarnsWhenHostNotDirectory(t *testing.T) {
 
 	var captured []string
 	restoreRun := runCommand
-	runCommand = func(_ context.Context, name string, args ...string) error {
+	runCommand = func(_ context.Context, _, _ io.Writer, name string, args ...string) error {
 		captured = append([]string{name}, args...)
 		return nil
 	}

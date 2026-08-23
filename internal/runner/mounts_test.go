@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -44,7 +45,7 @@ func TestLaunchCommandsUseSplitMounts(t *testing.T) {
 		origCommand = commandOutput
 		logBuffer   strings.Builder
 	)
-	runCommand = func(_ context.Context, name string, args ...string) error {
+	runCommand = func(_ context.Context, _, _ io.Writer, name string, args ...string) error {
 		mu.Lock()
 		defer mu.Unlock()
 		copied := make([]string, len(args))

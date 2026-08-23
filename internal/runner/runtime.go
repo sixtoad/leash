@@ -44,12 +44,22 @@ type Runtime interface {
 // env carries extra environment (e.g. DOCKER_HOST) for a future remote backend;
 // it is empty for the local docker/podman case.
 type cliRuntime struct {
-	bin string
-	env []string
+	bin    string
+	env    []string
+	stdout io.Writer
+	stderr io.Writer
 }
 
 func (c cliRuntime) Run(ctx context.Context, args ...string) error {
-	return runCommand(ctx, c.bin, args...)
+	stdout := c.stdout
+	if stdout == nil {
+		stdout = os.Stdout
+	}
+	stderr := c.stderr
+	if stderr == nil {
+		stderr = os.Stderr
+	}
+	return runCommand(ctx, stdout, stderr, c.bin, args...)
 }
 
 func (c cliRuntime) Output(ctx context.Context, args ...string) (string, error) {
@@ -69,6 +79,24 @@ func (c cliRuntime) Cmd(ctx context.Context, args ...string) *exec.Cmd {
 }
 
 func (c cliRuntime) Name() string { return c.bin }
+
+// withRuntimeWriters assigns ownership of lifecycle-command output without
+// changing workload commands built through Cmd. Non-CLI runtimes capture or
+// discard their own lifecycle output and are returned unchanged.
+func withRuntimeWriters(rt Runtime, stdout, stderr io.Writer) Runtime {
+	switch cli := rt.(type) {
+	case cliRuntime:
+		cli.stdout = stdout
+		cli.stderr = stderr
+		return cli
+	case *cliRuntime:
+		copy := *cli
+		copy.stdout = stdout
+		copy.stderr = stderr
+		return &copy
+	}
+	return rt
+}
 
 const defaultRuntime = "docker"
 

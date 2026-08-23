@@ -45,7 +45,7 @@ The Makefile, release scripts, and Docker builds all shell out to this script, s
   "enforcing": true,
   "contractVersion": 1,
   "minCompatibleContract": 0,
-  "capabilities": ["policy", "inject-service", "runtime", "user", "require-lsm", "version-json"],
+  "capabilities": ["policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json"],
   "os": "linux",
   "arch": "amd64"
 }
@@ -60,7 +60,7 @@ The Makefile, release scripts, and Docker builds all shell out to this script, s
 
 ### The compatibility contract: `contractVersion`, `minCompatibleContract`, `capabilities`
 
-The two integers bound the leash CLI surface external provisioners drive — the `--policy`, `--inject-service`, `--runtime`, `--user` and `--require-lsm` flags, plus the shape of this document — so an installer can refuse (or warn) up front instead of failing cryptically on the first real run. **A caller written against contract `C` proceeds iff `minCompatibleContract <= C <= contractVersion`.** `contractVersion >= C` alone is *not* the rule: it also admits a leash whose floor has since risen past `C`, which is exactly the leash that dropped `C`'s surface.
+The two integers bound the leash CLI surface external provisioners drive — the `--policy`, `--inject-service`, `--runtime`, `--user`, `--require-lsm` and `--machine-output` flags, plus the shape of this document — so an installer can refuse (or warn) up front instead of failing cryptically on the first real run. **A caller written against contract `C` proceeds iff `minCompatibleContract <= C <= contractVersion`.** `contractVersion >= C` alone is *not* the rule: it also admits a leash whose floor has since risen past `C`, which is exactly the leash that dropped `C`'s surface.
 
 The consumer-facing contract — that rule with both failure directions, the value domains, `capabilities`, contract 0, the probe hazard, and a snippet that decodes an installed binary's stdout — is [`api-contracts-leash-core.md` § CLI build contract](api-contracts-leash-core.md#cli-build-contract--leash-version---json). It is deliberately not duplicated here: that document is the published contract, and there is no package to import.
 
@@ -68,3 +68,9 @@ Maintainer rules:
 
 - **Bump `ContractVersion`** (in [`internal/version`](../internal/version)) when the surface changes in a way an existing caller cannot absorb: a flag is removed or renamed, its argument grammar changes, or its meaning changes. Do **not** bump for additive changes — new flags, new JSON fields, new `capabilities` entries, new accepted flag values — which stay compatible by construction. When a bump *removes* something, raise `MinCompatibleContract` to the first contract that no longer offers it; otherwise leave it alone. Both are decoupled from the release version — leash can ship many releases at the same contract — and both are pinned by tests, so update the docs and those tests in the same change.
 - **The emitted JSON is the contract; the Go type is not.** `internal/version` holds all of it — the document type, the bounds, the comparison, the argument parsing, the rendering — and stays `internal` on purpose. Exporting a package would bind this module, already tagged `v1.1.7`, to a permanent v1 Go API with no apidiff gate: removing one `Info` field would force a `/v2` and break every importer, in exchange for saving a consumer three lines. Change the wire document carefully, under the bump policy above; change the Go type freely.
+
+### Machine-readable workload output
+
+Use `leash --machine-output -- <command>` when another program consumes the governed command's stdout. The flag implies non-interactive execution. Leash sends all runner and Docker/Podman/native lifecycle diagnostics to stderr while attaching the workload directly to the host stdin, stdout, and stderr descriptors. No result bytes are inspected or buffered, and numeric workload exit codes continue to propagate exactly after cleanup. Without the flag, the existing interactive prompts, TTY allocation, output destinations, and signal semantics are unchanged.
+
+Provisioners must probe `leash version --json` and require the `machine-output` capability before adding the flag. The capability was added without changing `contractVersion` from 1, so the integer alone cannot distinguish an older contract-1 build that lacks this fd-ownership contract. The full consumer contract and examples are in [`api-contracts-leash-core.md` § Machine-output fd ownership](api-contracts-leash-core.md#machine-output-fd-ownership--leash---machine-output).

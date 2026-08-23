@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -97,7 +98,7 @@ func TestLaunchContainersAddSELinuxRelabelToInternalMounts(t *testing.T) {
 		origRun     = runCommand
 		origCommand = commandOutput
 	)
-	runCommand = func(_ context.Context, name string, args ...string) error {
+	runCommand = func(_ context.Context, _, _ io.Writer, name string, args ...string) error {
 		mu.Lock()
 		defer mu.Unlock()
 		copied := make([]string, len(args))
