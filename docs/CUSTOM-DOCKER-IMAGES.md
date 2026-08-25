@@ -58,6 +58,7 @@ CMD ["node", "--version"]
 - The `leash-entry` binary is located at `/usr/local/bin/leash-entry` in the leash image
 - You must preserve the `CMD` directive from your base image, otherwise the entrypoint won't execute commands correctly
 - Use the ECR registry URLs (`public.ecr.aws/s5i7k8t3/strongdm/`) rather than GitHub Container Registry
+- Images may declare a non-root `USER` (named, numeric, or with an optional group). Leash temporarily starts only its bootstrap entry process as root so it can publish cgroup state and install the CA, then restores the image's exact declared user for shell detection and the governed command. Custom images do not need to include `sudo`.
 
 ## 2. Build your image
 

@@ -174,6 +174,13 @@ type runner struct {
 
 	runtime Runtime
 
+	// targetContainerUser is the target image's exact Docker Config.User. The
+	// target entry process is temporarily started as root so leash-entry can
+	// complete the cgroup/CA bootstrap, while every governed workload exec uses
+	// this captured identity. An empty image user is normalized to uid 0 when its
+	// exec argv is built.
+	targetContainerUser string
+
 	verbose         bool
 	shareDirCreated bool
 	keepContainers  bool
@@ -2045,6 +2052,45 @@ func (r *runner) imageDefaultCommand(ctx context.Context) ([]string, error) {
 	return append(entry, cmd...), nil
 }
 
+func (r *runner) captureTargetContainerUser(ctx context.Context) error {
+	out, err := r.rt().Output(ctx, "image", "inspect", "--format", "{{json .Config.User}}", r.cfg.targetImage)
+	if err != nil {
+		return fmt.Errorf("query target image user: %w", err)
+	}
+
+	var user *string
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &user); err != nil {
+		return fmt.Errorf("parse target image user: %w", err)
+	}
+	if user == nil {
+		return errors.New("parse target image user: expected JSON string, got null")
+	}
+	if err := validateContainerUser(*user); err != nil {
+		return fmt.Errorf("invalid target image user %q: %w", *user, err)
+	}
+	r.targetContainerUser = *user
+	return nil
+}
+
+// validateContainerUser accepts Docker's user, uid, user:group, and uid:gid
+// forms as opaque runtime-owned syntax. The value is always passed as one argv
+// element (never through a shell), so Docker or Podman remains the authority on
+// whether a name resolves. NUL is the sole value Go cannot represent in an exec
+// argv; reject it during capture so restoration fails closed with a clear error.
+func validateContainerUser(user string) error {
+	if strings.IndexByte(user, 0) >= 0 {
+		return errors.New("NUL is not allowed")
+	}
+	return nil
+}
+
+func (r *runner) targetWorkloadUser() string {
+	if r.targetContainerUser == "" {
+		return "0"
+	}
+	return r.targetContainerUser
+}
+
 func (r *runner) getImageStopSignalContainer(ctx context.Context) (string, error) {
 	out, err := r.rt().Output(ctx, "inspect", "--format", "{{.Config.StopSignal}}", r.cfg.targetImage)
 	if err != nil {
@@ -2263,6 +2309,7 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 	args := []string{
 		"run", "--pull=missing", "-d",
 		"--name", r.cfg.targetContainer,
+		"--user", "0",
 		"--entrypoint", filepath.Join(leashPublicMount, entryName),
 		"--cgroupns", "host",
 	}
@@ -2919,7 +2966,7 @@ func (r *runner) precheckInteractiveContainer(ctx context.Context, shellBin, run
 	}
 	defer os.Remove(tmp.Name())
 
-	args := []string{"exec", "-it", "-w", r.cfg.callerDir, r.cfg.targetContainer, shellBin, "-lc", "true"}
+	args := r.targetWorkloadExecArgs("-it", shellBin, "-lc", "true")
 	cmd := r.rt().Cmd(ctx, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = io.MultiWriter(os.Stderr, tmp)
@@ -2933,12 +2980,12 @@ func (r *runner) precheckInteractiveContainer(ctx context.Context, shellBin, run
 	msg := strings.ToLower(string(data))
 	fmt.Fprintln(os.Stderr, "Interactive docker exec precheck failed; containers will remain running.")
 	if strings.Contains(msg, "setns") && strings.Contains(msg, "permission denied") {
-		fmt.Fprintf(os.Stderr, "Hint: Docker Desktop blocks setns; attach manually with: docker exec -it %s %s -lc 'exec %s'\n", r.cfg.targetContainer, shellBin, runCmd)
+		fmt.Fprintf(os.Stderr, "Hint: Docker Desktop blocks setns; attach manually with: %s\n", r.manualAttachCommand(shellBin, runCmd))
 	} else if len(data) > 0 {
 		fmt.Fprintln(os.Stderr, strings.TrimSpace(string(data)))
-		fmt.Fprintf(os.Stderr, "Attach manually with: docker exec -it %s %s -lc 'exec %s'\n", r.cfg.targetContainer, shellBin, runCmd)
+		fmt.Fprintf(os.Stderr, "Attach manually with: %s\n", r.manualAttachCommand(shellBin, runCmd))
 	} else {
-		fmt.Fprintf(os.Stderr, "Attach manually with: docker exec -it %s %s -lc 'exec %s'\n", r.cfg.targetContainer, shellBin, runCmd)
+		fmt.Fprintf(os.Stderr, "Attach manually with: %s\n", r.manualAttachCommand(shellBin, runCmd))
 	}
 	return fmt.Errorf("docker exec precheck failed: %w", err)
 }
@@ -2962,12 +3009,34 @@ func (r *runner) execInteractive(shellBin, cmd string) (int, error) {
 		data, _ := os.ReadFile(tmp.Name())
 		msg := strings.ToLower(string(data))
 		if strings.Contains(msg, "setns") && strings.Contains(msg, "permission denied") {
-			fmt.Fprintf(os.Stderr, "Interactive docker exec failed due to setns permission issue; containers remain running. Attach manually with: docker exec -it %s %s -lc 'exec %s'\n", r.cfg.targetContainer, shellBin, cmd)
+			fmt.Fprintf(os.Stderr, "Interactive docker exec failed due to setns permission issue; containers remain running. Attach manually with: %s\n", r.manualAttachCommand(shellBin, cmd))
 			return exitErr.ExitCode(), fmt.Errorf("docker exec failed: %w", err)
 		}
 		return exitErr.ExitCode(), nil
 	}
 	return 0, err
+}
+
+// targetWorkloadExecArgs is the single construction point for every
+// workload-facing container exec. Keeping the image identity as its own argv
+// value prevents shell interpretation and keeps shell probing, prechecks, and
+// real execution from drifting apart.
+func (r *runner) targetWorkloadExecArgs(ioFlag string, command ...string) []string {
+	args := []string{"exec"}
+	if ioFlag != "" {
+		args = append(args, ioFlag)
+	}
+	args = append(args,
+		"--user", r.targetWorkloadUser(),
+		"-w", r.cfg.callerDir,
+		r.cfg.targetContainer,
+	)
+	return append(args, command...)
+}
+
+func (r *runner) manualAttachCommand(shellBin, cmd string) string {
+	args := append([]string{r.rt().Name()}, r.targetWorkloadExecArgs("-it", shellBin, "-lc", "exec "+cmd)...)
+	return shellJoin(args)
 }
 
 // finalizeSession keeps two concerns separate:

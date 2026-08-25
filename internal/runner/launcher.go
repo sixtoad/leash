@@ -138,6 +138,11 @@ func (c containerLauncher) PullImages(ctx context.Context) error {
 }
 
 func (c containerLauncher) Provision(ctx context.Context, stopSignal string) (string, error) {
+	// Capture the image's workload identity before replacing its entrypoint and
+	// temporarily starting that bootstrap process as root.
+	if err := c.r.captureTargetContainerUser(ctx); err != nil {
+		return "", err
+	}
 	// Spawn the --inject-service plugins exactly once, before the launch retry loop
 	// (a port-conflict retry re-runs launchTargetContainer, which must not respawn
 	// them). Fail-closed: abort the run if any plugin can't start. The resulting
@@ -185,10 +190,10 @@ func (c containerLauncher) Remove(ctx context.Context) {
 }
 
 func (c containerLauncher) DetectShell(ctx context.Context) (string, error) {
-	if err := c.r.rt().Run(ctx, "exec", "-w", c.r.cfg.callerDir, c.r.cfg.targetContainer, "bash", "-lc", "true"); err == nil {
+	if err := c.r.rt().Run(ctx, c.r.targetWorkloadExecArgs("", "bash", "-lc", "true")...); err == nil {
 		return "bash", nil
 	}
-	if err := c.r.rt().Run(ctx, "exec", "-w", c.r.cfg.callerDir, c.r.cfg.targetContainer, "sh", "-lc", "true"); err == nil {
+	if err := c.r.rt().Run(ctx, c.r.targetWorkloadExecArgs("", "sh", "-lc", "true")...); err == nil {
 		return "sh", nil
 	}
 	return "", fmt.Errorf("failed to locate a usable shell (bash or sh) inside %s", c.r.cfg.targetContainer)
@@ -199,7 +204,7 @@ func (c containerLauncher) ExecCommand(ctx context.Context, shellBin, cmd string
 	if interactive {
 		flag = "-it"
 	}
-	return c.r.rt().Cmd(ctx, "exec", flag, "-w", c.r.cfg.callerDir, c.r.cfg.targetContainer, shellBin, "-lc", "exec "+cmd)
+	return c.r.rt().Cmd(ctx, c.r.targetWorkloadExecArgs(flag, shellBin, "-lc", "exec "+cmd)...)
 }
 
 func (c containerLauncher) Precheck(ctx context.Context, shellBin, cmd string) error {

@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -130,6 +131,23 @@ func TestLaunchCommandsUseSplitMounts(t *testing.T) {
 	if !containsArg(leashArgs, "LEASH_PRIVATE_DIR=/leash-private") {
 		t.Fatalf("leash container missing LEASH_PRIVATE_DIR environment export")
 	}
+	if !containsArgSequence(targetArgs, "--user", "0") {
+		t.Fatalf("target bootstrap missing numeric root identity, args=%v", targetArgs)
+	}
+	if containsArg(targetArgs, "--privileged") {
+		t.Fatalf("target container must remain unprivileged, args=%v", targetArgs)
+	}
+	for _, sequence := range [][]string{
+		{"--privileged"},
+		{"--cap-add", "NET_ADMIN"},
+		{"--cgroupns=host"},
+		{"--network", "container:leash-target-123"},
+		{"-v", "/sys/fs/cgroup:/sys/fs/cgroup:ro"},
+	} {
+		if !containsArgSequence(leashArgs, sequence...) {
+			t.Fatalf("leash manager missing required flags %v, args=%v", sequence, leashArgs)
+		}
+	}
 
 	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
 	tmpDir := t.TempDir()
@@ -144,6 +162,18 @@ func TestLaunchCommandsUseSplitMounts(t *testing.T) {
 func containsArg(args []string, want string) bool {
 	for _, arg := range args {
 		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsArgSequence(args []string, want ...string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	for i := 0; i+len(want) <= len(args); i++ {
+		if reflect.DeepEqual(args[i:i+len(want)], want) {
 			return true
 		}
 	}
