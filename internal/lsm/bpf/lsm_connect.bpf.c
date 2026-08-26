@@ -53,8 +53,8 @@ struct connect_event {
     char comm[16];         // Task command name
     u32 family;            // AF_INET, AF_INET6
     u32 protocol;          // IPPROTO_TCP, IPPROTO_UDP
-    u32 dest_ip;           // IPv4 destination (network byte order)
-    u16 dest_port;         // Destination port (network byte order)
+    u32 dest_ip;           // Canonical IPv4 value (a<<24 | b<<16 | c<<8 | d)
+    u16 dest_port;         // Host-order destination port
     s32 result;            // Result of the connect operation (0 = allowed, -EACCES = denied)
     char dest_hostname[MAX_HOSTNAME_LEN]; // Resolved hostname if available
 };
@@ -63,12 +63,19 @@ struct connect_event {
 struct connect_policy_rule {
     u32 action;            // 0 = deny, 1 = allow
     u32 operation;         // Always OP_CONNECT for this program
-    u32 dest_ip;           // IPv4 destination (0 = any IP, for hostname rules)
-    u16 dest_port;         // Destination port (0 = any port)
+    u32 dest_ip;           // Canonical IPv4 value (0 = any IP, for hostname rules)
+    u16 dest_port;         // Host-order destination port (0 = any port)
     char hostname[MAX_HOSTNAME_LEN]; // Hostname pattern (empty for IP-only rules)
     u32 hostname_len;      // Length of hostname for efficient matching
     u32 is_wildcard;       // 1 if hostname starts with *.
 };
+
+// Guard the address/port portion of the Go/BPF ABI used by policy maps and
+// ring-buffer events. The remaining legacy fields are outside this contract.
+_Static_assert(__builtin_offsetof(struct connect_event, dest_ip) == 48, "connect_event.dest_ip ABI drift");
+_Static_assert(__builtin_offsetof(struct connect_event, dest_port) == 52, "connect_event.dest_port ABI drift");
+_Static_assert(__builtin_offsetof(struct connect_policy_rule, dest_ip) == 8, "connect_policy_rule.dest_ip ABI drift");
+_Static_assert(__builtin_offsetof(struct connect_policy_rule, dest_port) == 12, "connect_policy_rule.dest_port ABI drift");
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -329,8 +336,10 @@ int BPF_PROG(lsm_connect, struct socket *sock, struct sockaddr *address, int add
     if (bpf_probe_read_user(&uaddr, sizeof(uaddr), address) != 0) {
         return 0;
     }
-    dest_ip = uaddr.sin_addr.s_addr; // Network byte order
-    dest_port = uaddr.sin_port;      // Network byte order
+    // sockaddr_in stores both fields in network byte order. Convert once at
+    // ingress so policy maps, DNS keys, and events all use canonical values.
+    dest_ip = bpf_ntohl(uaddr.sin_addr.s_addr);
+    dest_port = bpf_ntohs(uaddr.sin_port);
     
     return process_network_event(sock, dest_ip, dest_port, family);
 }
@@ -375,8 +384,9 @@ int BPF_PROG(lsm_sendmsg, struct socket *sock, void *msg, int size)
     if (bpf_probe_read_kernel(&kaddr, sizeof(kaddr), msg_name) != 0) {
         return 0;
     }
-    dest_ip = kaddr.sin_addr.s_addr; // Network byte order
-    dest_port = kaddr.sin_port;      // Network byte order
+    // Keep UDP/sendmsg on the same canonical representation as connect(2).
+    dest_ip = bpf_ntohl(kaddr.sin_addr.s_addr);
+    dest_port = bpf_ntohs(kaddr.sin_port);
     
     return process_network_event(sock, dest_ip, dest_port, family);
 }

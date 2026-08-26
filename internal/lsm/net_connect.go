@@ -21,8 +21,8 @@ import (
 type ConnectPolicyRule struct {
 	Action      int32     // 0 = deny, 1 = allow
 	Operation   int32     // Always OP_CONNECT (4) for this program
-	DestIP      uint32    // IPv4 destination (0 = any IP, for hostname rules)
-	DestPort    uint16    // Destination port (0 = any port)
+	DestIP      uint32    // Canonical IPv4 value a<<24|b<<16|c<<8|d (0 = any IP)
+	DestPort    uint16    // Host-order destination port (0 = any port)
 	Hostname    [128]byte // Hostname pattern (empty for IP-only rules)
 	HostnameLen int32     // Length of hostname for efficient matching
 	IsWildcard  int32     // 1 if hostname starts with *.
@@ -46,10 +46,7 @@ func (rule *ConnectPolicyRule) String() string {
 	if rule.DestIP == 0 {
 		parts = append(parts, "dest_ip=any")
 	} else {
-		// Convert uint32 to IP address
-		ip := make(net.IP, 4)
-		binary.BigEndian.PutUint32(ip, rule.DestIP)
-		parts = append(parts, fmt.Sprintf("dest_ip=%s", ip.String()))
+		parts = append(parts, fmt.Sprintf("dest_ip=%s", canonicalIPv4String(rule.DestIP)))
 	}
 
 	// Destination Port
@@ -100,8 +97,8 @@ type ConnectEvent struct {
 	Comm         [16]byte
 	Family       uint32    // AF_INET, AF_INET6
 	Protocol     uint32    // IPPROTO_TCP, IPPROTO_UDP
-	DestIP       uint32    // IPv4 destination (network byte order)
-	DestPort     uint16    // Destination port (network byte order)
+	DestIP       uint32    // Canonical IPv4 value a<<24|b<<16|c<<8|d
+	DestPort     uint16    // Host-order destination port
 	Result       int32     // Result of the connect operation (0 = allowed, -EACCES = denied)
 	DestHostname [128]byte // Resolved hostname if available
 }
@@ -231,7 +228,7 @@ func (l *ConnectLsm) LoadPolicies(policies []ConnectPolicyRule, defaultOverride 
 			if v4 == nil {
 				continue
 			}
-			ipNum := uint32(v4[0])<<24 | uint32(v4[1])<<16 | uint32(v4[2])<<8 | uint32(v4[3])
+			ipNum, _ := canonicalIPv4(v4)
 			var newRule ConnectPolicyRuleBPF
 			newRule.Action = uint32(rule.Action)
 			newRule.Operation = uint32(rule.Operation)
@@ -438,12 +435,8 @@ func (l *ConnectLsm) handleEvent(data []byte) {
 		return
 	}
 
-	// Convert destination IP from network byte order
-	destIP := make(net.IP, 4)
-	binary.BigEndian.PutUint32(destIP, event.DestIP)
-
-	// Convert port from network byte order
-	destPort := binary.BigEndian.Uint16((*[2]byte)(unsafe.Pointer(&event.DestPort))[:])
+	destIP := canonicalIPv4String(event.DestIP)
+	destPort := event.DestPort
 
 	// Use current time for ISO 8601 format (BPF timestamp is kernel boot time, not Unix time)
 	timestamp := time.Now().Format(time.RFC3339)
@@ -464,7 +457,7 @@ func (l *ConnectLsm) handleEvent(data []byte) {
 	}
 
 	// Create destination string
-	destStr := destIP.String()
+	destStr := destIP
 	if destPort != 0 {
 		destStr = fmt.Sprintf("%s:%d", destStr, destPort)
 	}
@@ -537,11 +530,8 @@ func NewSimplePolicyChecker(rules []ConnectPolicyRule, defaultPolicy bool, mcpRu
 func (pc *SimplePolicyChecker) CheckConnect(hostname string, ip string, port uint16) bool {
 	// Convert IP string to uint32 for comparison
 	var ipNum uint32
-	if net.ParseIP(ip) != nil {
-		ipAddr := net.ParseIP(ip).To4()
-		if ipAddr != nil {
-			ipNum = uint32(ipAddr[0])<<24 | uint32(ipAddr[1])<<16 | uint32(ipAddr[2])<<8 | uint32(ipAddr[3])
-		}
+	if ipAddr := net.ParseIP(ip); ipAddr != nil {
+		ipNum, _ = canonicalIPv4(ipAddr)
 	}
 
 	// Check each rule (rules should be sorted by specificity)
@@ -691,10 +681,7 @@ func (l *ConnectLsm) resolveHostnamesFromPolicies() error {
 		// Add all resolved IPs to our DNS cache
 		l.dnsCacheMux.Lock()
 		for _, ip := range ips {
-			ipv4 := ip.To4()
-			if ipv4 != nil {
-				// Convert to uint32 in network byte order
-				ipNum := uint32(ipv4[0])<<24 | uint32(ipv4[1])<<16 | uint32(ipv4[2])<<8 | uint32(ipv4[3])
+			if ipNum, ok := canonicalIPv4(ip); ok {
 				l.dnsCache[ipNum] = hostname
 				resolvedCount++
 			}

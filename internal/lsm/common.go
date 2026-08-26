@@ -3,6 +3,7 @@ package lsm
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -33,8 +34,8 @@ type PolicyRule struct {
 	ArgLens     [4]int32    // Length of each arg for efficient matching
 
 	// Network connection matching (only used for connect operations)
-	DestIP      uint32    // IPv4 destination (0 = any IP, for hostname rules)
-	DestPort    uint16    // Destination port (0 = any port)
+	DestIP      uint32    // Canonical IPv4 value a<<24|b<<16|c<<8|d (0 = any IP)
+	DestPort    uint16    // Host-order destination port (0 = any port)
 	Hostname    [128]byte // Hostname pattern (empty for IP-only rules)
 	HostnameLen int32     // Length of hostname for efficient matching
 	IsWildcard  int32     // 1 if hostname starts with *.
@@ -105,9 +106,7 @@ func (pr *PolicyRule) String() string {
 				target = hostname
 			}
 		} else if pr.DestIP > 0 {
-			ip := fmt.Sprintf("%d.%d.%d.%d",
-				(pr.DestIP>>24)&0xFF, (pr.DestIP>>16)&0xFF,
-				(pr.DestIP>>8)&0xFF, pr.DestIP&0xFF)
+			ip := canonicalIPv4String(pr.DestIP)
 			if pr.DestPort > 0 {
 				target = fmt.Sprintf("%s:%d", ip, pr.DestPort)
 			} else {
@@ -573,20 +572,33 @@ func isIPAddress(s string) bool {
 	return net.ParseIP(s) != nil
 }
 
+// canonicalIPv4 converts an IPv4 address to the numeric representation shared
+// by policy values, BPF maps, DNS cache keys, and connect events.
+func canonicalIPv4(ip net.IP) (uint32, bool) {
+	ipv4 := ip.To4()
+	if ipv4 == nil {
+		return 0, false
+	}
+	return binary.BigEndian.Uint32(ipv4), true
+}
+
+func canonicalIPv4String(addr uint32) string {
+	ip := make(net.IP, net.IPv4len)
+	binary.BigEndian.PutUint32(ip, addr)
+	return ip.String()
+}
+
 func parseIPAddress(s string) (uint32, error) {
 	ip := net.ParseIP(s)
 	if ip == nil {
 		return 0, fmt.Errorf("invalid IP address")
 	}
 
-	// Convert to IPv4
-	ipv4 := ip.To4()
-	if ipv4 == nil {
+	addr, ok := canonicalIPv4(ip)
+	if !ok {
 		return 0, fmt.Errorf("IPv6 not supported")
 	}
-
-	// Convert to uint32 in network byte order
-	return uint32(ipv4[0])<<24 | uint32(ipv4[1])<<16 | uint32(ipv4[2])<<8 | uint32(ipv4[3]), nil
+	return addr, nil
 }
 
 func parsePort(s string) (uint16, error) {
