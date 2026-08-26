@@ -92,6 +92,9 @@ const (
 	// CapabilityVersionJSON is this document itself, emitted by
 	// `leash version --json`.
 	CapabilityVersionJSON = "version-json"
+	// CapabilityResolverContractJSON is the machine-readable resolver ownership
+	// document emitted by `leash resolvers --runtime ... --json`.
+	CapabilityResolverContractJSON = "resolver-contract-json"
 )
 
 // capabilities is the surface this build offers. Order is stable so the emitted
@@ -104,6 +107,7 @@ var capabilities = []string{
 	CapabilityRequireLSM,
 	CapabilityMachineOutput,
 	CapabilityVersionJSON,
+	CapabilityResolverContractJSON,
 }
 
 // Capabilities returns the surface names this build advertises. The slice is a

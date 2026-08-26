@@ -63,6 +63,23 @@ func TestNativePullImagesNoop(t *testing.T) {
 	}
 }
 
+func TestNativeEgressResolversReturnsExactCopy(t *testing.T) {
+	t.Parallel()
+	got := NativeEgressResolvers()
+	if strings.Join(got, ",") != "1.1.1.1,8.8.8.8" {
+		t.Fatalf("NativeEgressResolvers = %v", got)
+	}
+	got[0] = "192.0.2.53"
+	if strings.Join(NativeEgressResolvers(), ",") != "1.1.1.1,8.8.8.8" {
+		t.Fatal("caller mutated the native resolver source")
+	}
+	for _, address := range NativeEgressResolvers() {
+		if !strings.Contains(nativeEgressResolvConf, "nameserver "+address+"\n") {
+			t.Fatalf("native resolv.conf omitted %s: %q", address, nativeEgressResolvConf)
+		}
+	}
+}
+
 func TestNativeHostLeashdArgv(t *testing.T) {
 	r := &runner{}
 	r.cfg.proxyPort = "18000"
