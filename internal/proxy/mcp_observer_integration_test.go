@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +16,8 @@ import (
 	"github.com/strongdm/leash/e2e/mcpserver"
 	"github.com/strongdm/leash/internal/lsm"
 )
+
+const syntheticMCPSessionID = "feedfacecafedead"
 
 type capturingBroadcaster struct {
 	mu      sync.Mutex
@@ -44,12 +48,7 @@ func TestMCPObserverCapturesJSONRPCAndSSE(t *testing.T) {
 	srv := mcpserver.New()
 	defer srv.Close()
 
-	logger, err := lsm.NewSharedLogger("")
-	if err != nil {
-		t.Fatalf("failed to create shared logger: %v", err)
-	}
-	capture := &capturingBroadcaster{}
-	logger.SetBroadcaster(capture)
+	logger, logPath, capture := newMCPTestLogger(t)
 
 	transport := &http.Transport{
 		DisableKeepAlives: true,
@@ -165,8 +164,8 @@ func TestMCPObserverCapturesJSONRPCAndSSE(t *testing.T) {
 	if !strings.Contains(discover, `method="tools/list"`) || !strings.Contains(discover, `transport="json"`) {
 		t.Fatalf("unexpected discover log: %s", discover)
 	}
-	if !strings.Contains(discover, `session="feedface"`) {
-		t.Fatalf("discover log missing truncated session: %s", discover)
+	if !strings.Contains(discover, `session_present=true`) || strings.Contains(discover, "feedface") {
+		t.Fatalf("discover log did not redact session: %s", discover)
 	}
 
 	if notify == "" {
@@ -175,8 +174,8 @@ func TestMCPObserverCapturesJSONRPCAndSSE(t *testing.T) {
 	if !strings.Contains(notify, `method="notifications/tools/list_changed"`) || !strings.Contains(notify, `transport="sse"`) {
 		t.Fatalf("unexpected notify log: %s", notify)
 	}
-	if !strings.Contains(notify, `session="feedface"`) {
-		t.Fatalf("notification log missing session: %s", notify)
+	if !strings.Contains(notify, `session_present=true`) || strings.Contains(notify, "feedface") {
+		t.Fatalf("notification log did not redact session: %s", notify)
 	}
 
 	if call == "" {
@@ -191,18 +190,14 @@ func TestMCPObserverCapturesJSONRPCAndSSE(t *testing.T) {
 	if !strings.Contains(call, `transport="sse"`) || !strings.Contains(call, `proto="1.1"`) {
 		t.Fatalf("call log missing transport/proto: %s", call)
 	}
-	if !strings.Contains(call, `session="feedface"`) {
-		t.Fatalf("call log missing session: %s", call)
+	if !strings.Contains(call, `session_present=true`) || strings.Contains(call, "feedface") {
+		t.Fatalf("call log did not redact session: %s", call)
 	}
+	assertMCPSessionAbsentFromLoggerSinks(t, logPath, capture)
 }
 
 func TestMCPObserverCapturesSessionSSEStream(t *testing.T) {
-	logger, err := lsm.NewSharedLogger("")
-	if err != nil {
-		t.Fatalf("failed to create shared logger: %v", err)
-	}
-	capture := &capturingBroadcaster{}
-	logger.SetBroadcaster(capture)
+	logger, logPath, capture := newMCPTestLogger(t)
 
 	observer := newMCPObserver(MCPConfig{
 		Mode:          MCPModeEnhanced,
@@ -219,7 +214,7 @@ func TestMCPObserverCapturesSessionSSEStream(t *testing.T) {
 		sampled: true,
 		started: time.Now(),
 	}
-	observer.registerSession("feedfacecafedead", ctx)
+	observer.registerSession(syntheticMCPSessionID, ctx)
 
 	stream := strings.Join([]string{
 		`data: {"jsonrpc":"2.0","id":"abc","method":"tools/call","params":{"name":"get_library_docs"}}`,
@@ -229,7 +224,7 @@ func TestMCPObserverCapturesSessionSSEStream(t *testing.T) {
 	}, "\n") + "\n"
 
 	body := io.NopCloser(strings.NewReader(stream))
-	wrapped := observer.wrapSessionSSE("feedfacecafedead", "mcp.test", "1.1", body)
+	wrapped := observer.wrapSessionSSE(syntheticMCPSessionID, "mcp.test", "1.1", body)
 	if _, err := io.ReadAll(wrapped); err != nil {
 		t.Fatalf("failed to read wrapped stream: %v", err)
 	}
@@ -251,7 +246,8 @@ func TestMCPObserverCapturesSessionSSEStream(t *testing.T) {
 	if !strings.Contains(streamCall, `tool="get_library_docs"`) ||
 		!strings.Contains(streamCall, `id="abc"`) ||
 		!strings.Contains(streamCall, `outcome=pending`) ||
-		!strings.Contains(streamCall, `session="feedface"`) {
+		!strings.Contains(streamCall, `session_present=true`) ||
+		strings.Contains(streamCall, "feedface") {
 		t.Fatalf("unexpected stream call log: %s", streamCall)
 	}
 
@@ -259,8 +255,38 @@ func TestMCPObserverCapturesSessionSSEStream(t *testing.T) {
 		t.Fatalf("missing stream notification log: %+v", capture.all())
 	}
 	if !strings.Contains(streamNotify, `method="notifications/foo"`) ||
-		!strings.Contains(streamNotify, `session="feedface"`) {
+		!strings.Contains(streamNotify, `session_present=true`) ||
+		strings.Contains(streamNotify, "feedface") {
 		t.Fatalf("unexpected stream notification log: %s", streamNotify)
+	}
+	assertMCPSessionAbsentFromLoggerSinks(t, logPath, capture)
+}
+
+func newMCPTestLogger(t *testing.T) (*lsm.SharedLogger, string, *capturingBroadcaster) {
+	t.Helper()
+	logPath := filepath.Join(t.TempDir(), "events.log")
+	logger, err := lsm.NewSharedLogger(logPath)
+	if err != nil {
+		t.Fatalf("failed to create shared logger: %v", err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+	capture := &capturingBroadcaster{}
+	logger.SetBroadcaster(capture)
+	return logger, logPath, capture
+}
+
+func assertMCPSessionAbsentFromLoggerSinks(t *testing.T, logPath string, capture *capturingBroadcaster) {
+	t.Helper()
+	fileBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read MCP event log: %v", err)
+	}
+	for _, sink := range []string{string(fileBytes), strings.Join(capture.all(), "\n")} {
+		for _, fragment := range secretFragments(syntheticMCPSessionID, 8) {
+			if strings.Contains(sink, fragment) {
+				t.Fatal("MCP logger sink contains synthetic session material")
+			}
+		}
 	}
 }
 

@@ -279,7 +279,7 @@ func (p *MITMProxy) checkConnectPolicy(hostname, destIP string, port uint16) boo
 }
 
 // blockConnection sends a policy violation response and closes the connection
-func (p *MITMProxy) blockConnection(clientConn net.Conn, isHTTPS bool, hostname, destIP string, port uint16, path, query, authHeader string) {
+func (p *MITMProxy) blockConnection(clientConn net.Conn, isHTTPS bool, hostname, destIP string, port uint16, path, query string, authPresent bool) {
 	// Determine protocol and port string for logging
 	protocol := "http"
 	portStr := fmt.Sprintf("%d", port)
@@ -291,7 +291,7 @@ func (p *MITMProxy) blockConnection(clientConn net.Conn, isHTTPS bool, hostname,
 	policyErr := fmt.Errorf("connection denied by security policy")
 
 	// Log the denied request to shared logger
-	p.logRequest(protocol, hostname, portStr, path, query, authHeader, 403, policyErr)
+	p.logRequest(protocol, hostname, portStr, path, query, authPresent, 403, policyErr)
 
 	body := "Connection denied by security policy: " + hostname
 	response := fmt.Sprintf("HTTP/1.1 403 Forbidden\r\n"+
@@ -314,7 +314,7 @@ func (p *MITMProxy) blockConnection(clientConn net.Conn, isHTTPS bool, hostname,
 	}
 }
 
-func (p *MITMProxy) enforceMCPCall(conn net.Conn, ctx *mcpRequestContext, serverHost string, logHost string, logPort string, path string, query string, authHeader string, scheme string) bool {
+func (p *MITMProxy) enforceMCPCall(conn net.Conn, ctx *mcpRequestContext, serverHost string, logHost string, logPort string, path string, query string, authPresent bool, scheme string) bool {
 	if p.policyChecker == nil || ctx == nil {
 		return false
 	}
@@ -354,7 +354,7 @@ func (p *MITMProxy) enforceMCPCall(conn net.Conn, ctx *mcpRequestContext, server
 		if p.mcpObserver != nil {
 			p.mcpObserver.logHTTPRequest(ctx, status, "denied", "", nil)
 		}
-		p.logRequest(scheme, logHost, logPort, path, query, authHeader, status, fmt.Errorf("mcp tools/call denied by policy"))
+		p.logRequest(scheme, logHost, logPort, path, query, authPresent, status, fmt.Errorf("mcp tools/call denied by policy"))
 		return true
 	}
 	return false
@@ -385,7 +385,7 @@ func (p *MITMProxy) handleTransparentHTTP(clientConn net.Conn, originalDest stri
 		if port == "" {
 			port = "80"
 		}
-		p.logRequest("http", host, port, "", "", "", 0, err)
+		p.logRequest("http", host, port, "", "", false, 0, err)
 		return
 	}
 
@@ -413,10 +413,10 @@ func (p *MITMProxy) handleTransparentHTTP(clientConn net.Conn, originalDest stri
 		path = "/"
 	}
 	query := req.URL.RawQuery
-	authHeader := req.Header.Get("Authorization")
+	authPresent := headerValuePresent(req.Header, "Authorization")
 
 	if !p.checkConnectPolicy(hostname, host, uint16(portNum)) {
-		p.blockConnection(clientConn, false, hostname, host, uint16(portNum), path, query, authHeader)
+		p.blockConnection(clientConn, false, hostname, host, uint16(portNum), path, query, authPresent)
 		return
 	}
 
@@ -440,14 +440,14 @@ func (p *MITMProxy) handleTransparentHTTP(clientConn net.Conn, originalDest stri
 	if serverForPolicy == "" {
 		serverForPolicy = hostname
 	}
-	if p.enforceMCPCall(clientConn, mcpCtx, serverForPolicy, hostname, port, path, query, authHeader, "http") {
+	if p.enforceMCPCall(clientConn, mcpCtx, serverForPolicy, hostname, port, path, query, authPresent, "http") {
 		return
 	}
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
 		log.Printf("Error forwarding request: %v", err)
-		p.logRequest("http", host, port, path, query, authHeader, 0, err)
+		p.logRequest("http", host, port, path, query, authPresent, 0, err)
 		if mcpCtx != nil {
 			p.mcpObserver.logHTTPRequest(mcpCtx, 0, "error", "", err)
 		}
@@ -489,7 +489,7 @@ func (p *MITMProxy) handleTransparentHTTP(clientConn net.Conn, originalDest stri
 		p.mcpObserver.logHTTPRequest(mcpCtx, resp.StatusCode, outcome, sessionHeader, writeErr)
 	}
 
-	p.logRequest("http", host, port, path, query, authHeader, resp.StatusCode, writeErr)
+	p.logRequest("http", host, port, path, query, authPresent, resp.StatusCode, writeErr)
 }
 
 // connWrapper wraps a net.Conn with additional reader for prepending data
@@ -583,7 +583,7 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 
 	if !p.checkConnectPolicy(hostname, destHost, uint16(portNum)) {
 		// For HTTPS connection denials, we don't have specific path/query/auth info yet
-		p.blockConnection(tlsConn, true, hostname, destHost, uint16(portNum), "/", "", "")
+		p.blockConnection(tlsConn, true, hostname, destHost, uint16(portNum), "/", "", false)
 		return
 	}
 
@@ -615,7 +615,7 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 			path = "/"
 		}
 		query := req.URL.RawQuery
-		authHeader := req.Header.Get("Authorization")
+		authPresent := headerValuePresent(req.Header, "Authorization")
 
 		// Unique request logging removed
 
@@ -631,7 +631,7 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 		if serverForPolicy == "" {
 			serverForPolicy = host
 		}
-		if p.enforceMCPCall(tlsConn, mcpCtx, serverForPolicy, host, port, path, query, authHeader, "https") {
+		if p.enforceMCPCall(tlsConn, mcpCtx, serverForPolicy, host, port, path, query, authPresent, "https") {
 			break
 		}
 
@@ -646,7 +646,7 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 		}
 
 		// Log request to logfmt
-		p.logRequest("https", host, port, path, query, authHeader, responseCode, forwardErr)
+		p.logRequest("https", host, port, path, query, authPresent, responseCode, forwardErr)
 	}
 }
 
@@ -801,7 +801,7 @@ func (p *MITMProxy) getCertificate(host string) (*tls.Certificate, error) {
 }
 
 // logRequest logs a request in logfmt format to the shared event log
-func (p *MITMProxy) logRequest(reqType, host, port, path, query, authHeader string, responseCode int, err error) {
+func (p *MITMProxy) logRequest(reqType, host, port, path, query string, authPresent bool, responseCode int, err error) {
 	// Log to shared logger
 	if p.sharedLogger != nil {
 		timestamp := time.Now().Format(time.RFC3339) // ISO 8601 format
@@ -832,8 +832,8 @@ func (p *MITMProxy) logRequest(reqType, host, port, path, query, authHeader stri
 			logEntry += fmt.Sprintf(" status=%d", responseCode)
 		}
 
-		if authHeader != "" {
-			logEntry += fmt.Sprintf(" auth=\"%s\"", authHeader[:min(len(authHeader), 20)]) // Truncate for security
+		if authPresent {
+			logEntry += " auth_present=true"
 		}
 
 		if err != nil {
@@ -843,14 +843,6 @@ func (p *MITMProxy) logRequest(reqType, host, port, path, query, authHeader stri
 		_ = p.sharedLogger.Write(logEntry)
 	}
 
-}
-
-// min returns the minimum of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func transportFromHeader(contentType string) string {

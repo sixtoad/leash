@@ -137,14 +137,14 @@ func (hr *HeaderRewriter) ApplyRules(req *http.Request) {
 	for _, rule := range hr.rules {
 		if rule.Host == host {
 			// always rewrite the header, even if it's empty
-			oldValue := req.Header.Get(rule.Header)
+			oldValuePresent := headerValuePresent(req.Header, rule.Header)
 			req.Header.Set(rule.Header, rule.Value)
 
 			// Log to shared event log
 			if hr.sharedLogger != nil {
 				timestamp := time.Now().Format(time.RFC3339)
-				logEntry := fmt.Sprintf("time=%s event=http.rewrite addr=\"%s\" header=\"%s\" from=\"%s\" to=\"%s\" decision=allowed",
-					timestamp, host, rule.Header, oldValue, rule.Value)
+				logEntry := fmt.Sprintf("time=%s event=http.rewrite addr=\"%s\" header=\"%s\" from_present=%t to_present=%t decision=allowed",
+					timestamp, host, rule.Header, oldValuePresent, strings.TrimSpace(rule.Value) != "")
 				_ = hr.sharedLogger.Write(logEntry)
 			}
 		}

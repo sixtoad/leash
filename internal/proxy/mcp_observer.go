@@ -68,16 +68,15 @@ type mcpRequestContext struct {
 	responseOutcome string
 	responseError   string
 	telemetryHandle *otel.RequestHandle
-	session         string
+	sessionPresent  bool
 
 	started time.Time
 	sampled bool
 }
 
 type sessionInfo struct {
-	server    string
-	proto     string
-	truncated string
+	server string
+	proto  string
 }
 
 const maxTrackedSessions = 64
@@ -281,16 +280,13 @@ func (o *mcpObserver) logHTTPRequest(ctx *mcpRequestContext, status int, outcome
 		decision = "denied"
 	}
 
-	truncatedSession := ""
-	if session != "" {
-		truncatedSession = truncateSession(session)
-		if ctx.session == "" {
-			ctx.session = truncatedSession
-		}
+	sessionPresent := strings.TrimSpace(session) != "" || ctx.sessionPresent
+	if sessionPresent {
+		ctx.sessionPresent = true
 	}
 
 	if o.telemetry != nil && ctx.telemetryHandle != nil {
-		o.telemetry.Finish(ctx.telemetryHandle, status, finalOutcome, transport, ctx.proto, truncatedSession, errorField)
+		o.telemetry.Finish(ctx.telemetryHandle, status, finalOutcome, transport, ctx.proto, sessionPresent, errorField)
 	}
 
 	var sb strings.Builder
@@ -341,10 +337,8 @@ func (o *mcpObserver) logHTTPRequest(ctx *mcpRequestContext, status int, outcome
 			sb.WriteString(escapeQuotes(ctx.proto))
 			sb.WriteString(`"`)
 		}
-		if truncatedSession != "" {
-			sb.WriteString(` session="`)
-			sb.WriteString(escapeQuotes(truncatedSession))
-			sb.WriteString(`"`)
+		if sessionPresent {
+			sb.WriteString(" session_present=true")
 		}
 	}
 
@@ -375,10 +369,8 @@ func (o *mcpObserver) logNotification(ctx *mcpRequestContext, method string) {
 			sb.WriteString(escapeQuotes(ctx.proto))
 			sb.WriteString(`"`)
 		}
-		if ctx.session != "" {
-			sb.WriteString(` session="`)
-			sb.WriteString(escapeQuotes(ctx.session))
-			sb.WriteString(`"`)
+		if ctx.sessionPresent {
+			sb.WriteString(" session_present=true")
 		}
 	}
 	_ = o.logger.Write(sb.String())
@@ -663,14 +655,6 @@ func isNotification(env *parsedEnvelope) bool {
 	return strings.TrimSpace(env.ID) == ""
 }
 
-func truncateSession(session string) string {
-	session = strings.TrimSpace(session)
-	if len(session) <= 8 {
-		return session
-	}
-	return session[:8]
-}
-
 func shortError(err error) string {
 	if err == nil {
 		return ""
@@ -754,8 +738,7 @@ func (o *mcpObserver) registerSession(session string, ctx *mcpRequestContext) {
 		return
 	}
 
-	truncated := truncateSession(session)
-	ctx.session = truncated
+	ctx.sessionPresent = true
 
 	o.sessionMu.Lock()
 	defer o.sessionMu.Unlock()
@@ -768,9 +751,8 @@ func (o *mcpObserver) registerSession(session string, ctx *mcpRequestContext) {
 	}
 
 	o.sessions[session] = &sessionInfo{
-		server:    ctx.server,
-		proto:     ctx.proto,
-		truncated: truncated,
+		server: ctx.server,
+		proto:  ctx.proto,
 	}
 }
 
@@ -800,12 +782,12 @@ func (o *mcpObserver) sessionContext(session string, fallbackServer string, fall
 	}
 
 	return &mcpRequestContext{
-		event:   "mcp.stream",
-		server:  server,
-		proto:   proto,
-		session: info.truncated,
-		started: time.Now(),
-		sampled: true,
+		event:          "mcp.stream",
+		server:         server,
+		proto:          proto,
+		sessionPresent: true,
+		started:        time.Now(),
+		sampled:        true,
 	}
 }
 
@@ -862,10 +844,8 @@ func (o *mcpObserver) logStreamRequest(ctx *mcpRequestContext, env *parsedEnvelo
 			sb.WriteString(escapeQuotes(ctx.proto))
 			sb.WriteString(`"`)
 		}
-		if ctx.session != "" {
-			sb.WriteString(` session="`)
-			sb.WriteString(escapeQuotes(ctx.session))
-			sb.WriteString(`"`)
+		if ctx.sessionPresent {
+			sb.WriteString(" session_present=true")
 		}
 	}
 
@@ -904,10 +884,8 @@ func (o *mcpObserver) logStreamResponse(ctx *mcpRequestContext, id string, outco
 			sb.WriteString(escapeQuotes(ctx.proto))
 			sb.WriteString(`"`)
 		}
-		if ctx.session != "" {
-			sb.WriteString(` session="`)
-			sb.WriteString(escapeQuotes(ctx.session))
-			sb.WriteString(`"`)
+		if ctx.sessionPresent {
+			sb.WriteString(" session_present=true")
 		}
 	}
 
