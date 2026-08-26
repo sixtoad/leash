@@ -138,7 +138,7 @@ func (i *MCPInstruments) injectTrace(ctx context.Context, carrier propagation.Te
 }
 
 // Finish records metrics and updates the span with outcome information.
-func (i *MCPInstruments) Finish(h *RequestHandle, status int, outcome string, transport, proto, session string, errText string) {
+func (i *MCPInstruments) Finish(h *RequestHandle, status int, outcome string, transport, proto string, sessionPresent bool, errText string) {
 	if i == nil || h == nil {
 		return
 	}
@@ -150,8 +150,8 @@ func (i *MCPInstruments) Finish(h *RequestHandle, status int, outcome string, tr
 	if proto != "" {
 		attrs = append(attrs, attribute.String("proto", proto))
 	}
-	if session != "" {
-		attrs = append(attrs, attribute.String("mcp.session", session))
+	if sessionPresent {
+		attrs = append(attrs, attribute.Bool("mcp.session_present", true))
 	}
 	if status > 0 {
 		attrs = append(attrs, attribute.Int("http.status_code", status))
