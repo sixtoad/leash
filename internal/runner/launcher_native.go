@@ -12,6 +12,7 @@ import (
 
 	"github.com/strongdm/leash/internal/entrypoint"
 	"github.com/strongdm/leash/internal/leashd/listen"
+	"github.com/strongdm/leash/internal/resolvercontract"
 )
 
 // nativeLauncher implements launcher without a container runtime: the workload
@@ -755,7 +756,24 @@ func (n nativeLauncher) addNetns(ctx context.Context) error {
 // nativeEgressResolvers are the only DNS servers the workload netns may reach on
 // :53 — both advertised via resolv.conf AND the sole :53 destinations the egress
 // firewall permits (so the box can't query an arbitrary DNS server).
-var nativeEgressResolvers = []string{"1.1.1.1", "8.8.8.8"}
+var nativeEgressResolvers = canonicalNativeEgressResolvers([]string{"1.1.1.1", "8.8.8.8"})
+
+func canonicalNativeEgressResolvers(raw []string) []string {
+	canonical, err := resolvercontract.CanonicalResolvers(raw)
+	if err != nil {
+		// This is static build-owned state. A binary carrying an invalid resolver
+		// source must fail closed before it can install or advertise that state.
+		panic("invalid native egress resolver source: " + err.Error())
+	}
+	return canonical
+}
+
+// NativeEgressResolvers returns a copy of the exact resolver source used for
+// the native workload's resolv.conf and :53 firewall allow-list. Orchestrators
+// query this through the resolver-contract command instead of duplicating it.
+func NativeEgressResolvers() []string {
+	return append([]string(nil), nativeEgressResolvers...)
+}
 
 // nativeEgressResolvConf is the resolv.conf bind-mounted into the workload's
 // mount ns. Pop!_OS points /etc/resolv.conf at systemd-resolved's 127.0.0.53

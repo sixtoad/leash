@@ -184,7 +184,7 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
   "contractVersion": 1,             // current CLI surface
   "minCompatibleContract": 0,       // oldest caller contract still served
   "capabilities": [                 // surface elements a provisioner can drive
-    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json"
+    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json"
   ],
   "os": "linux", "arch": "amd64"    // GOOS / GOARCH
 }
@@ -254,6 +254,67 @@ if myContract < doc.MinCompatibleContract || myContract > *doc.ContractVersion {
 Two traps that snippet avoids. Decoding straight into value types makes `null`, `{}` and any unrelated JSON object succeed with a zero range `[0,0]`, which a contract-0 caller reads as *compatible* — so require the fields that make it this document before trusting the numbers. And never compare leash against constants compiled into the caller: that compares the caller to itself and can only pass. The installed binary's stdout is the only thing that can disagree with you.
 
 `capabilities` is there because the integer over-refuses. Raising `minCompatibleContract` for one removal turns away every caller below the new floor, including those that never used the removed flag; a caller that drives only `--policy` can test for `"policy"` in the array instead of consulting the range at all. Adding a name is additive (no bump); removing one is a break (bump, and raise the floor). A pre-`capabilities` document decodes with the field empty — fall back to the range. The empty string is never a capability.
+
+### Resolver ownership — `leash resolvers` JSON
+
+An orchestrator that generates network policy before launching Leash probes
+`leash version --json`, requires the `resolver-contract-json` capability, and
+then queries the exact runtime it will launch:
+
+```sh
+leash resolvers --runtime native --json
+leash resolvers --runtime docker --json   # podman is identical
+```
+
+The command is side-effect free: it does not launch a workload, inspect an
+image, require credentials, or read host resolver configuration. Runtime is
+mandatory, as is `--json`; help and diagnostics are written only to stderr.
+
+Native Leash owns the workload resolver configuration:
+
+```json
+{
+  "schemaVersion": 1,
+  "runtime": "native",
+  "strategy": "leash-managed",
+  "resolvers": ["1.1.1.1", "8.8.8.8"],
+  "discovery": "use the complete resolver list reported by Leash"
+}
+```
+
+`resolvers` is the complete, non-empty set Leash uses for the native workload's
+private `resolv.conf` and DNS egress allow-list. Addresses are canonical IP
+literals, deduplicated and sorted. An orchestrator should authorize exactly
+these addresses on port 53. If native Layer 2 cannot be established, Leash's
+existing fail-closed policy remains authoritative; the contract does not claim
+that host resolvers were installed.
+
+This `native` strategy describes the Linux network-namespace launcher. A
+non-Linux build rejects `--runtime native` instead of reporting the Linux list;
+its independently managed native backend must not be inferred from this schema.
+
+Container engines own their workload resolver configuration:
+
+```json
+{
+  "schemaVersion": 1,
+  "runtime": "docker",
+  "strategy": "runtime-managed",
+  "resolvers": [],
+  "discovery": "inspect the target runtime's effective /etc/resolv.conf"
+}
+```
+
+An empty array is not an empty allow-list. `strategy: "runtime-managed"` is an
+explicit delegation: inspect the target image and selected network using the
+same engine and settings the workload will receive. Never copy the native
+resolver list into a Docker/Podman policy.
+
+`schemaVersion` versions this document independently of the broad CLI contract.
+Unknown schema versions or strategies must fail closed. Invalid runtime,
+malformed/empty/over-limit native resolver state, encoding failure, or output
+failure returns non-zero. No validation or usage failure writes a partial
+success document to stdout.
 
 ### Machine-output fd ownership — `leash --machine-output`
 

@@ -4,15 +4,18 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"syscall"
 
 	"github.com/strongdm/leash/internal/darwind"
 	"github.com/strongdm/leash/internal/doctor"
 	"github.com/strongdm/leash/internal/hardening"
 	"github.com/strongdm/leash/internal/leashd"
+	"github.com/strongdm/leash/internal/resolvercontract"
 	"github.com/strongdm/leash/internal/runner"
 	"github.com/strongdm/leash/internal/telemetry/statsig"
 	versionpkg "github.com/strongdm/leash/internal/version" // aliased: `version` is the ldflag var below
@@ -28,6 +31,9 @@ func main() {
 	statsig.Configure(version)
 
 	args := os.Args
+	if handled, code := runResolverSubcommand(args, os.Stdout, os.Stderr); handled {
+		os.Exit(code)
+	}
 	if len(args) > 1 {
 		switch args[1] {
 		case "--version":
@@ -73,6 +79,13 @@ func main() {
 			}
 		}
 	}
+}
+
+func runResolverSubcommand(args []string, stdout, stderr io.Writer) (bool, int) {
+	if len(args) <= 1 || args[1] != "resolvers" {
+		return false, 0
+	}
+	return true, resolvercontract.Main(args[2:], stdout, stderr, runtime.GOOS, runner.NativeEgressResolvers)
 }
 
 // hardenExec applies the seccomp/no-new-privs/cap-drop hardening to the current

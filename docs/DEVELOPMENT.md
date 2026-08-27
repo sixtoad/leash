@@ -45,7 +45,7 @@ The Makefile, release scripts, and Docker builds all shell out to this script, s
   "enforcing": true,
   "contractVersion": 1,
   "minCompatibleContract": 0,
-  "capabilities": ["policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json"],
+  "capabilities": ["policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json"],
   "os": "linux",
   "arch": "amd64"
 }
@@ -74,3 +74,25 @@ Maintainer rules:
 Use `leash --machine-output -- <command>` when another program consumes the governed command's stdout. The flag implies non-interactive execution. Leash sends all runner and Docker/Podman/native lifecycle diagnostics to stderr while attaching the workload directly to the host stdin, stdout, and stderr descriptors. No result bytes are inspected or buffered, and numeric workload exit codes continue to propagate exactly after cleanup. Without the flag, the existing interactive prompts, TTY allocation, output destinations, and signal semantics are unchanged.
 
 Provisioners must probe `leash version --json` and require the `machine-output` capability before adding the flag. The capability was added without changing `contractVersion` from 1, so the integer alone cannot distinguish an older contract-1 build that lacks this fd-ownership contract. The full consumer contract and examples are in [`api-contracts-leash-core.md` § Machine-output fd ownership](api-contracts-leash-core.md#machine-output-fd-ownership--leash---machine-output).
+
+### Effective DNS resolvers for orchestrators
+
+Before generating network policy, an orchestrator can run:
+
+```bash
+leash resolvers --runtime native --json
+leash resolvers --runtime docker --json
+```
+
+The command does not launch a workload, read credentials, or probe a container.
+For `native`, it reports the complete resolver list Leash installs in the
+workload network namespace and admits through its DNS firewall rules. For
+`docker` and `podman`, it reports `runtime-managed` and delegates discovery to
+the orchestrator, which must inspect the target image/network's effective
+`/etc/resolv.conf`. It never substitutes the native list for a container.
+Non-Linux builds reject the Linux `native` query instead of claiming its public
+resolver set for the separate platform-native backend.
+
+Provisioners must first require the `resolver-contract-json` capability from
+`leash version --json`. The exact schema and failure contract are published in
+[`api-contracts-leash-core.md` § Resolver ownership](api-contracts-leash-core.md#resolver-ownership--leash-resolvers-json).
