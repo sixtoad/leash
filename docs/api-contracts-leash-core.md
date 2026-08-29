@@ -179,6 +179,7 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
 {
   "version": "v0.2.0",              // -X main.version, or "dev" on a plain `go build`
   "commit": "c686025-dirty",        // abbreviated hex hash, optionally "-dirty"; or "dev"; or "unknown"
+  "sourceRevision": "c686025aa1b2c3-dirty", // complete -X main.commit value for provenance checks
   "builtAt": "2026-07-21T10:11:12Z",// RFC 3339 UTC, or "unknown"
   "enforcing": true,                // does THIS BUILD carry an enforcement path
   "contractVersion": 1,             // current CLI surface
@@ -196,6 +197,7 @@ Value domains a caller must accept rather than reject:
 
 - `version` — a release tag, a `git describe` string (which may end `-dirty`), or the literal `dev`.
 - `commit` — an abbreviated hex hash, optionally suffixed `-dirty`; or the literal `dev`; or the literal `unknown`. All three are legitimate builds.
+- `sourceRevision` — the complete linked commit value, optionally suffixed `-dirty`; or the same `dev` / `unknown` sentinels. Release tooling compares this field exactly with the manager image revision label.
 - `builtAt` — RFC 3339 UTC, or the literal `unknown`.
 
 `dev` and `unknown` are documented sentinels, not errors: `unknown` is the ldflag default in `cmd/leash`, and `dev` is both `main.version`'s default and what the build paths substitute for `commit` when `git rev-parse` fails.

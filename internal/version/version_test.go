@@ -61,7 +61,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			build: testBuild(),
 			goos:  "linux", goarch: "amd64",
 			want: Info{
-				Version: "v0.2.0", Commit: "c686025", BuiltAt: "2026-07-21T10:11:12Z",
+				Version: "v0.2.0", Commit: "c686025", SourceRevision: "c686025aa1b2c3", BuiltAt: "2026-07-21T10:11:12Z",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
 			},
@@ -71,7 +71,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			build: testBuild(),
 			goos:  "darwin", goarch: "arm64",
 			want: Info{
-				Version: "v0.2.0", Commit: "c686025", BuiltAt: "2026-07-21T10:11:12Z",
+				Version: "v0.2.0", Commit: "c686025", SourceRevision: "c686025aa1b2c3", BuiltAt: "2026-07-21T10:11:12Z",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, OS: "darwin", Arch: "arm64",
 			},
@@ -81,7 +81,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			build: testBuild(),
 			goos:  "windows", goarch: "amd64",
 			want: Info{
-				Version: "v0.2.0", Commit: "c686025", BuiltAt: "2026-07-21T10:11:12Z",
+				Version: "v0.2.0", Commit: "c686025", SourceRevision: "c686025aa1b2c3", BuiltAt: "2026-07-21T10:11:12Z",
 				Enforcing: false, ContractVersion: 1, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, OS: "windows", Arch: "amd64",
 			},
@@ -91,7 +91,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			build: Build{Version: "dev-c686025", Commit: "c686025aa1b2c3-dirty", BuildDate: "2026-07-21T10:11:12Z"},
 			goos:  "linux", goarch: "amd64",
 			want: Info{
-				Version: "dev-c686025", Commit: "c686025-dirty", BuiltAt: "2026-07-21T10:11:12Z",
+				Version: "dev-c686025", Commit: "c686025-dirty", SourceRevision: "c686025aa1b2c3-dirty", BuiltAt: "2026-07-21T10:11:12Z",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
 			},
@@ -103,7 +103,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			build: Build{Version: "dev", Commit: "abc-dirty", BuildDate: "unknown"},
 			goos:  "linux", goarch: "amd64",
 			want: Info{
-				Version: "dev", Commit: "abc-dirty", BuiltAt: "unknown",
+				Version: "dev", Commit: "abc-dirty", SourceRevision: "abc-dirty", BuiltAt: "unknown",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
 			},
@@ -115,7 +115,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			build: Build{Version: "v1.2.3-4-gabc1234", Commit: "v1.2.3-4-gabc1234", BuildDate: "unknown"},
 			goos:  "linux", goarch: "amd64",
 			want: Info{
-				Version: "v1.2.3-4-gabc1234", Commit: "v1.2.3-4-gabc1234", BuiltAt: "unknown",
+				Version: "v1.2.3-4-gabc1234", Commit: "v1.2.3-4-gabc1234", SourceRevision: "v1.2.3-4-gabc1234", BuiltAt: "unknown",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
 			},
@@ -127,7 +127,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			build: Build{Version: "dev", Commit: "unknown", BuildDate: "unknown"},
 			goos:  "linux", goarch: "amd64",
 			want: Info{
-				Version: "dev", Commit: "unknown", BuiltAt: "unknown",
+				Version: "dev", Commit: "unknown", SourceRevision: "unknown", BuiltAt: "unknown",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
 			},
@@ -137,7 +137,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			build: Build{},
 			goos:  "linux", goarch: "amd64",
 			want: Info{
-				Version: "unknown", Commit: "unknown", BuiltAt: "unknown",
+				Version: "unknown", Commit: "unknown", SourceRevision: "unknown", BuiltAt: "unknown",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
 			},
@@ -200,6 +200,7 @@ func TestJSONWireShape(t *testing.T) {
 	want := map[string]any{
 		"version":               "v0.2.0",
 		"commit":                "c686025",
+		"sourceRevision":        "c686025aa1b2c3",
 		"builtAt":               "2026-07-21T10:11:12Z",
 		"enforcing":             true,
 		"contractVersion":       float64(1), // encoding/json decodes numbers as float64
@@ -330,7 +331,7 @@ func TestRunFormatSelection(t *testing.T) {
 			if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
 				t.Fatalf("Run(%v) output %q is not JSON: %v", tt.args, out.String(), err)
 			}
-			if decoded.Version != "v0.2.0" || decoded.Commit != "c686025" || decoded.BuiltAt != "2026-07-21T10:11:12Z" {
+			if decoded.Version != "v0.2.0" || decoded.Commit != "c686025" || decoded.SourceRevision != "c686025aa1b2c3" || decoded.BuiltAt != "2026-07-21T10:11:12Z" {
 				t.Fatalf("Run(%v) decoded to %+v, want the testBuild values", tt.args, decoded)
 			}
 			if decoded.ContractVersion != 1 || decoded.MinCompatibleContract != 0 {

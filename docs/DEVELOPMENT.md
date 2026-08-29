@@ -41,6 +41,7 @@ The Makefile, release scripts, and Docker builds all shell out to this script, s
 {
   "version": "v0.2.0",
   "commit": "c686025-dirty",
+  "sourceRevision": "c686025aa1b2c3-dirty",
   "builtAt": "2026-07-21T10:11:12Z",
   "enforcing": true,
   "contractVersion": 1,
@@ -52,6 +53,7 @@ The Makefile, release scripts, and Docker builds all shell out to this script, s
 ```
 
 - `commit` is the abbreviated hash, keeping any `-dirty` suffix the build path stamped, so a build that carries the marker is telling you the tree was modified. The marker is **best-effort and explicitly not guaranteed on all paths**: only the `build` target in the [Makefile](../Makefile) appends it today (and it uses `git status --porcelain`, so an untracked file counts, and it runs after `precommit`'s `goimports -w`). [`scripts/release.sh`](../scripts/release.sh), [`scripts/install-leash.sh`](../scripts/install-leash.sh), [`build/publish-docker.sh`](../build/publish-docker.sh) and [`.goreleaser.yaml`](../.goreleaser.yaml) stamp the bare hash. **A consumer must not read the absence of `-dirty` as proof of a clean tree** — for that, verify provenance out of band. Only the hash component is ever abbreviated: a value that is not a hex hash (a `git describe` string) is reported whole rather than cut into a fragment that names a different build.
+- `sourceRevision` preserves the complete linked commit value for exact provenance comparisons. A native release must match it byte-for-byte with the manager image's `org.opencontainers.image.revision` label.
 - `version` is the literal string `dev` on a plain `go build` with no ldflags (that is the default of `main.version` in `cmd/leash`); `commit` and `builtAt` are the literal string `unknown`. Both are documented sentinels, not errors: parse them, don't choke on them. `scripts/install-leash.sh` stamps `version` from `git describe --tags --always --dirty`, so `version` may carry a `-dirty` suffix independently of `commit`.
 - The full value domain of `commit` is therefore: an abbreviated hex hash, optionally suffixed `-dirty`; the literal `dev` (the fallback when `git rev-parse` fails, and the `ARG COMMIT` default in `Dockerfile.leash`); or the literal `unknown` (the ldflag default). A caller validating `commit` against a fixed set must accept all three — `dev` is a legitimate build, not a malformed document.
 - `enforcing` reports whether **this binary carries an enforcement path**, derived from the target platform rather than hardcoded. It is `true` on linux (the eBPF LSM programs plus the intercepting MITM proxy) and `true` on darwin (the darwin runtime constructs and drives the same MITM proxy — `internal/darwind/runtime_darwin.go`, `NewMITMProxy` / `applyPolicyToProxy` — alongside the separately installed Endpoint Security and Network Extension components). Any other target reports `false`. This is a statement about the *binary*; whether a given *host* can actually enforce — LSM active in the kernel, the system extension approved, the right capabilities — is a runtime question this build-time document does not answer. That is `leash doctor`'s job.

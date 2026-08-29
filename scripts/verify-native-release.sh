@@ -25,15 +25,10 @@ import json
 import os
 
 document = json.loads(os.environ["VERSION_JSON"])
-reported_revision = document.get("commit", "")
-expected_revision = os.environ["REVISION"]
-if (
-    reported_revision.endswith("-dirty")
-    or len(reported_revision) < 7
-    or not expected_revision.startswith(reported_revision)
-):
+reported_revision = document.get("sourceRevision", "")
+if reported_revision != os.environ["REVISION"]:
     raise SystemExit(
-        f"released CLI revision mismatch: {reported_revision!r} is not a valid prefix of {expected_revision!r}"
+        f"released CLI revision mismatch: {reported_revision!r} != {os.environ['REVISION']!r}"
     )
 PY
 

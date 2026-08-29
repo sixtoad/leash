@@ -125,6 +125,7 @@ func Capabilities() []string {
 type Info struct {
 	Version               string   `json:"version"`
 	Commit                string   `json:"commit"`
+	SourceRevision        string   `json:"sourceRevision"`
 	BuiltAt               string   `json:"builtAt"`
 	Enforcing             bool     `json:"enforcing"`
 	ContractVersion       int      `json:"contractVersion"`
@@ -335,6 +336,7 @@ func describeFor(b Build, goos, goarch string) Info {
 	return Info{
 		Version:               orUnknown(b.Version),
 		Commit:                shortCommit(b.Commit),
+		SourceRevision:        orUnknown(b.Commit),
 		BuiltAt:               orUnknown(b.BuildDate),
 		Enforcing:             Enforcing(goos),
 		ContractVersion:       ContractVersion,
