@@ -212,6 +212,13 @@ func (c containerLauncher) Precheck(ctx context.Context, shellBin, cmd string) e
 }
 
 func (c containerLauncher) InstallPromptAssets(ctx context.Context) error {
+	// System-wide prompt hooks are optional decoration. A non-root image user
+	// cannot maintain them, and attempting the writes after enforcement is live
+	// produces policy denials that obscure the workload startup result.
+	if !c.r.targetWorkloadIsRoot() {
+		c.r.debugf("skipping system prompt installation for non-root target user %q", c.r.targetWorkloadUser())
+		return nil
+	}
 	return c.r.installPromptAssetsContainer(ctx)
 }
 
