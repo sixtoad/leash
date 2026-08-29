@@ -93,7 +93,7 @@ target_image = "ghcr.io/example/dev:latest"
 |                         | `LEASH_TARGET_IMAGE`, or `--image` flag |                                                       |
 | Target container base   | `TARGET_CONTAINER`                      | Auto-sanitized from the current directory when unset. |
 | Exact agent container   | `--container-name`                      | Force the exact agent container name (no sanitization, no collision suffix; leash container becomes `<name>-leash`). |
-| Leash manager image     | `--leash-image`, `LEASH_IMAGE`          | Override when testing custom manager builds.          |
+| Leash manager image     | `--leash-image`, `LEASH_IMAGE`          | Native releases default to their matching immutable `ghcr.io/sixtoad/leash-manager@sha256:...`; compatible labeled overrides remain supported. |
 | Container runtime       | `--runtime`, `LEASH_RUNTIME`            | Which container CLI to drive: `docker` (default) or `podman`. |
 | Cedar policy file       | `--policy`, `LEASH_POLICY_FILE`         | Mount a specific Cedar policy.                        |
 | Control UI bind address | `--listen`, `LEASH_LISTEN`              | Blank value binds to default 127.0.0.1:18080          |

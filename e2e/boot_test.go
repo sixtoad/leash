@@ -309,6 +309,30 @@ when { resource in [ Dir::"/tmp/", Dir::"/dev/", Dir::"/proc/", Dir::"/run/", Di
 	}
 }
 
+// TestNativeReleaseParity exercises the exact release gate against an already
+// built archive binary and manager ref. scripts/release.sh supplies these values
+// only after it has verified every archive's build metadata; ordinary test runs
+// remain credential-free and skip this Docker publication boundary.
+func TestNativeReleaseParity(t *testing.T) {
+	skipUnlessE2E(t)
+	bin := strings.TrimSpace(os.Getenv("LEASH_E2E_RELEASE_BIN"))
+	manager := strings.TrimSpace(os.Getenv("LEASH_E2E_RELEASE_MANAGER"))
+	revision := strings.TrimSpace(os.Getenv("LEASH_E2E_RELEASE_REVISION"))
+	if bin == "" || manager == "" || revision == "" {
+		t.Skip("set LEASH_E2E_RELEASE_BIN, LEASH_E2E_RELEASE_MANAGER, and LEASH_E2E_RELEASE_REVISION")
+	}
+	root, err := moduleRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("timeout", "240", filepath.Join(root, "scripts", "verify-native-release.sh"), bin, manager, revision)
+	cmd.Dir = root
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("native release parity gate failed: %v\n%s", err, out)
+	}
+}
+
 func shellQuoteForTest(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }

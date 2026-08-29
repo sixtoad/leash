@@ -134,7 +134,12 @@ func (c containerLauncher) PullImages(ctx context.Context) error {
 	if err := c.r.ensureLocalImage(ctx, c.r.cfg.targetImage); err != nil {
 		return err
 	}
-	return c.r.ensureLocalImage(ctx, c.r.cfg.leashImage)
+	if err := c.r.ensureLocalImage(ctx, c.r.cfg.leashImage); err != nil {
+		return err
+	}
+	// Validate the privileged manager immediately after it is available and
+	// before Provision can create or bootstrap the target container.
+	return c.r.validateManagerImage(ctx)
 }
 
 func (c containerLauncher) Provision(ctx context.Context, stopSignal string) (string, error) {
