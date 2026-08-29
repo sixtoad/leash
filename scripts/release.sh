@@ -62,7 +62,7 @@ done
 if ((DRY_RUN)); then
   LOCAL_MANAGER="leash-manager-release-test:$TAG"
   printf '%s\n' "release: building local manager fixture $LOCAL_MANAGER..." >&2
-  docker build --load --file Dockerfile.leash --target final-prebuilt \
+  docker build --file Dockerfile.leash --target final-prebuilt \
     --build-arg BASE_BUILD_IMAGE=build-base \
     --build-arg BASE_RUNTIME_IMAGE=runtime-base \
     --build-arg UI_SOURCE=ui-prebuilt \
