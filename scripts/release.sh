@@ -45,7 +45,7 @@ if [ ! -s internal/ui/dist/index.html ] || grep -q '>stub<\|<title>stub' interna
 fi
 
 printf '%s\n' "release: generating embedded leash-entry binaries..." >&2
-go generate ./internal/entrypoint/...
+GOFLAGS="${GOFLAGS:-} -buildvcs=false" go generate ./internal/entrypoint/...
 for file in internal/entrypoint/bundled_linux_amd64_gen.go internal/entrypoint/bundled_linux_arm64_gen.go; do
   [ -s "$file" ] || { printf '%s\n' "release: $file missing after generation" >&2; exit 1; }
 done
@@ -117,7 +117,7 @@ for pair in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
   os="${pair%/*}"
   arch="${pair#*/}"
   printf '%s\n' "release: building $os/$arch..." >&2
-  CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath \
+  CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -buildvcs=false -trimpath \
     -ldflags "-X main.version=$TAG -X main.commit=$COMMIT -X main.buildDate=$DATE -X main.managerImage=$MANAGER_REF -X main.managerRevision=$COMMIT -X main.managerContract=1" \
     -o "$DIST/leash" ./cmd/leash
   BUILD_INFO="$(go version -m "$DIST/leash")"
