@@ -12,14 +12,16 @@ multi-arch manager image at `ghcr.io/sixtoad/leash-manager:<native-tag>`.
 The script enforces this order:
 
 1. Require a clean tree and capture the full source revision.
-2. Build and publish the versioned manager without updating `latest`, then
-   resolve its registry digest and make the package public.
-3. Build every CLI archive from that revision with
+2. Build a local AMD64/ARM64 OCI layout and verify both child architectures,
+   revision/contract labels, and content digests before any remote mutation.
+3. Build and publish the versioned manager without updating `latest`, resolve
+   its registry digest, and verify the same platform metadata from GHCR.
+4. Build every CLI archive from that revision with
    `ghcr.io/sixtoad/leash-manager@sha256:...` embedded as its default.
-4. Verify manager OCI revision/contract labels and archive build metadata.
-5. Execute the archived Linux CLI with no manager override, the tracked exact
+5. Verify manager OCI revision/contract labels and archive build metadata.
+6. Execute the archived Linux CLI with no manager override, the tracked exact
    Walk #33 combined policy, a named non-root target, and fail-closed LSM.
-6. Only after every check succeeds, create the GitHub release with the manager
+7. Only after every check succeeds, create the GitHub release with the manager
    tag, digest, revision, and contract in its notes.
 
 The CLI inspects any selected manager immediately after pull and before target

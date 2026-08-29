@@ -85,26 +85,53 @@ if ! make lsm-generate >&2; then
   printf '%s\n' "release: host generation unavailable; using Docker toolchain..." >&2
   make lsm-generate-docker >&2
 fi
-for file in internal/lsm/lsmopen_bpfel.go internal/lsm/lsmexec_bpfel.go internal/lsm/lsmconnect_bpfel.go; do
+for file in \
+  internal/lsm/lsmopen_bpfeb.go internal/lsm/lsmopen_bpfeb.o \
+  internal/lsm/lsmopen_bpfel.go internal/lsm/lsmopen_bpfel.o \
+  internal/lsm/lsmexec_bpfeb.go internal/lsm/lsmexec_bpfeb.o \
+  internal/lsm/lsmexec_bpfel.go internal/lsm/lsmexec_bpfel.o \
+  internal/lsm/lsmconnect_bpfeb.go internal/lsm/lsmconnect_bpfeb.o \
+  internal/lsm/lsmconnect_bpfel.go internal/lsm/lsmconnect_bpfel.o; do
   [ -s "$file" ] || { printf '%s\n' "release: $file missing after generation" >&2; exit 1; }
 done
+
+MANAGER_BUILD_ARGS=(
+  --file Dockerfile.leash --target final-prebuilt
+  --build-arg BASE_BUILD_IMAGE=build-base
+  --build-arg BASE_RUNTIME_IMAGE=runtime-base
+  --build-arg UI_SOURCE=ui-prebuilt
+  --build-arg COMMIT="$COMMIT"
+  --build-arg BUILD_DATE="$DATE"
+  --build-arg VERSION="${TAG#native-v}"
+  --build-arg CHANNEL=release
+  --build-arg GIT_REMOTE_URL="$(git config --get remote.origin.url 2>/dev/null || echo unknown)"
+)
+
+# Validate the exact multi-platform graph, child architectures, labels, and
+# digests before the immutable registry name exists. The subsequent push reuses
+# these BuildKit results and is still verified independently from the registry.
+PREFLIGHT_OCI="$TEMP/manager-preflight.oci.tar"
+HAS_BUILDX=0
+if docker buildx version >/dev/null 2>&1; then
+  HAS_BUILDX=1
+  printf '%s\n' "release: verifying local multi-arch manager before publication..." >&2
+  timeout 10m docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    --output "type=oci,dest=$PREFLIGHT_OCI" \
+    "${MANAGER_BUILD_ARGS[@]}" .
+  python3 scripts/verify-manager-manifest.py oci "$PREFLIGHT_OCI" --revision "$COMMIT"
+elif (( !DRY_RUN )); then
+  printf '%s\n' "release: Docker Buildx is required for multi-arch publication" >&2
+  exit 1
+else
+  printf '%s\n' "release: Docker Buildx unavailable; Podman dry-run will verify the host fixture only" >&2
+fi
 
 if ((DRY_RUN)); then
   LOCAL_MANAGER="localhost/leash-manager-release-test:$TAG"
   printf '%s\n' "release: building local manager fixture $LOCAL_MANAGER..." >&2
-  BUILD_ARGS=(
-    --file Dockerfile.leash --target final-prebuilt
-    --build-arg BASE_BUILD_IMAGE=build-base
-    --build-arg BASE_RUNTIME_IMAGE=runtime-base
-    --build-arg UI_SOURCE=ui-prebuilt
-    --build-arg COMMIT="$COMMIT"
-    --build-arg BUILD_DATE="$DATE"
-    --build-arg VERSION="${TAG#native-v}"
-    --build-arg CHANNEL=release
-    --build-arg GIT_REMOTE_URL="$(git config --get remote.origin.url 2>/dev/null || echo unknown)"
-    --tag "$LOCAL_MANAGER" .
-  )
-  if docker buildx version >/dev/null 2>&1; then
+  BUILD_ARGS=("${MANAGER_BUILD_ARGS[@]}" --tag "$LOCAL_MANAGER" .)
+  if ((HAS_BUILDX)); then
     docker buildx build --load "${BUILD_ARGS[@]}"
   else
     command -v podman >/dev/null 2>&1 || { printf '%s\n' "release: dry-run requires Docker Buildx or Podman" >&2; exit 1; }
@@ -133,6 +160,13 @@ PY
 )"
   [ -n "$MANAGER_DIGEST" ] || { printf '%s\n' "release: manager publication did not return a digest" >&2; exit 1; }
   MANAGER_REF="$MANAGER_REPO@$MANAGER_DIGEST"
+  MANAGER_INDEX="$TEMP/manager-index.json"
+  MANAGER_IMAGES="$TEMP/manager-images.json"
+  timeout 2m docker buildx imagetools inspect --raw "$MANAGER_REF" >"$MANAGER_INDEX"
+  timeout 2m docker buildx imagetools inspect \
+    --format '{{json .Image}}' "$MANAGER_REF" >"$MANAGER_IMAGES"
+  python3 scripts/verify-manager-manifest.py registry "$MANAGER_INDEX" \
+    --images "$MANAGER_IMAGES" --revision "$COMMIT"
   docker pull "$MANAGER_REF" >/dev/null
   gh api --method PUT "/user/packages/container/leash-manager/visibility" -f visibility=public >/dev/null
   [ "$(gh api "/user/packages/container/leash-manager" --jq .visibility)" = "public" ] || {
