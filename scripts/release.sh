@@ -62,16 +62,26 @@ done
 if ((DRY_RUN)); then
   LOCAL_MANAGER="leash-manager-release-test:$TAG"
   printf '%s\n' "release: building local manager fixture $LOCAL_MANAGER..." >&2
-  DOCKER_BUILDKIT=1 docker build --file Dockerfile.leash --target final-prebuilt \
-    --build-arg BASE_BUILD_IMAGE=build-base \
-    --build-arg BASE_RUNTIME_IMAGE=runtime-base \
-    --build-arg UI_SOURCE=ui-prebuilt \
-    --build-arg COMMIT="$COMMIT" \
-    --build-arg BUILD_DATE="$DATE" \
-    --build-arg VERSION="${TAG#native-v}" \
-    --build-arg CHANNEL=release \
-    --build-arg GIT_REMOTE_URL="$(git config --get remote.origin.url 2>/dev/null || echo unknown)" \
+  BUILD_ARGS=(
+    --file Dockerfile.leash --target final-prebuilt
+    --build-arg BASE_BUILD_IMAGE=build-base
+    --build-arg BASE_RUNTIME_IMAGE=runtime-base
+    --build-arg UI_SOURCE=ui-prebuilt
+    --build-arg COMMIT="$COMMIT"
+    --build-arg BUILD_DATE="$DATE"
+    --build-arg VERSION="${TAG#native-v}"
+    --build-arg CHANNEL=release
+    --build-arg GIT_REMOTE_URL="$(git config --get remote.origin.url 2>/dev/null || echo unknown)"
     --tag "$LOCAL_MANAGER" .
+  )
+  if docker buildx version >/dev/null 2>&1; then
+    docker buildx build --load "${BUILD_ARGS[@]}"
+  else
+    command -v podman >/dev/null 2>&1 || { printf '%s\n' "release: dry-run requires Docker Buildx or Podman" >&2; exit 1; }
+    podman build --format docker "${BUILD_ARGS[@]}"
+    podman save --format docker-archive --output "$TEMP/manager.tar" "$LOCAL_MANAGER"
+    docker load --input "$TEMP/manager.tar" >/dev/null
+  fi
   MANAGER_DIGEST="$(docker image inspect --format '{{.Id}}' "$LOCAL_MANAGER")"
   MANAGER_REF="$MANAGER_DIGEST"
 else
