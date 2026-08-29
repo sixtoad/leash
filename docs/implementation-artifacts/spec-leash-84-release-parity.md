@@ -2,7 +2,7 @@
 title: 'Leash #84: release CLI and manager as one compatible unit'
 type: 'bugfix'
 created: '2026-08-29'
-status: 'in-progress'
+status: 'done'
 review_loop_iteration: 0
 baseline_commit: 'acfda6452aae8f6c84b42dd6d2b6c506f49736d3'
 context:
@@ -48,12 +48,12 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `internal/releasecontract/contract.go` (new) -- define the manager compatibility range and strict OCI metadata parsing/comparison shared by release stamping and runtime validation.
-- [ ] `cmd/leash/main.go`, `internal/runner/runner.go`, `internal/runner/launcher.go` -- inject the immutable release default, preserve override precedence, inspect the selected manager after pull, and fail before target bootstrap on absent/malformed/incompatible metadata.
-- [ ] `Dockerfile.leash`, `build/publish-docker.sh` -- stamp full source revision and manager-contract labels and expose the pushed version tag's immutable digest.
-- [ ] `scripts/release.sh` -- publish the versioned manager first, embed its digest into all host CLIs from the same commit, verify archive/image revision parity, run the release E2E, then create release notes containing the paired tag/digest.
-- [ ] `e2e/boot_test.go`, `e2e/testdata/walk33-combined.cedar` -- cover compatible/mismatched images and execute an extracted release binary with no override, a named non-root target, fail-closed LSM, and the tracked exact Walk combined policy.
-- [ ] `docs/RELEASE.md`, `docs/deployment-guide.md`, `README.md` -- document the coherent artifact contract, immutable default, override validation, registry, and operator diagnostics.
+- [x] `internal/managercontract/contract.go` (new) -- define the manager compatibility range and strict OCI metadata parsing/comparison shared by release stamping and runtime validation.
+- [x] `cmd/leash/main.go`, `internal/runner/runner.go`, `internal/runner/launcher.go` -- inject the immutable release default, preserve override precedence, inspect the selected manager after pull, and fail before target bootstrap on absent/malformed/incompatible metadata.
+- [x] `Dockerfile.leash`, `build/publish-docker.sh` -- stamp full source revision and manager-contract labels and expose the pushed version tag's immutable digest.
+- [x] `scripts/release.sh` -- publish the versioned manager first, embed its digest into all host CLIs from the same commit, verify archive/image revision parity, run the release E2E, then create release notes containing the paired tag/digest.
+- [x] `e2e/boot_test.go`, `e2e/testdata/walk33-combined.cedar` -- cover compatible/mismatched images and execute an extracted release binary with no override, a named non-root target, fail-closed LSM, and the tracked exact Walk combined policy.
+- [x] `docs/RELEASE.md`, `docs/deployment-guide.md`, `README.md` -- document the coherent artifact contract, immutable default, override validation, registry, and operator diagnostics.
 
 **Acceptance Criteria:**
 - Given one clean tagged commit, when the native release is built, then every CLI archive and the versioned multi-arch manager report that same full revision and compatible manager contract.
@@ -76,3 +76,38 @@ The release default must be a digest because a version tag alone can be moved. R
 - `timeout 10m go test ./...` -- expected: repository suite passes.
 - `scripts/release.sh --dry-run native-vX.Y.Z` -- expected: manager plus archives share revision, default resolves by digest, release E2E passes, and no remote release is created.
 - `git diff --check` -- expected: no whitespace errors.
+
+## Suggested Review Order
+
+**Coherent publication boundary**
+
+- Publish manager first, prove immutable parity, and create GitHub release last.
+  [`release.sh:118`](../../scripts/release.sh#L118)
+
+- Refuse existing artifact names before any remote mutation.
+  [`release.sh:41`](../../scripts/release.sh#L41)
+
+- Stamp manager provenance and compatibility into both image targets.
+  [`Dockerfile.leash:129`](../../Dockerfile.leash#L129)
+
+**Runtime fail-closed selection**
+
+- Inject the paired immutable manager contract at CLI startup.
+  [`main.go:34`](../../cmd/leash/main.go#L34)
+
+- Parse strict manager metadata and reject unverifiable privileged images.
+  [`contract.go:28`](../../internal/managercontract/contract.go#L28)
+
+- Validate the selected manager before target provisioning begins.
+  [`launcher.go:133`](../../internal/runner/launcher.go#L133)
+
+**Released-artifact evidence**
+
+- Execute the extracted CLI with no override and exact combined Walk policy.
+  [`verify-native-release.sh:63`](../../scripts/verify-native-release.sh#L63)
+
+- Expose the full linked revision for byte-exact provenance comparison.
+  [`version.go:128`](../../internal/version/version.go#L128)
+
+- Keep the release parity gate callable from Go E2E automation.
+  [`boot_test.go:316`](../../e2e/boot_test.go#L316)

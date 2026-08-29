@@ -16,7 +16,7 @@ if [[ ! "$TAG" =~ ^native-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 REPO="${LEASH_REPO:-sixtoad/leash}"
-MANAGER_REPO="${LEASH_MANAGER_REPO:-ghcr.io/sixtoad/leash-manager}"
+MANAGER_REPO="ghcr.io/sixtoad/leash-manager"
 ROOT="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
 cd "$ROOT"
 
@@ -37,6 +37,36 @@ for command in docker git go python3 sha256sum tar; do
 done
 if (( !DRY_RUN )); then
   command -v gh >/dev/null 2>&1 || { printf '%s\n' "release: required command not found: gh" >&2; exit 1; }
+
+  require_github_absent() {
+    local kind="$1"
+    local endpoint="$2"
+    local error_file="$TEMP/github-check.err"
+    if gh api "$endpoint" >/dev/null 2>"$error_file"; then
+      printf '%s\n' "release: refusing to mutate existing $kind $TAG" >&2
+      exit 1
+    fi
+    if ! grep -qi 'HTTP 404' "$error_file"; then
+      cat "$error_file" >&2
+      printf '%s\n' "release: could not prove $kind $TAG is absent" >&2
+      exit 1
+    fi
+  }
+  require_github_absent "Git tag" "/repos/$REPO/git/ref/tags/$TAG"
+  require_github_absent "GitHub release" "/repos/$REPO/releases/tags/$TAG"
+
+  GHCR_TAGS=""
+  if GHCR_TAGS="$(gh api --paginate "/user/packages/container/leash-manager/versions?per_page=100" \
+    --jq ".[] | .metadata.container.tags[]? | select(. == \"$TAG\")" 2>"$TEMP/ghcr-check.err")"; then
+    if [ -n "$GHCR_TAGS" ]; then
+      printf '%s\n' "release: refusing to mutate existing manager tag $MANAGER_TAG" >&2
+      exit 1
+    fi
+  elif ! grep -qi 'HTTP 404' "$TEMP/ghcr-check.err"; then
+    cat "$TEMP/ghcr-check.err" >&2
+    printf '%s\n' "release: could not prove manager tag $MANAGER_TAG is absent" >&2
+    exit 1
+  fi
 fi
 
 if [ ! -s internal/ui/dist/index.html ] || grep -q '>stub<\|<title>stub' internal/ui/dist/index.html 2>/dev/null; then
@@ -87,8 +117,11 @@ if ((DRY_RUN)); then
 else
   printf '%s\n' "release: publishing versioned manager $MANAGER_TAG without a floating tag..." >&2
   METADATA="$TEMP/manager-metadata.json"
-  LEASH_IMAGE="$MANAGER_REPO" RELEASE_CHANNEL=release \
-    ./build/publish-docker.sh --only-leash --no-latest --metadata-file "$METADATA" "$TAG"
+  (
+    unset LEASH_SOURCE_IMAGE ECR_LEASH_IMAGE EXTRA_LEASH_IMAGES
+    LEASH_IMAGE="$MANAGER_REPO" RELEASE_CHANNEL=release \
+      ./build/publish-docker.sh --only-leash --no-latest --metadata-file "$METADATA" "$TAG"
+  )
   MANAGER_DIGEST="$(METADATA="$METADATA" python3 - <<'PY'
 import json
 import os
@@ -102,6 +135,12 @@ PY
   MANAGER_REF="$MANAGER_REPO@$MANAGER_DIGEST"
   docker pull "$MANAGER_REF" >/dev/null
   gh api --method PUT "/user/packages/container/leash-manager/visibility" -f visibility=public >/dev/null
+  [ "$(gh api "/user/packages/container/leash-manager" --jq .visibility)" = "public" ] || {
+    printf '%s\n' "release: manager package did not become public" >&2
+    exit 1
+  }
+  mkdir -p "$TEMP/anonymous-docker"
+  DOCKER_CONFIG="$TEMP/anonymous-docker" docker pull "$MANAGER_REF" >/dev/null
 fi
 
 LABELS="$(docker image inspect --format '{{json .Config.Labels}}' "$MANAGER_REF")"
