@@ -130,11 +130,14 @@ for pair in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
   CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -buildvcs=false -trimpath \
     -ldflags "-X main.version=$TAG -X main.commit=$COMMIT -X main.buildDate=$DATE -X main.managerImage=$MANAGER_REF -X main.managerRevision=$COMMIT -X main.managerContract=1" \
     -o "$DIST/leash" ./cmd/leash
-  BUILD_INFO="$(go version -m "$DIST/leash")"
-  case "$BUILD_INFO" in
-    *"main.commit=$COMMIT"*"main.managerImage=$MANAGER_REF"*) ;;
-    *) printf '%s\n' "release: $os/$arch build metadata does not match manager provenance" >&2; exit 1 ;;
-  esac
+  grep -aFq "$COMMIT" "$DIST/leash" || {
+    printf '%s\n' "release: $os/$arch archive does not contain the stamped full revision" >&2
+    exit 1
+  }
+  grep -aFq "$MANAGER_REF" "$DIST/leash" || {
+    printf '%s\n' "release: $os/$arch archive does not contain the immutable manager default" >&2
+    exit 1
+  }
   tar -C "$DIST" -czf "$DIST/leash_${os}_${arch}.tar.gz" leash
   rm -f "$DIST/leash"
 done
