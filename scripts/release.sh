@@ -60,7 +60,7 @@ for file in internal/lsm/lsmopen_bpfel.go internal/lsm/lsmexec_bpfel.go internal
 done
 
 if ((DRY_RUN)); then
-  LOCAL_MANAGER="leash-manager-release-test:$TAG"
+  LOCAL_MANAGER="localhost/leash-manager-release-test:$TAG"
   printf '%s\n' "release: building local manager fixture $LOCAL_MANAGER..." >&2
   BUILD_ARGS=(
     --file Dockerfile.leash --target final-prebuilt
