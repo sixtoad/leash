@@ -29,7 +29,6 @@ import (
 
 const (
 	defaultTargetImage = "public.ecr.aws/s5i7k8t3/strongdm/coder:latest"
-	defaultLeashImage  = "public.ecr.aws/s5i7k8t3/strongdm/leash:latest"
 
 	defaultProxyPort = "18000"
 
