@@ -38,6 +38,22 @@ char LICENSE[] SEC("license") = "GPL";
 #define MAX_ENTRIES 8192
 // BPF verifier-friendly constant bound for policy rules (max 256 with loop-based implementation)
 #define MAX_POLICY_RULES 256
+#define PROC_SUPER_MAGIC 0x9fa0
+
+// CO-RE flavor for the fields needed from the otherwise forward-declared
+// vfsmount in the generated BTF header.
+struct super_block___proc {
+    unsigned long s_magic;
+} __attribute__((preserve_access_index));
+
+struct vfsmount___proc {
+    struct super_block___proc *mnt_sb;
+} __attribute__((preserve_access_index));
+
+struct mount___proc {
+    struct vfsmount___proc mnt;
+    void *mnt_ns;
+} __attribute__((preserve_access_index));
 
 // Operation types (must match Go constants)
 #define OP_OPEN 0    // open (any mode)
@@ -304,6 +320,65 @@ static __noinline int check_path_policy(const char *path, u32 file_op_type)
     return default_ptr ? *default_ptr : 0; // Default to deny if map lookup fails
 }
 
+// A detached procfs mount has no namespace mountpoint for bpf_d_path to report.
+// runc uses such a mount while preparing a non-root exec, so paths below a PID
+// can arrive as "/<pid>/setgroups" instead of "/proc/<pid>/setgroups". Restore
+// only that trusted procfs PID-tree prefix, then let the ordinary path policy
+// decide; this is path canonicalization, never an unconditional runtime allow.
+static __always_inline bool canonicalize_detached_proc_pid_path(struct file *file, char *path, int path_len)
+{
+    struct vfsmount___proc *vm = (void *)BPF_CORE_READ(file, f_path.mnt);
+    struct super_block___proc *sb = BPF_CORE_READ(vm, mnt_sb);
+    unsigned long magic = BPF_CORE_READ(sb, s_magic);
+    if (magic != PROC_SUPER_MAGIC || path_len < 4 || path_len > MAX_PATH_LEN - 5) {
+        return false;
+    }
+
+    // A normal procfs mount has namespace ownership and bpf_d_path already
+    // includes its real mountpoint (which may legitimately be numeric). Only an
+    // unattached fsmount has no namespace and needs a synthetic /proc prefix.
+    unsigned long mnt_offset = bpf_core_field_offset(struct mount___proc, mnt);
+    struct mount___proc *mount = (void *)((char *)vm - mnt_offset);
+    if (BPF_CORE_READ(mount, mnt_ns) != NULL) {
+        return false;
+    }
+    if (path[0] != '/' || path[1] < '0' || path[1] > '9') {
+        return false;
+    }
+
+    bool pid_component = false;
+    #pragma clang loop unroll(disable)
+    for (int i = 2; i < 24; i++) {
+        char c = path[i];
+        if (c >= '0' && c <= '9') {
+            continue;
+        }
+        if (c == '/') {
+            pid_component = true;
+        }
+        break;
+    }
+    if (!pid_component) {
+        return false;
+    }
+
+    // bpf_d_path's length includes the NUL. Shift it as well so the canonical
+    // path stays terminated. A reverse fixed-bound loop makes the overlap safe.
+    #pragma clang loop unroll(disable)
+    for (int i = MAX_PATH_LEN - 6; i >= 0; i--) {
+        if (i >= path_len) {
+            continue;
+        }
+        path[i + 5] = path[i];
+    }
+    path[0] = '/';
+    path[1] = 'p';
+    path[2] = 'r';
+    path[3] = 'o';
+    path[4] = 'c';
+    return true;
+}
+
 SEC("lsm/file_open")
 int BPF_PROG(lsm_open, struct file *file)
 {
@@ -323,6 +398,8 @@ int BPF_PROG(lsm_open, struct file *file)
         struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
         const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
         bpf_probe_read_kernel_str(path, sizeof(path), name);
+    } else {
+        canonicalize_detached_proc_pid_path(file, path, ret);
     }
 
     // Skip logging nsfs (namespace filesystem) paths

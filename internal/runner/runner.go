@@ -1671,8 +1671,7 @@ func (r *runner) startContainers(ctx context.Context) error {
 	}
 
 	if err := r.launcher().Precheck(ctx, shellBin, runCmd); err != nil {
-		r.keepContainers = true
-		return r.finishLifecycle(ctx, 0, err)
+		return r.finishInteractivePrecheckFailure(ctx, err)
 	}
 
 	exitCode, err := r.execInteractive(shellBin, runCmd)
@@ -2089,6 +2088,14 @@ func (r *runner) targetWorkloadUser() string {
 		return "0"
 	}
 	return r.targetContainerUser
+}
+
+func (r *runner) targetWorkloadIsRoot() bool {
+	user := r.targetWorkloadUser()
+	if idx := strings.IndexByte(user, ':'); idx >= 0 {
+		user = user[:idx]
+	}
+	return user == "0" || user == "root"
 }
 
 func (r *runner) getImageStopSignalContainer(ctx context.Context) (string, error) {
@@ -2959,7 +2966,7 @@ func attachWorkloadStdio(execCmd *exec.Cmd) {
 	execCmd.Stderr = os.Stderr
 }
 
-func (r *runner) precheckInteractiveContainer(ctx context.Context, shellBin, runCmd string) error {
+func (r *runner) precheckInteractiveContainer(ctx context.Context, shellBin, _ string) error {
 	tmp, err := os.CreateTemp("", "leash-runner-precheck-*.log")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
@@ -2977,17 +2984,15 @@ func (r *runner) precheckInteractiveContainer(ctx context.Context, shellBin, run
 	}
 
 	data, _ := os.ReadFile(tmp.Name())
-	msg := strings.ToLower(string(data))
-	fmt.Fprintln(os.Stderr, "Interactive docker exec precheck failed; containers will remain running.")
-	if strings.Contains(msg, "setns") && strings.Contains(msg, "permission denied") {
-		fmt.Fprintf(os.Stderr, "Hint: Docker Desktop blocks setns; attach manually with: %s\n", r.manualAttachCommand(shellBin, runCmd))
-	} else if len(data) > 0 {
+	fmt.Fprintln(os.Stderr, "Interactive docker exec precheck failed; stopping containers.")
+	if len(data) > 0 {
 		fmt.Fprintln(os.Stderr, strings.TrimSpace(string(data)))
-		fmt.Fprintf(os.Stderr, "Attach manually with: %s\n", r.manualAttachCommand(shellBin, runCmd))
-	} else {
-		fmt.Fprintf(os.Stderr, "Attach manually with: %s\n", r.manualAttachCommand(shellBin, runCmd))
 	}
 	return fmt.Errorf("docker exec precheck failed: %w", err)
+}
+
+func (r *runner) finishInteractivePrecheckFailure(ctx context.Context, err error) error {
+	return r.finishLifecycle(ctx, 0, err)
 }
 
 func (r *runner) execInteractive(shellBin, cmd string) (int, error) {

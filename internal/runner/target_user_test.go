@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -15,6 +16,7 @@ type identityRecordingRuntime struct {
 	runs            [][]string
 	runErrors       []error
 	commands        [][]string
+	execCommands    []string
 }
 
 func (rt *identityRecordingRuntime) Run(_ context.Context, args ...string) error {
@@ -34,7 +36,8 @@ func (rt *identityRecordingRuntime) Output(_ context.Context, args ...string) (s
 	return "", fmt.Errorf("unexpected output command: %v", args)
 }
 
-func (rt *identityRecordingRuntime) ExecWithInput(context.Context, string, string, io.Reader) error {
+func (rt *identityRecordingRuntime) ExecWithInput(_ context.Context, _ string, command string, _ io.Reader) error {
+	rt.execCommands = append(rt.execCommands, command)
 	return nil
 }
 
@@ -156,6 +159,78 @@ func TestTargetWorkloadExecArgsPreserveIdentity(t *testing.T) {
 				t.Fatalf("targetWorkloadExecArgs() = %v, want %v", got, want)
 			}
 		})
+	}
+}
+
+func TestTargetWorkloadRootClassification(t *testing.T) {
+	tests := []struct {
+		user string
+		want bool
+	}{
+		{user: "", want: true},
+		{user: "0", want: true},
+		{user: "0:0", want: true},
+		{user: "root", want: true},
+		{user: "root:staff", want: true},
+		{user: "agent", want: false},
+		{user: "1001:1001", want: false},
+	}
+
+	for _, tt := range tests {
+		r := &runner{targetContainerUser: tt.user}
+		if got := r.targetWorkloadIsRoot(); got != tt.want {
+			t.Fatalf("targetWorkloadIsRoot() for %q = %v, want %v", tt.user, got, tt.want)
+		}
+	}
+}
+
+func TestContainerLauncherPromptInstallationRespectsTargetIdentity(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		user      string
+		wantCalls bool
+	}{
+		{name: "non-root named user", user: "agent", wantCalls: false},
+		{name: "non-root numeric user", user: "1001:1001", wantCalls: false},
+		{name: "default root", user: "", wantCalls: true},
+		{name: "explicit root", user: "root:root", wantCalls: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rt := &identityRecordingRuntime{}
+			r := &runner{
+				runtime:             rt,
+				cfg:                 config{targetContainer: "target"},
+				targetContainerUser: tt.user,
+			}
+			if err := (containerLauncher{r: r}).InstallPromptAssets(context.Background()); err != nil {
+				t.Fatalf("InstallPromptAssets() error = %v", err)
+			}
+			if got := len(rt.execCommands) > 0; got != tt.wantCalls {
+				t.Fatalf("system prompt commands issued = %v, want %v; commands=%v", got, tt.wantCalls, rt.execCommands)
+			}
+		})
+	}
+}
+
+func TestInteractivePrecheckFailureRemovesContainers(t *testing.T) {
+	rt := &identityRecordingRuntime{}
+	r := &runner{
+		runtime: rt,
+		cfg: config{
+			targetContainer: "target",
+			leashContainer:  "manager",
+		},
+	}
+	wantErr := errors.New("precheck failed")
+	if err := r.finishInteractivePrecheckFailure(context.Background(), wantErr); !errors.Is(err, wantErr) {
+		t.Fatalf("finishInteractivePrecheckFailure() error = %v, want %v", err, wantErr)
+	}
+	want := [][]string{
+		{"rm", "-f", "manager"},
+		{"rm", "-f", "target"},
+	}
+	if !reflect.DeepEqual(rt.commands, want) {
+		t.Fatalf("cleanup commands = %v, want %v", rt.commands, want)
 	}
 }
 

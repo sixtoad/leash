@@ -36,7 +36,7 @@ func ensureLeashBinary(t *testing.T) string {
 		tmp := os.TempDir()
 		out := filepath.Join(tmp, fmt.Sprintf("leash-e2e-%d", time.Now().UnixNano()))
 		cmd := exec.Command("go", "build", "-o", out, "../cmd/leash")
-		cmd.Env = append(os.Environ(), "GOFLAGS=-vet=off")
+		cmd.Env = append(os.Environ(), "GOFLAGS=-vet=off -buildvcs=false")
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		buildErr = cmd.Run()
@@ -249,6 +249,68 @@ when { resource in [ Dir::"/" ] };`))
 			t.Fatalf("expected bootstrap timeout to produce non-zero exit; stdout=%s stderr=%s", stdout.String(), stderr.String())
 		}
 	}
+}
+
+func TestRunnerNonRootInteractiveExecAfterEnforcement(t *testing.T) {
+	skipUnlessE2E(t)
+	targetImage := strings.TrimSpace(os.Getenv("LEASH_E2E_NONROOT_IMAGE"))
+	managerImage := strings.TrimSpace(os.Getenv("LEASH_E2E_MANAGER_IMAGE"))
+	if targetImage == "" || managerImage == "" {
+		t.Skip("set LEASH_E2E_NONROOT_IMAGE and LEASH_E2E_MANAGER_IMAGE for the non-root runner regression")
+	}
+	if _, err := exec.LookPath("script"); err != nil {
+		t.Skip("script(1) is required to allocate the interactive TTY")
+	}
+
+	bin := ensureLeashBinary(t)
+	root, err := moduleRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyPath := filepath.Join(t.TempDir(), "nonroot.cedar")
+	policy := fmt.Sprintf(`permit (principal, action in [Action::"FileOpen", Action::"FileOpenReadOnly"], resource)
+when { resource in [ Dir::"/usr/", Dir::"/lib/", Dir::"/lib64/", Dir::"/bin/", Dir::"/sbin/", Dir::"/etc/", Dir::"/proc/", Dir::"/sys/", Dir::"/dev/", Dir::"/run/", Dir::"/tmp/", Dir::"/leash/", Dir::%q ] };
+permit (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ Dir::"/tmp/", Dir::"/dev/", Dir::"/proc/", Dir::"/run/", Dir::"/leash/", Dir::%q ] };`, root+"/", root+"/")
+	mustWrite(t, policyPath, []byte(policy))
+
+	containerName := fmt.Sprintf("leash-e2e-nonroot-%d", time.Now().UnixNano())
+	t.Cleanup(func() { dockerRmForced(t, containerName, containerName+"-leash") })
+
+	args := []string{
+		bin, "--runtime", "docker", "--require-lsm", "--image", targetImage,
+		"--leash-image", managerImage, "--policy", policyPath,
+		"--container-name", containerName,
+		"sh", "-lc", "printf 'LEASH82_USER='; id -un; sleep 1",
+	}
+	var quoted []string
+	for _, arg := range args {
+		quoted = append(quoted, shellQuoteForTest(arg))
+	}
+	cmd := exec.Command("timeout", "180", "script", "-qec", strings.Join(quoted, " "), "/dev/null")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(),
+		"LEASH_HOME="+t.TempDir(),
+		"LEASH_WORK_DIR="+filepath.Join(t.TempDir(), "work"),
+		"LEASH_LISTEN=",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("non-root interactive runner failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "LEASH82_USER=agent") {
+		t.Fatalf("workload did not run as configured user agent:\n%s", out)
+	}
+	for _, name := range []string{containerName, containerName + "-leash"} {
+		_, exit, _ := runDockerCommand(t, 15*time.Second, "inspect", name)
+		if exit == 0 {
+			t.Fatalf("container %s remained after successful command", name)
+		}
+	}
+}
+
+func shellQuoteForTest(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func TestRunnerPrivateMountIsolation(t *testing.T) {
