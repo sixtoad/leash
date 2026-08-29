@@ -47,6 +47,8 @@ ARG BUILD_DATE=unknown
 ARG VERSION=dev
 ARG CHANNEL=main
 ARG GIT_REMOTE_URL=unknown
+ARG MANAGER_CONTRACT_VERSION=1
+ARG MANAGER_MIN_COMPATIBLE_CONTRACT=1
 
 ENV GOPATH=/go \
     PATH=/usr/local/go/bin:/go/bin:$PATH \
@@ -128,7 +130,9 @@ LABEL org.opencontainers.image.version="v${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.source="${GIT_REMOTE_URL}" \
-      org.opencontainers.image.ref.name="${CHANNEL}"
+      org.opencontainers.image.ref.name="${CHANNEL}" \
+      io.leash.manager.contract.version="${MANAGER_CONTRACT_VERSION}" \
+      io.leash.manager.contract.min-compatible="${MANAGER_MIN_COMPATIBLE_CONTRACT}"
 COPY --from=build /out/leash /usr/local/bin/leash
 COPY --from=build /out/leash-entry /usr/local/bin/leash-entry
 
@@ -138,11 +142,15 @@ ARG COMMIT=dev
 ARG BUILD_DATE=unknown
 ARG CHANNEL=main
 ARG GIT_REMOTE_URL=unknown
+ARG MANAGER_CONTRACT_VERSION=1
+ARG MANAGER_MIN_COMPATIBLE_CONTRACT=1
 LABEL org.opencontainers.image.version="v${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.source="${GIT_REMOTE_URL}" \
-      org.opencontainers.image.ref.name="${CHANNEL}"
+      org.opencontainers.image.ref.name="${CHANNEL}" \
+      io.leash.manager.contract.version="${MANAGER_CONTRACT_VERSION}" \
+      io.leash.manager.contract.min-compatible="${MANAGER_MIN_COMPATIBLE_CONTRACT}"
 COPY --from=build /out/leash /usr/local/bin/leash
 COPY --from=build /out/leash-entry /usr/local/bin/leash-entry
 

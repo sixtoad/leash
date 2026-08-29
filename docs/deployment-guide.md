@@ -8,6 +8,7 @@ Two pipelines ship leash: container images + standalone binaries (via Goreleaser
 
 | Artifact | Channel | Built by |
 |---|---|---|
+| Fork-native coherent CLI + manager | GitHub `native-vX.Y.Z` archives paired with public `ghcr.io/sixtoad/leash-manager:<native-tag>` and its immutable digest | `scripts/release.sh` |
 | `leash` binary (linux/darwin × amd64/arm64) | GitHub Releases `leash_<v>_<os>_<arch>.tar.gz` | Goreleaser (`.goreleaser.yaml`) |
 | `leash` manager Docker image | `public.ecr.aws/s5i7k8t3/strongdm/leash:{vX.Y.Z,latest}` | `build/publish-docker.sh` via Dockerfile.leash |
 | `coder` target image (default agent runtime) | `public.ecr.aws/s5i7k8t3/strongdm/coder:{vX.Y.Z,latest}` | same script via Dockerfile.coder |
@@ -15,6 +16,12 @@ Two pipelines ship leash: container images + standalone binaries (via Goreleaser
 | `Leash.app` (macOS) | Homebrew cask `strongdm/tap/leash-app` | Out-of-tree; uses Sparkle for in-app updates |
 
 The npm wrapper and the macOS app both ultimately re-distribute the Goreleaser tarballs.
+
+Fork-native CLIs never select a floating manager by default. Their embedded
+`ghcr.io/sixtoad/leash-manager@sha256:...` reference is verified against the
+manager's full source revision and manager-contract labels before any target is
+created. Explicit flag/environment overrides remain available for compatible,
+labeled manager images.
 
 ## 2. CI workflows
 

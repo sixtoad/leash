@@ -22,12 +22,18 @@ import (
 )
 
 var (
-	version   = "dev"
-	commit    = "unknown"
-	buildDate = "unknown"
+	version         = "dev"
+	commit          = "unknown"
+	buildDate       = "unknown"
+	managerImage    = "ghcr.io/sixtoad/leash-manager:dev"
+	managerRevision = ""
+	managerContract = "1"
 )
 
 func main() {
+	if err := runner.SetManagerRelease(managerImage, managerRevision, managerContract); err != nil {
+		log.Fatal(err)
+	}
 	statsig.Configure(version)
 
 	args := os.Args

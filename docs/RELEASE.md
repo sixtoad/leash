@@ -4,6 +4,41 @@ This document describes how we cut a Leash release, why the workflow looks the w
 
 For npm distribution specifics (trusted publishing, dist-tags, and manual fallbacks), see `docs/release_management.md`.
 
+## Fork-native coherent releases (`native-vX.Y.Z`)
+
+`scripts/release.sh` is the release authority for `sixtoad/leash` native tags. A
+native release is one unit containing four host CLI archives and a public
+multi-arch manager image at `ghcr.io/sixtoad/leash-manager:<native-tag>`.
+The script enforces this order:
+
+1. Require a clean tree and capture the full source revision.
+2. Build and publish the versioned manager without updating `latest`, then
+   resolve its registry digest and make the package public.
+3. Build every CLI archive from that revision with
+   `ghcr.io/sixtoad/leash-manager@sha256:...` embedded as its default.
+4. Verify manager OCI revision/contract labels and archive build metadata.
+5. Execute the archived Linux CLI with no manager override, the tracked exact
+   Walk #33 combined policy, a named non-root target, and fail-closed LSM.
+6. Only after every check succeeds, create the GitHub release with the manager
+   tag, digest, revision, and contract in its notes.
+
+The CLI inspects any selected manager immediately after pull and before target
+provisioning. The generated default must match the CLI revision and contract.
+`--leash-image` and `LEASH_IMAGE` keep their existing precedence, but custom
+images must advertise a compatible manager-contract range and OCI revision;
+unlabeled or incompatible privileged managers fail closed.
+
+Run the complete path without registry or GitHub publication:
+
+```bash
+scripts/release.sh --dry-run native-v0.0.0
+```
+
+The dry run uses a local content-addressed manager image and still executes the
+same archived-binary/no-override E2E. It never creates a tag or release.
+
+The remainder of this document describes the upstream `vX.Y.Z`/npm pipeline.
+
 ## Flow Overview
 
 ```mermaid
@@ -144,4 +179,3 @@ npm login --scope=@strongdm
 npm publish dist/npm/strongdm-leash-<semver>.tgz --access public --tag <alpha|latest>
 ```
 4. Record the manual publish in the release notes and rerun CI to ensure the normal workflow succeeds next time.
-

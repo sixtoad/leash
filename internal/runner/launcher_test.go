@@ -18,8 +18,11 @@ type recordingRuntime struct {
 func (rr recordingRuntime) Run(ctx context.Context, args ...string) error { return nil }
 
 func (rr recordingRuntime) Output(ctx context.Context, args ...string) (string, error) {
-	if len(args) >= 3 && args[0] == "image" && args[1] == "inspect" {
+	if len(args) == 3 && args[0] == "image" && args[1] == "inspect" {
 		*rr.inspected = append(*rr.inspected, args[2])
+	}
+	if len(args) >= 5 && args[0] == "image" && args[1] == "inspect" && args[2] == "--format" {
+		return `{"io.leash.manager.contract.version":"1","io.leash.manager.contract.min-compatible":"1","org.opencontainers.image.revision":"dev"}`, nil
 	}
 	return "ok", nil
 }

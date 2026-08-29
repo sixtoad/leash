@@ -4,6 +4,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SCRIPT_NAME="$(basename "$0")"
 VERSION_SCRIPT="${REPO_ROOT}/build/versionator.py"
+PUBLISH_LATEST=1
+PUBLISH_METADATA_FILE=""
 
 log() {
     local level="$1"
@@ -51,6 +53,9 @@ Usage: publish-docker.sh [OPTIONS] [VERSION]
 Options:
   --only-coder   Build and publish coder images only
   --only-leash   Build and publish leash images only
+  --no-latest    Do not create or update a floating latest tag
+  --metadata-file PATH
+                 Write Docker Buildx publication metadata to PATH
   -h, --help     Show this help message
 
 VERSION is the tag/identifier used for the built images. If omitted, the script
@@ -89,11 +94,20 @@ docker_build_push() {
     shift 2
     local args=("$@")
 
+    local -a tag_args=(-t "${image}:${version}")
+    if ((PUBLISH_LATEST)); then
+        tag_args+=(-t "${image}:latest")
+    fi
+    local -a metadata_args=()
+    if [ -n "${PUBLISH_METADATA_FILE}" ]; then
+        metadata_args=(--metadata-file "${PUBLISH_METADATA_FILE}")
+    fi
+
     log_info "Building ${image}:${version} (multi-arch)"
     DOCKER_BUILDKIT=1 docker buildx build \
         --platform linux/amd64,linux/arm64 \
-        -t "${image}:${version}" \
-        -t "${image}:latest" \
+        "${tag_args[@]}" \
+        "${metadata_args[@]}" \
         "${args[@]}" \
         --push \
         .
@@ -105,10 +119,11 @@ promote_image() {
     local version="$3"
 
     log_info "Promoting ${source_ref} -> ${image}:${version} (multi-arch)"
-    docker buildx imagetools create \
-        --tag "${image}:${version}" \
-        --tag "${image}:latest" \
-        "${source_ref}"
+    local -a tag_args=(--tag "${image}:${version}")
+    if ((PUBLISH_LATEST)); then
+        tag_args+=(--tag "${image}:latest")
+    fi
+    docker buildx imagetools create "${tag_args[@]}" "${source_ref}"
 }
 
 main() {
@@ -127,6 +142,14 @@ main() {
                 ;;
             --only-leash)
                 only_leash=1
+                ;;
+            --no-latest)
+                PUBLISH_LATEST=0
+                ;;
+            --metadata-file)
+                [ "$#" -ge 2 ] || die "--metadata-file requires a path"
+                PUBLISH_METADATA_FILE="$2"
+                shift
                 ;;
             -h|--help)
                 usage
@@ -208,7 +231,7 @@ main() {
     )
 
     local commit
-    commit="$(git rev-parse --short=7 HEAD)"
+    commit="$(git rev-parse HEAD)"
     local build_date
     build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     local channel="${RELEASE_CHANNEL:-}"
