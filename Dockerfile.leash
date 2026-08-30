@@ -149,6 +149,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     tcpdump \
     tini \
+    util-linux \
     vim \
     wget \
     && rm -rf /var/lib/apt/lists/*

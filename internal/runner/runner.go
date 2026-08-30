@@ -17,11 +17,13 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/strongdm/leash/internal/assets"
 	"github.com/strongdm/leash/internal/configstore"
 	"github.com/strongdm/leash/internal/entrypoint"
+	"github.com/strongdm/leash/internal/idmap"
 	"github.com/strongdm/leash/internal/leashd/listen"
 	"github.com/strongdm/leash/internal/openflag"
 	"github.com/strongdm/leash/internal/telemetry/statsig"
@@ -94,6 +96,7 @@ type options struct {
 	policyOverride string
 	verbose        bool
 	volumes        []string
+	idmapVolumes   []idmapVolume
 	envVars        []string
 	command        []string
 	subcommand     string
@@ -116,6 +119,11 @@ type options struct {
 	allowNamespaces bool            // skip the seccomp mount/unshare block (reopens the userns bind-mount bypass)
 	injectServices  []injectService // --inject-service: helper plugins to spawn and bind into the box
 	dropUser        string          // --user <name>: explicit native drop-user (overrides $SUDO_USER; "root" opts in to running as root)
+}
+
+type idmapVolume struct {
+	raw, host, target, mode string
+	hostUID, hostGID        uint32
 }
 
 // injectService describes one --inject-service
@@ -179,6 +187,7 @@ type runner struct {
 	// this captured identity. An empty image user is normalized to uid 0 when its
 	// exec argv is built.
 	targetContainerUser string
+	idmapSpecs          []idmap.Spec
 
 	verbose         bool
 	shareDirCreated bool
@@ -400,6 +409,7 @@ Flags:
   -l, --listen <addr>             Control UI bind address (e.g. :18080, 127.0.0.1:18080; setting this to blank disables the UI).
   -o, --open                      Open Control UI in default browser once ready.
   -v, --volume <src:dst[:ro]>     Bind mount to pass through to the target container (repeatable).
+  --idmap-volume <src:dst[:ro]>   Linux Docker only: map the bind owner's UID/GID to the image user during privileged bootstrap (repeatable).
   -e, --env <key[=value]>         Set environment variables inside the leash containers (repeatable).
   -p, --publish <[ip:]host:container[/proto]>   Publish a container port to the host (repeatable). Examples: -p 3000, -p 8000:3000, -p 127.0.0.1:3000:3000, -p :3000, -p 3000/udp
   -P, --publish-all               Publish all EXPOSEd ports (host same as container when free, auto-bump on conflicts).
@@ -634,6 +644,16 @@ func parseArgs(args []string) (options, error) {
 			}
 			opts.volumes = append(opts.volumes, value)
 			i++
+		case "--idmap-volume":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for %s", arg)
+			}
+			volume, err := parseIDMapVolume(args[i+1])
+			if err != nil {
+				return opts, err
+			}
+			opts.idmapVolumes = append(opts.idmapVolumes, volume)
+			i++
 		case "-V", "--verbose":
 			opts.verbose = true
 		case "--image":
@@ -765,6 +785,12 @@ func parseArgs(args []string) (options, error) {
 					return opts, fmt.Errorf("invalid volume mount %q; expected src:dst[:ro]", volume)
 				}
 				opts.volumes = append(opts.volumes, volume)
+			case strings.HasPrefix(arg, "--idmap-volume="):
+				volume, err := parseIDMapVolume(strings.TrimPrefix(arg, "--idmap-volume="))
+				if err != nil {
+					return opts, err
+				}
+				opts.idmapVolumes = append(opts.idmapVolumes, volume)
 			case strings.HasPrefix(arg, "-e="):
 				value := strings.TrimPrefix(arg, "-e=")
 				if err := appendEnvSpec(&opts, value); err != nil {
@@ -2097,6 +2123,87 @@ func (r *runner) targetWorkloadIsRoot() bool {
 	return user == "0" || user == "root"
 }
 
+func (r *runner) validateIDMapVolumes() error {
+	if len(r.opts.idmapVolumes) == 0 {
+		return nil
+	}
+	if runtime.GOOS != "linux" {
+		return errors.New("--idmap-volume requires a Linux host")
+	}
+	if r.rt().Name() != "docker" {
+		return fmt.Errorf("--idmap-volume requires Docker; runtime %q is unsupported", r.rt().Name())
+	}
+	seen := make(map[string]string)
+	for i := range r.opts.idmapVolumes {
+		v := &r.opts.idmapVolumes[i]
+		info, err := os.Lstat(v.host)
+		if err != nil {
+			return fmt.Errorf("inspect idmap volume source %q: %w", v.host, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("idmap volume source %q must not be a symlink", v.host)
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("read owner of idmap volume source %q", v.host)
+		}
+		if stat.Uid == 0 || stat.Gid == 0 {
+			return fmt.Errorf("idmap volume source %q must have a non-root owner", v.host)
+		}
+		v.hostUID, v.hostGID = stat.Uid, stat.Gid
+		for target, raw := range seen {
+			if target == v.target || strings.HasPrefix(target, v.target+"/") || strings.HasPrefix(v.target, target+"/") {
+				return fmt.Errorf("idmap volume target %q conflicts with %q", v.raw, raw)
+			}
+		}
+		seen[v.target] = v.raw
+	}
+	for _, volume := range r.opts.volumes {
+		if target := volumeContainerPath(volume); target != "" {
+			if raw, ok := seen[filepath.Clean(target)]; ok {
+				return fmt.Errorf("idmap volume %q conflicts with ordinary volume %q", raw, volume)
+			}
+		}
+	}
+	return nil
+}
+
+type resolvedTargetIdentity struct {
+	UID  uint32 `json:"uid"`
+	GID  uint32 `json:"gid"`
+	Home string `json:"home"`
+}
+
+func (r *runner) prepareIDMapVolumes(ctx context.Context) error {
+	if len(r.opts.idmapVolumes) == 0 {
+		return nil
+	}
+	if r.targetWorkloadIsRoot() {
+		return fmt.Errorf("--idmap-volume requires a configured non-root image user, got %q", r.targetWorkloadUser())
+	}
+	arch, err := r.detectImageArch(ctx)
+	if err != nil {
+		return err
+	}
+	helper := filepath.Join(leashPublicMount, fmt.Sprintf("leash-entry-linux-%s", arch))
+	out, err := r.rt().Output(ctx, "exec", "--user", "0", r.cfg.targetContainer, helper, "--resolve-identity", r.targetWorkloadUser())
+	if err != nil {
+		return fmt.Errorf("resolve target image user %q: %w", r.targetWorkloadUser(), err)
+	}
+	var identity resolvedTargetIdentity
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &identity); err != nil {
+		return fmt.Errorf("parse target image identity: %w", err)
+	}
+	if identity.UID == 0 || identity.GID == 0 || !filepath.IsAbs(identity.Home) {
+		return fmt.Errorf("target image user %q resolved to unsafe identity uid=%d gid=%d home=%q", r.targetWorkloadUser(), identity.UID, identity.GID, identity.Home)
+	}
+	r.idmapSpecs = make([]idmap.Spec, 0, len(r.opts.idmapVolumes))
+	for _, v := range r.opts.idmapVolumes {
+		r.idmapSpecs = append(r.idmapSpecs, idmap.Spec{Target: v.target, HostUID: v.hostUID, HostGID: v.hostGID, ContainerUID: identity.UID, ContainerGID: identity.GID})
+	}
+	return nil
+}
+
 func (r *runner) getImageStopSignalContainer(ctx context.Context) (string, error) {
 	out, err := r.rt().Output(ctx, "inspect", "--format", "{{.Config.StopSignal}}", r.cfg.targetImage)
 	if err != nil {
@@ -2351,6 +2458,20 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 		"-e", "LEASH_ENTRY_KILL_SIGNAL=SIGKILL",
 		"-e", "NODE_OPTIONS=--use-openssl-ca",
 	)
+	for _, volume := range r.opts.idmapVolumes {
+		// The caller directory is already bound above; do not add a duplicate
+		// mount when it is the requested idmapped workspace.
+		if volume.host == filepath.Clean(r.cfg.callerDir) && volume.target == filepath.Clean(r.cfg.callerDir) {
+			targetMounts = append(targetMounts, volume.target)
+			continue
+		}
+		spec := volume.host + ":" + volume.target
+		if volume.mode != "" {
+			spec += ":" + volume.mode
+		}
+		args = append(args, "-v", spec)
+		targetMounts = append(targetMounts, volume.target)
+	}
 	for _, env := range r.opts.envVars {
 		args = append(args, "-e", env)
 		targetEnv = append(targetEnv, env)
@@ -2623,6 +2744,17 @@ func (r *runner) launchLeashContainer(ctx context.Context, cgroupPath string) er
 		fmt.Sprintf("LEASH_BOOTSTRAP_TIMEOUT=%s", r.cfg.bootstrapTimeout.String()),
 		fmt.Sprintf("LEASH_DIR=%s", leashPublicMount),
 		fmt.Sprintf("LEASH_PRIVATE_DIR=%s", leashPrivateMount),
+	}
+	if len(r.idmapSpecs) > 0 {
+		payload, err := idmap.Encode(r.idmapSpecs)
+		if err != nil {
+			return fmt.Errorf("encode idmapped mount bootstrap: %w", err)
+		}
+		args = append(args,
+			"--pid", fmt.Sprintf("container:%s", r.cfg.targetContainer),
+			"-e", fmt.Sprintf("%s=%s", idmap.Env, payload),
+		)
+		leashEnv = append(leashEnv, idmap.Env+"=<redacted>")
 	}
 
 	// Propagate --require-lsm so leashd fails hard (rather than degrading to
