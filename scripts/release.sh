@@ -37,6 +37,7 @@ MANAGER_OWNER="${MANAGER_OWNER%%/*}"
 MANAGER_PACKAGE="${MANAGER_REPO##*/}"
 TOOL_ROOT="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
 source "$TOOL_ROOT/scripts/native-release-remote.sh"
+MANAGER_VERSION="$(native_manager_version "$TAG")" || exit 1
 RELEASE_ROOT="$(native_release_source_root "$TOOL_ROOT" "$RELEASE_SOURCE_OVERRIDE" "$RESUME_EXISTING_MANAGER")" || exit 1
 cd "$RELEASE_ROOT"
 
@@ -105,7 +106,7 @@ MANAGER_BUILD_ARGS=(
   --build-arg UI_SOURCE=ui-prebuilt
   --build-arg COMMIT="$COMMIT"
   --build-arg BUILD_DATE="$DATE"
-  --build-arg VERSION="${TAG#native-v}"
+  --build-arg VERSION="$MANAGER_VERSION"
   --build-arg CHANNEL=release
   --build-arg GIT_REMOTE_URL="$(git config --get remote.origin.url 2>/dev/null || echo unknown)"
 )
@@ -141,7 +142,7 @@ publish_fresh_manager() {
   (
     unset LEASH_SOURCE_IMAGE ECR_LEASH_IMAGE EXTRA_LEASH_IMAGES
     LEASH_IMAGE="$MANAGER_REPO" RELEASE_CHANNEL=release \
-      ./build/publish-docker.sh --only-leash --no-latest --metadata-file "$METADATA" "$TAG"
+      ./build/publish-docker.sh --only-leash --no-latest --metadata-file "$METADATA" "$MANAGER_VERSION"
   )
   MANAGER_DIGEST="$(METADATA="$METADATA" python3 - <<'PY'
 import json
@@ -196,7 +197,7 @@ if (( !DRY_RUN )); then
   python3 "$TOOL_ROOT/scripts/verify-manager-manifest.py" registry "$MANAGER_INDEX" \
     --image-amd64 "$MANAGER_IMAGE_AMD64" --image-arm64 "$MANAGER_IMAGE_ARM64" \
     --revision "$COMMIT" --digest "$MANAGER_DIGEST" \
-    --version "${TAG#native-v}" --channel release
+    --version "$MANAGER_VERSION" --channel release
   timeout 2m docker pull "$MANAGER_REF" >/dev/null
   native_require_release_names_absent "$TEMP" "$REPO" "$TAG"
   native_require_manager_public "$TEMP" "$MANAGER_OWNER" "$MANAGER_PACKAGE" "$TAG" "$RELEASE_ROOT"

@@ -2,6 +2,15 @@
 # Remote-state and package-visibility helpers for scripts/release.sh.
 # This file is sourced; callers retain `set -euo pipefail` policy.
 
+native_manager_version() {
+  local tag="$1"
+  if [[ ! "$tag" =~ ^native-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf '%s\n' "release: cannot derive manager version from tag '$tag'" >&2
+    return 1
+  fi
+  printf '%s\n' "$tag"
+}
+
 native_release_source_root() {
   local tooling_root="$1" source_override="$2" resume="$3"
   if [ "$resume" != 1 ]; then

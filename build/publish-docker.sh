@@ -275,7 +275,7 @@ main() {
                 --build-arg UI_SOURCE=ui-prebuilt \
                 --build-arg COMMIT="${commit}" \
                 --build-arg BUILD_DATE="${build_date}" \
-                --build-arg VERSION="${version#v}" \
+                --build-arg VERSION="${version}" \
                 --build-arg CHANNEL="${channel}" \
                 --build-arg GIT_REMOTE_URL="${git_url}"
             leash_source="${leash_image}:${version}"
@@ -302,7 +302,7 @@ main() {
                 --build-arg UI_SOURCE=ui-prebuilt \
                 --build-arg COMMIT="${commit}" \
                 --build-arg BUILD_DATE="${build_date}" \
-                --build-arg VERSION="${version#v}" \
+                --build-arg VERSION="${version}" \
                 --build-arg CHANNEL="${channel}" \
                 --build-arg GIT_REMOTE_URL="${git_url}"
             leash_source="${leash_target}:${version}"
