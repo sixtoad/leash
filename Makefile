@@ -71,7 +71,8 @@ lsm-generate: ## Generate LSM eBPF artifacts on the host system
 	if [ "$(shell uname -s)" = 'Linux' ]; then \
 	  command -v clang >/dev/null 2>&1 || { echo 'clang is required to generate LSM eBPF bindings' >&2; exit 1; }; \
 	  command -v llvm-strip >/dev/null 2>&1 || command -v llvm-objdump >/dev/null 2>&1 || echo 'warning: llvm tools not found; ensure LLVM is installed'; \
-	  command -v bpf2go >/dev/null 2>&1 || { echo 'installing bpf2go...'; go install github.com/cilium/ebpf/cmd/bpf2go@v0.19.0; }; \
+	  echo 'installing pinned bpf2go v0.19.0...'; \
+	  go install github.com/cilium/ebpf/cmd/bpf2go@v0.19.0; \
 	  echo 'generating LSM BPF artifacts...'; \
 	  GOOS=linux GOARCH=$$(go env GOARCH) go generate ./internal/lsm; \
 	else \
