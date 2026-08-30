@@ -46,7 +46,7 @@ The Makefile, release scripts, and Docker builds all shell out to this script, s
   "enforcing": true,
   "contractVersion": 1,
   "minCompatibleContract": 0,
-  "capabilities": ["policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json"],
+  "capabilities": ["policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume"],
   "os": "linux",
   "arch": "amd64"
 }
@@ -62,7 +62,7 @@ The Makefile, release scripts, and Docker builds all shell out to this script, s
 
 ### The compatibility contract: `contractVersion`, `minCompatibleContract`, `capabilities`
 
-The two integers bound the leash CLI surface external provisioners drive — the `--policy`, `--inject-service`, `--runtime`, `--user`, `--require-lsm` and `--machine-output` flags, plus the shape of this document — so an installer can refuse (or warn) up front instead of failing cryptically on the first real run. **A caller written against contract `C` proceeds iff `minCompatibleContract <= C <= contractVersion`.** `contractVersion >= C` alone is *not* the rule: it also admits a leash whose floor has since risen past `C`, which is exactly the leash that dropped `C`'s surface.
+The two integers bound the leash CLI surface external provisioners drive — the `--policy`, `--inject-service`, `--runtime`, `--user`, `--require-lsm`, `--machine-output` and `--idmap-volume` flags, plus the shape of this document — so an installer can refuse (or warn) up front instead of failing cryptically on the first real run. **A caller written against contract `C` proceeds iff `minCompatibleContract <= C <= contractVersion`.** `contractVersion >= C` alone is *not* the rule: it also admits a leash whose floor has since risen past `C`, which is exactly the leash that dropped `C`'s surface.
 
 The consumer-facing contract — that rule with both failure directions, the value domains, `capabilities`, contract 0, the probe hazard, and a snippet that decodes an installed binary's stdout — is [`api-contracts-leash-core.md` § CLI build contract](api-contracts-leash-core.md#cli-build-contract--leash-version---json). It is deliberately not duplicated here: that document is the published contract, and there is no package to import.
 
