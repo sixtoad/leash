@@ -53,6 +53,30 @@ func TestParseArgsVolumeEquals(t *testing.T) {
 	}
 }
 
+func TestParseArgsIDMapVolume(t *testing.T) {
+	t.Parallel()
+	opts, err := parseArgs([]string{"--idmap-volume", "/host/work:/workspace:ro"})
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+	if len(opts.idmapVolumes) != 1 {
+		t.Fatalf("idmap volumes = %+v", opts.idmapVolumes)
+	}
+	got := opts.idmapVolumes[0]
+	if got.host != "/host/work" || got.target != "/workspace" || got.mode != "ro" {
+		t.Fatalf("idmap volume = %+v", got)
+	}
+}
+
+func TestParseArgsIDMapVolumeRejectsUnsafeForms(t *testing.T) {
+	t.Parallel()
+	for _, spec := range []string{"relative:/workspace", "/host:relative", "/host:/workspace:delegated", "/host"} {
+		if _, err := parseArgs([]string{"--idmap-volume", spec}); err == nil {
+			t.Errorf("parseArgs accepted unsafe idmap volume %q", spec)
+		}
+	}
+}
+
 func TestParseArgsVerboseShort(t *testing.T) {
 	t.Parallel()
 

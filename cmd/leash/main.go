@@ -14,6 +14,7 @@ import (
 	"github.com/strongdm/leash/internal/darwind"
 	"github.com/strongdm/leash/internal/doctor"
 	"github.com/strongdm/leash/internal/hardening"
+	"github.com/strongdm/leash/internal/idmap"
 	"github.com/strongdm/leash/internal/leashd"
 	"github.com/strongdm/leash/internal/resolvercontract"
 	"github.com/strongdm/leash/internal/runner"
@@ -31,6 +32,20 @@ var (
 )
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--idmap-userns-holder" {
+		idmap.HoldUserNamespace()
+		return
+	}
+	if len(os.Args) == 2 && os.Args[1] == "--idmap-mount-helper" {
+		specs, err := idmap.Decode(os.Getenv(idmap.Env))
+		if err == nil {
+			err = idmap.ApplyCurrent(specs)
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if err := runner.SetManagerRelease(managerImage, managerRevision, managerContract); err != nil {
 		log.Fatal(err)
 	}

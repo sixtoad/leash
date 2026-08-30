@@ -27,6 +27,7 @@ import (
 	cedarutil "github.com/strongdm/leash/internal/cedar"
 	"github.com/strongdm/leash/internal/entrypoint"
 	"github.com/strongdm/leash/internal/httpserver"
+	"github.com/strongdm/leash/internal/idmap"
 	"github.com/strongdm/leash/internal/leashd/listen"
 	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/policy"
@@ -73,6 +74,15 @@ func Main(args []string) error {
 			return nil
 		}
 		return err
+	}
+	if raw := strings.TrimSpace(os.Getenv(idmap.Env)); raw != "" {
+		specs, err := idmap.Decode(raw)
+		if err != nil {
+			return fmt.Errorf("decode idmapped mount bootstrap: %w", err)
+		}
+		if err := idmap.Apply(specs); err != nil {
+			return fmt.Errorf("apply idmapped mount bootstrap: %w", err)
+		}
 	}
 
 	sessionID := strings.TrimSpace(os.Getenv("LEASH_SESSION_ID"))

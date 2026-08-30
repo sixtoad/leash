@@ -169,6 +169,9 @@ func (c containerLauncher) Provision(ctx context.Context, stopSignal string) (st
 		}
 		return "", err
 	}
+	if err := c.r.prepareIDMapVolumes(ctx); err != nil {
+		return "", err
+	}
 	return c.r.resolveCgroupPath()
 }
 
@@ -227,7 +230,7 @@ func (c containerLauncher) InstallPromptAssets(ctx context.Context) error {
 	return c.r.installPromptAssetsContainer(ctx)
 }
 
-func (c containerLauncher) Preflight() error { return nil }
+func (c containerLauncher) Preflight() error { return c.r.validateIDMapVolumes() }
 
 func (c containerLauncher) RequiredCommands() []string { return []string{c.r.rt().Name()} }
 

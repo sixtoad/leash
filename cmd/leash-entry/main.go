@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -24,6 +26,13 @@ const (
 )
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "--resolve-identity" {
+		if err := printResolvedIdentity(os.Args[2]); err != nil {
+			os.Stderr.WriteString("leash-error: resolve identity: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		return
+	}
 	_ = os.Remove(bootstrapPath)
 
 	for {
@@ -141,6 +150,41 @@ func main() {
 		os.Stderr.WriteString("leash-error: failed to exec: " + err.Error() + "\n")
 		os.Exit(1)
 	}
+}
+
+func printResolvedIdentity(raw string) error {
+	userPart, groupPart, _ := strings.Cut(raw, ":")
+	var account *user.User
+	var err error
+	if _, parseErr := strconv.ParseUint(userPart, 10, 32); parseErr == nil {
+		account, err = user.LookupId(userPart)
+	} else {
+		account, err = user.Lookup(userPart)
+	}
+	if err != nil {
+		return err
+	}
+	uid64, err := strconv.ParseUint(account.Uid, 10, 32)
+	if err != nil {
+		return fmt.Errorf("invalid uid %q", account.Uid)
+	}
+	gidText := account.Gid
+	if groupPart != "" {
+		if _, parseErr := strconv.ParseUint(groupPart, 10, 32); parseErr == nil {
+			gidText = groupPart
+		} else {
+			group, lookupErr := user.LookupGroup(groupPart)
+			if lookupErr != nil {
+				return lookupErr
+			}
+			gidText = group.Gid
+		}
+	}
+	gid64, err := strconv.ParseUint(gidText, 10, 32)
+	if err != nil {
+		return fmt.Errorf("invalid gid %q", gidText)
+	}
+	return json.NewEncoder(os.Stdout).Encode(map[string]any{"uid": uint32(uid64), "gid": uint32(gid64), "home": account.HomeDir})
 }
 
 func resolveTargetArgs(fallback []string) []string {
