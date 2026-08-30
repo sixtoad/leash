@@ -125,7 +125,7 @@ if docker buildx version >/dev/null 2>&1; then
       --output "type=oci,dest=$PREFLIGHT_OCI" \
       "${MANAGER_BUILD_ARGS[@]}" .
     python3 "$TOOL_ROOT/scripts/verify-manager-manifest.py" oci "$PREFLIGHT_OCI" \
-      --revision "$COMMIT" --version "${TAG#native-v}" --channel release
+      --revision "$COMMIT" --version "$TAG" --channel release
   fi
 elif (( !DRY_RUN )); then
   printf '%s\n' "release: Docker Buildx is required for multi-arch publication" >&2

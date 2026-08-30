@@ -130,6 +130,10 @@ func TestReleaseGeneratesBeforeBuildAndVerifiesPublishedPlatforms(t *testing.T) 
 	if !strings.Contains(release, "--no-latest") {
 		t.Fatal("release must preserve immutable manager publication without latest")
 	}
+	if !strings.Contains(release, `--revision "$COMMIT" --version "$TAG" --channel release`) ||
+		strings.Contains(release, `${TAG#native-v}`) {
+		t.Fatal("local OCI preflight must validate the canonical release tag byte-for-byte")
+	}
 	for _, forbidden := range []string{"allow-legacy-version", "LEGACY_VERSION", "LEGACY_MANAGER"} {
 		if strings.Contains(release, forbidden) {
 			t.Fatalf("release must reject all noncanonical manager labels; found %q", forbidden)
