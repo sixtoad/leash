@@ -113,9 +113,9 @@ func dockerInstructions(stage string) []string {
 func TestReleaseGeneratesBeforeBuildAndVerifiesPublishedPlatforms(t *testing.T) {
 	release := readRepositoryFile(t, "scripts/release.sh")
 	generation := strings.Index(release, "make lsm-generate")
-	preflight := strings.Index(release, "verify-manager-manifest.py oci")
+	preflight := strings.Index(release, `verify-manager-manifest.py" oci`)
 	publication := strings.Index(release, "./build/publish-docker.sh")
-	platformGate := strings.Index(release, "verify-manager-manifest.py registry")
+	platformGate := strings.Index(release, `verify-manager-manifest.py" registry`)
 	pull := strings.Index(release, "docker pull \"$MANAGER_REF\"")
 	if generation < 0 || preflight < 0 || publication < 0 || platformGate < 0 || pull < 0 {
 		t.Fatalf("release boundary missing: generation=%d preflight=%d publication=%d platformGate=%d pull=%d", generation, preflight, publication, platformGate, pull)

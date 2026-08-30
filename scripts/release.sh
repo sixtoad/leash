@@ -5,18 +5,24 @@ set -euo pipefail
 
 DRY_RUN=0
 RESUME_EXISTING_MANAGER=0
+RELEASE_SOURCE_OVERRIDE=""
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --resume-existing-manager) RESUME_EXISTING_MANAGER=1 ;;
+    --release-source-root)
+      [ "$#" -ge 2 ] || { printf '%s\n' "release: --release-source-root requires a path" >&2; exit 1; }
+      RELEASE_SOURCE_OVERRIDE="$2"
+      shift
+      ;;
     *) printf '%s\n' "release: unknown option $1" >&2; exit 1 ;;
   esac
   shift
 done
 
-TAG="${1:?usage: scripts/release.sh [--dry-run] [--resume-existing-manager] <native-vX.Y.Z>}"
+TAG="${1:?usage: scripts/release.sh [--dry-run] [--resume-existing-manager --release-source-root <path>] <native-vX.Y.Z>}"
 if [ "$#" -ne 1 ]; then
-  printf '%s\n' "release: usage: scripts/release.sh [--dry-run] [--resume-existing-manager] <native-vX.Y.Z>" >&2
+  printf '%s\n' "release: usage: scripts/release.sh [--dry-run] [--resume-existing-manager --release-source-root <path>] <native-vX.Y.Z>" >&2
   exit 1
 fi
 if [[ ! "$TAG" =~ ^native-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -29,21 +35,22 @@ MANAGER_REPO="ghcr.io/sixtoad/leash-manager"
 MANAGER_OWNER="${MANAGER_REPO#ghcr.io/}"
 MANAGER_OWNER="${MANAGER_OWNER%%/*}"
 MANAGER_PACKAGE="${MANAGER_REPO##*/}"
-ROOT="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
-cd "$ROOT"
-source "$ROOT/scripts/native-release-remote.sh"
+TOOL_ROOT="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
+source "$TOOL_ROOT/scripts/native-release-remote.sh"
+RELEASE_ROOT="$(native_release_source_root "$TOOL_ROOT" "$RELEASE_SOURCE_OVERRIDE" "$RESUME_EXISTING_MANAGER")" || exit 1
+cd "$RELEASE_ROOT"
 
 if ((DRY_RUN && RESUME_EXISTING_MANAGER)); then
   printf '%s\n' "release: --resume-existing-manager cannot be combined with --dry-run" >&2
   exit 1
 fi
 
-if [ -n "$(git status --porcelain)" ]; then
-  printf '%s\n' "release: working tree must be clean so CLI and manager provenance name one commit" >&2
+if [ -n "$(git -C "$TOOL_ROOT" status --porcelain --untracked-files=all)" ]; then
+  printf '%s\n' "release: recovery tooling checkout must be clean" >&2
   exit 1
 fi
 
-COMMIT="$(git rev-parse HEAD)"
+COMMIT="$(git -C "$RELEASE_ROOT" rev-parse HEAD)"
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 MANAGER_TAG="$MANAGER_REPO:$TAG"
 TEMP="$(mktemp -d /tmp/leash-native-release.XXXXXX)"
@@ -66,16 +73,20 @@ if [ ! -s internal/ui/dist/index.html ] || grep -q '>stub<\|<title>stub' interna
   exit 1
 fi
 
-printf '%s\n' "release: generating embedded leash-entry binaries..." >&2
-GOFLAGS="${GOFLAGS:-} -buildvcs=false" go generate ./internal/entrypoint/...
+if [ "$REMOTE_MODE" != resume ]; then
+  printf '%s\n' "release: generating embedded leash-entry binaries..." >&2
+  GOFLAGS="${GOFLAGS:-} -buildvcs=false" go generate ./internal/entrypoint/...
+fi
 for file in internal/entrypoint/bundled_linux_amd64_gen.go internal/entrypoint/bundled_linux_arm64_gen.go; do
   [ -s "$file" ] || { printf '%s\n' "release: $file missing after generation" >&2; exit 1; }
 done
 
-printf '%s\n' "release: generating eBPF LSM bytecode..." >&2
-if ! make lsm-generate >&2; then
-  printf '%s\n' "release: host generation unavailable; using Docker toolchain..." >&2
-  make lsm-generate-docker >&2
+if [ "$REMOTE_MODE" != resume ]; then
+  printf '%s\n' "release: generating eBPF LSM bytecode..." >&2
+  if ! make lsm-generate >&2; then
+    printf '%s\n' "release: host generation unavailable; using Docker toolchain..." >&2
+    make lsm-generate-docker >&2
+  fi
 fi
 for file in \
   internal/lsm/lsmopen_bpfeb.go internal/lsm/lsmopen_bpfeb.o \
@@ -112,7 +123,7 @@ if docker buildx version >/dev/null 2>&1; then
       --platform linux/amd64,linux/arm64 \
       --output "type=oci,dest=$PREFLIGHT_OCI" \
       "${MANAGER_BUILD_ARGS[@]}" .
-    python3 scripts/verify-manager-manifest.py oci "$PREFLIGHT_OCI" \
+    python3 "$TOOL_ROOT/scripts/verify-manager-manifest.py" oci "$PREFLIGHT_OCI" \
       --revision "$COMMIT" --version "${TAG#native-v}" --channel release
   fi
 elif (( !DRY_RUN )); then
@@ -174,21 +185,21 @@ if (( !DRY_RUN )); then
   MANAGER_IMAGE_AMD64="$TEMP/manager-image-amd64.json"
   MANAGER_IMAGE_ARM64="$TEMP/manager-image-arm64.json"
   timeout 2m docker buildx imagetools inspect --raw "$MANAGER_REF" >"$MANAGER_INDEX"
-  MANAGER_DIGEST_AMD64="$(python3 scripts/verify-manager-manifest.py descriptor \
+  MANAGER_DIGEST_AMD64="$(python3 "$TOOL_ROOT/scripts/verify-manager-manifest.py" descriptor \
     "$MANAGER_INDEX" --os linux --arch amd64)"
-  MANAGER_DIGEST_ARM64="$(python3 scripts/verify-manager-manifest.py descriptor \
+  MANAGER_DIGEST_ARM64="$(python3 "$TOOL_ROOT/scripts/verify-manager-manifest.py" descriptor \
     "$MANAGER_INDEX" --os linux --arch arm64)"
   timeout 2m docker buildx imagetools inspect \
     --format '{{json .Image}}' "$MANAGER_REPO@$MANAGER_DIGEST_AMD64" >"$MANAGER_IMAGE_AMD64"
   timeout 2m docker buildx imagetools inspect \
     --format '{{json .Image}}' "$MANAGER_REPO@$MANAGER_DIGEST_ARM64" >"$MANAGER_IMAGE_ARM64"
-  python3 scripts/verify-manager-manifest.py registry "$MANAGER_INDEX" \
+  python3 "$TOOL_ROOT/scripts/verify-manager-manifest.py" registry "$MANAGER_INDEX" \
     --image-amd64 "$MANAGER_IMAGE_AMD64" --image-arm64 "$MANAGER_IMAGE_ARM64" \
     --revision "$COMMIT" --digest "$MANAGER_DIGEST" \
     --version "${TAG#native-v}" --channel release
   timeout 2m docker pull "$MANAGER_REF" >/dev/null
   native_require_release_names_absent "$TEMP" "$REPO" "$TAG"
-  native_require_manager_public "$TEMP" "$MANAGER_OWNER" "$MANAGER_PACKAGE" "$TAG"
+  native_require_manager_public "$TEMP" "$MANAGER_OWNER" "$MANAGER_PACKAGE" "$TAG" "$RELEASE_ROOT"
   mkdir -p "$TEMP/anonymous-docker"
   if ! DOCKER_CONFIG="$TEMP/anonymous-docker" timeout 2m docker pull "$MANAGER_REF" >/dev/null; then
     printf '%s\n' "release: anonymous pull failed for public manager digest $MANAGER_REF" >&2
@@ -212,8 +223,7 @@ for key, expected in required.items():
         raise SystemExit(f"manager label {key}: {labels.get(key)!r} != {expected!r}")
 PY
 
-DIST="$ROOT/dist"
-rm -rf "$DIST"
+DIST="$TEMP/dist"
 mkdir -p "$DIST"
 for pair in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
   os="${pair%/*}"
@@ -242,7 +252,7 @@ case "$(uname -m)" in
 esac
 tar -C "$TEMP" -xzf "$DIST/leash_linux_${HOST_ARCH}.tar.gz"
 chmod +x "$TEMP/leash"
-"$ROOT/scripts/verify-native-release.sh" "$TEMP/leash" "$MANAGER_REF" "$COMMIT"
+"$RELEASE_ROOT/scripts/verify-native-release.sh" "$TEMP/leash" "$MANAGER_REF" "$COMMIT"
 
 if ((DRY_RUN)); then
   printf '%s\n' "release: dry-run verified manager $MANAGER_TAG ($MANAGER_REF) and all CLI archives; no release was published" >&2
@@ -251,6 +261,7 @@ fi
 
 native_require_release_names_absent "$TEMP" "$REPO" "$TAG"
 native_assert_manager_digest "$MANAGER_TAG" "$MANAGER_DIGEST" "$TEMP/manager-final-tag.json"
+native_assert_release_source "$RELEASE_ROOT" "$COMMIT"
 printf '%s\n' "release: publishing $TAG to $REPO only after manager, archive, and E2E verification..." >&2
 gh release create "$TAG" --repo "$REPO" --target "$COMMIT" --title "$TAG" --notes "\
 Leash native release from commit \`$COMMIT\`.
