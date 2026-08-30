@@ -47,10 +47,19 @@ failed before the Git tag or GitHub release existed, an ordinary retry refuses
 the existing manager. Resume that exact release explicitly:
 
 ```bash
-scripts/release.sh --resume-existing-manager native-vX.Y.Z
+scripts/release.sh --resume-existing-manager \
+  --release-source-root /absolute/path/to/clean-source-checkout \
+  native-vX.Y.Z
 ```
 
 Recovery is accepted only while both the Git tag and GitHub release are absent.
+The source root is mandatory, absolute, the exact Git checkout root, and clean.
+Its full HEAD must match the already-published manager revision. Recovery tooling
+and manifest verification come from the current tooling checkout, while manager
+provenance checks, CLI builds, E2E inputs, release target, and stamped revision
+come from the source checkout. Recovery does not generate into or otherwise
+modify that checkout; its required UI, entrypoint, and BPF artifacts must already
+exist. Fresh publication rejects the source-root option.
 It resolves the existing manager tag to one digest, then verifies that digest's
 exact AMD64/ARM64 runnable children, distinct child manifests, architectures,
 full source revision, release version/channel, and manager-contract labels.
@@ -61,7 +70,7 @@ exact resume command:
 
 ```text
 https://github.com/users/sixtoad/packages/container/leash-manager/settings
-scripts/release.sh --resume-existing-manager native-vX.Y.Z
+scripts/release.sh --resume-existing-manager --release-source-root /absolute/path/to/clean-source-checkout native-vX.Y.Z
 ```
 
 After the operator makes it public, recovery proves both authenticated public

@@ -86,7 +86,7 @@ func TestNativeReleaseVisibility(t *testing.T) {
 			temp := t.TempDir()
 			command := exec.Command("bash", "-c", `
 source "$1"
-native_require_manager_public "$2" sixtoad leash-manager native-v0.3.4
+native_require_manager_public "$2" sixtoad leash-manager native-v0.3.4 /release/source
 `, "bash", filepath.Join(repositoryRoot(t), "scripts", "native-release-remote.sh"), temp)
 			command.Env = append(os.Environ(),
 				"PATH="+fakeBin+":"+os.Getenv("PATH"),
@@ -109,7 +109,7 @@ native_require_manager_public "$2" sixtoad leash-manager native-v0.3.4
 			if strings.Contains(string(log), "--method") {
 				t.Fatalf("visibility gate attempted unsupported mutation: %s", log)
 			}
-			if tc.scenario == "private" && !strings.Contains(string(output), "scripts/release.sh --resume-existing-manager native-v0.3.4") {
+			if tc.scenario == "private" && !strings.Contains(string(output), "scripts/release.sh --resume-existing-manager --release-source-root /release/source native-v0.3.4") {
 				t.Fatalf("private-package output lacks exact resume command: %s", output)
 			}
 		})
@@ -193,6 +193,108 @@ native_assert_manager_digest ghcr.io/sixtoad/leash-manager:native-v0.3.4 "$2" "$
 			}
 		})
 	}
+}
+
+func TestNativeReleaseSourceRoot(t *testing.T) {
+	toolingRoot, toolingHead := committedCheckout(t, "tooling")
+	sourceRoot, sourceHead := committedCheckout(t, "source")
+	if toolingHead == sourceHead {
+		t.Fatal("test requires distinct tooling and release-source revisions")
+	}
+
+	tests := []struct {
+		name     string
+		override string
+		resume   string
+		want     string
+		wantErr  string
+	}{
+		{name: "resume selects distinct clean source", override: sourceRoot, resume: "1", want: sourceRoot + "\n"},
+		{name: "resume requires source", resume: "1", wantErr: "requires --release-source-root"},
+		{name: "fresh refuses source override", override: sourceRoot, resume: "0", wantErr: "allowed only with --resume-existing-manager"},
+		{name: "resume refuses tooling checkout as source", override: toolingRoot, resume: "1", wantErr: "must be separate checkouts"},
+		{name: "relative source refused", override: "relative/source", resume: "1", wantErr: "existing absolute directory"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			command := exec.Command("bash", "-c", `
+source "$1"
+native_release_source_root "$2" "$3" "$4"
+`, "bash", filepath.Join(repositoryRoot(t), "scripts", "native-release-remote.sh"), toolingRoot, tc.override, tc.resume)
+			output, err := command.CombinedOutput()
+			if tc.wantErr == "" {
+				if err != nil || string(output) != tc.want {
+					t.Fatalf("source selection: %v, output %q, want %q", err, output, tc.want)
+				}
+				selectedHead := gitOutput(t, tc.override, "rev-parse", "HEAD")
+				if selectedHead != sourceHead || selectedHead == toolingHead {
+					t.Fatalf("selected HEAD = %s, source = %s, tooling = %s", selectedHead, sourceHead, toolingHead)
+				}
+			} else if err == nil || !strings.Contains(string(output), tc.wantErr) {
+				t.Fatalf("source selection output = %q, want failure containing %q", output, tc.wantErr)
+			}
+		})
+	}
+
+	t.Run("dirty source refused", func(t *testing.T) {
+		if err := os.WriteFile(filepath.Join(sourceRoot, "dirty"), []byte("dirty"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		command := exec.Command("bash", "-c", `source "$1"; native_release_source_root "$2" "$3" 1`, "bash",
+			filepath.Join(repositoryRoot(t), "scripts", "native-release-remote.sh"), toolingRoot, sourceRoot)
+		output, err := command.CombinedOutput()
+		if err == nil || !strings.Contains(string(output), "must be clean") {
+			t.Fatalf("dirty source output = %q, want clean-checkout refusal", output)
+		}
+	})
+}
+
+func TestReleaseUsesToolingVerifierAndSourceRevision(t *testing.T) {
+	release := readRepositoryFile(t, "scripts/release.sh")
+	required := []string{
+		`COMMIT="$(git -C "$RELEASE_ROOT" rev-parse HEAD)"`,
+		`python3 "$TOOL_ROOT/scripts/verify-manager-manifest.py" registry`,
+		`"$RELEASE_ROOT/scripts/verify-native-release.sh"`,
+		`gh release create "$TAG" --repo "$REPO" --target "$COMMIT"`,
+		`DIST="$TEMP/dist"`,
+	}
+	for _, fragment := range required {
+		if !strings.Contains(release, fragment) {
+			t.Fatalf("release source/tooling boundary missing %q", fragment)
+		}
+	}
+}
+
+func committedCheckout(t *testing.T, content string) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"config", "user.name", "Release Test"},
+		{"config", "user.email", "release-test@example.invalid"},
+	} {
+		if output, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "source.txt"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"add", "source.txt"}, {"commit", "-qm", "fixture"}} {
+		if output, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, output)
+		}
+	}
+	return dir, gitOutput(t, dir, "rev-parse", "HEAD")
+}
+
+func gitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	output, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
+	}
+	return strings.TrimSpace(string(output))
 }
 
 func fakeGitHubCLI(t *testing.T) (string, string) {
