@@ -185,7 +185,7 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
   "contractVersion": 1,             // current CLI surface
   "minCompatibleContract": 0,       // oldest caller contract still served
   "capabilities": [                 // surface elements a provisioner can drive
-    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json"
+    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume"
   ],
   "os": "linux", "arch": "amd64"    // GOOS / GOARCH
 }
@@ -204,7 +204,7 @@ Value domains a caller must accept rather than reject:
 
 **The `-dirty` marker is best-effort and not guaranteed on any given path.** Today only the Makefile `build` target appends it; `scripts/release.sh`, `scripts/install-leash.sh`, `build/publish-docker.sh` and `.goreleaser.yaml` stamp the bare hash. Its presence means the tree was modified; **its absence is not proof of a clean tree** and must not be treated as a provenance guarantee.
 
-**Compatibility rule.** The contract covers the flags a provisioner drives (`--policy`, `--inject-service`, `--runtime`, `--user`, `--require-lsm`, `--machine-output`) plus the shape of this document. A caller written against contract `C` proceeds iff:
+**Compatibility rule.** The contract covers the flags a provisioner drives (`--policy`, `--inject-service`, `--runtime`, `--user`, `--require-lsm`, `--machine-output`, `--idmap-volume`) plus the shape of this document. A caller written against contract `C` proceeds iff:
 
 ```
 minCompatibleContract <= C <= contractVersion
