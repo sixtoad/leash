@@ -32,6 +32,10 @@ func readRepositoryFile(t *testing.T, path string) string {
 
 func TestManagerTargetConsumesGeneratedBPFArtifacts(t *testing.T) {
 	dockerfile := readRepositoryFile(t, "Dockerfile.leash")
+	if strings.Count(dockerfile, `org.opencontainers.image.version="${VERSION}"`) != 2 ||
+		strings.Contains(dockerfile, `org.opencontainers.image.version="v${VERSION}"`) {
+		t.Fatal("manager OCI labels must preserve the exact release identifier")
+	}
 	if !strings.Contains(dockerfile, "FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS build-base") {
 		t.Fatal("shared manager build-base must execute on BUILDPLATFORM")
 	}
@@ -126,6 +130,11 @@ func TestReleaseGeneratesBeforeBuildAndVerifiesPublishedPlatforms(t *testing.T) 
 	if !strings.Contains(release, "--no-latest") {
 		t.Fatal("release must preserve immutable manager publication without latest")
 	}
+	for _, forbidden := range []string{"allow-legacy-version", "LEGACY_VERSION", "LEGACY_MANAGER"} {
+		if strings.Contains(release, forbidden) {
+			t.Fatalf("release must reject all noncanonical manager labels; found %q", forbidden)
+		}
+	}
 	if !strings.Contains(release, "timeout 10m docker buildx build") ||
 		strings.Count(release, "timeout 2m docker buildx imagetools inspect") != 3 {
 		t.Fatal("local build and registry inspection gates must be bounded")
@@ -162,6 +171,24 @@ func TestVerifyManagerManifest(t *testing.T) {
 				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":100,"platform":{"os":"linux","architecture":"arm64","variant":"v8"}}
 			]}`,
 			images: validManagerImages("test-revision"),
+		},
+		{
+			name: "prefixed legacy version label is rejected",
+			manifest: `{"digest":"` + testDigest + `","manifests":[
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}},
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":100,"platform":{"os":"linux","architecture":"arm64"}}
+			]}`,
+			images:  validManagerImagesWithRelease("test-revision", "vnative-v0.3.4", "release"),
+			wantErr: "org.opencontainers.image.version",
+		},
+		{
+			name: "other version mismatch is rejected",
+			manifest: `{"digest":"` + testDigest + `","manifests":[
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}},
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":100,"platform":{"os":"linux","architecture":"arm64"}}
+			]}`,
+			images:  validManagerImagesWithRelease("test-revision", "native-v0.3.5", "release"),
+			wantErr: "org.opencontainers.image.version",
 		},
 		{
 			name:     "missing arm64",
@@ -231,7 +258,7 @@ func TestVerifyManagerManifest(t *testing.T) {
 				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}},
 				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":100,"platform":{"os":"linux","architecture":"arm64"}}
 			]}`,
-			images:  validManagerImagesWithRelease("test-revision", "v0.3.4", "main"),
+			images:  validManagerImagesWithRelease("test-revision", "native-v0.3.4", "main"),
 			wantErr: "org.opencontainers.image.ref.name",
 		},
 		{
@@ -277,10 +304,11 @@ func TestVerifyManagerManifest(t *testing.T) {
 			if expectedDigest == "" {
 				expectedDigest = fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(tc.manifest)))
 			}
-			cmd := exec.Command("python3", script, "registry", manifestPath,
+			args := []string{"python3", script, "registry", manifestPath,
 				"--image-amd64", amd64Path, "--image-arm64", arm64Path,
 				"--revision", "test-revision", "--digest", expectedDigest,
-				"--version", "0.3.4", "--channel", "release")
+				"--version", "native-v0.3.4", "--channel", "release"}
+			cmd := exec.Command(args[0], args[1:]...)
 			output, err := cmd.CombinedOutput()
 			if tc.wantErr == "" {
 				if err != nil {
@@ -299,7 +327,7 @@ func TestVerifyManagerManifest(t *testing.T) {
 }
 
 func validManagerImages(revision string) string {
-	return validManagerImagesWithRelease(revision, "v0.3.4", "release")
+	return validManagerImagesWithRelease(revision, "native-v0.3.4", "release")
 }
 
 func validManagerImagesWithRelease(revision, version, channel string) string {

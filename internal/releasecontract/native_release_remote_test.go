@@ -8,6 +8,69 @@ import (
 	"testing"
 )
 
+func TestNativeManagerVersionNormalizer(t *testing.T) {
+	for _, tc := range []struct {
+		tag     string
+		want    string
+		wantErr bool
+	}{
+		{tag: "native-v0.3.4", want: "native-v0.3.4\n"},
+		{tag: "v0.3.4", wantErr: true},
+		{tag: "native-v0.3", wantErr: true},
+	} {
+		t.Run(tc.tag, func(t *testing.T) {
+			command := exec.Command("bash", "-c", `source "$1"; native_manager_version "$2"`, "bash",
+				filepath.Join(repositoryRoot(t), "scripts", "native-release-remote.sh"), tc.tag)
+			output, err := command.CombinedOutput()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("normalizer succeeded: %s", output)
+				}
+				return
+			}
+			if err != nil || string(output) != tc.want {
+				t.Fatalf("normalizer: %v, output %q, want %q", err, output, tc.want)
+			}
+		})
+	}
+}
+
+func TestNativePublisherUsesCanonicalLabelVersionWithNativeTag(t *testing.T) {
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(fakeBin, "docker.log")
+	docker := `#!/bin/sh
+printf '%s\n' "$*" >> "$DOCKER_LOG"
+`
+	if err := os.WriteFile(filepath.Join(fakeBin, "docker"), []byte(docker), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("bash", filepath.Join(repositoryRoot(t), "build", "publish-docker.sh"),
+		"--only-leash", "--no-latest", "native-v0.3.4")
+	command.Dir = repositoryRoot(t)
+	command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"), "DOCKER_LOG="+logPath,
+		"LEASH_IMAGE=ghcr.io/sixtoad/leash-manager", "RELEASE_CHANNEL=release")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("publisher: %v\n%s", err, output)
+	}
+	logged, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := string(logged)
+	for _, want := range []string{
+		"-t ghcr.io/sixtoad/leash-manager:native-v0.3.4",
+		"--build-arg VERSION=native-v0.3.4",
+	} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("publisher args %q lack %q", args, want)
+		}
+	}
+	if strings.Contains(args, "VERSION=0.3.4") || strings.Contains(args, "VERSION=v0.3.4") {
+		t.Fatalf("publisher transformed the canonical release identifier: %s", args)
+	}
+}
+
 func TestNativeReleaseRemoteModes(t *testing.T) {
 	tests := []struct {
 		name      string

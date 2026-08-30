@@ -155,9 +155,15 @@ def validate_image_config(
     labels = config.get("Labels")
     if not isinstance(labels, dict):
         raise SystemExit(f"{context}: missing OCI labels")
+    canonical_version_label = version
+    observed_version_label = labels.get("org.opencontainers.image.version")
+    if observed_version_label != canonical_version_label:
+        raise SystemExit(
+            f"{context}: label org.opencontainers.image.version: "
+            f"{observed_version_label!r} != {canonical_version_label!r}"
+        )
     required = {
         "org.opencontainers.image.revision": revision,
-        "org.opencontainers.image.version": f"v{version}",
         "org.opencontainers.image.ref.name": channel,
         "io.leash.manager.contract.version": "1",
         "io.leash.manager.contract.min-compatible": "1",
