@@ -4,12 +4,21 @@
 set -euo pipefail
 
 DRY_RUN=0
-if [ "${1:-}" = "--dry-run" ]; then
-  DRY_RUN=1
+RESUME_EXISTING_MANAGER=0
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --resume-existing-manager) RESUME_EXISTING_MANAGER=1 ;;
+    *) printf '%s\n' "release: unknown option $1" >&2; exit 1 ;;
+  esac
   shift
-fi
+done
 
-TAG="${1:?usage: scripts/release.sh [--dry-run] <native-vX.Y.Z>}"
+TAG="${1:?usage: scripts/release.sh [--dry-run] [--resume-existing-manager] <native-vX.Y.Z>}"
+if [ "$#" -ne 1 ]; then
+  printf '%s\n' "release: usage: scripts/release.sh [--dry-run] [--resume-existing-manager] <native-vX.Y.Z>" >&2
+  exit 1
+fi
 if [[ ! "$TAG" =~ ^native-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   printf '%s\n' "release: tag must match native-vX.Y.Z, got $TAG" >&2
   exit 1
@@ -17,8 +26,17 @@ fi
 
 REPO="${LEASH_REPO:-sixtoad/leash}"
 MANAGER_REPO="ghcr.io/sixtoad/leash-manager"
+MANAGER_OWNER="${MANAGER_REPO#ghcr.io/}"
+MANAGER_OWNER="${MANAGER_OWNER%%/*}"
+MANAGER_PACKAGE="${MANAGER_REPO##*/}"
 ROOT="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
 cd "$ROOT"
+source "$ROOT/scripts/native-release-remote.sh"
+
+if ((DRY_RUN && RESUME_EXISTING_MANAGER)); then
+  printf '%s\n' "release: --resume-existing-manager cannot be combined with --dry-run" >&2
+  exit 1
+fi
 
 if [ -n "$(git status --porcelain)" ]; then
   printf '%s\n' "release: working tree must be clean so CLI and manager provenance name one commit" >&2
@@ -37,36 +55,10 @@ for command in docker git go python3 sha256sum tar; do
 done
 if (( !DRY_RUN )); then
   command -v gh >/dev/null 2>&1 || { printf '%s\n' "release: required command not found: gh" >&2; exit 1; }
-
-  require_github_absent() {
-    local kind="$1"
-    local endpoint="$2"
-    local error_file="$TEMP/github-check.err"
-    if gh api "$endpoint" >/dev/null 2>"$error_file"; then
-      printf '%s\n' "release: refusing to mutate existing $kind $TAG" >&2
-      exit 1
-    fi
-    if ! grep -qi 'HTTP 404' "$error_file"; then
-      cat "$error_file" >&2
-      printf '%s\n' "release: could not prove $kind $TAG is absent" >&2
-      exit 1
-    fi
-  }
-  require_github_absent "Git tag" "/repos/$REPO/git/ref/tags/$TAG"
-  require_github_absent "GitHub release" "/repos/$REPO/releases/tags/$TAG"
-
-  GHCR_TAGS=""
-  if GHCR_TAGS="$(gh api --paginate "/user/packages/container/leash-manager/versions?per_page=100" \
-    --jq ".[] | .metadata.container.tags[]? | select(. == \"$TAG\")" 2>"$TEMP/ghcr-check.err")"; then
-    if [ -n "$GHCR_TAGS" ]; then
-      printf '%s\n' "release: refusing to mutate existing manager tag $MANAGER_TAG" >&2
-      exit 1
-    fi
-  elif ! grep -qi 'HTTP 404' "$TEMP/ghcr-check.err"; then
-    cat "$TEMP/ghcr-check.err" >&2
-    printf '%s\n' "release: could not prove manager tag $MANAGER_TAG is absent" >&2
-    exit 1
-  fi
+  REMOTE_MODE="$(native_remote_mode "$TEMP" "$REPO" "$MANAGER_OWNER" \
+    "$MANAGER_PACKAGE" "$TAG" "$RESUME_EXISTING_MANAGER")" || exit 1
+else
+  REMOTE_MODE=dry-run
 fi
 
 if [ ! -s internal/ui/dist/index.html ] || grep -q '>stub<\|<title>stub' internal/ui/dist/index.html 2>/dev/null; then
@@ -108,18 +100,21 @@ MANAGER_BUILD_ARGS=(
 )
 
 # Validate the exact multi-platform graph, child architectures, labels, and
-# digests before the immutable registry name exists. The subsequent push reuses
-# these BuildKit results and is still verified independently from the registry.
+# digests before a fresh immutable registry name exists. A recovery instead
+# validates the already-published index and never invokes a manager build/push.
 PREFLIGHT_OCI="$TEMP/manager-preflight.oci.tar"
 HAS_BUILDX=0
 if docker buildx version >/dev/null 2>&1; then
   HAS_BUILDX=1
-  printf '%s\n' "release: verifying local multi-arch manager before publication..." >&2
-  timeout 10m docker buildx build \
-    --platform linux/amd64,linux/arm64 \
-    --output "type=oci,dest=$PREFLIGHT_OCI" \
-    "${MANAGER_BUILD_ARGS[@]}" .
-  python3 scripts/verify-manager-manifest.py oci "$PREFLIGHT_OCI" --revision "$COMMIT"
+  if [ "$REMOTE_MODE" != resume ]; then
+    printf '%s\n' "release: verifying local multi-arch manager before publication..." >&2
+    timeout 10m docker buildx build \
+      --platform linux/amd64,linux/arm64 \
+      --output "type=oci,dest=$PREFLIGHT_OCI" \
+      "${MANAGER_BUILD_ARGS[@]}" .
+    python3 scripts/verify-manager-manifest.py oci "$PREFLIGHT_OCI" \
+      --revision "$COMMIT" --version "${TAG#native-v}" --channel release
+  fi
 elif (( !DRY_RUN )); then
   printf '%s\n' "release: Docker Buildx is required for multi-arch publication" >&2
   exit 1
@@ -127,21 +122,9 @@ else
   printf '%s\n' "release: Docker Buildx unavailable; Podman dry-run will verify the host fixture only" >&2
 fi
 
-if ((DRY_RUN)); then
-  LOCAL_MANAGER="localhost/leash-manager-release-test:$TAG"
-  printf '%s\n' "release: building local manager fixture $LOCAL_MANAGER..." >&2
-  BUILD_ARGS=("${MANAGER_BUILD_ARGS[@]}" --tag "$LOCAL_MANAGER" .)
-  if ((HAS_BUILDX)); then
-    docker buildx build --load "${BUILD_ARGS[@]}"
-  else
-    command -v podman >/dev/null 2>&1 || { printf '%s\n' "release: dry-run requires Docker Buildx or Podman" >&2; exit 1; }
-    podman build --format docker "${BUILD_ARGS[@]}"
-    podman save --format docker-archive --output "$TEMP/manager.tar" "$LOCAL_MANAGER"
-    docker load --input "$TEMP/manager.tar" >/dev/null
-  fi
-  MANAGER_DIGEST="$(docker image inspect --format '{{.Id}}' "$LOCAL_MANAGER")"
-  MANAGER_REF="$MANAGER_DIGEST"
-else
+publish_fresh_manager() {
+  native_require_release_names_absent "$TEMP" "$REPO" "$TAG"
+  native_require_manager_absent "$TEMP" "$MANAGER_OWNER" "$MANAGER_PACKAGE" "$TAG"
   printf '%s\n' "release: publishing versioned manager $MANAGER_TAG without a floating tag..." >&2
   METADATA="$TEMP/manager-metadata.json"
   (
@@ -158,23 +141,59 @@ with open(os.environ["METADATA"], encoding="utf-8") as handle:
 print(metadata.get("containerimage.digest", ""), end="")
 PY
 )"
-  [ -n "$MANAGER_DIGEST" ] || { printf '%s\n' "release: manager publication did not return a digest" >&2; exit 1; }
+  [ -n "$MANAGER_DIGEST" ] || { printf '%s\n' "release: manager publication did not return a digest" >&2; return 1; }
+}
+
+resume_existing_manager() {
+  printf '%s\n' "release: safely resuming from existing manager $MANAGER_TAG without build or push..." >&2
+  TAG_MANIFEST="$TEMP/manager-tag.json"
+  MANAGER_DIGEST="$(native_resolve_manager_digest "$MANAGER_TAG" "$TAG_MANIFEST")" || return 1
+}
+
+if ((DRY_RUN)); then
+  LOCAL_MANAGER="localhost/leash-manager-release-test:$TAG"
+  printf '%s\n' "release: building local manager fixture $LOCAL_MANAGER..." >&2
+  BUILD_ARGS=("${MANAGER_BUILD_ARGS[@]}" --tag "$LOCAL_MANAGER" .)
+  if ((HAS_BUILDX)); then
+    docker buildx build --load "${BUILD_ARGS[@]}"
+  else
+    command -v podman >/dev/null 2>&1 || { printf '%s\n' "release: dry-run requires Docker Buildx or Podman" >&2; exit 1; }
+    podman build --format docker "${BUILD_ARGS[@]}"
+    podman save --format docker-archive --output "$TEMP/manager.tar" "$LOCAL_MANAGER"
+    docker load --input "$TEMP/manager.tar" >/dev/null
+  fi
+  MANAGER_DIGEST="$(docker image inspect --format '{{.Id}}' "$LOCAL_MANAGER")"
+  MANAGER_REF="$MANAGER_DIGEST"
+else
+  native_execute_manager_mode "$REMOTE_MODE" publish_fresh_manager resume_existing_manager
+fi
+
+if (( !DRY_RUN )); then
   MANAGER_REF="$MANAGER_REPO@$MANAGER_DIGEST"
   MANAGER_INDEX="$TEMP/manager-index.json"
-  MANAGER_IMAGES="$TEMP/manager-images.json"
+  MANAGER_IMAGE_AMD64="$TEMP/manager-image-amd64.json"
+  MANAGER_IMAGE_ARM64="$TEMP/manager-image-arm64.json"
   timeout 2m docker buildx imagetools inspect --raw "$MANAGER_REF" >"$MANAGER_INDEX"
+  MANAGER_DIGEST_AMD64="$(python3 scripts/verify-manager-manifest.py descriptor \
+    "$MANAGER_INDEX" --os linux --arch amd64)"
+  MANAGER_DIGEST_ARM64="$(python3 scripts/verify-manager-manifest.py descriptor \
+    "$MANAGER_INDEX" --os linux --arch arm64)"
   timeout 2m docker buildx imagetools inspect \
-    --format '{{json .Image}}' "$MANAGER_REF" >"$MANAGER_IMAGES"
+    --format '{{json .Image}}' "$MANAGER_REPO@$MANAGER_DIGEST_AMD64" >"$MANAGER_IMAGE_AMD64"
+  timeout 2m docker buildx imagetools inspect \
+    --format '{{json .Image}}' "$MANAGER_REPO@$MANAGER_DIGEST_ARM64" >"$MANAGER_IMAGE_ARM64"
   python3 scripts/verify-manager-manifest.py registry "$MANAGER_INDEX" \
-    --images "$MANAGER_IMAGES" --revision "$COMMIT"
-  docker pull "$MANAGER_REF" >/dev/null
-  gh api --method PUT "/user/packages/container/leash-manager/visibility" -f visibility=public >/dev/null
-  [ "$(gh api "/user/packages/container/leash-manager" --jq .visibility)" = "public" ] || {
-    printf '%s\n' "release: manager package did not become public" >&2
-    exit 1
-  }
+    --image-amd64 "$MANAGER_IMAGE_AMD64" --image-arm64 "$MANAGER_IMAGE_ARM64" \
+    --revision "$COMMIT" --digest "$MANAGER_DIGEST" \
+    --version "${TAG#native-v}" --channel release
+  timeout 2m docker pull "$MANAGER_REF" >/dev/null
+  native_require_release_names_absent "$TEMP" "$REPO" "$TAG"
+  native_require_manager_public "$TEMP" "$MANAGER_OWNER" "$MANAGER_PACKAGE" "$TAG"
   mkdir -p "$TEMP/anonymous-docker"
-  DOCKER_CONFIG="$TEMP/anonymous-docker" docker pull "$MANAGER_REF" >/dev/null
+  if ! DOCKER_CONFIG="$TEMP/anonymous-docker" timeout 2m docker pull "$MANAGER_REF" >/dev/null; then
+    printf '%s\n' "release: anonymous pull failed for public manager digest $MANAGER_REF" >&2
+    exit 1
+  fi
 fi
 
 LABELS="$(docker image inspect --format '{{json .Config.Labels}}' "$MANAGER_REF")"
@@ -230,6 +249,8 @@ if ((DRY_RUN)); then
   exit 0
 fi
 
+native_require_release_names_absent "$TEMP" "$REPO" "$TAG"
+native_assert_manager_digest "$MANAGER_TAG" "$MANAGER_DIGEST" "$TEMP/manager-final-tag.json"
 printf '%s\n' "release: publishing $TAG to $REPO only after manager, archive, and E2E verification..." >&2
 gh release create "$TAG" --repo "$REPO" --target "$COMMIT" --title "$TAG" --notes "\
 Leash native release from commit \`$COMMIT\`.

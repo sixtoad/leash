@@ -35,13 +35,26 @@ def parse_args() -> argparse.Namespace:
     oci = subparsers.add_parser("oci", help="verify a local OCI archive")
     oci.add_argument("archive", type=Path)
     oci.add_argument("--revision", required=True)
+    oci.add_argument("--version", required=True)
+    oci.add_argument("--channel", required=True)
 
     registry = subparsers.add_parser(
         "registry", help="verify registry index and Buildx image metadata"
     )
     registry.add_argument("manifest", type=Path, help="raw OCI index JSON")
-    registry.add_argument("--images", type=Path, required=True)
+    registry.add_argument("--image-amd64", type=Path, required=True)
+    registry.add_argument("--image-arm64", type=Path, required=True)
     registry.add_argument("--revision", required=True)
+    registry.add_argument("--digest", required=True)
+    registry.add_argument("--version", required=True)
+    registry.add_argument("--channel", required=True)
+
+    descriptor = subparsers.add_parser(
+        "descriptor", help="print one verified platform descriptor digest"
+    )
+    descriptor.add_argument("manifest", type=Path, help="raw OCI index JSON")
+    descriptor.add_argument("--os", required=True)
+    descriptor.add_argument("--arch", required=True)
     return parser.parse_args()
 
 
@@ -70,6 +83,7 @@ def required_descriptors(index: dict[str, Any]) -> dict[tuple[str, str], dict[st
         raise SystemExit("manager manifest: 'manifests' must be an array")
 
     required: dict[tuple[str, str], dict[str, Any]] = {}
+    attestations: list[tuple[int, dict[str, Any]]] = []
     for position, descriptor in enumerate(manifests):
         if not isinstance(descriptor, dict):
             raise SystemExit(f"manager manifest descriptor {position}: expected an object")
@@ -78,8 +92,18 @@ def required_descriptors(index: dict[str, Any]) -> dict[tuple[str, str], dict[st
             raise SystemExit(f"manager manifest descriptor {position}: invalid platform")
         key = (platform.get("os"), platform.get("architecture"))
         if key not in REQUIRED_PLATFORMS:
+            if key == ("unknown", "unknown"):
+                attestations.append((position, descriptor))
+            else:
+                raise SystemExit(
+                    f"manager manifest has unexpected runnable platform {key[0]}/{key[1]}"
+                )
             continue
         context = f"manager manifest {key[0]}/{key[1]}"
+        variant = platform.get("variant")
+        allowed_variants = {None, "v8"} if key == ("linux", "arm64") else {None}
+        if variant not in allowed_variants:
+            raise SystemExit(f"{context}: unsupported platform variant {variant!r}")
         if descriptor.get("mediaType") not in IMAGE_MEDIA_TYPES:
             raise SystemExit(f"{context}: descriptor is not an image manifest")
         descriptor_digest(descriptor, context)
@@ -94,11 +118,32 @@ def required_descriptors(index: dict[str, Any]) -> dict[tuple[str, str], dict[st
     digests = {descriptor["digest"] for descriptor in required.values()}
     if len(digests) != len(REQUIRED_PLATFORMS):
         raise SystemExit("manager manifest required platforms must use distinct images")
+
+    attestation_digests: set[str] = set()
+    for position, descriptor in attestations:
+        context = f"manager attestation descriptor {position}"
+        if descriptor.get("mediaType") not in IMAGE_MEDIA_TYPES:
+            raise SystemExit(f"{context}: descriptor is not an image manifest")
+        descriptor_digest(descriptor, context)
+        if descriptor["digest"] in digests or descriptor["digest"] in attestation_digests:
+            raise SystemExit(f"{context}: descriptor digest is not distinct")
+        attestation_digests.add(descriptor["digest"])
+        annotations = descriptor.get("annotations")
+        if not isinstance(annotations, dict):
+            raise SystemExit(f"{context}: missing attestation annotations")
+        if annotations.get("vnd.docker.reference.type") != "attestation-manifest":
+            raise SystemExit(f"{context}: unknown descriptor identity")
+        if annotations.get("vnd.docker.reference.digest") not in digests:
+            raise SystemExit(f"{context}: does not reference a required platform image")
     return required
 
 
 def validate_image_config(
-    document: dict[str, Any], platform: tuple[str, str], revision: str
+    document: dict[str, Any],
+    platform: tuple[str, str],
+    revision: str,
+    version: str,
+    channel: str,
 ) -> None:
     context = f"manager image {platform[0]}/{platform[1]}"
     observed = (document.get("os"), document.get("architecture"))
@@ -112,6 +157,8 @@ def validate_image_config(
         raise SystemExit(f"{context}: missing OCI labels")
     required = {
         "org.opencontainers.image.revision": revision,
+        "org.opencontainers.image.version": f"v{version}",
+        "org.opencontainers.image.ref.name": channel,
         "io.leash.manager.contract.version": "1",
         "io.leash.manager.contract.min-compatible": "1",
     }
@@ -123,26 +170,25 @@ def validate_image_config(
 
 
 def validate_registry(
-    index: dict[str, Any], images: dict[str, Any], revision: str
+    manifest_path: Path,
+    image_paths: dict[tuple[str, str], Path],
+    revision: str,
+    digest: str,
+    version: str,
+    channel: str,
 ) -> None:
+    if DIGEST_PATTERN.fullmatch(digest) is None:
+        raise SystemExit(f"manager registry: invalid expected digest {digest!r}")
+    observed_digest = f"sha256:{hashlib.sha256(manifest_path.read_bytes()).hexdigest()}"
+    if observed_digest != digest:
+        raise SystemExit(
+            f"manager registry digest {observed_digest!r} != expected {digest!r}"
+        )
+    index = load_json(manifest_path)
     required_descriptors(index)
-    by_platform: dict[tuple[str, str], dict[str, Any]] = {}
-    for key, document in images.items():
-        if not isinstance(document, dict):
-            raise SystemExit(f"manager registry image {key!r}: expected an object")
-        platform = (document.get("os"), document.get("architecture"))
-        if platform in REQUIRED_PLATFORMS:
-            if platform in by_platform:
-                raise SystemExit(
-                    f"manager registry metadata duplicates {platform[0]}/{platform[1]}"
-                )
-            by_platform[platform] = document
-    missing = sorted(REQUIRED_PLATFORMS - by_platform.keys())
-    if missing:
-        rendered = ", ".join(f"{os_name}/{arch}" for os_name, arch in missing)
-        raise SystemExit(f"manager registry metadata missing platform(s): {rendered}")
-    for platform, document in by_platform.items():
-        validate_image_config(document, platform, revision)
+    for platform, path in image_paths.items():
+        document = load_json(path)
+        validate_image_config(document, platform, revision, version, channel)
 
 
 def read_oci_blob(archive: tarfile.TarFile, digest: str, expected_size: int) -> bytes:
@@ -175,7 +221,9 @@ def decode_json(content: bytes, context: str) -> dict[str, Any]:
     return document
 
 
-def validate_oci(archive_path: Path, revision: str) -> None:
+def validate_oci(
+    archive_path: Path, revision: str, version: str, channel: str
+) -> None:
     with tarfile.open(archive_path) as archive:
         index_handle = archive.extractfile("index.json")
         if index_handle is None:
@@ -233,16 +281,30 @@ def validate_oci(archive_path: Path, revision: str) -> None:
                 ),
                 f"OCI image config {platform[0]}/{platform[1]}",
             )
-            validate_image_config(config, platform, revision)
+            validate_image_config(config, platform, revision, version, channel)
 
 
 def main() -> int:
     args = parse_args()
     if args.mode == "oci":
-        validate_oci(args.archive, args.revision)
+        validate_oci(args.archive, args.revision, args.version, args.channel)
+    elif args.mode == "descriptor":
+        descriptors = required_descriptors(load_json(args.manifest))
+        platform = (args.os, args.arch)
+        if platform not in descriptors:
+            raise SystemExit(f"manager manifest missing {args.os}/{args.arch}")
+        print(descriptors[platform]["digest"], end="")
     else:
         validate_registry(
-            load_json(args.manifest), load_json(args.images), args.revision
+            args.manifest,
+            {
+                ("linux", "amd64"): args.image_amd64,
+                ("linux", "arm64"): args.image_arm64,
+            },
+            args.revision,
+            args.digest,
+            args.version,
+            args.channel,
         )
     return 0
 

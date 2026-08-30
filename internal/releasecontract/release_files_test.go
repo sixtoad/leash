@@ -1,6 +1,9 @@
 package releasecontract
 
 import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -124,39 +127,51 @@ func TestReleaseGeneratesBeforeBuildAndVerifiesPublishedPlatforms(t *testing.T) 
 		t.Fatal("release must preserve immutable manager publication without latest")
 	}
 	if !strings.Contains(release, "timeout 10m docker buildx build") ||
-		strings.Count(release, "timeout 2m docker buildx imagetools inspect") != 2 {
+		strings.Count(release, "timeout 2m docker buildx imagetools inspect") != 3 {
 		t.Fatal("local build and registry inspection gates must be bounded")
+	}
+	for _, required := range []string{
+		`--raw "$MANAGER_REF"`,
+		`"$MANAGER_REPO@$MANAGER_DIGEST_AMD64"`,
+		`"$MANAGER_REPO@$MANAGER_DIGEST_ARM64"`,
+		`native_assert_manager_digest "$MANAGER_TAG" "$MANAGER_DIGEST"`,
+	} {
+		if !strings.Contains(release, required) {
+			t.Errorf("release is missing digest-bound recovery gate %q", required)
+		}
 	}
 }
 
 func TestVerifyManagerManifest(t *testing.T) {
 	root := repositoryRoot(t)
 	script := filepath.Join(root, "scripts", "verify-manager-manifest.py")
+	testDigest := "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 
 	tests := []struct {
-		name     string
-		manifest string
-		images   string
-		wantErr  string
+		name           string
+		manifest       string
+		images         string
+		expectedDigest string
+		wantErr        string
 	}{
 		{
 			name: "required platforms plus attestation",
-			manifest: `{"manifests":[
+			manifest: `{"digest":"` + testDigest + `","manifests":[
 				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}},
-				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","size":50,"platform":{"os":"unknown","architecture":"unknown"}},
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","size":50,"annotations":{"vnd.docker.reference.type":"attestation-manifest","vnd.docker.reference.digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"platform":{"os":"unknown","architecture":"unknown"}},
 				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":100,"platform":{"os":"linux","architecture":"arm64","variant":"v8"}}
 			]}`,
 			images: validManagerImages("test-revision"),
 		},
 		{
 			name:     "missing arm64",
-			manifest: `{"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}}]}`,
+			manifest: `{"digest":"` + testDigest + `","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}}]}`,
 			images:   validManagerImages("test-revision"),
 			wantErr:  "manager manifest missing required platform(s): linux/arm64",
 		},
 		{
 			name: "same image for both platforms",
-			manifest: `{"manifests":[
+			manifest: `{"digest":"` + testDigest + `","manifests":[
 				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}},
 				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"arm64"}}
 			]}`,
@@ -165,7 +180,7 @@ func TestVerifyManagerManifest(t *testing.T) {
 		},
 		{
 			name: "descriptor without digest",
-			manifest: `{"manifests":[
+			manifest: `{"digest":"` + testDigest + `","manifests":[
 				{"mediaType":"application/vnd.oci.image.manifest.v1+json","size":100,"platform":{"os":"linux","architecture":"amd64"}},
 				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":100,"platform":{"os":"linux","architecture":"arm64"}}
 			]}`,
@@ -174,12 +189,69 @@ func TestVerifyManagerManifest(t *testing.T) {
 		},
 		{
 			name: "wrong arm64 label",
-			manifest: `{"manifests":[
+			manifest: `{"digest":"` + testDigest + `","manifests":[
 				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}},
 				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":100,"platform":{"os":"linux","architecture":"arm64"}}
 			]}`,
 			images:  validManagerImages("wrong-revision"),
 			wantErr: "org.opencontainers.image.revision",
+		},
+		{
+			name: "unexpected runnable platform",
+			manifest: `{"digest":"` + testDigest + `","manifests":[
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}},
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":100,"platform":{"os":"linux","architecture":"arm64"}},
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","size":100,"platform":{"os":"linux","architecture":"s390x"}}
+			]}`,
+			images:  validManagerImages("test-revision"),
+			wantErr: "unexpected runnable platform linux/s390x",
+		},
+		{
+			name: "wrong index digest",
+			manifest: `{"digest":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","manifests":[
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}},
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":100,"platform":{"os":"linux","architecture":"arm64"}}
+			]}`,
+			images:         validManagerImages("test-revision"),
+			expectedDigest: testDigest,
+			wantErr:        "manager registry digest",
+		},
+		{
+			name: "wrong release version",
+			manifest: `{"digest":"` + testDigest + `","manifests":[
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}},
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":100,"platform":{"os":"linux","architecture":"arm64"}}
+			]}`,
+			images:  validManagerImagesWithRelease("test-revision", "v9.9.9", "release"),
+			wantErr: "org.opencontainers.image.version",
+		},
+		{
+			name: "wrong release channel",
+			manifest: `{"digest":"` + testDigest + `","manifests":[
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}},
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":100,"platform":{"os":"linux","architecture":"arm64"}}
+			]}`,
+			images:  validManagerImagesWithRelease("test-revision", "v0.3.4", "main"),
+			wantErr: "org.opencontainers.image.ref.name",
+		},
+		{
+			name: "invalid arm64 variant",
+			manifest: `{"digest":"` + testDigest + `","manifests":[
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}},
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":100,"platform":{"os":"linux","architecture":"arm64","variant":"v7"}}
+			]}`,
+			images:  validManagerImages("test-revision"),
+			wantErr: "unsupported platform variant",
+		},
+		{
+			name: "unknown descriptor without attestation identity",
+			manifest: `{"digest":"` + testDigest + `","manifests":[
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":100,"platform":{"os":"linux","architecture":"amd64"}},
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","size":100,"platform":{"os":"linux","architecture":"arm64"}},
+				{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","size":50,"platform":{"os":"unknown","architecture":"unknown"}}
+			]}`,
+			images:  validManagerImages("test-revision"),
+			wantErr: "missing attestation annotations",
 		},
 	}
 
@@ -189,12 +261,26 @@ func TestVerifyManagerManifest(t *testing.T) {
 			if err := os.WriteFile(manifestPath, []byte(tc.manifest), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			imagesPath := filepath.Join(t.TempDir(), "images.json")
-			if err := os.WriteFile(imagesPath, []byte(tc.images), 0o600); err != nil {
+			var images map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(tc.images), &images); err != nil {
 				t.Fatal(err)
 			}
+			amd64Path := filepath.Join(t.TempDir(), "amd64.json")
+			arm64Path := filepath.Join(t.TempDir(), "arm64.json")
+			if err := os.WriteFile(amd64Path, images["linux/amd64"], 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(arm64Path, images["linux/arm64"], 0o600); err != nil {
+				t.Fatal(err)
+			}
+			expectedDigest := tc.expectedDigest
+			if expectedDigest == "" {
+				expectedDigest = fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(tc.manifest)))
+			}
 			cmd := exec.Command("python3", script, "registry", manifestPath,
-				"--images", imagesPath, "--revision", "test-revision")
+				"--image-amd64", amd64Path, "--image-arm64", arm64Path,
+				"--revision", "test-revision", "--digest", expectedDigest,
+				"--version", "0.3.4", "--channel", "release")
 			output, err := cmd.CombinedOutput()
 			if tc.wantErr == "" {
 				if err != nil {
@@ -213,13 +299,21 @@ func TestVerifyManagerManifest(t *testing.T) {
 }
 
 func validManagerImages(revision string) string {
+	return validManagerImagesWithRelease(revision, "v0.3.4", "release")
+}
+
+func validManagerImagesWithRelease(revision, version, channel string) string {
 	return `{
 		"linux/amd64":{"architecture":"amd64","os":"linux","config":{"Labels":{
 			"org.opencontainers.image.revision":"` + revision + `",
+			"org.opencontainers.image.version":"` + version + `",
+			"org.opencontainers.image.ref.name":"` + channel + `",
 			"io.leash.manager.contract.version":"1",
 			"io.leash.manager.contract.min-compatible":"1"}}},
 		"linux/arm64":{"architecture":"arm64","os":"linux","config":{"Labels":{
 			"org.opencontainers.image.revision":"` + revision + `",
+			"org.opencontainers.image.version":"` + version + `",
+			"org.opencontainers.image.ref.name":"` + channel + `",
 			"io.leash.manager.contract.version":"1",
 			"io.leash.manager.contract.min-compatible":"1"}}}
 	}`

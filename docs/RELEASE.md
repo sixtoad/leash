@@ -12,8 +12,9 @@ multi-arch manager image at `ghcr.io/sixtoad/leash-manager:<native-tag>`.
 The script enforces this order:
 
 1. Require a clean tree and capture the full source revision.
-2. Build a local AMD64/ARM64 OCI layout and verify both child architectures,
-   revision/contract labels, and content digests before any remote mutation.
+2. For a fresh release, build a local AMD64/ARM64 OCI layout and verify both
+   child architectures, revision/version/channel/contract labels, and content
+   digests before any remote mutation.
 3. Build and publish the versioned manager without updating `latest`, resolve
    its registry digest, and verify the same platform metadata from GHCR.
 4. Build every CLI archive from that revision with
@@ -38,6 +39,35 @@ scripts/release.sh --dry-run native-v0.0.0
 
 The dry run uses a local content-addressed manager image and still executes the
 same archived-binary/no-override E2E. It never creates a tag or release.
+
+### Resume a stranded manager publication
+
+If the immutable manager tag was pushed but a later package-visibility gate
+failed before the Git tag or GitHub release existed, an ordinary retry refuses
+the existing manager. Resume that exact release explicitly:
+
+```bash
+scripts/release.sh --resume-existing-manager native-vX.Y.Z
+```
+
+Recovery is accepted only while both the Git tag and GitHub release are absent.
+It resolves the existing manager tag to one digest, then verifies that digest's
+exact AMD64/ARM64 runnable children, distinct child manifests, architectures,
+full source revision, release version/channel, and manager-contract labels.
+The recovery path never builds, pushes, deletes, mutates, or retags the manager.
+GitHub exposes no supported package-visibility update API. If the package is
+private, release stops before CLI work and prints this settings page plus the
+exact resume command:
+
+```text
+https://github.com/users/sixtoad/packages/container/leash-manager/settings
+scripts/release.sh --resume-existing-manager native-vX.Y.Z
+```
+
+After the operator makes it public, recovery proves both authenticated public
+state and an anonymous digest pull, then preserves the normal archive parity
+and released-binary E2E gates before creating the GitHub release. Any missing
+tag, existing Git tag/release, digest drift, or metadata mismatch fails closed.
 
 The remainder of this document describes the upstream `vX.Y.Z`/npm pipeline.
 
