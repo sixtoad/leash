@@ -13,6 +13,7 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 )
 
@@ -67,11 +68,13 @@ type OpenLsm struct {
 
 	policyRules         []OpenPolicyRule
 	numPolicyRules      int
-	defaultPolicyResult bool       // Default policy result: false=deny, true=allow
+	defaultPolicyResult bool // Default policy result: false=deny, true=allow
+	containerOverlay    bool
 	logMutex            sync.Mutex // Protect concurrent writes to stdout and log file
 
 	// BPF program state
 	ebpfCollection *ebpf.Collection
+	exitTracepoint link.Link
 
 	lastEvent openEventFingerprint
 }
@@ -134,7 +137,7 @@ func (l *OpenLsm) LoadPolicies(policies []OpenPolicyRule) error {
 
 func (l *OpenLsm) LoadAndAttach(loader func() (*ebpf.CollectionSpec, error)) error {
 	config := BPFConfig{
-		ProgramNames: []string{"lsm_open"},
+		ProgramNames: l.requiredProgramNames(),
 		// lsm_link (hard-link guard, audit #3) is best-effort: it needs
 		// CONFIG_SECURITY_PATH and rides the same policy maps, but must never
 		// degrade file-open enforcement if it can't attach on some kernel.
@@ -145,7 +148,33 @@ func (l *OpenLsm) LoadAndAttach(loader func() (*ebpf.CollectionSpec, error)) err
 		StartMessage:         "Successfully started monitoring file opens",
 		ShutdownMessage:      "Shutting down open LSM tracker",
 	}
+	if l.containerOverlay {
+		config.AfterRequiredAttach = l.attachCopyUpExitTracepoint
+	}
 	return LoadAndAttachBPF(l, loader, config)
+}
+
+func (l *OpenLsm) requiredProgramNames() []string {
+	if l.containerOverlay {
+		return []string{"lsm_open", "lsm_mark_overlay_write"}
+	}
+	return []string{"lsm_open"}
+}
+
+func (l *OpenLsm) attachCopyUpExitTracepoint(coll *ebpf.Collection) error {
+	if !l.containerOverlay {
+		return nil
+	}
+	prog := coll.Programs["trace_sys_exit_open"]
+	if prog == nil {
+		return fmt.Errorf("required container copy-up syscall-exit program not found")
+	}
+	tp, err := link.AttachRawTracepoint(link.RawTracepointOptions{Name: "sys_exit", Program: prog})
+	if err != nil {
+		return fmt.Errorf("attach required container copy-up syscall-exit raw tracepoint: %w", err)
+	}
+	l.exitTracepoint = tp
+	return nil
 }
 
 // checkRootPathPolicy checks if the root path "/" is explicitly allowed in the policy rules
@@ -173,6 +202,13 @@ func (l *OpenLsm) loadPolicyIntoBPF(coll *ebpf.Collection) error {
 	}
 	if err := coll.Maps["default_policy"].Put(&key, &defaultResult); err != nil {
 		return fmt.Errorf("failed to update default_policy map: %w", err)
+	}
+	containerOverlay := uint32(0)
+	if l.containerOverlay {
+		containerOverlay = 1
+	}
+	if err := coll.Maps["container_overlay_mode"].Put(&key, &containerOverlay); err != nil {
+		return fmt.Errorf("failed to update container_overlay_mode map: %w", err)
 	}
 
 	if l.numPolicyRules == 0 {

@@ -17,7 +17,8 @@ type LSMManager struct {
 
 	// requireLSM makes an eBPF LSM attach failure fatal instead of degrading to
 	// proxy-only enforcement.
-	requireLSM bool
+	requireLSM      bool
+	containerRootfs bool
 
 	// Active LSM programs
 	openLsm    *OpenLsm
@@ -34,6 +35,12 @@ type LSMManager struct {
 	attachWG        sync.WaitGroup
 	trackOnce       sync.Once
 	settleWatchOnce sync.Once
+}
+
+// SetContainerRootfs enables container layered-root compatibility. Native
+// sessions intentionally leave it disabled and retain actual-user-home policy.
+func (m *LSMManager) SetContainerRootfs(enabled bool) {
+	m.containerRootfs = enabled
 }
 
 func NewLSMManager(cgroupPath string, logger *SharedLogger, requireLSM bool) *LSMManager {
@@ -116,6 +123,7 @@ func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
 		if err != nil {
 			return fmt.Errorf("failed to create file open LSM: %w", err)
 		}
+		m.openLsm.containerOverlay = m.containerRootfs
 
 		// Load policies and start in background
 		if err := m.openLsm.LoadPolicies(ConvertToFileOpenRules(policies.Open)); err != nil {

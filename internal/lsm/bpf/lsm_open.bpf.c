@@ -39,6 +39,7 @@ char LICENSE[] SEC("license") = "GPL";
 // BPF verifier-friendly constant bound for policy rules (max 256 with loop-based implementation)
 #define MAX_POLICY_RULES 256
 #define PROC_SUPER_MAGIC 0x9fa0
+#define OVERLAYFS_SUPER_MAGIC 0x794c7630
 
 // CO-RE flavor for the fields needed from the otherwise forward-declared
 // vfsmount in the generated BTF header.
@@ -125,6 +126,24 @@ struct {
     __type(key, u32);
     __type(value, u32);
 } default_policy SEC(".maps");
+
+// Container image roots use overlayfs. A declared write is first checked on
+// the overlay path, then overlayfs opens backing-store objects while completing
+// that same syscall. Track only that current syscall so those nested opens do
+// not inherit a user-visible path decision beyond the operation boundary.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_ENTRIES);
+    __type(key, u64);
+    __type(value, u8);
+} overlay_write_context SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u32);
+} container_overlay_mode SEC(".maps");
 
 // Helper to check if we're in a target cgroup or descendant
 static __always_inline bool is_target_cgroup()
@@ -387,6 +406,12 @@ int BPF_PROG(lsm_open, struct file *file)
         return 0;
     }
 
+    u64 context_key = bpf_get_current_pid_tgid();
+    u8 *active = bpf_map_lookup_elem(&overlay_write_context, &context_key);
+    if (active) {
+        return 0;
+    }
+
     struct open_event *event;
     char path[MAX_PATH_LEN];
     int policy_result = 0;
@@ -410,7 +435,6 @@ int BPF_PROG(lsm_open, struct file *file)
     // Determine file operation type from file mode
     u32 file_op_type = get_file_operation_type(file);
 
-    // Check policy for this path and operation type
     policy_result = check_path_policy(path, file_op_type);
 
     // Reserve ringbuf space
@@ -453,6 +477,46 @@ int BPF_PROG(lsm_open, struct file *file)
 
     // Return policy decision: 0 = allow, negative = deny
     return policy_result ? 0 : -13; // -EACCES = 13
+}
+
+SEC("lsm/file_open")
+int BPF_PROG(lsm_mark_overlay_write, struct file *file, int ret)
+{
+    if (ret != 0) {
+        return ret;
+    }
+
+    u32 key = 0;
+    u32 *container_mode = bpf_map_lookup_elem(&container_overlay_mode, &key);
+    if (!container_mode || !*container_mode) {
+        return ret;
+    }
+
+    fmode_t mode = BPF_CORE_READ(file, f_mode);
+    if (!(mode & FMODE_WRITE)) {
+        return ret;
+    }
+
+    struct vfsmount___proc *vm = (void *)BPF_CORE_READ(file, f_path.mnt);
+    struct super_block___proc *sb = BPF_CORE_READ(vm, mnt_sb);
+    if (BPF_CORE_READ(sb, s_magic) != OVERLAYFS_SUPER_MAGIC) {
+        return ret;
+    }
+
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u8 correlation = 1;
+    bpf_map_update_elem(&overlay_write_context, &pid_tgid, &correlation, BPF_ANY);
+    return ret;
+}
+
+// The correlation is operation-bounded, not time/counter-bounded: every syscall
+// exit removes it, so a later ordinary open by the same task is checked normally.
+SEC("raw_tracepoint/sys_exit")
+int trace_sys_exit_open(struct bpf_raw_tracepoint_args *ctx)
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    bpf_map_delete_elem(&overlay_write_context, &pid_tgid);
+    return 0;
 }
 
 // --- hard-link guard (audit finding #3) -------------------------------------

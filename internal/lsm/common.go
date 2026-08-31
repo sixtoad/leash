@@ -442,13 +442,14 @@ func validateEventArrays(arrays ...[]byte) bool {
 
 // BPFConfig holds configuration for BPF program attachment
 type BPFConfig struct {
-	ProgramNames         []string // Programs to attach; a failure fails enforcement (caller decides degrade vs --require-lsm)
-	OptionalProgramNames []string // Best-effort programs: a failure degrades only that hook, not the whole enforcement
-	EventMapName         string   // Name of the event ring buffer map
-	AllowedCgroupsMap    string   // Name of the allowed cgroups map
-	TargetCgroupMap      string   // Name of the target cgroup map
-	StartMessage         string   // Success message to display
-	ShutdownMessage      string   // Shutdown message to display
+	ProgramNames         []string                     // Programs to attach; a failure fails enforcement (caller decides degrade vs --require-lsm)
+	OptionalProgramNames []string                     // Best-effort programs: a failure degrades only that hook, not the whole enforcement
+	AfterRequiredAttach  func(*ebpf.Collection) error // Required setup after ordered core attachments, before optional hooks
+	EventMapName         string                       // Name of the event ring buffer map
+	AllowedCgroupsMap    string                       // Name of the allowed cgroups map
+	TargetCgroupMap      string                       // Name of the target cgroup map
+	StartMessage         string                       // Success message to display
+	ShutdownMessage      string                       // Shutdown message to display
 }
 
 // LSMModule interface for modules that can load BPF programs
@@ -594,6 +595,12 @@ func LoadAndAttachBPFWithSetup(
 			return fmt.Errorf("attach %s LSM program (kernel may lack an active bpf LSM): %w", programName, err)
 		}
 		links = append(links, lsmLink)
+	}
+
+	if config.AfterRequiredAttach != nil {
+		if err := config.AfterRequiredAttach(coll); err != nil {
+			return fmt.Errorf("required post-attach setup: %w", err)
+		}
 	}
 
 	// Optional hooks attach best-effort: a failure (e.g. the kernel lacks
