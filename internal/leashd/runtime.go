@@ -414,6 +414,7 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 	reqLSM := strings.TrimSpace(os.Getenv("LEASH_REQUIRE_LSM"))
 	requireLSM := reqLSM == "1" || strings.EqualFold(reqLSM, "true") || strings.EqualFold(reqLSM, "yes")
 	lsmManager := lsm.NewLSMManager(cfg.CgroupPath, logger, requireLSM)
+	lsmManager.SetContainerRootfs(!cfg.HostMode)
 	lsm.BumpMemlockRlimit()
 
 	headerRewriter := proxy.NewHeaderRewriter()
