@@ -11,24 +11,24 @@ import (
 	"github.com/strongdm/leash/internal/lsm"
 )
 
-// Native/host-mode adapter for leashd. It plugs host-mode readiness signaling
-// into the generic lsm settle hook. Kept in its own file so runtime.go (the
-// container/upstream path) carries only a single `if cfg.HostMode { enableHostMode() }`.
+// Readiness adapter for leashd. Both native and container launchers consume the
+// same post-attach marker so neither can release a workload during LSM startup.
 
-// enableHostMode logs host-mode operation and installs the enforcement-ready
-// hook: once the eBPF LSM settles (all programs attached, or degraded), write
-// the marker a native launcher waits on before running the workload
-// (fail-closed).
-func enableHostMode() {
-	log.Printf("leash: host mode (no container) — workload in a systemd scope; enforcement requires CAP_BPF/CAP_NET_ADMIN and an active bpf LSM (see docs/LEASHD-HOST-MODE.md)")
+func enableEnforcementReady() {
 	var once sync.Once
 	lsm.SetEnforcementSettledHook(func() {
 		once.Do(func() { writeEnforcementReadyMarker(getLeashDirFromEnv()) })
 	})
 }
 
-// writeEnforcementReadyMarker writes the enforcement-ready marker — the signal a
-// native launcher waits on before running the workload. Also called on the
+// enableHostMode logs the additional native/host-mode contract. The common
+// readiness hook is installed for every runtime by Main.
+func enableHostMode() {
+	log.Printf("leash: host mode (no container) — workload in a systemd scope; enforcement requires CAP_BPF/CAP_NET_ADMIN and an active bpf LSM (see docs/LEASHD-HOST-MODE.md)")
+}
+
+// writeEnforcementReadyMarker writes the enforcement-ready marker — the signal
+// every launcher waits on before running the workload. Also called on the
 // skip-enforcement path.
 func writeEnforcementReadyMarker(dir string) {
 	if strings.TrimSpace(dir) == "" {

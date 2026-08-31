@@ -94,6 +94,10 @@ func Main(args []string) error {
 	})
 	defer statsig.Stop(context.Background())
 
+	// Every launcher must wait for the same post-attach signal. Container mode
+	// previously observed bootstrap.ready, which is written before the LSM attach
+	// goroutines settle and let the workload race ahead unenforced.
+	enableEnforcementReady()
 	if cfg.HostMode {
 		enableHostMode()
 	}
@@ -111,8 +115,8 @@ func Main(args []string) error {
 		return err
 	}
 
-	if err := clearBootstrapMarker(leashDir); err != nil {
-		return fmt.Errorf("prepare bootstrap marker: %w", err)
+	if err := clearReadyMarkers(leashDir); err != nil {
+		return fmt.Errorf("prepare readiness markers: %w", err)
 	}
 
 	rt, err := initRuntime(cfg, leashDir)
@@ -499,9 +503,7 @@ func (rt *runtimeState) activate() error {
 	if skipEnforcement() {
 		logPolicyEvent("bootstrap.activate", map[string]any{"status": "skipped"})
 		rt.policyReady.Store(true)
-		if rt.cfg != nil && rt.cfg.HostMode {
-			writeEnforcementReadyMarker(getLeashDirFromEnv())
-		}
+		writeEnforcementReadyMarker(getLeashDirFromEnv())
 		waitForShutdown()
 		return nil
 	}
@@ -769,13 +771,15 @@ func applyPolicyToProxy(mitmproxy *proxy.MITMProxy, rules *lsm.PolicySet) {
 
 const proxyMark = "0x2000"
 
-func clearBootstrapMarker(dir string) error {
+func clearReadyMarkers(dir string) error {
 	if dir == "" {
 		dir = "/leash"
 	}
-	marker := filepath.Join(dir, entrypoint.BootstrapReadyFileName)
-	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
-		return err
+	for _, name := range []string{entrypoint.BootstrapReadyFileName, entrypoint.EnforcementReadyFileName} {
+		marker := filepath.Join(dir, name)
+		if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	return nil
 }
