@@ -186,7 +186,7 @@ func (c containerLauncher) WaitReady(ctx context.Context) error {
 	} else if c.r.verbose {
 		c.r.logger.Printf("Leash CA certificate is available at %s\n", caCert)
 	}
-	return c.r.waitForBootstrap(ctx)
+	return c.r.waitForEnforcementReady(ctx)
 }
 
 func (c containerLauncher) Remove(ctx context.Context) {

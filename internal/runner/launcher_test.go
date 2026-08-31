@@ -3,9 +3,13 @@ package runner
 import (
 	"context"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/strongdm/leash/internal/entrypoint"
 )
 
 // recordingRuntime is an in-memory Runtime that records image inspections, so
@@ -64,6 +68,39 @@ func TestContainerLauncherNameTracksRuntime(t *testing.T) {
 func TestCACertPath(t *testing.T) {
 	if got := caCertPath("/share"); got != filepath.Join("/share", "ca-cert.pem") {
 		t.Fatalf("caCertPath = %q", got)
+	}
+}
+
+func TestContainerWaitReadyRequiresPostAttachMarker(t *testing.T) {
+	share := t.TempDir()
+	for _, name := range []string{"ca-cert.pem", entrypoint.BootstrapReadyFileName} {
+		if err := os.WriteFile(filepath.Join(share, name), []byte("ready\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var inspected []string
+	r := &runner{runtime: recordingRuntime{inspected: &inspected}}
+	r.cfg.shareDir = share
+	r.cfg.bootstrapTimeout = 2 * time.Second
+
+	done := make(chan error, 1)
+	go func() { done <- (containerLauncher{r: r}).WaitReady(context.Background()) }()
+	select {
+	case err := <-done:
+		t.Fatalf("WaitReady returned on pre-attach bootstrap marker: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	if err := os.WriteFile(filepath.Join(share, entrypoint.EnforcementReadyFileName), []byte("ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitReady after enforcement marker: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitReady did not observe enforcement marker")
 	}
 }
 

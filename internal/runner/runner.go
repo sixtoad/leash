@@ -2918,8 +2918,8 @@ func (r *runner) waitForFile(path string, attempts int, delay time.Duration) err
 	return fmt.Errorf("file %s not found after waiting", path)
 }
 
-func (r *runner) waitForBootstrap(ctx context.Context) error {
-	marker := filepath.Join(r.cfg.shareDir, entrypoint.BootstrapReadyFileName)
+func (r *runner) waitForEnforcementReady(ctx context.Context) error {
+	marker := filepath.Join(r.cfg.shareDir, entrypoint.EnforcementReadyFileName)
 	deadline := time.Now().Add(r.cfg.bootstrapTimeout)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -2928,9 +2928,9 @@ func (r *runner) waitForBootstrap(ctx context.Context) error {
 		if _, err := os.Stat(marker); err == nil {
 			if r.verbose {
 				if info := describeBootstrapMarker(marker); info != "" {
-					r.diagnosticf("Bootstrap complete (%s)\n", info)
+					r.diagnosticf("Enforcement ready (%s)\n", info)
 				} else {
-					r.diagnosticln("Bootstrap complete.")
+					r.diagnosticln("Enforcement ready.")
 				}
 			}
 			return nil
@@ -2939,23 +2939,23 @@ func (r *runner) waitForBootstrap(ctx context.Context) error {
 		if time.Now().After(deadline) {
 			targetState := r.containerSummary(ctx, r.cfg.targetContainer)
 			leashState := r.containerSummary(ctx, r.cfg.leashContainer)
-			return fmt.Errorf("bootstrap timed out after %s (target=%s, leash=%s). Ensure leash-entry is up to date and policy allows CA installation tooling (/bin/sh, update-ca-certificates).", r.cfg.bootstrapTimeout, targetState, leashState)
+			return fmt.Errorf("enforcement readiness timed out after %s (target=%s, leash=%s)", r.cfg.bootstrapTimeout, targetState, leashState)
 		}
 
 		if state := r.containerSummary(ctx, r.cfg.targetContainer); isTerminalStatus(state) {
 			logs := r.containerLogs(ctx, r.cfg.targetContainer)
 			if logs != "" {
-				return fmt.Errorf("target container terminated before bootstrap completed (state=%s).\nRecent docker logs (%s):\n%s", state, r.cfg.targetContainer, indentLines(logs, "  "))
+				return fmt.Errorf("target container terminated before enforcement was ready (state=%s).\nRecent docker logs (%s):\n%s", state, r.cfg.targetContainer, indentLines(logs, "  "))
 			}
-			return fmt.Errorf("target container terminated before bootstrap completed (state=%s). Inspect docker logs %s", state, r.cfg.targetContainer)
+			return fmt.Errorf("target container terminated before enforcement was ready (state=%s). Inspect docker logs %s", state, r.cfg.targetContainer)
 		}
 
 		if state := r.containerSummary(ctx, r.cfg.leashContainer); isTerminalStatus(state) {
 			logs := r.containerLogs(ctx, r.cfg.leashContainer)
 			if logs != "" {
-				return fmt.Errorf("leash container terminated before bootstrap completed (state=%s).\nRecent docker logs (%s):\n%s", state, r.cfg.leashContainer, indentLines(logs, "  "))
+				return fmt.Errorf("leash container terminated before enforcement was ready (state=%s).\nRecent docker logs (%s):\n%s", state, r.cfg.leashContainer, indentLines(logs, "  "))
 			}
-			return fmt.Errorf("leash container terminated before bootstrap completed (state=%s). Inspect docker logs %s", state, r.cfg.leashContainer)
+			return fmt.Errorf("leash container terminated before enforcement was ready (state=%s). Inspect docker logs %s", state, r.cfg.leashContainer)
 		}
 
 		select {
