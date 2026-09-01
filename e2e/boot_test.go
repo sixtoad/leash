@@ -309,6 +309,140 @@ when { resource in [ Dir::"/tmp/", Dir::"/dev/", Dir::"/proc/", Dir::"/run/", Di
 	}
 }
 
+func TestRunnerDeclaredDirectoryMutations(t *testing.T) {
+	skipUnlessE2E(t)
+	targetImage := strings.TrimSpace(os.Getenv("LEASH_E2E_NONROOT_IMAGE"))
+	managerImage := strings.TrimSpace(os.Getenv("LEASH_E2E_MANAGER_IMAGE"))
+	if targetImage == "" || managerImage == "" {
+		t.Skip("set LEASH_E2E_NONROOT_IMAGE and LEASH_E2E_MANAGER_IMAGE for the directory mutation regression")
+	}
+	fixtureDir := t.TempDir()
+	fixtureImage := fmt.Sprintf("leash-e2e-dir-fixture:%d", time.Now().UnixNano())
+	fixtureDockerfile := fmt.Sprintf(`FROM %s
+USER root
+RUN rm -rf /home/agent/.undeclared /home/agent/.future /home/agent/.npm-renamed /home/agent/escaped && \
+    mkdir -p /home/agent/.npm && chown 1001:1001 /home/agent /home/agent/.npm && \
+    chmod 0700 /home/agent /home/agent/.npm
+USER 1001:1001
+`, targetImage)
+	mustWrite(t, filepath.Join(fixtureDir, "Dockerfile"), []byte(fixtureDockerfile))
+	buildOut, buildExit, buildErr := runDockerCommand(t, 90*time.Second,
+		"build", "-t", fixtureImage, fixtureDir)
+	if buildErr != nil || buildExit != 0 {
+		t.Fatalf("build credential-free UID 1001 fixture: exit=%d err=%v\n%s", buildExit, buildErr, buildOut)
+	}
+	t.Cleanup(func() {
+		_, _, _ = runDockerCommand(t, 30*time.Second, "image", "rm", "-f", fixtureImage)
+		_, exit, _ := runDockerCommand(t, 15*time.Second, "image", "inspect", fixtureImage)
+		if exit == 0 {
+			t.Errorf("fixture image %s remained after cleanup", fixtureImage)
+		}
+	})
+	targetImage = fixtureImage
+
+	bin := ensureLeashBinary(t)
+	root, err := moduleRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyPath := filepath.Join(t.TempDir(), "directory-mutation.cedar")
+	policy := `permit (principal, action in [Action::"FileOpen", Action::"FileOpenReadOnly"], resource)
+when { resource in [ Dir::"/", Dir::"/usr/", Dir::"/lib/", Dir::"/lib64/", Dir::"/bin/", Dir::"/sbin/", Dir::"/etc/", Dir::"/proc/", Dir::"/sys/", Dir::"/dev/", Dir::"/run/", Dir::"/tmp/", Dir::"/leash/", Dir::"/home/agent/.npm/" ] };
+permit (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ Dir::"/tmp/", Dir::"/dev/", Dir::"/proc/", Dir::"/run/", Dir::"/leash/", Dir::"/home/agent/.npm/", Dir::"/home/agent/.future/" ] };`
+	mustWrite(t, policyPath, []byte(policy))
+
+	containerName := fmt.Sprintf("leash-e2e-dir-mutation-%d", time.Now().UnixNano())
+	t.Cleanup(func() {
+		dockerRmForced(t, containerName, containerName+"-leash")
+		for _, name := range []string{containerName, containerName + "-leash"} {
+			_, exit, _ := runDockerCommand(t, 15*time.Second, "inspect", name)
+			if exit == 0 {
+				t.Errorf("container %s remained after cleanup", name)
+			}
+		}
+	})
+	workload := `set -eu
+test "$(id -u)" = 1001
+mkdir /home/agent/.npm/cache
+printf x > /home/agent/.npm/cache/source
+mv /home/agent/.npm/cache/source /home/agent/.npm/cache/renamed
+rm /home/agent/.npm/cache/renamed
+printf y > /home/agent/.npm/cache/boundary-source
+if mv /home/agent/.npm/cache/boundary-source /home/agent/escaped 2>/tmp/leash103-boundary-rename; then
+  echo LEASH103_BOUNDARY_RENAME_ALLOWED
+  exit 46
+fi
+test -f /home/agent/.npm/cache/boundary-source
+rm /home/agent/.npm/cache/boundary-source
+rmdir /home/agent/.npm/cache
+if mkdir /home/agent/.undeclared 2>/tmp/leash103-denial; then
+  echo LEASH103_UNDECLARED_ALLOWED
+  exit 42
+fi
+if rmdir /home/agent/.npm 2>/tmp/leash103-exact-rmdir; then
+  echo LEASH103_EXACT_RMDIR_ALLOWED
+  exit 43
+fi
+if mv /home/agent/.npm /home/agent/.npm-renamed 2>/tmp/leash103-exact-rename; then
+  echo LEASH103_EXACT_RENAME_ALLOWED
+  exit 44
+fi
+if mkdir /home/agent/.future 2>/tmp/leash103-exact-create; then
+  echo LEASH103_EXACT_CREATE_ALLOWED
+  exit 45
+fi
+sleep 1
+echo LEASH103_MUTATIONS_OK`
+	cmd := exec.Command("timeout", "180", bin,
+		"--runtime", "docker", "--require-lsm", "--no-interactive",
+		"--image", targetImage, "--leash-image", managerImage,
+		"--policy", policyPath, "--container-name", containerName,
+		"sh", "-c", workload)
+	cmd.Dir = root
+	workDir := filepath.Join(t.TempDir(), "work")
+	logDir := filepath.Join(workDir, "log")
+	cmd.Env = append(os.Environ(),
+		"LEASH_HOME="+t.TempDir(),
+		"LEASH_WORK_DIR="+workDir,
+		"LEASH_LOG_DIR="+logDir,
+		"LEASH_LISTEN=",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		managerLogs, _, _ := runDockerCommand(t, 15*time.Second, "logs", containerName+"-leash")
+		t.Fatalf("declared directory mutation regression failed: %v\n%s\nmanager logs:\n%s", err, out, managerLogs)
+	}
+	foundOK := false
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.TrimSpace(line) == "LEASH103_MUTATIONS_OK" {
+			foundOK = true
+			break
+		}
+	}
+	if !foundOK {
+		t.Fatalf("unexpected directory mutation result:\n%s", out)
+	}
+	audit, auditErr := os.ReadFile(filepath.Join(logDir, "events.log"))
+	if auditErr != nil {
+		t.Fatalf("read mutation audit: %v", auditErr)
+	}
+	for _, want := range []string{
+		`event=file.mkdir`, `path="/home/agent/.undeclared"`, `decision=denied`,
+		`event=file.rename`, `path="/home/agent/escaped"`,
+	} {
+		if !strings.Contains(string(audit), want) {
+			t.Fatalf("mutation audit missing %q:\n%s", want, audit)
+		}
+	}
+	for _, name := range []string{containerName, containerName + "-leash"} {
+		_, exit, _ := runDockerCommand(t, 15*time.Second, "inspect", name)
+		if exit == 0 {
+			t.Fatalf("container %s remained after directory mutation regression", name)
+		}
+	}
+}
+
 // TestNativeReleaseParity exercises the exact release gate against an already
 // built archive binary and manager ref. scripts/release.sh supplies these values
 // only after it has verified every archive's build metadata; ordinary test runs

@@ -53,7 +53,11 @@ type OpenEvent struct {
 }
 
 const (
-	MaxPolicyRules = 256
+	MaxPolicyRules          = 256
+	mutationOpMkdir  uint32 = 3
+	mutationOpUnlink uint32 = 4
+	mutationOpRmdir  uint32 = 5
+	mutationOpRename uint32 = 6
 	// Note: Policy constants are now defined in common.go
 
 	// duplicateSuppressionWindow limits how long we treat identical payloads as retries.
@@ -155,10 +159,11 @@ func (l *OpenLsm) LoadAndAttach(loader func() (*ebpf.CollectionSpec, error)) err
 }
 
 func (l *OpenLsm) requiredProgramNames() []string {
+	programs := []string{"lsm_open", "lsm_mkdir", "lsm_unlink", "lsm_rmdir", "lsm_rename_source", "lsm_rename_destination"}
 	if l.containerOverlay {
-		return []string{"lsm_open", "lsm_mark_overlay_write"}
+		return append(programs, "lsm_mark_overlay_write")
 	}
-	return []string{"lsm_open"}
+	return programs
 }
 
 func (l *OpenLsm) attachCopyUpExitTracepoint(coll *ebpf.Collection) error {
@@ -300,6 +305,14 @@ func (l *OpenLsm) handleEvent(data []byte) {
 		eventName = "file.open:rw"
 	case uint32(OpOpen):
 		eventName = "file.open"
+	case mutationOpMkdir:
+		eventName = "file.mkdir"
+	case mutationOpUnlink:
+		eventName = "file.unlink"
+	case mutationOpRmdir:
+		eventName = "file.rmdir"
+	case mutationOpRename:
+		eventName = "file.rename"
 	}
 
 	// Format in logfmt (key=value pairs) - matching C version format exactly

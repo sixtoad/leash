@@ -53,12 +53,14 @@ func TestContainerCopyUpContextIsClearedAtSyscallExit(t *testing.T) {
 }
 
 func TestContainerCopyUpAttachmentOrderAndRequiredCleanup(t *testing.T) {
-	if got := (&OpenLsm{}).requiredProgramNames(); !reflect.DeepEqual(got, []string{"lsm_open"}) {
+	want := []string{"lsm_open", "lsm_mkdir", "lsm_unlink", "lsm_rmdir", "lsm_rename_source", "lsm_rename_destination"}
+	if got := (&OpenLsm{}).requiredProgramNames(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("native required programs = %v", got)
 	}
 
 	container := &OpenLsm{containerOverlay: true}
-	if got := container.requiredProgramNames(); !reflect.DeepEqual(got, []string{"lsm_open", "lsm_mark_overlay_write"}) {
+	wantContainer := append(append([]string{}, want...), "lsm_mark_overlay_write")
+	if got := container.requiredProgramNames(); !reflect.DeepEqual(got, wantContainer) {
 		t.Fatalf("container required program order = %v", got)
 	}
 	if err := container.attachCopyUpExitTracepoint(&ebpf.Collection{}); err == nil {
