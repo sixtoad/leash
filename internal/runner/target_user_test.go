@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"reflect"
 	"testing"
@@ -251,7 +252,7 @@ func TestContainerLauncherWorkloadPathsUseCapturedIdentity(t *testing.T) {
 		t.Fatalf("DetectShell argv = %v, want %v", rt.runs[0], wantDetect)
 	}
 
-	_ = l.ExecCommand(context.Background(), "bash", "id", false)
+	_ = l.execCommandWithStdinKind(context.Background(), "bash", "id", false, false)
 	wantNonInteractive := []string{"exec", "-i", "--user", "agent:workers", "-w", "/workspace", "target", "bash", "-lc", "exec id"}
 	if !reflect.DeepEqual(rt.commands[0], wantNonInteractive) {
 		t.Fatalf("non-interactive argv = %v, want %v", rt.commands[0], wantNonInteractive)
@@ -269,6 +270,53 @@ func TestContainerLauncherWorkloadPathsUseCapturedIdentity(t *testing.T) {
 	wantPrecheck := []string{"exec", "-it", "--user", "agent:workers", "-w", "/workspace", "target", "bash", "-lc", "true"}
 	if !reflect.DeepEqual(rt.commands[2], wantPrecheck) {
 		t.Fatalf("precheck argv = %v, want %v", rt.commands[2], wantPrecheck)
+	}
+}
+
+func TestContainerLauncherExecCommandSelectsInputFlag(t *testing.T) {
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer devNull.Close()
+	if containerStdinIsTerminal(devNull) {
+		t.Fatalf("%s is a redirected character device, not a terminal", os.DevNull)
+	}
+
+	tests := []struct {
+		name            string
+		interactive     bool
+		stdinIsTerminal bool
+		wantFlag        string
+	}{
+		{name: "terminal non-interactive", stdinIsTerminal: true},
+		{name: "pipe non-interactive", wantFlag: "-i"},
+		{name: "file non-interactive", wantFlag: "-i"},
+		{name: "redirected character device non-interactive", wantFlag: "-i"},
+		{name: "terminal interactive", interactive: true, stdinIsTerminal: true, wantFlag: "-it"},
+		{name: "non-terminal interactive", interactive: true, wantFlag: "-it"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rt := &identityRecordingRuntime{}
+			r := &runner{
+				runtime:             rt,
+				cfg:                 config{callerDir: "/workspace", targetContainer: "target"},
+				targetContainerUser: "agent",
+			}
+			l := containerLauncher{r: r}
+
+			_ = l.execCommandWithStdinKind(context.Background(), "sh", "cat", tt.interactive, tt.stdinIsTerminal)
+			want := []string{"exec"}
+			if tt.wantFlag != "" {
+				want = append(want, tt.wantFlag)
+			}
+			want = append(want, "--user", "agent", "-w", "/workspace", "target", "sh", "-lc", "exec cat")
+			if !reflect.DeepEqual(rt.commands[0], want) {
+				t.Fatalf("ExecCommand argv = %v, want %v", rt.commands[0], want)
+			}
+		})
 	}
 }
 

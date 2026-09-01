@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"time"
 
 	"github.com/strongdm/leash/internal/leashd/listen"
+	"golang.org/x/term"
 )
 
 // CA-cert readiness wait — extracted verbatim from the previous inline values in
@@ -208,9 +210,23 @@ func (c containerLauncher) DetectShell(ctx context.Context) (string, error) {
 }
 
 func (c containerLauncher) ExecCommand(ctx context.Context, shellBin, cmd string, interactive bool) *exec.Cmd {
+	return c.execCommandWithStdinKind(ctx, shellBin, cmd, interactive, containerStdinIsTerminal(os.Stdin))
+}
+
+func containerStdinIsTerminal(stdin *os.File) bool {
+	return stdin != nil && term.IsTerminal(int(stdin.Fd()))
+}
+
+func (c containerLauncher) execCommandWithStdinKind(ctx context.Context, shellBin, cmd string, interactive, stdinIsTerminal bool) *exec.Cmd {
 	flag := "-i"
 	if interactive {
 		flag = "-it"
+	} else if stdinIsTerminal {
+		// A non-interactive command running on the left side of a pipeline may
+		// belong to a background process group while still inheriting the
+		// controlling terminal. Asking Docker to read it would stop the process
+		// group with SIGTTIN. Pipes and redirected files retain -i below.
+		flag = ""
 	}
 	return c.r.rt().Cmd(ctx, c.r.targetWorkloadExecArgs(flag, shellBin, "-lc", "exec "+cmd)...)
 }
