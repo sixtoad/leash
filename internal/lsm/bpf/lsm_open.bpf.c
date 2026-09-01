@@ -14,6 +14,7 @@ typedef long long __s64;
 typedef __u16 __be16;
 typedef __u32 __be32;
 typedef __u64 __wsum;
+typedef unsigned short umode_t;
 
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -60,6 +61,10 @@ struct mount___proc {
 #define OP_OPEN 0    // open (any mode)
 #define OP_OPEN_RO 1 // open:ro (read-only)
 #define OP_OPEN_RW 2 // open:rw (any write mode)
+#define OP_MKDIR 3
+#define OP_UNLINK 4
+#define OP_RMDIR 5
+#define OP_RENAME 6
 
 struct open_event {
     u32 pid;
@@ -293,6 +298,7 @@ static __noinline int check_path_policy(const char *path, u32 file_op_type)
         return default_ptr ? *default_ptr : 0; // Default to deny if map lookup fails
     }
     if (n > 256) n = 256;
+    bool mutation_allowed = false;
 
     #pragma clang loop unroll(disable)
     for (__u32 i = 0; i < 256; i++) {
@@ -313,14 +319,32 @@ static __noinline int check_path_policy(const char *path, u32 file_op_type)
         // forbidden dir's entries could otherwise be enumerated and an allowed dir
         // wasn't listable.
         bool matches = false;
+        bool directory_self = false;
         if (simple_string_starts_with(path, rule->path, len - 1)) {
             if (path[len - 1] == rule->path[len - 1]) {
                 matches = true;
             } else if (rule->is_directory && path[len - 1] == '\0') {
                 matches = true;
+                directory_self = true;
             }
         }
         if (matches) {
+            // Path-mutation hooks are authorized only by an explicit writable
+            // DIRECTORY rule. A writable File must not implicitly grant
+            // mutation rights on its parent, and a generic read/open allow is
+            // not a directory-write grant. Generic forbids still win.
+            if (file_op_type >= OP_MKDIR) {
+                if (rule->operation == OP_OPEN && rule->action == 0) {
+                    return 0;
+                }
+                if (rule->is_directory && !directory_self && rule->operation == OP_OPEN_RW) {
+                    if (rule->action == 0) {
+                        return 0;
+                    }
+                    mutation_allowed = true;
+                }
+                continue;
+            }
             // Check if operation types match
             if (rule->operation == OP_OPEN) {
                 // "open" matches any file operation type
@@ -333,10 +357,241 @@ static __noinline int check_path_policy(const char *path, u32 file_op_type)
         }
     }
 
-    // No matching rule found, use default policy from userspace
+    // Mutation rights never inherit the shared open default. In particular, a
+    // read/open allow on Dir::"/" may make ordinary opens default-allow, but it
+    // must not authorize writes to every directory. An explicit RW Dir::"/"
+    // still matches directly in the scan above.
+    if (file_op_type >= OP_MKDIR) {
+        return mutation_allowed ? 1 : 0;
+    }
+
+    // No matching open rule found, use default policy from userspace
     key = 0;
     __u32 *default_ptr = bpf_map_lookup_elem(&default_policy, &key);
     return default_ptr ? *default_ptr : 0; // Default to deny if map lookup fails
+}
+
+struct mutation_scratch {
+    char parent[MAX_PATH_LEN];
+    char target[MAX_PATH_LEN];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct mutation_scratch);
+} mutation_scratch_map SEC(".maps");
+
+// path_* hooks receive a trusted parent path plus a child dentry. Build the
+// user-visible absolute target without walking outside that mount.
+static __noinline int build_mutation_path(const struct path *dir, struct dentry *dentry, char *parent, char *target)
+{
+    __builtin_memset(parent, 0, MAX_PATH_LEN);
+    __builtin_memset(target, 0, MAX_PATH_LEN);
+
+    long ret = bpf_d_path((struct path *)dir, parent, MAX_PATH_LEN);
+    if (ret < 1 || ret > MAX_PATH_LEN) {
+        return -1;
+    }
+
+    int parent_len = (int)ret - 1; // bpf_d_path includes NUL
+    __u32 name_len = BPF_CORE_READ(dentry, d_name.len);
+    const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
+    if (parent_len < 1 || name_len == 0 || name_len >= MAX_PATH_LEN) {
+        return -1;
+    }
+
+    bool root = parent_len == 1 && parent[0] == '/';
+    int separator = root ? 0 : 1;
+    if (parent_len + separator + (int)name_len >= MAX_PATH_LEN) {
+        return -1;
+    }
+
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < MAX_PATH_LEN; i++) {
+        if (i >= parent_len) break;
+        target[i & (MAX_PATH_LEN - 1)] = parent[i & (MAX_PATH_LEN - 1)];
+    }
+    if (!root) {
+        target[parent_len & (MAX_PATH_LEN - 1)] = '/';
+    }
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < MAX_PATH_LEN; i++) {
+        if ((__u32)i >= name_len) break;
+        unsigned char c = 0;
+        if (bpf_probe_read_kernel(&c, sizeof(c), name + (i & (MAX_PATH_LEN - 1))) < 0) {
+            return -1;
+        }
+        int dst = parent_len + separator + i;
+        target[dst & (MAX_PATH_LEN - 1)] = c;
+    }
+    return 0;
+}
+
+static __noinline int emit_mutation_decision(const char *path, u32 operation, int allowed)
+{
+    struct open_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+    if (!event) {
+        return allowed ? 0 : -13;
+    }
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    event->pid = pid_tgid >> 32;
+    event->tgid = pid_tgid & 0xFFFFFFFF;
+    event->timestamp = bpf_ktime_get_ns();
+    event->cgroup_id = bpf_get_current_cgroup_id();
+    bpf_get_current_comm(event->comm, sizeof(event->comm));
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < MAX_PATH_LEN; i++) {
+        event->path[i] = path[i];
+        if (path[i] == '\0') break;
+    }
+    event->operation = operation;
+    event->result = allowed ? 0 : -13;
+    bpf_ringbuf_submit(event, 0);
+    return allowed ? 0 : -13;
+}
+
+static const char unresolved_path[] = "<unresolved>";
+
+static __noinline int check_directory_mutation(const struct path *dir, struct dentry *dentry, u32 operation, bool emit_allowed)
+{
+    u32 zero = 0;
+    struct mutation_scratch *scratch = bpf_map_lookup_elem(&mutation_scratch_map, &zero);
+    if (!scratch) {
+        return emit_mutation_decision(unresolved_path, operation, 0);
+    }
+    if (build_mutation_path(dir, dentry, scratch->parent, scratch->target) != 0) {
+        // An unresolved path cannot safely inherit a broader grant, but the
+        // denial must remain actionable to the operator.
+        return emit_mutation_decision(unresolved_path, operation, 0);
+    }
+    int allowed = check_path_policy(scratch->target, operation);
+    if (!allowed || emit_allowed) {
+        return emit_mutation_decision(scratch->target, operation, allowed);
+    }
+    return 0;
+}
+
+static __noinline int emit_current_mutation(u32 operation, int allowed)
+{
+    u32 zero = 0;
+    struct mutation_scratch *scratch = bpf_map_lookup_elem(&mutation_scratch_map, &zero);
+    if (!scratch) {
+        return emit_mutation_decision(unresolved_path, operation, 0);
+    }
+    return emit_mutation_decision(scratch->target, operation, allowed);
+}
+
+// Reuse the #98 operation-bounded overlay correlation: an allowed mutation is
+// first checked at its container-visible overlay path, then overlayfs performs
+// the same mutation against backing-store paths. Mark only the allowed outer
+// operation and let sys_exit clear it; never translate or broadly allow a host
+// backing path.
+#define PF_IO_WORKER 0x00000010
+
+struct task_struct___leash {
+    unsigned int flags;
+} __attribute__((preserve_access_index));
+
+static __always_inline bool current_is_io_worker()
+{
+    struct task_struct___leash *task = (void *)bpf_get_current_task_btf();
+    unsigned int flags = BPF_CORE_READ(task, flags);
+    return (flags & PF_IO_WORKER) != 0;
+}
+
+static __always_inline int mark_allowed_overlay_mutation(const struct path *dir)
+{
+    u32 key = 0;
+    u32 *container_mode = bpf_map_lookup_elem(&container_overlay_mode, &key);
+    if (!container_mode || !*container_mode) return 0;
+    struct vfsmount___proc *vm = (void *)BPF_CORE_READ(dir, mnt);
+    struct super_block___proc *sb = BPF_CORE_READ(vm, mnt_sb);
+    if (BPF_CORE_READ(sb, s_magic) != OVERLAYFS_SUPER_MAGIC) return 0;
+    // io_uring workers may perform an operation without a matching sys_exit in
+    // this task. Refuse correlation rather than leave a reusable bypass entry.
+    if (current_is_io_worker()) return -1;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u8 correlation = 1;
+    if (bpf_map_update_elem(&overlay_write_context, &pid_tgid, &correlation, BPF_ANY) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static __always_inline bool mutation_overlay_context_active()
+{
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (current_is_io_worker()) {
+        bpf_map_delete_elem(&overlay_write_context, &pid_tgid);
+        return false;
+    }
+    return bpf_map_lookup_elem(&overlay_write_context, &pid_tgid) != NULL;
+}
+
+SEC("lsm/path_mkdir")
+int BPF_PROG(lsm_mkdir, const struct path *dir, struct dentry *dentry, umode_t mode, int ret)
+{
+    if (ret != 0) return ret;
+    if (!is_target_cgroup()) return 0;
+    if (mutation_overlay_context_active()) return 0;
+    ret = check_directory_mutation(dir, dentry, OP_MKDIR, false);
+    if (ret != 0) return ret;
+    if (mark_allowed_overlay_mutation(dir) != 0) return emit_current_mutation(OP_MKDIR, 0);
+    return emit_current_mutation(OP_MKDIR, 1);
+}
+
+SEC("lsm/path_unlink")
+int BPF_PROG(lsm_unlink, const struct path *dir, struct dentry *dentry, int ret)
+{
+    if (ret != 0) return ret;
+    if (!is_target_cgroup()) return 0;
+    if (mutation_overlay_context_active()) return 0;
+    ret = check_directory_mutation(dir, dentry, OP_UNLINK, false);
+    if (ret != 0) return ret;
+    if (mark_allowed_overlay_mutation(dir) != 0) return emit_current_mutation(OP_UNLINK, 0);
+    return emit_current_mutation(OP_UNLINK, 1);
+}
+
+SEC("lsm/path_rmdir")
+int BPF_PROG(lsm_rmdir, const struct path *dir, struct dentry *dentry, int ret)
+{
+    if (ret != 0) return ret;
+    if (!is_target_cgroup()) return 0;
+    if (mutation_overlay_context_active()) return 0;
+    ret = check_directory_mutation(dir, dentry, OP_RMDIR, false);
+    if (ret != 0) return ret;
+    if (mark_allowed_overlay_mutation(dir) != 0) return emit_current_mutation(OP_RMDIR, 0);
+    return emit_current_mutation(OP_RMDIR, 1);
+}
+
+SEC("lsm/path_rename")
+int BPF_PROG(lsm_rename_source, const struct path *old_dir, struct dentry *old_dentry,
+             const struct path *new_dir, struct dentry *new_dentry, unsigned int flags, int ret)
+{
+    if (ret != 0) return ret;
+    if (!is_target_cgroup()) return 0;
+    if (mutation_overlay_context_active()) return 0;
+    // A denial is emitted by the shared check; an allow stays silent until the
+    // destination program confirms the other endpoint.
+    return check_directory_mutation(old_dir, old_dentry, OP_RENAME, false);
+}
+
+SEC("lsm/path_rename")
+int BPF_PROG(lsm_rename_destination, const struct path *old_dir, struct dentry *old_dentry,
+             const struct path *new_dir, struct dentry *new_dentry, unsigned int flags, int ret)
+{
+    // Preserve an earlier source denial exactly; do not inspect or audit the
+    // destination as allowed after the operation is already forbidden.
+    if (ret != 0) return ret;
+    if (!is_target_cgroup()) return 0;
+    if (mutation_overlay_context_active()) return 0;
+    ret = check_directory_mutation(new_dir, new_dentry, OP_RENAME, false);
+    if (ret != 0) return ret;
+    if (mark_allowed_overlay_mutation(new_dir) != 0) return emit_current_mutation(OP_RENAME, 0);
+    // Emit one success only after the chained source and destination checks.
+    return emit_current_mutation(OP_RENAME, 1);
 }
 
 // A detached procfs mount has no namespace mountpoint for bpf_d_path to report.
@@ -408,7 +663,9 @@ int BPF_PROG(lsm_open, struct file *file)
 
     u64 context_key = bpf_get_current_pid_tgid();
     u8 *active = bpf_map_lookup_elem(&overlay_write_context, &context_key);
-    if (active) {
+    if (current_is_io_worker()) {
+        bpf_map_delete_elem(&overlay_write_context, &context_key);
+    } else if (active) {
         return 0;
     }
 
@@ -482,9 +739,7 @@ int BPF_PROG(lsm_open, struct file *file)
 SEC("lsm/file_open")
 int BPF_PROG(lsm_mark_overlay_write, struct file *file, int ret)
 {
-    if (ret != 0) {
-        return ret;
-    }
+    if (ret != 0) return ret;
 
     u32 key = 0;
     u32 *container_mode = bpf_map_lookup_elem(&container_overlay_mode, &key);
@@ -504,6 +759,10 @@ int BPF_PROG(lsm_mark_overlay_write, struct file *file, int ret)
     }
 
     u64 pid_tgid = bpf_get_current_pid_tgid();
+    if (current_is_io_worker()) {
+        bpf_map_delete_elem(&overlay_write_context, &pid_tgid);
+        return ret;
+    }
     u8 correlation = 1;
     bpf_map_update_elem(&overlay_write_context, &pid_tgid, &correlation, BPF_ANY);
     return ret;
@@ -603,7 +862,8 @@ static __always_inline int hl_within_len(struct dentry *dentry, struct dentry *m
 // the verifier's budget. Stopping at mnt_root (not the filesystem root) is what
 // makes bind mounts work: a bind mount shares the source dentry tree, so d_parent
 // would otherwise walk past the mount into the source filesystem.
-static __always_inline int hl_build_within(struct dentry *dentry, struct dentry *mnt_root, char *buf)
+static __always_inline int hl_build_within(struct dentry *dentry, struct dentry *mnt_root,
+                                           char *buf)
 {
     int off = MAX_PATH_LEN; // exclusive write cursor, moves down
     struct dentry *d = dentry;
@@ -619,14 +879,17 @@ static __always_inline int hl_build_within(struct dentry *dentry, struct dentry 
         }
         __u32 len = BPF_CORE_READ(d, d_name.len);
         const char *name = (const char *)BPF_CORE_READ(d, d_name.name);
-        if (len == 0 || len > HL_MAX_COMP) {
-            return -1;
+        if (len == 0 || len >= HL_MAX_COMP) {
+            return -2;
         }
         if (off - (int)len - 1 < 1) {
             return -1;
         }
         char comp[HL_MAX_COMP];
-        bpf_probe_read_kernel(comp, len, name);
+        long read = bpf_probe_read_kernel_str(comp, sizeof(comp), name);
+        if (read < 0 || read <= (long)len) {
+            return -2;
+        }
         #pragma clang loop unroll(disable)
         for (int j = 0; j < HL_MAX_COMP; j++) {
             if ((__u32)j >= len) {
@@ -658,7 +921,7 @@ int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, st
     u32 zero = 0;
     struct hl_scratch *s = bpf_map_lookup_elem(&hl_scratch_map, &zero);
     if (!s) {
-        return 0;
+        return -13;
     }
 
     // Hard links are same-mount, so source and destination share this mount root.
@@ -695,6 +958,9 @@ int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, st
     // Source's within-mount path (a file, so always "/..." with len > 1).
     __builtin_memset(s->raw, 0, sizeof(s->raw));
     int sstart = hl_build_within(old_dentry, mnt_root, s->raw);
+    if (sstart == -2) {
+        return -13;
+    }
     if (sstart < 0 || sstart >= MAX_PATH_LEN) {
         return 0;
     }
