@@ -36,6 +36,7 @@ typedef int bool;
 char LICENSE[] SEC("license") = "GPL";
 
 #define MAX_PATH_LEN 256
+#define MAX_POLICY_PATH_LEN 64
 #define MAX_ENTRIES 8192
 // BPF verifier-friendly constant bound for policy rules (max 256 with loop-based implementation)
 #define MAX_POLICY_RULES 256
@@ -86,6 +87,16 @@ struct policy_rule {
     u32 is_directory; // 1 if path ends with /
 };
 
+struct mutation_rule_key {
+    u32 generation;
+    u32 path_len;
+    char path[MAX_POLICY_PATH_LEN];
+};
+
+#define MUTATION_GENERIC_DENY (1U << 0)
+#define MUTATION_RW_DIR_ALLOW (1U << 1)
+#define MUTATION_RW_DIR_DENY (1U << 2)
+
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
     __uint(max_entries, 256 * 1024);
@@ -115,6 +126,23 @@ struct {
     __type(key, u32);
     __type(value, struct policy_rule);
 } policy_rules SEC(".maps");
+
+// Verifier-bounded mutation index derived from policy_rules by userspace. The
+// key retains the existing 64-byte policy-prefix contract; flags aggregate all
+// rules at that exact prefix so denies remain order-independent.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_POLICY_RULES * 2);
+    __type(key, struct mutation_rule_key);
+    __type(value, u32);
+} mutation_rules SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u32);
+} active_mutation_generation SEC(".maps");
 
 // Map to store the number of policy rules
 struct {
@@ -298,8 +326,6 @@ static __noinline int check_path_policy(const char *path, u32 file_op_type)
         return default_ptr ? *default_ptr : 0; // Default to deny if map lookup fails
     }
     if (n > 256) n = 256;
-    bool mutation_allowed = false;
-
     #pragma clang loop unroll(disable)
     for (__u32 i = 0; i < 256; i++) {
         if (i >= n) break;
@@ -329,22 +355,6 @@ static __noinline int check_path_policy(const char *path, u32 file_op_type)
             }
         }
         if (matches) {
-            // Path-mutation hooks are authorized only by an explicit writable
-            // DIRECTORY rule. A writable File must not implicitly grant
-            // mutation rights on its parent, and a generic read/open allow is
-            // not a directory-write grant. Generic forbids still win.
-            if (file_op_type >= OP_MKDIR) {
-                if (rule->operation == OP_OPEN && rule->action == 0) {
-                    return 0;
-                }
-                if (rule->is_directory && !directory_self && rule->operation == OP_OPEN_RW) {
-                    if (rule->action == 0) {
-                        return 0;
-                    }
-                    mutation_allowed = true;
-                }
-                continue;
-            }
             // Check if operation types match
             if (rule->operation == OP_OPEN) {
                 // "open" matches any file operation type
@@ -357,18 +367,65 @@ static __noinline int check_path_policy(const char *path, u32 file_op_type)
         }
     }
 
-    // Mutation rights never inherit the shared open default. In particular, a
-    // read/open allow on Dir::"/" may make ordinary opens default-allow, but it
-    // must not authorize writes to every directory. An explicit RW Dir::"/"
-    // still matches directly in the scan above.
-    if (file_op_type >= OP_MKDIR) {
-        return mutation_allowed ? 1 : 0;
-    }
-
     // No matching open rule found, use default policy from userspace
     key = 0;
     __u32 *default_ptr = bpf_map_lookup_elem(&default_policy, &key);
     return default_ptr ? *default_ptr : 0; // Default to deny if map lookup fails
+}
+
+struct mutation_lookup_scratch {
+    struct mutation_rule_key key;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct mutation_lookup_scratch);
+} mutation_lookup_scratch_map SEC(".maps");
+
+// Evaluate every policy prefix of the target with at most 64 hash lookups,
+// instead of nesting a 64-byte comparison inside a 256-rule scan. Looking up
+// each byte prefix preserves the historical file-rule prefix behavior, while
+// the synthetic trailing slash preserves a directory rule's exact-self deny.
+static __noinline int check_mutation_policy(const char *path)
+{
+    u32 zero = 0;
+    struct mutation_lookup_scratch *scratch = bpf_map_lookup_elem(&mutation_lookup_scratch_map, &zero);
+    if (!scratch) return 0;
+    u32 *active_generation = bpf_map_lookup_elem(&active_mutation_generation, &zero);
+    if (!active_generation) return 0;
+    __builtin_memset(&scratch->key, 0, sizeof(scratch->key));
+    // Read one immutable generation for the whole decision. Userspace stages
+    // the other generation completely before atomically flipping this value.
+    scratch->key.generation = *active_generation;
+    bool mutation_allowed = false;
+
+    #pragma clang loop unroll(disable)
+    for (u32 i = 0; i < MAX_POLICY_PATH_LEN; i++) {
+        char c = path[i];
+        if (c == '\0') {
+            // A directory rule carries a trailing slash but bpf_d_path omits it
+            // for the directory itself. Only its generic deny applies here;
+            // writable-directory authority is descendant-only.
+            scratch->key.path[i] = '/';
+            scratch->key.path_len = i + 1;
+            u32 *self_flags = bpf_map_lookup_elem(&mutation_rules, &scratch->key);
+            if (self_flags && (*self_flags & MUTATION_GENERIC_DENY)) return 0;
+            break;
+        }
+
+        scratch->key.path[i] = c;
+        scratch->key.path_len = i + 1;
+        u32 *flags = bpf_map_lookup_elem(&mutation_rules, &scratch->key);
+        if (!flags) continue;
+        if (*flags & (MUTATION_GENERIC_DENY | MUTATION_RW_DIR_DENY)) return 0;
+        if (*flags & MUTATION_RW_DIR_ALLOW) mutation_allowed = true;
+    }
+
+    // Mutation rights never inherit the shared open default. In particular, a
+    // read/open allow on Dir::"/" must not authorize writes to every directory.
+    return mutation_allowed ? 1 : 0;
 }
 
 struct mutation_scratch {
@@ -466,7 +523,7 @@ static __noinline int check_directory_mutation(const struct path *dir, struct de
         // denial must remain actionable to the operator.
         return emit_mutation_decision(unresolved_path, operation, 0);
     }
-    int allowed = check_path_policy(scratch->target, operation);
+    int allowed = check_mutation_policy(scratch->target);
     if (!allowed || emit_allowed) {
         return emit_mutation_decision(scratch->target, operation, allowed);
     }

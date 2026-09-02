@@ -118,17 +118,24 @@ func TestReleaseGeneratesBeforeBuildAndVerifiesPublishedPlatforms(t *testing.T) 
 	release := readRepositoryFile(t, "scripts/release.sh")
 	generation := strings.Index(release, "make lsm-generate")
 	preflight := strings.Index(release, `verify-manager-manifest.py" oci`)
+	loadGate := strings.Index(release, "release: verifying real host-kernel LSM load before publication")
 	publication := strings.Index(release, "./build/publish-docker.sh")
 	platformGate := strings.Index(release, `verify-manager-manifest.py" registry`)
 	pull := strings.Index(release, "docker pull \"$MANAGER_REF\"")
-	if generation < 0 || preflight < 0 || publication < 0 || platformGate < 0 || pull < 0 {
-		t.Fatalf("release boundary missing: generation=%d preflight=%d publication=%d platformGate=%d pull=%d", generation, preflight, publication, platformGate, pull)
+	if generation < 0 || preflight < 0 || loadGate < 0 || publication < 0 || platformGate < 0 || pull < 0 {
+		t.Fatalf("release boundary missing: generation=%d preflight=%d loadGate=%d publication=%d platformGate=%d pull=%d", generation, preflight, loadGate, publication, platformGate, pull)
 	}
-	if !(generation < preflight && preflight < publication && publication < platformGate && platformGate < pull) {
-		t.Fatalf("release boundary out of order: generation=%d preflight=%d publication=%d platformGate=%d pull=%d", generation, preflight, publication, platformGate, pull)
+	if !(generation < preflight && preflight < loadGate && loadGate < publication && publication < platformGate && platformGate < pull) {
+		t.Fatalf("release boundary out of order: generation=%d preflight=%d loadGate=%d publication=%d platformGate=%d pull=%d", generation, preflight, loadGate, publication, platformGate, pull)
 	}
 	if !strings.Contains(release, "--no-latest") {
 		t.Fatal("release must preserve immutable manager publication without latest")
+	}
+	collisionCheck := strings.Index(release, `docker image inspect "$LOCAL_LOAD_CANDIDATE"`)
+	cleanupOwnership := strings.Index(release, `LOCAL_LOAD_MANAGER="$LOCAL_LOAD_CANDIDATE"`)
+	if collisionCheck < 0 || cleanupOwnership < 0 || collisionCheck > cleanupOwnership ||
+		!strings.Contains(release, `localhost/leash-manager-release-load:${TAG}-${RELEASE_INSTANCE}`) {
+		t.Fatal("local load preflight must use a unique tag and reject collisions before cleanup owns it")
 	}
 	if !strings.Contains(release, `--revision "$COMMIT" --version "$TAG" --channel release`) ||
 		strings.Contains(release, `${TAG#native-v}`) {
