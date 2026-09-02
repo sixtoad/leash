@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -305,6 +306,171 @@ when { resource in [ Dir::"/tmp/", Dir::"/dev/", Dir::"/proc/", Dir::"/run/", Di
 		_, exit, _ := runDockerCommand(t, 15*time.Second, "inspect", name)
 		if exit == 0 {
 			t.Fatalf("container %s remained after successful command", name)
+		}
+	}
+}
+
+func TestRunnerNonRootInteractiveExecAfterIdmapEnforcement(t *testing.T) {
+	skipUnlessE2E(t)
+	targetImage := strings.TrimSpace(os.Getenv("LEASH_E2E_NONROOT_IMAGE"))
+	managerImage := strings.TrimSpace(os.Getenv("LEASH_E2E_MANAGER_IMAGE"))
+	if targetImage == "" || managerImage == "" {
+		t.Skip("set LEASH_E2E_NONROOT_IMAGE and LEASH_E2E_MANAGER_IMAGE for the non-root idmap regression")
+	}
+	if os.Getuid() == 0 || os.Getgid() == 0 {
+		t.Skip("the idmapped source must be owned by a non-root host identity")
+	}
+	if _, err := exec.LookPath("script"); err != nil {
+		t.Skip("script(1) is required to allocate the interactive TTY")
+	}
+
+	bin := ensureLeashBinary(t)
+	root, err := moduleRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	workspaceInfo, err := os.Stat(workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOwner, ok := workspaceInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("workspace ownership is unavailable")
+	}
+	policyPath := filepath.Join(t.TempDir(), "nonroot-idmap.cedar")
+	policy := fmt.Sprintf(`permit (principal, action in [Action::"FileOpen", Action::"FileOpenReadOnly"], resource)
+when { resource in [ Dir::"/usr/", Dir::"/lib/", Dir::"/lib64/", Dir::"/bin/", Dir::"/sbin/", Dir::"/etc/", Dir::"/proc/", Dir::"/sys/", Dir::"/dev/", Dir::"/run/", Dir::"/tmp/", Dir::"/leash/", Dir::%q ] };
+permit (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ Dir::"/tmp/", Dir::"/dev/", Dir::"/proc/", Dir::"/run/", Dir::"/leash/", Dir::%q ] };`, workspace+"/", workspace+"/")
+	mustWrite(t, policyPath, []byte(policy))
+
+	containerName := fmt.Sprintf("leash-e2e-nonroot-idmap-%d", time.Now().UnixNano())
+	t.Cleanup(func() { dockerRmForced(t, containerName, containerName+"-leash") })
+	created := filepath.Join(workspace, "created-by-agent")
+	workload := fmt.Sprintf("set -eu; test \"$(id -u)\" = 1001; test \"$(id -un)\" = agent; test \"$HOME\" = /home/agent; test -w \"$HOME\"; printf LEASH82_IDMAP_OK > %s", shellQuoteForTest(created))
+	args := []string{
+		bin, "--runtime", "docker", "--require-lsm", "--image", targetImage,
+		"--leash-image", managerImage, "--policy", policyPath,
+		"--container-name", containerName,
+		"--idmap-volume", workspace + ":" + workspace,
+		"sh", "-lc", workload,
+	}
+	var quoted []string
+	for _, arg := range args {
+		quoted = append(quoted, shellQuoteForTest(arg))
+	}
+	cmd := exec.Command("timeout", "180", "script", "-qec", strings.Join(quoted, " "), "/dev/null")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(),
+		"LEASH_HOME="+t.TempDir(),
+		"LEASH_WORK_DIR="+filepath.Join(t.TempDir(), "work"),
+		"LEASH_LISTEN=",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("non-root idmapped interactive runner failed: %v\n%s", err, out)
+	}
+	content, err := os.ReadFile(created)
+	if err != nil {
+		t.Fatalf("read idmapped workspace result: %v\n%s", err, out)
+	}
+	if string(content) != "LEASH82_IDMAP_OK" {
+		t.Fatalf("idmapped workspace result = %q, want LEASH82_IDMAP_OK", content)
+	}
+	createdInfo, err := os.Stat(created)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotOwner, ok := createdInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatal("created file ownership is unavailable")
+	}
+	if gotOwner.Uid != wantOwner.Uid || gotOwner.Gid != wantOwner.Gid {
+		t.Fatalf("created file owner = %d:%d, want host owner %d:%d", gotOwner.Uid, gotOwner.Gid, wantOwner.Uid, wantOwner.Gid)
+	}
+	for _, name := range []string{containerName, containerName + "-leash"} {
+		_, exit, _ := runDockerCommand(t, 15*time.Second, "inspect", name)
+		if exit == 0 {
+			t.Fatalf("container %s remained after successful command", name)
+		}
+	}
+}
+
+func TestRunnerNonRootIdmapProcControlsRemainPolicyDenied(t *testing.T) {
+	skipUnlessE2E(t)
+	targetImage := strings.TrimSpace(os.Getenv("LEASH_E2E_NONROOT_IMAGE"))
+	managerImage := strings.TrimSpace(os.Getenv("LEASH_E2E_MANAGER_IMAGE"))
+	if targetImage == "" || managerImage == "" {
+		t.Skip("set LEASH_E2E_NONROOT_IMAGE and LEASH_E2E_MANAGER_IMAGE for the non-root idmap denial control")
+	}
+	if os.Getuid() == 0 || os.Getgid() == 0 {
+		t.Skip("the idmapped source must be owned by a non-root host identity")
+	}
+	if _, err := exec.LookPath("script"); err != nil {
+		t.Skip("script(1) is required to allocate the interactive TTY")
+	}
+
+	bin := ensureLeashBinary(t)
+	root, err := moduleRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspace := t.TempDir()
+	workloadSentinel := filepath.Join(workspace, "workload-started")
+	logDir := filepath.Join(t.TempDir(), "log")
+	policyPath := filepath.Join(t.TempDir(), "nonroot-idmap-deny-proc.cedar")
+	policy := fmt.Sprintf(`permit (principal, action in [Action::"FileOpen", Action::"FileOpenReadOnly"], resource)
+when { resource in [ Dir::"/usr/", Dir::"/lib/", Dir::"/lib64/", Dir::"/bin/", Dir::"/sbin/", Dir::"/etc/", Dir::"/sys/", Dir::"/dev/", Dir::"/run/", Dir::"/tmp/", Dir::"/leash/", File::"/proc/filesystems", File::"/proc/sys/kernel/cap_last_cap", Dir::%q ] };
+permit (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ Dir::"/tmp/", Dir::"/dev/", Dir::"/run/", Dir::"/leash/", Dir::%q ] };`, workspace+"/", workspace+"/")
+	mustWrite(t, policyPath, []byte(policy))
+
+	containerName := fmt.Sprintf("leash-e2e-nonroot-idmap-deny-%d", time.Now().UnixNano())
+	t.Cleanup(func() { dockerRmForced(t, containerName, containerName+"-leash") })
+	args := []string{
+		bin, "--runtime", "docker", "--require-lsm", "--image", targetImage,
+		"--leash-image", managerImage, "--policy", policyPath,
+		"--container-name", containerName,
+		"--idmap-volume", workspace + ":" + workspace,
+		"sh", "-lc", "printf started > " + shellQuoteForTest(workloadSentinel),
+	}
+	var quoted []string
+	for _, arg := range args {
+		quoted = append(quoted, shellQuoteForTest(arg))
+	}
+	cmd := exec.Command("timeout", "180", "script", "-qec", strings.Join(quoted, " "), "/dev/null")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(),
+		"LEASH_HOME="+t.TempDir(),
+		"LEASH_WORK_DIR="+filepath.Join(t.TempDir(), "work"),
+		"LEASH_LOG_DIR="+logDir,
+		"LEASH_LISTEN=",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("runner unexpectedly bypassed procfs deny policy:\n%s", out)
+	}
+	if !strings.Contains(string(out), "permission denied") {
+		t.Fatalf("runner failed without the expected policy denial: %v\n%s", err, out)
+	}
+	if _, statErr := os.Stat(workloadSentinel); !os.IsNotExist(statErr) {
+		t.Fatalf("denied workload unexpectedly started: stat error %v", statErr)
+	}
+	audit, auditErr := os.ReadFile(filepath.Join(logDir, "events.log"))
+	if auditErr != nil {
+		t.Fatalf("read persisted deny audit: %v\n%s", auditErr, out)
+	}
+	auditText := string(audit)
+	if !strings.Contains(auditText, `event=file.open:ro`) ||
+		!strings.Contains(auditText, `path="/proc/`) ||
+		!strings.Contains(auditText, `setgroups" decision=denied`) {
+		t.Fatalf("missing canonical proc setgroups denial audit:\n%s", auditText)
+	}
+	for _, name := range []string{containerName, containerName + "-leash"} {
+		_, exit, _ := runDockerCommand(t, 15*time.Second, "inspect", name)
+		if exit == 0 {
+			t.Fatalf("container %s remained after denied command", name)
 		}
 	}
 }

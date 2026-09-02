@@ -59,14 +59,19 @@ type OpenEvent struct {
 }
 
 const (
-	MaxPolicyRules             = 256
-	mutationOpMkdir     uint32 = 3
-	mutationOpUnlink    uint32 = 4
-	mutationOpRmdir     uint32 = 5
-	mutationOpRename    uint32 = 6
-	mutationGenericDeny uint32 = 1 << 0
-	mutationRWDirAllow  uint32 = 1 << 1
-	mutationRWDirDeny   uint32 = 1 << 2
+	MaxPolicyRules                       = 256
+	openTailCallMapName                  = "open_tail_calls"
+	openTailCallCanonicalizerName        = "lsm_open_canonicalize"
+	openTailCallProgramName              = "lsm_open_policy"
+	openTailCallCanonicalizerSlot        = uint32(0)
+	openTailCallPolicySlot               = uint32(1)
+	mutationOpMkdir               uint32 = 3
+	mutationOpUnlink              uint32 = 4
+	mutationOpRmdir               uint32 = 5
+	mutationOpRename              uint32 = 6
+	mutationGenericDeny           uint32 = 1 << 0
+	mutationRWDirAllow            uint32 = 1 << 1
+	mutationRWDirDeny             uint32 = 1 << 2
 	// Note: Policy constants are now defined in common.go
 
 	// duplicateSuppressionWindow limits how long we treat identical payloads as retries.
@@ -167,7 +172,38 @@ func (l *OpenLsm) LoadAndAttach(loader func() (*ebpf.CollectionSpec, error)) err
 	if l.containerOverlay {
 		config.AfterRequiredAttach = l.attachCopyUpExitTracepoint
 	}
-	return LoadAndAttachBPF(l, loader, config)
+	return LoadAndAttachBPFWithSetup(l, loader, config, populateOpenTailCall)
+}
+
+func populateOpenTailCall(coll *ebpf.Collection) error {
+	if coll == nil {
+		return fmt.Errorf("file-open tail-call collection is nil")
+	}
+	tailCalls := coll.Maps[openTailCallMapName]
+	if tailCalls == nil {
+		return fmt.Errorf("required file-open tail-call map %q not found", openTailCallMapName)
+	}
+	stages := []struct {
+		name    string
+		slot    uint32
+		program *ebpf.Program
+	}{
+		{name: openTailCallCanonicalizerName, slot: openTailCallCanonicalizerSlot},
+		{name: openTailCallProgramName, slot: openTailCallPolicySlot},
+	}
+	for i := range stages {
+		stages[i].program = coll.Programs[stages[i].name]
+		if stages[i].program == nil {
+			return fmt.Errorf("required file-open tail-call program %q not found", stages[i].name)
+		}
+	}
+	for _, stage := range stages {
+		programFD := uint32(stage.program.FD())
+		if err := tailCalls.Put(stage.slot, programFD); err != nil {
+			return fmt.Errorf("populate file-open tail-call slot %d: %w", stage.slot, err)
+		}
+	}
+	return nil
 }
 
 func (l *OpenLsm) requiredProgramNames() []string {

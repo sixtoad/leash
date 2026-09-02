@@ -29,6 +29,7 @@ typedef int bool;
 // BPF map types
 #define BPF_MAP_TYPE_ARRAY 2
 #define BPF_MAP_TYPE_HASH 1
+#define BPF_MAP_TYPE_PROG_ARRAY 3
 #define BPF_MAP_TYPE_RINGBUF 27
 #define BPF_MAP_TYPE_PERCPU_ARRAY 6
 #define BPF_ANY 0
@@ -51,6 +52,7 @@ struct super_block___proc {
 
 struct vfsmount___proc {
     struct super_block___proc *mnt_sb;
+    struct dentry *mnt_root;
 } __attribute__((preserve_access_index));
 
 struct mount___proc {
@@ -653,10 +655,97 @@ int BPF_PROG(lsm_rename_destination, const struct path *old_dir, struct dentry *
 
 // A detached procfs mount has no namespace mountpoint for bpf_d_path to report.
 // runc uses such a mount while preparing a non-root exec, so paths below a PID
-// can arrive as "/<pid>/setgroups" instead of "/proc/<pid>/setgroups". Restore
-// only that trusted procfs PID-tree prefix, then let the ordinary path policy
-// decide; this is path canonicalization, never an unconditional runtime allow.
-static __always_inline bool canonicalize_detached_proc_pid_path(struct file *file, char *path, int path_len)
+// can arrive as "/<pid>/setgroups" instead of "/proc/<pid>/setgroups". An
+// idmapped bind changes the exec mount topology: trusted setgroups and AppArmor
+// exec-control reopens may retain a mount namespace while still resolving
+// relative to the procfs root. Restore only those exact kernel-visible control
+// paths too, then let ordinary policy decide; this is never an allow.
+struct open_path_scratch {
+    int path_len;
+    char path[MAX_PATH_LEN];
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct open_path_scratch);
+} open_path_scratch_map SEC(".maps");
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(max_entries, 2);
+    __type(key, u32);
+    __type(value, u32);
+} open_tail_calls SEC(".maps");
+
+enum proc_component { PROC_SETGROUPS, PROC_EXEC, PROC_APPARMOR, PROC_ATTR, PROC_TASK, PROC_FD };
+
+static __noinline bool proc_name_is(struct dentry *dentry, int component)
+{
+    __u32 len = BPF_CORE_READ(dentry, d_name.len);
+    const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
+    char value[10] = {};
+    if (!name || len == 0 || len > sizeof(value) ||
+        bpf_probe_read_kernel(value, sizeof(value), name) < 0) return false;
+    if (component == PROC_SETGROUPS) return len == 9 && value[0]=='s' && value[1]=='e' && value[2]=='t' && value[3]=='g' && value[4]=='r' && value[5]=='o' && value[6]=='u' && value[7]=='p' && value[8]=='s';
+    if (component == PROC_EXEC) return len == 4 && value[0]=='e' && value[1]=='x' && value[2]=='e' && value[3]=='c';
+    if (component == PROC_APPARMOR) return len == 8 && value[0]=='a' && value[1]=='p' && value[2]=='p' && value[3]=='a' && value[4]=='r' && value[5]=='m' && value[6]=='o' && value[7]=='r';
+    if (component == PROC_ATTR) return len == 4 && value[0]=='a' && value[1]=='t' && value[2]=='t' && value[3]=='r';
+    if (component == PROC_TASK) return len == 4 && value[0]=='t' && value[1]=='a' && value[2]=='s' && value[3]=='k';
+    if (component == PROC_FD) return len == 2 && value[0]=='f' && value[1]=='d';
+    return false;
+}
+
+static __noinline bool proc_name_is_numeric(struct dentry *dentry)
+{
+    __u32 len = BPF_CORE_READ(dentry, d_name.len);
+    const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
+    char value[10] = {};
+    if (!name || len == 0 || len > sizeof(value) ||
+        bpf_probe_read_kernel(value, sizeof(value), name) < 0) return false;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 10; i++) {
+        if (i < len && (value[i] < '0' || value[i] > '9')) return false;
+    }
+    return true;
+}
+
+// Return the exact mount-relative bpf_d_path length (including NUL) for an
+// approved control, or zero for every other ancestry.
+static __noinline int proc_runtime_control_relative_len(struct file *file, struct dentry *root)
+{
+    struct dentry *leaf = BPF_CORE_READ(file, f_path.dentry);
+    struct dentry *parent = BPF_CORE_READ(leaf, d_parent);
+    if (proc_name_is(leaf, PROC_SETGROUPS)) {
+        __u32 pid_len = BPF_CORE_READ(parent, d_name.len);
+        if (proc_name_is_numeric(parent) && BPF_CORE_READ(parent, d_parent) == root)
+            return (int)pid_len + 12; // /<pid>/setgroups plus NUL
+        return 0;
+    }
+    if (proc_name_is(leaf, PROC_FD)) {
+        if (!proc_name_is_numeric(parent)) return 0;
+        __u32 tid_len = BPF_CORE_READ(parent, d_name.len);
+        parent = BPF_CORE_READ(parent, d_parent);
+        if (!proc_name_is(parent, PROC_TASK)) return 0;
+        parent = BPF_CORE_READ(parent, d_parent);
+        __u32 pid_len = BPF_CORE_READ(parent, d_name.len);
+        if (!proc_name_is_numeric(parent) || BPF_CORE_READ(parent, d_parent) != root) return 0;
+        return (int)pid_len + (int)tid_len + 11; // /PID/task/TID/fd plus NUL
+    }
+    if (!proc_name_is(leaf, PROC_EXEC) || !proc_name_is(parent, PROC_APPARMOR)) return 0;
+    parent = BPF_CORE_READ(parent, d_parent);
+    if (!proc_name_is(parent, PROC_ATTR)) return 0;
+    parent = BPF_CORE_READ(parent, d_parent);
+    if (!proc_name_is_numeric(parent)) return 0;
+    __u32 tid_len = BPF_CORE_READ(parent, d_name.len);
+    parent = BPF_CORE_READ(parent, d_parent);
+    if (!proc_name_is(parent, PROC_TASK)) return 0;
+    parent = BPF_CORE_READ(parent, d_parent);
+    __u32 pid_len = BPF_CORE_READ(parent, d_name.len);
+    if (!proc_name_is_numeric(parent) || BPF_CORE_READ(parent, d_parent) != root) return 0;
+    return (int)pid_len + (int)tid_len + 27; // /PID/task/TID/attr/apparmor/exec plus NUL
+}
+
+static __always_inline int canonicalize_proc_runtime_path(struct file *file, char *path, int path_len)
 {
     struct vfsmount___proc *vm = (void *)BPF_CORE_READ(file, f_path.mnt);
     struct super_block___proc *sb = BPF_CORE_READ(vm, mnt_sb);
@@ -665,32 +754,32 @@ static __always_inline bool canonicalize_detached_proc_pid_path(struct file *fil
         return false;
     }
 
-    // A normal procfs mount has namespace ownership and bpf_d_path already
-    // includes its real mountpoint (which may legitimately be numeric). Only an
-    // unattached fsmount has no namespace and needs a synthetic /proc prefix.
+    // A normal procfs mount has namespace ownership and bpf_d_path includes its
+    // real mountpoint (which may legitimately be numeric). Namespace membership
+    // therefore permits only the exact setgroups fallback checked below; a
+    // fully detached fsmount may canonicalize the wider PID subtree.
     unsigned long mnt_offset = bpf_core_field_offset(struct mount___proc, mnt);
     struct mount___proc *mount = (void *)((char *)vm - mnt_offset);
-    if (BPF_CORE_READ(mount, mnt_ns) != NULL) {
-        return false;
-    }
-    if (path[0] != '/' || path[1] < '0' || path[1] > '9') {
-        return false;
-    }
+    bool namespace_detached = BPF_CORE_READ(mount, mnt_ns) == NULL;
 
-    bool pid_component = false;
-    #pragma clang loop unroll(disable)
-    for (int i = 2; i < 24; i++) {
-        char c = path[i];
-        if (c >= '0' && c <= '9') {
-            continue;
+    // Preserve the original broad rewrite for a genuinely detached procfs
+    // mount. Namespace-associated procfs gets only exact trusted ancestry.
+    if (namespace_detached) {
+        if (path[0] != '/' || path[1] < '0' || path[1] > '9') return false;
+        bool pid_component = false;
+        #pragma clang loop unroll(disable)
+        for (int i = 2; i < 24; i++) {
+            char c = path[i];
+            if (c >= '0' && c <= '9') continue;
+            if (c == '/') pid_component = true;
+            break;
         }
-        if (c == '/') {
-            pid_component = true;
-        }
-        break;
-    }
-    if (!pid_component) {
-        return false;
+        if (!pid_component) return false;
+    } else {
+        int relative_len = proc_runtime_control_relative_len(file, BPF_CORE_READ(vm, mnt_root));
+        // Already canonical `/proc/...` is relative_len+5; a custom visible
+        // mountpoint has another length. Neither may be reinterpreted.
+        if (relative_len == 0 || path_len != relative_len) return false;
     }
 
     // bpf_d_path's length includes the NUL. Shift it as well so the canonical
@@ -726,20 +815,56 @@ int BPF_PROG(lsm_open, struct file *file)
         return 0;
     }
 
-    struct open_event *event;
-    char path[MAX_PATH_LEN];
-    int policy_result = 0;
+    u32 zero = 0;
+    struct open_path_scratch *scratch = bpf_map_lookup_elem(&open_path_scratch_map, &zero);
+    if (!scratch) {
+        return -13;
+    }
+    char *path = scratch->path;
 
     // Get file path first - file pointer is already trusted from BPF_PROG macro
-    int ret = bpf_d_path(&file->f_path, path, sizeof(path));
+    int ret = bpf_d_path(&file->f_path, path, MAX_PATH_LEN);
     if (ret < 0) {
         // If d_path fails, try to at least get the filename
         struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
         const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
-        bpf_probe_read_kernel_str(path, sizeof(path), name);
-    } else {
-        canonicalize_detached_proc_pid_path(file, path, ret);
+        ret = bpf_probe_read_kernel_str(path, MAX_PATH_LEN, name);
+        if (ret < 0) {
+            return -13;
+        }
     }
+    scratch->path_len = ret;
+
+    // Canonicalization and policy/audit are each verified separately. An
+    // absent/unpopulated slot must never bypass either stage.
+    bpf_tail_call(ctx, &open_tail_calls, 0);
+    return -13;
+}
+
+SEC("lsm/file_open")
+int BPF_PROG(lsm_open_canonicalize, struct file *file)
+{
+    u32 zero = 0;
+    struct open_path_scratch *scratch = bpf_map_lookup_elem(&open_path_scratch_map, &zero);
+    if (!scratch || scratch->path_len <= 0 || scratch->path_len > MAX_PATH_LEN) {
+        return -13;
+    }
+    char *path = scratch->path;
+    canonicalize_proc_runtime_path(file, path, scratch->path_len);
+
+    bpf_tail_call(ctx, &open_tail_calls, 1);
+    return -13;
+}
+
+SEC("lsm/file_open")
+int BPF_PROG(lsm_open_policy, struct file *file)
+{
+    u32 zero = 0;
+    struct open_path_scratch *scratch = bpf_map_lookup_elem(&open_path_scratch_map, &zero);
+    if (!scratch || scratch->path_len <= 0 || scratch->path_len > MAX_PATH_LEN) {
+        return -13;
+    }
+    char *path = scratch->path;
 
     // Skip logging nsfs (namespace filesystem) paths
     if (is_nsfs_path(path)) {
@@ -749,10 +874,10 @@ int BPF_PROG(lsm_open, struct file *file)
     // Determine file operation type from file mode
     u32 file_op_type = get_file_operation_type(file);
 
-    policy_result = check_path_policy(path, file_op_type);
+    int policy_result = check_path_policy(path, file_op_type);
 
     // Reserve ringbuf space
-    event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+    struct open_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
     if (!event) {
         // Still need to enforce policy even if we can't log
         return policy_result ? 0 : -13; // -EACCES = 13
