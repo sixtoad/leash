@@ -55,7 +55,13 @@ COMMIT="$(git -C "$RELEASE_ROOT" rev-parse HEAD)"
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 MANAGER_TAG="$MANAGER_REPO:$TAG"
 TEMP="$(mktemp -d /tmp/leash-native-release.XXXXXX)"
-cleanup() { rm -rf "$TEMP"; }
+LOCAL_LOAD_MANAGER=""
+cleanup() {
+  if [ -n "$LOCAL_LOAD_MANAGER" ] && command -v docker >/dev/null 2>&1; then
+    docker image rm -f "$LOCAL_LOAD_MANAGER" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$TEMP"
+}
 trap cleanup EXIT
 
 for command in docker git go python3 sha256sum tar; do
@@ -111,6 +117,12 @@ MANAGER_BUILD_ARGS=(
   --build-arg GIT_REMOTE_URL="$(git config --get remote.origin.url 2>/dev/null || echo unknown)"
 )
 
+case "$(uname -m)" in
+  x86_64) HOST_ARCH=amd64 ;;
+  aarch64|arm64) HOST_ARCH=arm64 ;;
+  *) printf '%s\n' "release: unsupported E2E host architecture $(uname -m)" >&2; exit 1 ;;
+esac
+
 # Validate the exact multi-platform graph, child architectures, labels, and
 # digests before a fresh immutable registry name exists. A recovery instead
 # validates the already-published index and never invokes a manager build/push.
@@ -132,6 +144,32 @@ elif (( !DRY_RUN )); then
   exit 1
 else
   printf '%s\n' "release: Docker Buildx unavailable; Podman dry-run will verify the host fixture only" >&2
+fi
+
+# A multi-arch OCI build proves graph and label parity but does not ask the host
+# kernel to verify the embedded BPF programs. Exercise the exact fresh source as
+# a host-arch manager before an immutable registry name can exist. Recovery has
+# an already-published manager and converges on the ordinary post-publish gate.
+if (( !DRY_RUN )) && [ "$REMOTE_MODE" = fresh ]; then
+  RELEASE_INSTANCE="${TEMP##*.}"
+  LOCAL_LOAD_CANDIDATE="localhost/leash-manager-release-load:${TAG}-${RELEASE_INSTANCE}"
+  if docker image inspect "$LOCAL_LOAD_CANDIDATE" >/dev/null 2>&1; then
+    printf '%s\n' "release: refusing to replace pre-existing local preflight image $LOCAL_LOAD_CANDIDATE" >&2
+    exit 1
+  fi
+  # Cleanup owns the tag only after absence has been proven.
+  LOCAL_LOAD_MANAGER="$LOCAL_LOAD_CANDIDATE"
+  LOCAL_LOAD_CLI="$TEMP/leash-load-preflight"
+  printf '%s\n' "release: verifying real host-kernel LSM load before publication..." >&2
+  timeout 3m docker buildx build \
+    --platform "linux/$HOST_ARCH" --load --tag "$LOCAL_LOAD_MANAGER" \
+    "${MANAGER_BUILD_ARGS[@]}" .
+  CGO_ENABLED=0 GOOS=linux GOARCH="$HOST_ARCH" timeout 3m go build \
+    -buildvcs=false -trimpath \
+    -ldflags "-X main.version=$TAG -X main.commit=$COMMIT -X main.buildDate=$DATE -X main.managerImage=$LOCAL_LOAD_MANAGER -X main.managerRevision=$COMMIT -X main.managerContract=1" \
+    -o "$LOCAL_LOAD_CLI" ./cmd/leash
+  timeout 4m "$RELEASE_ROOT/scripts/verify-native-release.sh" \
+    "$LOCAL_LOAD_CLI" "$LOCAL_LOAD_MANAGER" "$COMMIT"
 fi
 
 publish_fresh_manager() {
@@ -246,11 +284,6 @@ for pair in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
 done
 (cd "$DIST" && sha256sum ./*.tar.gz > checksums.txt)
 
-case "$(uname -m)" in
-  x86_64) HOST_ARCH=amd64 ;;
-  aarch64|arm64) HOST_ARCH=arm64 ;;
-  *) printf '%s\n' "release: unsupported E2E host architecture $(uname -m)" >&2; exit 1 ;;
-esac
 tar -C "$TEMP" -xzf "$DIST/leash_linux_${HOST_ARCH}.tar.gz"
 chmod +x "$TEMP/leash"
 "$RELEASE_ROOT/scripts/verify-native-release.sh" "$TEMP/leash" "$MANAGER_REF" "$COMMIT"

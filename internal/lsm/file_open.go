@@ -28,6 +28,12 @@ type OpenPolicyRule struct {
 	IsDirectory uint32
 }
 
+type mutationRuleKey struct {
+	Generation uint32
+	PathLen    uint32
+	Path       [64]byte
+}
+
 type openEventFingerprint struct {
 	valid     bool
 	timestamp uint64
@@ -53,11 +59,14 @@ type OpenEvent struct {
 }
 
 const (
-	MaxPolicyRules          = 256
-	mutationOpMkdir  uint32 = 3
-	mutationOpUnlink uint32 = 4
-	mutationOpRmdir  uint32 = 5
-	mutationOpRename uint32 = 6
+	MaxPolicyRules             = 256
+	mutationOpMkdir     uint32 = 3
+	mutationOpUnlink    uint32 = 4
+	mutationOpRmdir     uint32 = 5
+	mutationOpRename    uint32 = 6
+	mutationGenericDeny uint32 = 1 << 0
+	mutationRWDirAllow  uint32 = 1 << 1
+	mutationRWDirDeny   uint32 = 1 << 2
 	// Note: Policy constants are now defined in common.go
 
 	// duplicateSuppressionWindow limits how long we treat identical payloads as retries.
@@ -110,7 +119,10 @@ func (l *OpenLsm) setEbpfCollection(coll *ebpf.Collection) {
 
 // LoadPolicies loads file open policy rules into the LSM
 func (l *OpenLsm) LoadPolicies(policies []OpenPolicyRule) error {
-	l.policyRules = policies
+	if len(policies) > MaxPolicyRules {
+		return fmt.Errorf("too many file open policy rules: %d exceeds maximum %d", len(policies), MaxPolicyRules)
+	}
+	l.policyRules = append([]OpenPolicyRule(nil), policies...)
 	l.numPolicyRules = len(policies)
 
 	// Sort policy rules by path length (longest first) for specificity
@@ -215,6 +227,18 @@ func (l *OpenLsm) loadPolicyIntoBPF(coll *ebpf.Collection) error {
 	if err := coll.Maps["container_overlay_mode"].Put(&key, &containerOverlay); err != nil {
 		return fmt.Errorf("failed to update container_overlay_mode map: %w", err)
 	}
+	mutationMap := coll.Maps["mutation_rules"]
+	if mutationMap == nil {
+		return fmt.Errorf("required mutation_rules map not found")
+	}
+	activeMutationGeneration := coll.Maps["active_mutation_generation"]
+	if activeMutationGeneration == nil {
+		return fmt.Errorf("required active_mutation_generation map not found")
+	}
+	store := &ebpfMutationRuleStore{rules: mutationMap, active: activeMutationGeneration}
+	if err := replaceMutationRules(store, compileMutationRules(l.policyRules)); err != nil {
+		return fmt.Errorf("failed to update mutation_rules map: %w", err)
+	}
 
 	if l.numPolicyRules == 0 {
 		fmt.Printf("No policy rules to load, using default policy result: %v\n", l.defaultPolicyResult)
@@ -249,6 +273,136 @@ func (l *OpenLsm) loadPolicyIntoBPF(coll *ebpf.Collection) error {
 	}
 
 	// fmt.Printf("Successfully loaded all policy rules into BPF\n")
+	return nil
+}
+
+func compileMutationRules(rules []OpenPolicyRule) map[mutationRuleKey]uint32 {
+	entries := make(map[mutationRuleKey]uint32)
+	for _, rule := range rules {
+		if rule.PathLen == 0 || rule.PathLen > uint32(len(mutationRuleKey{}.Path)) {
+			continue
+		}
+
+		var flags uint32
+		if rule.Operation == OpOpen && rule.Action == PolicyDeny {
+			flags |= mutationGenericDeny
+		}
+		if rule.IsDirectory != 0 && rule.Operation == OpOpenRW {
+			if rule.Action == PolicyDeny {
+				flags |= mutationRWDirDeny
+			} else {
+				flags |= mutationRWDirAllow
+			}
+		}
+		if flags == 0 {
+			continue
+		}
+
+		key := mutationRuleKey{PathLen: rule.PathLen}
+		copy(key.Path[:], rule.Path[:rule.PathLen])
+		entries[key] |= flags
+	}
+	return entries
+}
+
+type mutationRuleStore interface {
+	activeGeneration() (uint32, error)
+	setActiveGeneration(uint32) error
+	listRuleKeys() ([]mutationRuleKey, error)
+	putRule(mutationRuleKey, uint32) error
+	deleteRule(mutationRuleKey) error
+}
+
+type ebpfMutationRuleStore struct {
+	rules  *ebpf.Map
+	active *ebpf.Map
+}
+
+func (s *ebpfMutationRuleStore) activeGeneration() (uint32, error) {
+	key := uint32(0)
+	var generation uint32
+	if err := s.active.Lookup(&key, &generation); err != nil {
+		return 0, err
+	}
+	return generation, nil
+}
+
+func (s *ebpfMutationRuleStore) setActiveGeneration(generation uint32) error {
+	key := uint32(0)
+	return s.active.Put(&key, &generation)
+}
+
+func (s *ebpfMutationRuleStore) listRuleKeys() ([]mutationRuleKey, error) {
+	iterator := s.rules.Iterate()
+	var key mutationRuleKey
+	var value uint32
+	var keys []mutationRuleKey
+	for iterator.Next(&key, &value) {
+		keys = append(keys, key)
+	}
+	if err := iterator.Err(); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+func (s *ebpfMutationRuleStore) putRule(key mutationRuleKey, flags uint32) error {
+	return s.rules.Put(&key, &flags)
+}
+
+func (s *ebpfMutationRuleStore) deleteRule(key mutationRuleKey) error {
+	return s.rules.Delete(&key)
+}
+
+func cleanMutationGeneration(store mutationRuleStore, generation uint32) error {
+	keys, err := store.listRuleKeys()
+	if err != nil {
+		return fmt.Errorf("list generation %d: %w", generation, err)
+	}
+	for _, key := range keys {
+		if key.Generation != generation {
+			continue
+		}
+		if err := store.deleteRule(key); err != nil {
+			return fmt.Errorf("delete generation %d entry: %w", generation, err)
+		}
+	}
+	return nil
+}
+
+func replaceMutationRules(store mutationRuleStore, entries map[mutationRuleKey]uint32) error {
+	active, err := store.activeGeneration()
+	if err != nil {
+		return fmt.Errorf("read active generation: %w", err)
+	}
+	if active > 1 {
+		return fmt.Errorf("invalid active generation %d", active)
+	}
+	inactive := active ^ 1
+	if err := cleanMutationGeneration(store, inactive); err != nil {
+		return fmt.Errorf("prepare inactive generation: %w", err)
+	}
+
+	for key, flags := range entries {
+		key.Generation = inactive
+		if err := store.putRule(key, flags); err != nil {
+			cleanupErr := cleanMutationGeneration(store, inactive)
+			if cleanupErr != nil {
+				return fmt.Errorf("stage generation %d: %w (cleanup failed: %v)", inactive, err, cleanupErr)
+			}
+			return fmt.Errorf("stage generation %d: %w", inactive, err)
+		}
+	}
+	if err := store.setActiveGeneration(inactive); err != nil {
+		cleanupErr := cleanMutationGeneration(store, inactive)
+		if cleanupErr != nil {
+			return fmt.Errorf("activate generation %d: %w (cleanup failed: %v)", inactive, err, cleanupErr)
+		}
+		return fmt.Errorf("activate generation %d: %w", inactive, err)
+	}
+	if err := cleanMutationGeneration(store, active); err != nil {
+		return fmt.Errorf("generation %d active but old generation cleanup failed: %w", inactive, err)
+	}
 	return nil
 }
 
