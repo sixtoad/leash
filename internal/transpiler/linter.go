@@ -5,6 +5,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+
+	"github.com/strongdm/leash/internal/lsm"
 )
 
 // LintSeverity indicates the severity of a lint finding.
@@ -138,8 +140,14 @@ func lintPolicySet(ps *CedarPolicySet) []LintIssue {
 					if r.Type == "Host" {
 						issues = append(issues, LintIssue{PolicyID: p.ID, Severity: LintError, Code: "resource_mismatch", Message: "Host cannot be used with file/exec operations.", Suggestion: "Use File or Dir for file/exec operations."})
 					}
-					if (r.Type == "File" || r.Type == "Dir") && len(r.Value) >= 256 {
-						issues = append(issues, LintIssue{PolicyID: p.ID, Severity: LintError, Code: "path_too_long", Message: fmt.Sprintf("Path length %d exceeds 255 bytes.", len(r.Value)), Suggestion: "Shorten the path or target a higher-level directory."})
+					if r.Type == "File" || r.Type == "Dir" {
+						normalizedLength := len(r.Value)
+						if r.Type == "Dir" && !strings.HasSuffix(r.Value, "/") {
+							normalizedLength++
+						}
+						if normalizedLength > lsm.MaxPolicyPathLength {
+							issues = append(issues, LintIssue{PolicyID: p.ID, Severity: LintError, Code: "path_too_long", Message: fmt.Sprintf("Normalized path length %d exceeds %d bytes.", normalizedLength, lsm.MaxPolicyPathLength), Suggestion: "Shorten the path or target a higher-level directory."})
+						}
 					}
 					if r.Type == "Dir" && !strings.HasSuffix(r.Value, "/") {
 						issues = append(issues, LintIssue{PolicyID: p.ID, Severity: LintWarning, Code: "dir_missing_trailing_slash", Message: "Directory resources should end with '/'.", Suggestion: "Append '/' to indicate recursive coverage."})

@@ -1,6 +1,12 @@
 package transpiler
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/strongdm/leash/internal/lsm"
+)
 
 func TestLint_MissingAction(t *testing.T) {
 	cedar := `
@@ -121,5 +127,31 @@ when { resource in [ MCP::Server::"mcp.context7.com" ] };`
 		if it.Severity == LintError {
 			t.Fatalf("expected no lint errors, found %+v", rep.Issues)
 		}
+	}
+}
+
+func TestLint_DirectoryLengthIncludesNormalizedSlash(t *testing.T) {
+	path := "/" + strings.Repeat("d", lsm.MaxPolicyPathLength-1)
+	cedar := fmt.Sprintf(`permit (principal, action == Action::"FileOpen", resource == Dir::%q);`, path)
+	report, err := LintFromString(cedar)
+	if err != nil {
+		t.Fatalf("lint parse failed: %v", err)
+	}
+
+	foundLengthError := false
+	foundSlashWarning := false
+	for _, issue := range report.Issues {
+		if issue.Code == "path_too_long" && issue.Severity == LintError {
+			foundLengthError = true
+		}
+		if issue.Code == "dir_missing_trailing_slash" && issue.Severity == LintWarning {
+			foundSlashWarning = true
+		}
+	}
+	if !foundLengthError {
+		t.Fatalf("expected normalized directory path_too_long error, got %+v", report.Issues)
+	}
+	if !foundSlashWarning {
+		t.Fatalf("expected trailing-slash warning alongside length error, got %+v", report.Issues)
 	}
 }

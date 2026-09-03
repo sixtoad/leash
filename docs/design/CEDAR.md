@@ -125,6 +125,7 @@ Leash IR and logs use stable operation strings. Actions map as follows:
 
 Notes:
 - Directory resources must end with `/`. The transpiler normalises this; the linter warns when missing.
+- `FileOpen` file and directory resource paths may contain at most 255 bytes; parsers and loaders reject a longer individual rule.
 - IPv6 literals and CIDR are not supported in v1 policies.
 - Hostname rules require the Leash proxy for hostname enforcement (kernel enforces IP only).
 

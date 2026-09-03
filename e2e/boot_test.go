@@ -397,6 +397,150 @@ when { resource in [ Dir::"/tmp/", Dir::"/dev/", Dir::"/proc/", Dir::"/run/", Di
 	}
 }
 
+func TestRunnerLongFilePolicyEnforcement(t *testing.T) {
+	skipUnlessE2E(t)
+	targetImage := strings.TrimSpace(os.Getenv("LEASH_E2E_NONROOT_IMAGE"))
+	managerImage := strings.TrimSpace(os.Getenv("LEASH_E2E_MANAGER_IMAGE"))
+	if targetImage == "" || managerImage == "" {
+		t.Skip("set LEASH_E2E_NONROOT_IMAGE and LEASH_E2E_MANAGER_IMAGE for the long file-policy regression")
+	}
+	if os.Getuid() == 0 || os.Getgid() == 0 {
+		t.Skip("the idmapped source must be owned by a non-root host identity")
+	}
+	if _, err := exec.LookPath("script"); err != nil {
+		t.Skip("script(1) is required to allocate the interactive TTY")
+	}
+
+	bin := ensureLeashBinary(t)
+	root, err := moduleRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostDir := t.TempDir()
+	containerDir := "/home/agent/" + strings.Repeat("long-policy-segment-", 4)
+	allowedPath := filepath.Join(containerDir, "allowed.txt")
+	blockedPath := filepath.Join(containerDir, "blocked.txt")
+	if len(allowedPath) <= 64 || len(blockedPath) > maxPolicyPathBytesForTest {
+		t.Fatalf("test paths outside required long-path range: allowed=%d blocked=%d", len(allowedPath), len(blockedPath))
+	}
+
+	type policyCase struct {
+		name          string
+		writeRules    string
+		blockedMarker string
+	}
+	cases := []policyCase{
+		{
+			name: "long-forbid-overrides-parent-permit",
+			writeRules: fmt.Sprintf(`permit (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ Dir::%q ] };
+forbid (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ File::%q ] };`, containerDir+"/", blockedPath),
+			blockedMarker: "FORBID",
+		},
+		{
+			name: "long-exact-permit-does-not-authorize-sibling",
+			writeRules: fmt.Sprintf(`permit (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ File::%q ] };`, allowedPath),
+			blockedMarker: "DEFAULT_DENY",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hostAllowed := filepath.Join(hostDir, "allowed.txt")
+			hostBlocked := filepath.Join(hostDir, "blocked.txt")
+			mustWrite(t, hostAllowed, []byte("allowed-original"))
+			mustWrite(t, hostBlocked, []byte("blocked-original"))
+
+			policyPath := filepath.Join(t.TempDir(), "long-path.cedar")
+			policy := fmt.Sprintf(`permit (principal, action == Action::"FileOpen", resource)
+when { resource in [ Dir::"/usr/", Dir::"/lib/", Dir::"/lib64/", Dir::"/bin/", Dir::"/sbin/", Dir::"/etc/", Dir::"/proc/", Dir::"/sys/", Dir::"/dev/", Dir::"/run/", Dir::"/tmp/", Dir::"/leash/" ] };
+permit (principal, action == Action::"FileOpenReadOnly", resource)
+when { resource in [ Dir::"/home/agent/", Dir::%q ] };
+permit (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ Dir::"/tmp/", Dir::"/dev/", Dir::"/proc/", Dir::"/run/", Dir::"/leash/" ] };
+%s`, containerDir+"/", tc.writeRules)
+			mustWrite(t, policyPath, []byte(policy))
+
+			containerName := fmt.Sprintf("leash-e2e-long-path-%d", time.Now().UnixNano())
+			t.Cleanup(func() { dockerRmForced(t, containerName, containerName+"-leash") })
+			logDir := filepath.Join(t.TempDir(), "log")
+			workload := fmt.Sprintf(
+				"set -u; printf LEASH108_ALLOWED > %s; if printf LEASH108_UNEXPECTED > %s; then exit 41; fi; sleep 1; printf LEASH108_DONE",
+				shellQuoteForTest(allowedPath), shellQuoteForTest(blockedPath),
+			)
+			args := []string{
+				bin, "--runtime", "docker", "--require-lsm", "--image", targetImage,
+				"--leash-image", managerImage, "--policy", policyPath,
+				"--container-name", containerName,
+				"--idmap-volume", hostDir + ":" + containerDir,
+				"sh", "-lc", workload,
+			}
+			var quoted []string
+			for _, arg := range args {
+				quoted = append(quoted, shellQuoteForTest(arg))
+			}
+			cmd := exec.Command("timeout", "180", "script", "-qec", strings.Join(quoted, " "), "/dev/null")
+			cmd.Dir = root
+			cmd.Env = append(os.Environ(),
+				"LEASH_HOME="+t.TempDir(),
+				"LEASH_WORK_DIR="+filepath.Join(t.TempDir(), "work"),
+				"LEASH_LOG_DIR="+logDir,
+				"LEASH_LISTEN=",
+			)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				managerLogs, _, _ := runDockerCommand(t, 15*time.Second, "logs", containerName+"-leash")
+				t.Fatalf("long-path runner failed: %v\n%s\nmanager logs:\n%s", err, out, managerLogs)
+			}
+			if !strings.Contains(string(out), "LEASH108_DONE") {
+				t.Fatalf("long-path workload did not finish:\n%s", out)
+			}
+			if got, err := os.ReadFile(hostAllowed); err != nil || string(got) != "LEASH108_ALLOWED" {
+				t.Fatalf("allowed file = %q, err=%v", got, err)
+			}
+			if got, err := os.ReadFile(hostBlocked); err != nil || string(got) != "blocked-original" {
+				t.Fatalf("blocked file = %q, err=%v", got, err)
+			}
+
+			audit, err := os.ReadFile(filepath.Join(logDir, "events.log"))
+			if err != nil {
+				t.Fatalf("read long-path audit: %v\n%s", err, out)
+			}
+			auditText := string(audit)
+			for _, want := range []struct {
+				path     string
+				decision string
+			}{
+				{path: allowedPath, decision: "allowed"},
+				{path: blockedPath, decision: "denied"},
+			} {
+				found := false
+				for _, line := range strings.Split(auditText, "\n") {
+					if strings.Contains(line, `event=file.open:rw`) &&
+						strings.Contains(line, `path="`+want.path+`"`) &&
+						strings.Contains(line, `decision=`+want.decision) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Fatalf("%s audit missing file.open:rw path=%q decision=%s on one record:\n%s", tc.blockedMarker, want.path, want.decision, auditText)
+				}
+			}
+			for _, name := range []string{containerName, containerName + "-leash"} {
+				_, exit, _ := runDockerCommand(t, 15*time.Second, "inspect", name)
+				if exit == 0 {
+					t.Fatalf("container %s remained after long-path command", name)
+				}
+			}
+		})
+	}
+}
+
+const maxPolicyPathBytesForTest = 255
+
 func TestRunnerNonRootIdmapProcControlsRemainPolicyDenied(t *testing.T) {
 	skipUnlessE2E(t)
 	targetImage := strings.TrimSpace(os.Getenv("LEASH_E2E_NONROOT_IMAGE"))

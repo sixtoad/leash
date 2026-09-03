@@ -1,11 +1,80 @@
 package transpiler
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/strongdm/leash/internal/lsm"
 )
+
+func TestCedarToLeashTranspiler_FilePathLengthContract(t *testing.T) {
+	t.Parallel()
+
+	transpiler := NewCedarToLeashTranspiler()
+	policy := func(effect, resourceType, path string) string {
+		return fmt.Sprintf(`
+%s (
+    principal == User::"test",
+    action == Action::"FileOpenReadWrite",
+    resource == %s::%q
+);`, effect, resourceType, path)
+	}
+
+	t.Run("accepts-255-byte-file", func(t *testing.T) {
+		path := "/" + strings.Repeat("a", lsm.MaxPolicyPathLength-1)
+		policies, _, err := transpiler.TranspileFromString(policy("permit", "File", path))
+		if err != nil {
+			t.Fatalf("transpile 255-byte path: %v", err)
+		}
+		if len(policies.Open) != 1 || policies.Open[0].PathLen != lsm.MaxPolicyPathLength {
+			t.Fatalf("expected one complete 255-byte rule, got %#v", policies.Open)
+		}
+	})
+
+	t.Run("rejects-256-byte-file-without-partial-authority", func(t *testing.T) {
+		longPath := "/" + strings.Repeat("b", lsm.MaxPolicyPathLength)
+		cedar := policy("permit", "Dir", "/workspace/") + policy("forbid", "File", longPath)
+		policies, rewrites, err := transpiler.TranspileFromString(cedar)
+		if err == nil || !strings.Contains(err.Error(), errFilePolicyPathTooLong.Error()) {
+			t.Fatalf("expected overlength file error, got %v", err)
+		}
+		if policies != nil || rewrites != nil {
+			t.Fatalf("overlength mixed policy published partial authority: policies=%#v rewrites=%#v", policies, rewrites)
+		}
+	})
+
+	t.Run("rejects-overlength-file-before-mcp-forbid-shortcut", func(t *testing.T) {
+		longPath := "/" + strings.Repeat("m", lsm.MaxPolicyPathLength)
+		cedar := fmt.Sprintf(`
+forbid (
+    principal == User::"test",
+    action in [Action::"McpCall", Action::"FileOpenReadWrite"],
+    resource
+)
+when {
+    resource in [MCP::Server::"mcp.example.com", File::%q]
+};`, longPath)
+		policies, rewrites, err := transpiler.TranspileFromString(cedar)
+		if err == nil || !strings.Contains(err.Error(), errFilePolicyPathTooLong.Error()) {
+			t.Fatalf("expected mixed MCP/file overlength error, got %v", err)
+		}
+		if policies != nil || rewrites != nil {
+			t.Fatalf("mixed MCP/file policy published partial authority: policies=%#v rewrites=%#v", policies, rewrites)
+		}
+	})
+
+	t.Run("rejects-directory-that-normalizes-to-256-bytes", func(t *testing.T) {
+		path := "/" + strings.Repeat("c", lsm.MaxPolicyPathLength-1)
+		policies, rewrites, err := transpiler.TranspileFromString(policy("forbid", "Dir", path))
+		if err == nil || !strings.Contains(err.Error(), errFilePolicyPathTooLong.Error()) {
+			t.Fatalf("expected normalized overlength directory error, got %v", err)
+		}
+		if policies != nil || rewrites != nil {
+			t.Fatalf("normalized overlength directory published partial authority: policies=%#v rewrites=%#v", policies, rewrites)
+		}
+	})
+}
 
 func TestCedarToLeashTranspiler_BasicFileOpen(t *testing.T) {
 	t.Parallel()
