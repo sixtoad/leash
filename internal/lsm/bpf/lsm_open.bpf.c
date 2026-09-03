@@ -39,11 +39,11 @@ typedef int bool;
 char LICENSE[] SEC("license") = "GPL";
 
 #define MAX_PATH_LEN 256
-#define MAX_POLICY_PATH_LEN 64
 #define MAX_ENTRIES 8192
 // BPF verifier-friendly constant bound for policy rules (max 256 with loop-based implementation)
 #define MAX_POLICY_RULES 256
 #define MAX_OPEN_INDEX_ENTRIES (MAX_POLICY_RULES * 3 * 2)
+#define MAX_MUTATION_INDEX_ENTRIES (MAX_POLICY_RULES * 2)
 #define PROC_SUPER_MAGIC 0x9fa0
 #define OVERLAYFS_SUPER_MAGIC 0x794c7630
 
@@ -111,15 +111,17 @@ struct open_index_rule {
     u32 order;
 };
 
-struct mutation_rule_key {
-    u32 generation;
-    u32 path_len;
-    char path[MAX_POLICY_PATH_LEN];
+struct mutation_prefix_rule_key {
+    u32 prefix_len;
+    u8 domain;
+    char path[MAX_PATH_LEN - 1];
 };
 
-#define MUTATION_GENERIC_DENY (1U << 0)
-#define MUTATION_RW_DIR_ALLOW (1U << 1)
-#define MUTATION_RW_DIR_DENY (1U << 2)
+struct mutation_exact_rule_key {
+    u32 generation;
+    u32 path_len;
+    char path[MAX_PATH_LEN];
+};
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -187,21 +189,34 @@ struct {
     __type(value, u32);
 } open_default_policy SEC(".maps");
 
-// Verifier-bounded mutation index derived from policy_rules by userspace. The
-// key retains the existing 64-byte policy-prefix contract; flags aggregate all
-// rules at that exact prefix so denies remain order-independent.
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, MAX_MUTATION_INDEX_ENTRIES);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct mutation_prefix_rule_key);
+    __type(value, u8);
+} mutation_deny_rules SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, MAX_MUTATION_INDEX_ENTRIES);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct mutation_prefix_rule_key);
+    __type(value, u8);
+} mutation_allow_rules SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_POLICY_RULES * 2);
-    __type(key, struct mutation_rule_key);
-    __type(value, u32);
-} mutation_rules SEC(".maps");
+    __uint(max_entries, MAX_MUTATION_INDEX_ENTRIES);
+    __type(key, struct mutation_exact_rule_key);
+    __type(value, u8);
+} mutation_self_deny_rules SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, u32);
-    __type(value, u32);
+    __type(value, u64);
 } active_mutation_generation SEC(".maps");
 
 // Map to store the number of policy rules
@@ -443,7 +458,9 @@ static __noinline int check_path_policy(const char *path, u32 file_op_type)
 }
 
 struct mutation_lookup_scratch {
-    struct mutation_rule_key key;
+    u64 activation_token;
+    struct mutation_prefix_rule_key prefix;
+    struct mutation_exact_rule_key exact;
 };
 
 struct {
@@ -453,48 +470,62 @@ struct {
     __type(value, struct mutation_lookup_scratch);
 } mutation_lookup_scratch_map SEC(".maps");
 
-// Evaluate every policy prefix of the target with at most 64 hash lookups,
-// instead of nesting a 64-byte comparison inside a 256-rule scan. Looking up
-// each byte prefix preserves the historical file-rule prefix behavior, while
-// the synthetic trailing slash preserves a directory rule's exact-self deny.
 static __noinline int check_mutation_policy(const char *path)
 {
     u32 zero = 0;
     struct mutation_lookup_scratch *scratch = bpf_map_lookup_elem(&mutation_lookup_scratch_map, &zero);
     if (!scratch) return 0;
-    u32 *active_generation = bpf_map_lookup_elem(&active_mutation_generation, &zero);
-    if (!active_generation) return 0;
-    __builtin_memset(&scratch->key, 0, sizeof(scratch->key));
-    // Read one immutable generation for the whole decision. Userspace stages
-    // the other generation completely before atomically flipping this value.
-    scratch->key.generation = *active_generation;
-    bool mutation_allowed = false;
+    u64 *token_ptr = bpf_map_lookup_elem(&active_mutation_generation, &zero);
+    if (!token_ptr) return 0;
+    u64 activation_token = *token_ptr;
+    u32 active_generation = activation_token & 1;
+    scratch->activation_token = activation_token;
+    __builtin_memset(&scratch->prefix, 0, sizeof(scratch->prefix));
+    __builtin_memset(&scratch->exact, 0, sizeof(scratch->exact));
 
+    u32 path_len = 0;
+    bool terminated = false;
     #pragma clang loop unroll(disable)
-    for (u32 i = 0; i < MAX_POLICY_PATH_LEN; i++) {
+    for (int i = 0; i < MAX_PATH_LEN; i++) {
         char c = path[i];
         if (c == '\0') {
-            // A directory rule carries a trailing slash but bpf_d_path omits it
-            // for the directory itself. Only its generic deny applies here;
-            // writable-directory authority is descendant-only.
-            scratch->key.path[i] = '/';
-            scratch->key.path_len = i + 1;
-            u32 *self_flags = bpf_map_lookup_elem(&mutation_rules, &scratch->key);
-            if (self_flags && (*self_flags & MUTATION_GENERIC_DENY)) return 0;
+            path_len = i;
+            terminated = true;
             break;
         }
-
-        scratch->key.path[i] = c;
-        scratch->key.path_len = i + 1;
-        u32 *flags = bpf_map_lookup_elem(&mutation_rules, &scratch->key);
-        if (!flags) continue;
-        if (*flags & (MUTATION_GENERIC_DENY | MUTATION_RW_DIR_DENY)) return 0;
-        if (*flags & MUTATION_RW_DIR_ALLOW) mutation_allowed = true;
+        scratch->exact.path[i] = c;
+        if (i < MAX_PATH_LEN - 1) scratch->prefix.path[i] = c;
     }
+    if (!terminated || path_len == 0 || path_len > MAX_PATH_LEN - 1) return 0;
 
-    // Mutation rights never inherit the shared open default. In particular, a
-    // read/open allow on Dir::"/" must not authorize writes to every directory.
-    return mutation_allowed ? 1 : 0;
+    scratch->prefix.prefix_len = 8 + path_len * 8;
+    scratch->prefix.domain = active_generation;
+    scratch->exact.generation = active_generation;
+    scratch->exact.path_len = path_len;
+
+    // Keep nullable map lookups genuinely nested: issuing both before their
+    // identical deny branches lets LLVM merge the pointers with a verifier-
+    // prohibited bitwise OR.
+    u8 *deny = bpf_map_lookup_elem(&mutation_deny_rules, &scratch->prefix);
+    if (!deny) {
+        u8 *self_deny = bpf_map_lookup_elem(&mutation_self_deny_rules, &scratch->exact);
+        if (!self_deny) {
+            u8 *allow = bpf_map_lookup_elem(&mutation_allow_rules, &scratch->prefix);
+            return allow ? 1 : 0;
+        }
+    }
+    return 0;
+}
+
+static __noinline int mutation_generation_unchanged()
+{
+    u32 zero = 0;
+    struct mutation_lookup_scratch *scratch = bpf_map_lookup_elem(&mutation_lookup_scratch_map, &zero);
+    if (!scratch) return 0;
+    barrier();
+    u64 *confirmed_token = bpf_map_lookup_elem(&active_mutation_generation, &zero);
+    if (!confirmed_token) return 0;
+    return *confirmed_token == scratch->activation_token;
 }
 
 struct mutation_scratch {
@@ -557,6 +588,7 @@ static __noinline int build_mutation_path(const struct path *dir, struct dentry 
 
 static __noinline int emit_mutation_decision(const char *path, u32 operation, int allowed)
 {
+    if (!mutation_generation_unchanged()) allowed = 0;
     struct open_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
     if (!event) {
         return allowed ? 0 : -13;
@@ -596,7 +628,7 @@ static __noinline int check_directory_mutation(const struct path *dir, struct de
     if (!allowed || emit_allowed) {
         return emit_mutation_decision(scratch->target, operation, allowed);
     }
-    return 0;
+    return mutation_generation_unchanged() ? 0 : -13;
 }
 
 static __noinline int emit_current_mutation(u32 operation, int allowed)

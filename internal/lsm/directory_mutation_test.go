@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
 type mutationLogCapture struct{ entries []string }
@@ -19,23 +20,43 @@ func TestDirectoryMutationHooksRequireWritableDirectoryRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(source)
-	if got := strings.Count(text, "if (ret != 0) return ret;"); got < 6 {
-		t.Fatalf("only %d chained LSM hooks preserve prior denial, want at least 6", got)
-	}
 	for _, hook := range []string{"lsm/path_mkdir", "lsm/path_unlink", "lsm/path_rmdir", "lsm/path_rename"} {
 		if !strings.Contains(text, hook) {
 			t.Fatalf("required directory mutation hook %q is absent", hook)
 		}
 	}
+	for _, signature := range []string{
+		"int BPF_PROG(lsm_mkdir,",
+		"int BPF_PROG(lsm_unlink,",
+		"int BPF_PROG(lsm_rmdir,",
+		"int BPF_PROG(lsm_rename_source,",
+		"int BPF_PROG(lsm_rename_destination,",
+	} {
+		start := strings.Index(text, signature)
+		if start < 0 {
+			t.Fatalf("required directory mutation function %q is absent", signature)
+		}
+		end := start + 700
+		if end > len(text) {
+			end = len(text)
+		}
+		if !strings.Contains(text[start:end], "if (ret != 0) return ret;") {
+			t.Fatalf("%s does not preserve a prior LSM denial", signature)
+		}
+	}
 	for _, guard := range []string{
 		"static __noinline int check_mutation_policy(const char *path)",
-		"for (u32 i = 0; i < MAX_POLICY_PATH_LEN; i++)",
-		"bpf_map_lookup_elem(&mutation_rules, &scratch->key)",
+		"for (int i = 0; i < MAX_PATH_LEN; i++)",
+		"bpf_map_lookup_elem(&mutation_deny_rules, &scratch->prefix)",
+		"bpf_map_lookup_elem(&mutation_allow_rules, &scratch->prefix)",
+		"bpf_map_lookup_elem(&mutation_self_deny_rules, &scratch->exact)",
 		"bpf_map_lookup_elem(&active_mutation_generation, &zero)",
-		"scratch->key.generation = *active_generation;",
-		"*flags & (MUTATION_GENERIC_DENY | MUTATION_RW_DIR_DENY)",
-		"*flags & MUTATION_RW_DIR_ALLOW",
-		"scratch->key.path[i] = '/';",
+		"u64 activation_token = *token_ptr;",
+		"if (!deny) {",
+		"if (!self_deny) {",
+		"if (!scratch) return 0;",
+		"if (!confirmed_token) return 0;",
+		"*confirmed_token == scratch->activation_token",
 		"if (bpf_probe_read_kernel(&c, sizeof(c), name + (i & (MAX_PATH_LEN - 1))) < 0)",
 		"emit_mutation_decision(unresolved_path, operation, 0)",
 		"current_is_io_worker()) return -1",
@@ -54,130 +75,224 @@ func TestDirectoryMutationHooksRequireWritableDirectoryRules(t *testing.T) {
 			t.Fatalf("directory mutation enforcement is missing %q", guard)
 		}
 	}
+	if strings.Contains(text, "if (deny || self_deny)") {
+		t.Fatal("nullable mutation map pointers are merged before the verifier")
+	}
 	if strings.Contains(text, "check_path_policy(scratch->target, operation)") {
 		t.Fatal("mutation hooks still carry ordinary open-policy branches through the verifier")
 	}
+	if got := strings.Count(text, "bpf_map_lookup_elem(&active_mutation_generation, &zero)"); got != 2 {
+		t.Fatalf("mutation decision performs %d activation-token lookups, want snapshot and confirmation", got)
+	}
 }
 
-type fakeMutationRuleStore struct {
-	active     uint32
-	rules      map[mutationRuleKey]uint32
+type fakeMutationIndexStore struct {
+	active     uint64
+	denies     map[mutationPrefixRuleKey]uint8
+	allows     map[mutationPrefixRuleKey]uint8
+	self       map[mutationExactRuleKey]uint8
 	putCalls   int
 	failPutAt  int
 	failActive bool
+	failDelete bool
 }
 
-func (s *fakeMutationRuleStore) activeGeneration() (uint32, error) { return s.active, nil }
-
-func (s *fakeMutationRuleStore) setActiveGeneration(generation uint32) error {
+func newFakeMutationIndexStore() *fakeMutationIndexStore {
+	return &fakeMutationIndexStore{denies: map[mutationPrefixRuleKey]uint8{}, allows: map[mutationPrefixRuleKey]uint8{}, self: map[mutationExactRuleKey]uint8{}}
+}
+func (s *fakeMutationIndexStore) activeToken() (uint64, error) { return s.active, nil }
+func (s *fakeMutationIndexStore) setActiveToken(v uint64) error {
 	if s.failActive {
-		return errors.New("active generation write failed")
+		return errors.New("active")
 	}
-	s.active = generation
+	s.active = v
 	return nil
 }
-
-func (s *fakeMutationRuleStore) listRuleKeys() ([]mutationRuleKey, error) {
-	keys := make([]mutationRuleKey, 0, len(s.rules))
-	for key := range s.rules {
-		keys = append(keys, key)
+func (s *fakeMutationIndexStore) listDenyKeys() ([]mutationPrefixRuleKey, error) {
+	var r []mutationPrefixRuleKey
+	for k := range s.denies {
+		r = append(r, k)
 	}
-	return keys, nil
+	return r, nil
 }
-
-func (s *fakeMutationRuleStore) putRule(key mutationRuleKey, flags uint32) error {
+func (s *fakeMutationIndexStore) listAllowKeys() ([]mutationPrefixRuleKey, error) {
+	var r []mutationPrefixRuleKey
+	for k := range s.allows {
+		r = append(r, k)
+	}
+	return r, nil
+}
+func (s *fakeMutationIndexStore) listSelfDenyKeys() ([]mutationExactRuleKey, error) {
+	var r []mutationExactRuleKey
+	for k := range s.self {
+		r = append(r, k)
+	}
+	return r, nil
+}
+func (s *fakeMutationIndexStore) fail() error {
 	s.putCalls++
 	if s.failPutAt > 0 && s.putCalls == s.failPutAt {
-		return errors.New("rule write failed")
+		return errors.New("put")
 	}
-	s.rules[key] = flags
 	return nil
 }
-
-func (s *fakeMutationRuleStore) deleteRule(key mutationRuleKey) error {
-	delete(s.rules, key)
+func (s *fakeMutationIndexStore) putDeny(k mutationPrefixRuleKey, v uint8) error {
+	if e := s.fail(); e != nil {
+		return e
+	}
+	s.denies[k] = v
 	return nil
 }
-
-func mutationTestKey(generation uint32, path string) mutationRuleKey {
-	key := mutationRuleKey{Generation: generation, PathLen: uint32(len(path))}
-	copy(key.Path[:], path)
-	return key
+func (s *fakeMutationIndexStore) putAllow(k mutationPrefixRuleKey, v uint8) error {
+	if e := s.fail(); e != nil {
+		return e
+	}
+	s.allows[k] = v
+	return nil
+}
+func (s *fakeMutationIndexStore) putSelfDeny(k mutationExactRuleKey, v uint8) error {
+	if e := s.fail(); e != nil {
+		return e
+	}
+	s.self[k] = v
+	return nil
+}
+func (s *fakeMutationIndexStore) deleteDeny(k mutationPrefixRuleKey) error {
+	if s.failDelete {
+		return errors.New("delete")
+	}
+	delete(s.denies, k)
+	return nil
+}
+func (s *fakeMutationIndexStore) deleteAllow(k mutationPrefixRuleKey) error {
+	if s.failDelete {
+		return errors.New("delete")
+	}
+	delete(s.allows, k)
+	return nil
+}
+func (s *fakeMutationIndexStore) deleteSelfDeny(k mutationExactRuleKey) error {
+	if s.failDelete {
+		return errors.New("delete")
+	}
+	delete(s.self, k)
+	return nil
+}
+func mutationPrefixTestKey(path string) mutationPrefixRuleKey {
+	k := mutationPrefixRuleKey{PrefixLen: 8 + uint32(len(path))*8}
+	copy(k.Path[:], path)
+	return k
+}
+func mutationSelfTestKey(path string) mutationExactRuleKey {
+	k := mutationExactRuleKey{PathLen: uint32(len(path))}
+	copy(k.Path[:], path)
+	return k
 }
 
-func TestReplaceMutationRulesFlipsOnlyAfterCompleteStaging(t *testing.T) {
-	oldKey := mutationTestKey(0, "/old/")
-	store := &fakeMutationRuleStore{
-		active: 0,
-		rules:  map[mutationRuleKey]uint32{oldKey: mutationRWDirAllow},
-	}
-	entries := map[mutationRuleKey]uint32{
-		mutationTestKey(0, "/new/"):    mutationRWDirAllow,
-		mutationTestKey(0, "/denied/"): mutationGenericDeny,
-	}
-
-	if err := replaceMutationRules(store, entries); err != nil {
+func TestReplaceMutationIndexTokenAndStaging(t *testing.T) {
+	s := newFakeMutationIndexStore()
+	idx := compiledMutationIndex{map[mutationPrefixRuleKey]uint8{mutationPrefixTestKey("/deny/"): 1}, map[mutationPrefixRuleKey]uint8{mutationPrefixTestKey("/allow/"): 1}, map[mutationExactRuleKey]uint8{mutationSelfTestKey("/deny"): 1}}
+	old := mutationPrefixTestKey("/old/")
+	s.allows[old] = 1
+	if _, err := replaceMutationIndex(s, idx); err != nil {
 		t.Fatal(err)
 	}
-	if store.active != 1 {
-		t.Fatalf("active generation = %d, want 1", store.active)
+	if s.active != 1 {
+		t.Fatalf("token=%d", s.active)
 	}
-	if _, exists := store.rules[oldKey]; exists {
-		t.Fatal("old generation remained after successful transition")
+	if _, ok := s.allows[old]; ok {
+		t.Fatal("old generation survived committed replacement")
 	}
-	for key, flags := range entries {
-		key.Generation = 1
-		if got := store.rules[key]; got != flags {
-			t.Fatalf("staged flags for %q = %03b, want %03b", key.Path[:key.PathLen], got, flags)
+	for key := range s.denies {
+		if key.Domain != 1 {
+			t.Fatalf("deny staged in generation %d", key.Domain)
 		}
+	}
+	for key := range s.allows {
+		if key.Domain != 1 {
+			t.Fatalf("allow staged in generation %d", key.Domain)
+		}
+	}
+	for key := range s.self {
+		if key.Generation != 1 {
+			t.Fatalf("self deny staged in generation %d", key.Generation)
+		}
+	}
+	s.active = ^uint64(0)
+	if _, err := replaceMutationIndex(s, idx); err == nil || !strings.Contains(err.Error(), "exhausted") {
+		t.Fatalf("wrap=%v", err)
+	}
+	for name, configure := range map[string]func(*fakeMutationIndexStore){
+		"partial staging": func(store *fakeMutationIndexStore) { store.failPutAt = 2 },
+		"activation":      func(store *fakeMutationIndexStore) { store.failActive = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			failed := newFakeMutationIndexStore()
+			failed.allows[old] = 1
+			configure(failed)
+			if _, err := replaceMutationIndex(failed, idx); err == nil {
+				t.Fatal("failed replacement unexpectedly succeeded")
+			}
+			if failed.active != 0 || failed.allows[old] != 1 {
+				t.Fatal("failed replacement changed active authority")
+			}
+			for key := range failed.denies {
+				if key.Domain == 1 {
+					t.Fatal("failed replacement retained staged deny")
+				}
+			}
+			for key := range failed.allows {
+				if key.Domain == 1 {
+					t.Fatal("failed replacement retained staged allow")
+				}
+			}
+			for key := range failed.self {
+				if key.Generation == 1 {
+					t.Fatal("failed replacement retained staged self deny")
+				}
+			}
+		})
+	}
+
+	debt := newFakeMutationIndexStore()
+	debt.allows[old] = 1
+	debt.failDelete = true
+	result, err := replaceMutationIndex(debt, idx)
+	if err != nil {
+		t.Fatalf("committed replacement returned fatal cleanup error: %v", err)
+	}
+	if debt.active != 1 || result.cleanupDebt == nil {
+		t.Fatalf("post-commit cleanup: token=%d debt=%v", debt.active, result.cleanupDebt)
 	}
 }
 
-func TestReplaceMutationRulesFailedStagingLeavesActiveGenerationIntact(t *testing.T) {
-	oldKey := mutationTestKey(0, "/old/")
-	store := &fakeMutationRuleStore{
-		active:    0,
-		rules:     map[mutationRuleKey]uint32{oldKey: mutationRWDirAllow},
-		failPutAt: 2,
+func TestMutationTokenRejectsSameSlotABA(t *testing.T) {
+	snapshot, reloaded := uint64(0), uint64(2)
+	if snapshot&1 != reloaded&1 {
+		t.Fatal("test setup does not reuse the same generation slot")
 	}
-	entries := map[mutationRuleKey]uint32{
-		mutationTestKey(0, "/one/"): mutationRWDirAllow,
-		mutationTestKey(0, "/two/"): mutationGenericDeny,
-	}
-
-	if err := replaceMutationRules(store, entries); err == nil {
-		t.Fatal("failed staging unexpectedly succeeded")
-	}
-	if store.active != 0 || store.rules[oldKey] != mutationRWDirAllow {
-		t.Fatal("failed staging changed active mutation authority")
-	}
-	for key := range store.rules {
-		if key.Generation == 1 {
-			t.Fatal("failed staging left partial inactive generation")
-		}
+	if snapshot == reloaded {
+		t.Fatal("full token equality accepted an ABA reload")
 	}
 }
 
-func TestReplaceMutationRulesFailedFlipLeavesActiveGenerationIntact(t *testing.T) {
-	oldKey := mutationTestKey(0, "/old/")
-	store := &fakeMutationRuleStore{
-		active:     0,
-		rules:      map[mutationRuleKey]uint32{oldKey: mutationRWDirAllow},
-		failActive: true,
+func TestMutationIndexPreservesFullPathBoundaries(t *testing.T) {
+	if got := unsafe.Sizeof(mutationPrefixRuleKey{}); got != 260 {
+		t.Fatalf("mutation LPM key size = %d, want 260", got)
 	}
-	entries := map[mutationRuleKey]uint32{
-		mutationTestKey(0, "/new/"): mutationRWDirAllow,
-	}
-
-	if err := replaceMutationRules(store, entries); err == nil {
-		t.Fatal("failed generation flip unexpectedly succeeded")
-	}
-	if store.active != 0 || store.rules[oldKey] != mutationRWDirAllow {
-		t.Fatal("failed generation flip changed active mutation authority")
-	}
-	for key := range store.rules {
-		if key.Generation == 1 {
-			t.Fatal("failed generation flip left staged inactive authority")
+	for _, length := range []int{64, 65, MaxPolicyPathLength} {
+		path := policyPathOfLength(length, '/')
+		idx := compileMutationIndex([]OpenPolicyRule{
+			openDirectoryRuleForPath(PolicyAllow, OpOpenRW, path),
+			openDirectoryRuleForPath(PolicyDeny, OpOpen, path),
+		})
+		prefix := mutationPrefixTestKey(path)
+		if idx.allows[prefix] != 1 || idx.denies[prefix] != 1 {
+			t.Fatalf("%d-byte mutation prefix lost allow or deny", length)
+		}
+		selfPath := path[:len(path)-1]
+		if idx.selfDenies[mutationSelfTestKey(selfPath)] != 1 {
+			t.Fatalf("%d-byte directory self deny missing", length)
 		}
 	}
 }
@@ -195,7 +310,7 @@ func TestLoadPoliciesRejectsOverflowBeforeChangingState(t *testing.T) {
 	}
 }
 
-func TestCompileMutationRulesPreservesDenyAndDirectoryAuthority(t *testing.T) {
+func TestCompileMutationIndexPreservesDenyAndDirectoryAuthority(t *testing.T) {
 	rule := func(action, operation, directory uint32, path string) OpenPolicyRule {
 		result := OpenPolicyRule{
 			Action:      action,
@@ -212,25 +327,31 @@ func TestCompileMutationRulesPreservesDenyAndDirectoryAuthority(t *testing.T) {
 		rule(PolicyDeny, OpOpenRW, 1, "/home/agent/private/"),
 		rule(PolicyAllow, OpOpenRW, 0, "/home/agent/file"),
 		rule(PolicyAllow, OpOpen, 1, "/ignored/"),
+		rule(PolicyDeny, OpOpen, 0, "/generic-prefix"),
 	}
 
-	entries := compileMutationRules(rules)
-	key := func(path string) mutationRuleKey {
-		result := mutationRuleKey{PathLen: uint32(len(path))}
-		copy(result.Path[:], path)
-		return result
+	idx := compileMutationIndex(rules)
+	if idx.denies[mutationPrefixTestKey("/home/agent/.npm/")] != 1 || idx.allows[mutationPrefixTestKey("/home/agent/.npm/")] != 1 {
+		t.Fatal("combined deny/allow missing")
 	}
-	if got := entries[key("/home/agent/.npm/")]; got != mutationGenericDeny|mutationRWDirAllow {
-		t.Fatalf("combined deny/allow flags = %03b", got)
+	if idx.selfDenies[mutationSelfTestKey("/home/agent/.npm")] != 1 {
+		t.Fatal("self deny missing")
 	}
-	if got := entries[key("/home/agent/private/")]; got != mutationRWDirDeny {
-		t.Fatalf("writable-directory deny flags = %03b", got)
+	if idx.denies[mutationPrefixTestKey("/home/agent/private/")] != 1 {
+		t.Fatal("rw deny missing")
 	}
-	if _, ok := entries[key("/home/agent/file")]; ok {
+	if _, ok := idx.allows[mutationPrefixTestKey("/home/agent/file")]; ok {
 		t.Fatal("writable file rule became directory mutation authority")
 	}
-	if _, ok := entries[key("/ignored/")]; ok {
+	if _, ok := idx.allows[mutationPrefixTestKey("/ignored/")]; ok {
 		t.Fatal("generic allow became directory mutation authority")
+	}
+	if idx.denies[mutationPrefixTestKey("/generic-prefix")] != 1 {
+		t.Fatal("generic file deny prefix was not retained")
+	}
+	malformed := compileMutationIndex([]OpenPolicyRule{rule(PolicyDeny, OpOpen, 1, "/directory-without-slash")})
+	if len(malformed.selfDenies) != 0 {
+		t.Fatal("malformed directory rule stripped a real path byte into exact-self authority")
 	}
 }
 
