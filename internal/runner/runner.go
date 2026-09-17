@@ -3097,31 +3097,6 @@ func attachWorkloadStdio(execCmd *exec.Cmd) {
 	execCmd.Stderr = os.Stderr
 }
 
-func (r *runner) precheckInteractiveContainer(ctx context.Context, shellBin, _ string) error {
-	tmp, err := os.CreateTemp("", "leash-runner-precheck-*.log")
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-	defer os.Remove(tmp.Name())
-
-	args := r.targetWorkloadExecArgs("-it", shellBin, "-lc", "true")
-	cmd := r.rt().Cmd(ctx, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = io.MultiWriter(os.Stderr, tmp)
-	cmd.Stdin = os.Stdin
-	err = cmd.Run()
-	if err == nil {
-		return nil
-	}
-
-	data, _ := os.ReadFile(tmp.Name())
-	fmt.Fprintln(os.Stderr, "Interactive docker exec precheck failed; stopping containers.")
-	if len(data) > 0 {
-		fmt.Fprintln(os.Stderr, strings.TrimSpace(string(data)))
-	}
-	return fmt.Errorf("docker exec precheck failed: %w", err)
-}
-
 func (r *runner) finishInteractivePrecheckFailure(ctx context.Context, err error) error {
 	return r.finishLifecycle(ctx, 0, err)
 }
@@ -3158,9 +3133,23 @@ func (r *runner) execInteractive(shellBin, cmd string) (int, error) {
 // value prevents shell interpretation and keeps shell probing, prechecks, and
 // real execution from drifting apart.
 func (r *runner) targetWorkloadExecArgs(ioFlag string, command ...string) []string {
+	return r.targetWorkloadExecArgsWithEnv(ioFlag, nil, command...)
+}
+
+// targetWorkloadProbeArgs preserves the target's environment except for the
+// shell startup hooks that non-interactive bash/sh may source. Probes must not
+// depend on policy allowing a user-controlled profile-like file.
+func (r *runner) targetWorkloadProbeArgs(ioFlag string, command ...string) []string {
+	return r.targetWorkloadExecArgsWithEnv(ioFlag, []string{"BASH_ENV=", "ENV="}, command...)
+}
+
+func (r *runner) targetWorkloadExecArgsWithEnv(ioFlag string, env []string, command ...string) []string {
 	args := []string{"exec"}
 	if ioFlag != "" {
 		args = append(args, ioFlag)
+	}
+	for _, value := range env {
+		args = append(args, "--env", value)
 	}
 	args = append(args,
 		"--user", r.targetWorkloadUser(),

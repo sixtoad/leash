@@ -7,8 +7,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 type identityRecordingRuntime struct {
@@ -17,6 +21,7 @@ type identityRecordingRuntime struct {
 	runs            [][]string
 	runErrors       []error
 	commands        [][]string
+	commandCtxErrs  []error
 	execCommands    []string
 }
 
@@ -44,6 +49,7 @@ func (rt *identityRecordingRuntime) ExecWithInput(_ context.Context, _ string, c
 
 func (rt *identityRecordingRuntime) Cmd(ctx context.Context, args ...string) *exec.Cmd {
 	rt.commands = append(rt.commands, append([]string(nil), args...))
+	rt.commandCtxErrs = append(rt.commandCtxErrs, ctx.Err())
 	return exec.CommandContext(ctx, "true")
 }
 
@@ -235,6 +241,33 @@ func TestInteractivePrecheckFailureRemovesContainers(t *testing.T) {
 	}
 }
 
+func TestCanceledProbeStillRemovesContainersWithUsableContext(t *testing.T) {
+	rt := &identityRecordingRuntime{}
+	r := &runner{
+		runtime: rt,
+		cfg: config{
+			targetContainer: "target",
+			leashContainer:  "manager",
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := r.finishLifecycle(ctx, 0, context.Canceled); !errors.Is(err, context.Canceled) {
+		t.Fatalf("finishLifecycle() error = %v, want context.Canceled", err)
+	}
+	want := [][]string{
+		{"rm", "-f", "manager"},
+		{"rm", "-f", "target"},
+	}
+	if !reflect.DeepEqual(rt.commands, want) {
+		t.Fatalf("cleanup commands = %v, want %v", rt.commands, want)
+	}
+	if !reflect.DeepEqual(rt.commandCtxErrs, []error{nil, nil}) {
+		t.Fatalf("cleanup context errors = %v, want usable contexts", rt.commandCtxErrs)
+	}
+}
+
 func TestContainerLauncherWorkloadPathsUseCapturedIdentity(t *testing.T) {
 	rt := &identityRecordingRuntime{}
 	r := &runner{
@@ -247,29 +280,29 @@ func TestContainerLauncherWorkloadPathsUseCapturedIdentity(t *testing.T) {
 	if shell, err := l.DetectShell(context.Background()); err != nil || shell != "bash" {
 		t.Fatalf("DetectShell() = %q, %v; want bash, nil", shell, err)
 	}
-	wantDetect := []string{"exec", "--user", "agent:workers", "-w", "/workspace", "target", "bash", "-lc", "true"}
-	if !reflect.DeepEqual(rt.runs[0], wantDetect) {
-		t.Fatalf("DetectShell argv = %v, want %v", rt.runs[0], wantDetect)
+	wantDetect := []string{"exec", "--env", "BASH_ENV=", "--env", "ENV=", "--user", "agent:workers", "-w", "/workspace", "target", "bash", "--noprofile", "--norc", "-c", "true"}
+	if !reflect.DeepEqual(rt.commands[0], wantDetect) {
+		t.Fatalf("DetectShell argv = %v, want %v", rt.commands[0], wantDetect)
 	}
 
 	_ = l.execCommandWithStdinKind(context.Background(), "bash", "id", false, false)
 	wantNonInteractive := []string{"exec", "-i", "--user", "agent:workers", "-w", "/workspace", "target", "bash", "-lc", "exec id"}
-	if !reflect.DeepEqual(rt.commands[0], wantNonInteractive) {
-		t.Fatalf("non-interactive argv = %v, want %v", rt.commands[0], wantNonInteractive)
+	if !reflect.DeepEqual(rt.commands[1], wantNonInteractive) {
+		t.Fatalf("non-interactive argv = %v, want %v", rt.commands[1], wantNonInteractive)
 	}
 
 	_ = l.ExecCommand(context.Background(), "bash", "id", true)
 	wantInteractive := []string{"exec", "-it", "--user", "agent:workers", "-w", "/workspace", "target", "bash", "-lc", "exec id"}
-	if !reflect.DeepEqual(rt.commands[1], wantInteractive) {
-		t.Fatalf("interactive argv = %v, want %v", rt.commands[1], wantInteractive)
+	if !reflect.DeepEqual(rt.commands[2], wantInteractive) {
+		t.Fatalf("interactive argv = %v, want %v", rt.commands[2], wantInteractive)
 	}
 
 	if err := l.Precheck(context.Background(), "bash", "id"); err != nil {
 		t.Fatalf("Precheck() error = %v", err)
 	}
-	wantPrecheck := []string{"exec", "-it", "--user", "agent:workers", "-w", "/workspace", "target", "bash", "-lc", "true"}
-	if !reflect.DeepEqual(rt.commands[2], wantPrecheck) {
-		t.Fatalf("precheck argv = %v, want %v", rt.commands[2], wantPrecheck)
+	wantPrecheck := []string{"exec", "-it", "--env", "BASH_ENV=", "--env", "ENV=", "--user", "agent:workers", "-w", "/workspace", "target", "bash", "--noprofile", "--norc", "-c", "true"}
+	if !reflect.DeepEqual(rt.commands[3], wantPrecheck) {
+		t.Fatalf("precheck argv = %v, want %v", rt.commands[3], wantPrecheck)
 	}
 }
 
@@ -321,7 +354,10 @@ func TestContainerLauncherExecCommandSelectsInputFlag(t *testing.T) {
 }
 
 func TestContainerLauncherDetectShellFallbackPreservesIdentity(t *testing.T) {
-	rt := &identityRecordingRuntime{runErrors: []error{fmt.Errorf("bash unavailable"), nil}}
+	rt := &shellProbeRuntime{actions: []shellProbeAction{
+		{stderr: "bash unavailable", exitCode: 1},
+		{},
+	}}
 	r := &runner{
 		runtime:             rt,
 		cfg:                 config{callerDir: "/workspace", targetContainer: "target"},
@@ -333,11 +369,213 @@ func TestContainerLauncherDetectShellFallbackPreservesIdentity(t *testing.T) {
 		t.Fatalf("DetectShell() = %q, %v; want sh, nil", shell, err)
 	}
 	want := [][]string{
-		{"exec", "--user", "10001:10001", "-w", "/workspace", "target", "bash", "-lc", "true"},
-		{"exec", "--user", "10001:10001", "-w", "/workspace", "target", "sh", "-lc", "true"},
+		{"exec", "--env", "BASH_ENV=", "--env", "ENV=", "--user", "10001:10001", "-w", "/workspace", "target", "bash", "--noprofile", "--norc", "-c", "true"},
+		{"exec", "--env", "BASH_ENV=", "--env", "ENV=", "--user", "10001:10001", "-w", "/workspace", "target", "sh", "-c", "true"},
 	}
-	if !reflect.DeepEqual(rt.runs, want) {
-		t.Fatalf("DetectShell fallback argv = %v, want %v", rt.runs, want)
+	if !reflect.DeepEqual(rt.commands, want) {
+		t.Fatalf("DetectShell fallback argv = %v, want %v", rt.commands, want)
+	}
+}
+
+type shellProbeAction struct {
+	stderr      string
+	exitCode    int
+	hang        bool
+	startedFile string
+}
+
+type shellProbeRuntime struct {
+	actions  []shellProbeAction
+	commands [][]string
+}
+
+func (rt *shellProbeRuntime) Run(context.Context, ...string) error { return nil }
+
+func (rt *shellProbeRuntime) Output(context.Context, ...string) (string, error) { return "", nil }
+
+func (rt *shellProbeRuntime) ExecWithInput(context.Context, string, string, io.Reader) error {
+	return nil
+}
+
+func (rt *shellProbeRuntime) Cmd(ctx context.Context, args ...string) *exec.Cmd {
+	rt.commands = append(rt.commands, append([]string(nil), args...))
+	var action shellProbeAction
+	if len(rt.actions) > 0 {
+		action = rt.actions[0]
+		rt.actions = rt.actions[1:]
+	}
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestContainerShellProbeHelper$", "--")
+	cmd.Env = append(os.Environ(),
+		"GO_WANT_CONTAINER_SHELL_PROBE_HELPER=1",
+		"CONTAINER_SHELL_PROBE_STDERR="+action.stderr,
+		"CONTAINER_SHELL_PROBE_EXIT_CODE="+strconv.Itoa(action.exitCode),
+		"CONTAINER_SHELL_PROBE_HANG="+strconv.FormatBool(action.hang),
+		"CONTAINER_SHELL_PROBE_STARTED_FILE="+action.startedFile,
+	)
+	return cmd
+}
+
+func (rt *shellProbeRuntime) Name() string { return "docker" }
+
+func TestContainerShellProbeHelper(t *testing.T) {
+	if os.Getenv("GO_WANT_CONTAINER_SHELL_PROBE_HELPER") != "1" {
+		return
+	}
+	if startedFile := os.Getenv("CONTAINER_SHELL_PROBE_STARTED_FILE"); startedFile != "" {
+		if err := os.WriteFile(startedFile, []byte("started"), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(125)
+		}
+	}
+	fmt.Fprint(os.Stderr, os.Getenv("CONTAINER_SHELL_PROBE_STDERR"))
+	if os.Getenv("CONTAINER_SHELL_PROBE_HANG") == "true" {
+		for {
+			time.Sleep(time.Hour)
+		}
+	}
+	exitCode, _ := strconv.Atoi(os.Getenv("CONTAINER_SHELL_PROBE_EXIT_CODE"))
+	os.Exit(exitCode)
+}
+
+func TestContainerLauncherDetectShellReportsBoundedFailures(t *testing.T) {
+	noisy := strings.Repeat("x", shellProbeDiagnosticLimit*2)
+	rt := &shellProbeRuntime{actions: []shellProbeAction{
+		{stderr: "bash: permission denied\n", exitCode: 126},
+		{stderr: noisy, exitCode: 127},
+	}}
+	r := &runner{runtime: rt, cfg: config{callerDir: "/workspace", targetContainer: "target"}}
+
+	_, err := (containerLauncher{r: r}).DetectShell(context.Background())
+	if err == nil {
+		t.Fatal("DetectShell() error = nil, want both-candidates failure")
+	}
+	got := err.Error()
+	for _, want := range []string{"bash failed: bash: permission denied", "sh failed:", "[stderr truncated]"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("DetectShell() error = %q, want %q", got, want)
+		}
+	}
+	if len(got) > shellProbeDiagnosticLimit+512 {
+		t.Fatalf("DetectShell() error length = %d, want bounded diagnostic", len(got))
+	}
+}
+
+func TestContainerLauncherDetectShellTimeoutIsTerminal(t *testing.T) {
+	original := containerShellProbeTimeout
+	containerShellProbeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { containerShellProbeTimeout = original })
+
+	rt := &shellProbeRuntime{actions: []shellProbeAction{{hang: true}, {}}}
+	r := &runner{runtime: rt, cfg: config{callerDir: "/workspace", targetContainer: "target"}}
+	started := time.Now()
+	_, err := (containerLauncher{r: r}).DetectShell(context.Background())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("DetectShell() error = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("DetectShell() took %s; candidate timeout did not bound the probe", elapsed)
+	}
+	if len(rt.commands) != 1 {
+		t.Fatalf("probe commands = %v, want no fallback after timeout", rt.commands)
+	}
+}
+
+func TestContainerLauncherDetectShellParentCancellationStopsFallback(t *testing.T) {
+	original := containerShellProbeTimeout
+	containerShellProbeTimeout = 5 * time.Second
+	t.Cleanup(func() { containerShellProbeTimeout = original })
+
+	startedFile := filepath.Join(t.TempDir(), "started")
+	rt := &shellProbeRuntime{actions: []shellProbeAction{{hang: true, startedFile: startedFile}, {}}}
+	r := &runner{runtime: rt, cfg: config{callerDir: "/workspace", targetContainer: "target"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := (containerLauncher{r: r}).DetectShell(ctx)
+		done <- err
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(startedFile); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("shell probe helper did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("DetectShell() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DetectShell() did not terminate the active probe after cancellation")
+	}
+	if len(rt.commands) != 1 {
+		t.Fatalf("probe commands after cancellation = %v, want no fallback", rt.commands)
+	}
+}
+
+func TestContainerLauncherPrecheckUsesBoundedNonLoginProbe(t *testing.T) {
+	original := containerShellProbeTimeout
+	containerShellProbeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { containerShellProbeTimeout = original })
+
+	rt := &shellProbeRuntime{actions: []shellProbeAction{{hang: true}}}
+	r := &runner{
+		runtime:             rt,
+		cfg:                 config{callerDir: "/workspace", targetContainer: "target"},
+		targetContainerUser: "agent:workers",
+	}
+	started := time.Now()
+	err := (containerLauncher{r: r}).Precheck(context.Background(), "bash", "ignored workload")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Precheck() error = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("Precheck() took %s; timeout did not bound the probe", elapsed)
+	}
+	want := [][]string{{"exec", "-it", "--env", "BASH_ENV=", "--env", "ENV=", "--user", "agent:workers", "-w", "/workspace", "target", "bash", "--noprofile", "--norc", "-c", "true"}}
+	if !reflect.DeepEqual(rt.commands, want) {
+		t.Fatalf("Precheck argv = %v, want non-login probe %v", rt.commands, want)
+	}
+}
+
+func TestContainerLauncherPrecheckParentCancellationTerminatesProbe(t *testing.T) {
+	original := containerShellProbeTimeout
+	containerShellProbeTimeout = 5 * time.Second
+	t.Cleanup(func() { containerShellProbeTimeout = original })
+
+	startedFile := filepath.Join(t.TempDir(), "started")
+	rt := &shellProbeRuntime{actions: []shellProbeAction{{hang: true, startedFile: startedFile}}}
+	r := &runner{runtime: rt, cfg: config{callerDir: "/workspace", targetContainer: "target"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- (containerLauncher{r: r}).Precheck(ctx, "sh", "ignored workload") }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(startedFile); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("interactive shell probe helper did not start")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Precheck() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Precheck() did not terminate after parent cancellation")
 	}
 }
 
