@@ -2,11 +2,13 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/strongdm/leash/internal/leashd/listen"
@@ -18,7 +20,15 @@ import (
 const (
 	caCertWaitAttempts = 50
 	caCertWaitDelay    = 200 * time.Millisecond
+
+	shellProbeDiagnosticLimit = 4 * 1024
+	shellProbeDiagnosticLines = 3
+	shellProbeWaitDelay       = time.Second
 )
+
+// containerShellProbeTimeout is deliberately independent for each candidate.
+// A var keeps the timeout path fast and deterministic in unit tests.
+var containerShellProbeTimeout = 5 * time.Second
 
 // caCertPath is where leash writes the MITM CA cert in the shared dir.
 func caCertPath(shareDir string) string { return filepath.Join(shareDir, "ca-cert.pem") }
@@ -200,14 +210,119 @@ func (c containerLauncher) Remove(ctx context.Context) {
 }
 
 func (c containerLauncher) DetectShell(ctx context.Context) (string, error) {
-	if err := c.r.rt().Run(ctx, c.r.targetWorkloadExecArgs("", "bash", "-lc", "true")...); err == nil {
-		return "bash", nil
+	var failures []string
+	for _, shellBin := range []string{"bash", "sh"} {
+		if err := c.probeShell(ctx, shellBin, false); err == nil {
+			if cancelErr := ctx.Err(); cancelErr != nil {
+				return "", fmt.Errorf("detect shell in %s: %w", c.r.cfg.targetContainer, cancelErr)
+			}
+			return shellBin, nil
+		} else {
+			// Parent cancellation is terminal. In particular, do not mistake
+			// its inherited deadline for a candidate-local timeout and try the
+			// fallback shell.
+			if ctx.Err() != nil {
+				return "", err
+			}
+			failures = append(failures, err.Error())
+			// Killing the runtime client does not guarantee that a timed-out
+			// docker exec process has stopped server-side. Do not overlap a
+			// fallback probe with it; return so normal lifecycle cleanup removes
+			// the disposable container and terminates the exec.
+			if errors.Is(err, context.DeadlineExceeded) {
+				return "", fmt.Errorf("failed to locate a usable shell inside %s: %w", c.r.cfg.targetContainer, err)
+			}
+		}
 	}
-	if err := c.r.rt().Run(ctx, c.r.targetWorkloadExecArgs("", "sh", "-lc", "true")...); err == nil {
-		return "sh", nil
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("detect shell in %s: %w", c.r.cfg.targetContainer, err)
 	}
-	return "", fmt.Errorf("failed to locate a usable shell (bash or sh) inside %s", c.r.cfg.targetContainer)
+	return "", fmt.Errorf("failed to locate a usable shell inside %s: %s", c.r.cfg.targetContainer, strings.Join(failures, "; "))
 }
+
+// probeShell validates a shell without reading login profiles. Each call owns
+// its timeout, so one hung candidate cannot consume the fallback's budget.
+// interactive preserves the existing TTY precheck path while sharing the same
+// bounded stderr and cancellation behavior as detection.
+func (c containerLauncher) probeShell(ctx context.Context, shellBin string, interactive bool) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%s shell probe in %s canceled: %w", shellBin, c.r.cfg.targetContainer, err)
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, containerShellProbeTimeout)
+	defer cancel()
+	ioFlag := ""
+	if interactive {
+		ioFlag = "-it"
+	}
+	shellArgs := []string{"-c", "true"}
+	if shellBin == "bash" {
+		shellArgs = []string{"--noprofile", "--norc", "-c", "true"}
+	}
+	cmd := c.r.rt().Cmd(probeCtx, c.r.targetWorkloadProbeArgs(ioFlag, append([]string{shellBin}, shellArgs...)...)...)
+	if interactive {
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+	} else {
+		cmd.Stdout = io.Discard
+	}
+	var stderr cappedProbeOutput
+	cmd.Stderr = &stderr
+	// A runtime CLI may leave a helper holding its stderr descriptor. Keep
+	// cancellation bounded even in that case.
+	cmd.WaitDelay = shellProbeWaitDelay
+	runErr := cmd.Run()
+	probeErr := probeCtx.Err()
+	if runErr == nil {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%s shell probe in %s canceled: %w", shellBin, c.r.cfg.targetContainer, err)
+		}
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%s shell probe in %s canceled: %w", shellBin, c.r.cfg.targetContainer, err)
+	}
+	if errors.Is(probeErr, context.DeadlineExceeded) {
+		return fmt.Errorf("%s timed out after %s: %w", shellBin, containerShellProbeTimeout, context.DeadlineExceeded)
+	}
+
+	detail := firstLines(stderr.String(), shellProbeDiagnosticLines)
+	if stderr.truncated {
+		if detail != "" {
+			detail += " "
+		}
+		detail += "[stderr truncated]"
+	}
+	if detail == "" {
+		detail = runErr.Error()
+	}
+	return fmt.Errorf("%s failed: %s", shellBin, detail)
+}
+
+// cappedProbeOutput keeps a runtime failure useful without letting a noisy
+// engine grow the launcher's memory use or final error without bound.
+type cappedProbeOutput struct {
+	data      []byte
+	truncated bool
+}
+
+func (w *cappedProbeOutput) Write(p []byte) (int, error) {
+	written := len(p)
+	remaining := shellProbeDiagnosticLimit - len(w.data)
+	if remaining <= 0 {
+		w.truncated = w.truncated || len(p) > 0
+		return written, nil
+	}
+	if len(p) > remaining {
+		w.data = append(w.data, p[:remaining]...)
+		w.truncated = true
+		return written, nil
+	}
+	w.data = append(w.data, p...)
+	return written, nil
+}
+
+func (w *cappedProbeOutput) String() string { return string(w.data) }
 
 func (c containerLauncher) ExecCommand(ctx context.Context, shellBin, cmd string, interactive bool) *exec.Cmd {
 	return c.execCommandWithStdinKind(ctx, shellBin, cmd, interactive, containerStdinIsTerminal(os.Stdin))
@@ -232,7 +347,12 @@ func (c containerLauncher) execCommandWithStdinKind(ctx context.Context, shellBi
 }
 
 func (c containerLauncher) Precheck(ctx context.Context, shellBin, cmd string) error {
-	return c.r.precheckInteractiveContainer(ctx, shellBin, cmd)
+	if err := c.probeShell(ctx, shellBin, true); err != nil {
+		fmt.Fprintln(os.Stderr, "Interactive docker exec precheck failed; stopping containers.")
+		fmt.Fprintln(os.Stderr, err)
+		return fmt.Errorf("docker exec precheck failed: %w", err)
+	}
+	return nil
 }
 
 func (c containerLauncher) InstallPromptAssets(ctx context.Context) error {
