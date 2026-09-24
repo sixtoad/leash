@@ -720,7 +720,7 @@ func (n nativeLauncher) exportCACert(shareDir string) {
 // delete the netns, and stop the holder unit. Gated on the attempt (root +
 // compiled), not layer2Active, so a run that fell back to LSM-only after a
 // partial egress setup still cleans up.
-func (n nativeLauncher) Remove(ctx context.Context) {
+func (n nativeLauncher) Remove(ctx context.Context) error {
 	n.r.teardownInjectedPlugins()
 	if nativeLayer2Enabled && !n.useUserManager() {
 		n.teardownEgress(ctx)
@@ -728,6 +728,7 @@ func (n nativeLauncher) Remove(ctx context.Context) {
 		_ = os.Remove(n.userReadableCACert())
 	}
 	n.stopUnit(ctx, n.unitName())
+	return nil
 }
 
 func (n nativeLauncher) addNetns(ctx context.Context) error {

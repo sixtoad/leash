@@ -189,6 +189,12 @@ type runner struct {
 	targetContainerUser string
 	idmapSpecs          []idmap.Spec
 
+	// A session label and attempted names constrain cleanup to our own creates.
+	containerSession       string
+	containerLaunches      map[string]bool // true while the daemon may still create it
+	cleanupReconcileWindow time.Duration
+	cleanupPollInterval    time.Duration
+
 	verbose         bool
 	shareDirCreated bool
 	keepContainers  bool
@@ -366,7 +372,7 @@ func execute(cmdName string, args []string) error {
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
+	signal.Notify(sigCh, terminationSignals()...)
 	defer signal.Stop(sigCh)
 
 	var interrupted int32
@@ -387,6 +393,10 @@ func execute(cmdName string, args []string) error {
 		return err
 	}
 	return nil
+}
+
+func terminationSignals() []os.Signal {
+	return []os.Signal{os.Interrupt, syscall.SIGTERM}
 }
 
 var errShowUsage = errors.New("show usage")
@@ -1699,14 +1709,18 @@ func (r *runner) startContainers(ctx context.Context) error {
 		return r.finishInteractivePrecheckFailure(ctx, err)
 	}
 
-	exitCode, err := r.execInteractive(shellBin, runCmd)
-	if err != nil {
+	exitCode, err := r.execInteractive(ctx, shellBin, runCmd)
+	return r.finishInteractiveSession(ctx, exitCode, err)
+}
+
+func (r *runner) finishInteractiveSession(ctx context.Context, exitCode int, err error) error {
+	if err != nil && ctx.Err() == nil {
 		r.keepContainers = true
 		return r.finishLifecycle(ctx, exitCode, err)
 	}
 
 	r.diagnosticf("Interactive session exited (code=%d). Stopping containers...\n", exitCode)
-	return r.finishLifecycle(ctx, exitCode, nil)
+	return r.finishLifecycle(ctx, exitCode, err)
 }
 
 func (r *runner) assignContainerNames(ctx context.Context) error {
@@ -1722,6 +1736,8 @@ func (r *runner) assignContainerNames(ctx context.Context) error {
 }
 
 func (r *runner) assignContainerNamesContainer(ctx context.Context, baseTarget, baseLeash string) error {
+	ctx, cancel := context.WithTimeout(ctx, defaultBootstrapTimeout)
+	defer cancel()
 	// An explicit --container-name must be honored verbatim: no suffix munging.
 	// Renaming silently would defeat the point (orchestrators address the agent
 	// by this exact name), so fail clearly if the name is already taken.
@@ -1744,6 +1760,9 @@ func (r *runner) assignContainerNamesContainer(ctx context.Context, baseTarget, 
 
 	const maxAttempts = 1000
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		targetCandidate := containerNameWithSuffix(baseTarget, attempt)
 		leashCandidate := containerNameWithSuffix(baseLeash, attempt)
 
@@ -1905,26 +1924,14 @@ func isPortConflictError(err error) bool {
 // Additional helper methods will be defined below.
 
 func (r *runner) ensureNotRunningContainer(ctx context.Context) error {
-	running, err := r.containerRunning(ctx, r.cfg.targetContainer)
-	if err != nil {
-		return err
-	}
-	if running {
-		return fmt.Errorf("error: containers already running (target='%s', leash='%s').\nRun: docker rm -f %s %s   to stop them, then try again.", r.cfg.targetContainer, r.cfg.leashContainer, r.cfg.targetContainer, r.cfg.leashContainer)
-	}
-	running, err = r.containerRunning(ctx, r.cfg.leashContainer)
-	if err != nil {
-		return err
-	}
-	if running {
-		return fmt.Errorf("error: containers already running (target='%s', leash='%s').\nRun: docker rm -f %s %s   to stop them, then try again.", r.cfg.targetContainer, r.cfg.leashContainer, r.cfg.targetContainer, r.cfg.leashContainer)
-	}
-
-	if exists, _ := r.containerExists(ctx, r.cfg.targetContainer); exists {
-		_ = r.rt().Run(ctx, "rm", "-f", r.cfg.targetContainer)
-	}
-	if exists, _ := r.containerExists(ctx, r.cfg.leashContainer); exists {
-		_ = r.rt().Run(ctx, "rm", "-f", r.cfg.leashContainer)
+	for _, name := range []string{r.cfg.targetContainer, r.cfg.leashContainer} {
+		exists, err := r.containerExists(ctx, name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return fmt.Errorf("container name %q already in use; choose a different name", name)
+		}
 	}
 	return nil
 }
@@ -2576,7 +2583,7 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 	}
 	args = append(args, r.cfg.targetImage)
 	r.logContainerConfig("target", targetMounts, targetEnv)
-	if err := r.runDocker(ctx, args...); err != nil {
+	if err := r.launchContainer(ctx, r.cfg.targetContainer, args...); err != nil {
 		return err
 	}
 	// Print final port mappings
@@ -2799,7 +2806,7 @@ func (r *runner) launchLeashContainer(ctx context.Context, cgroupPath string) er
 
 	args = append(args, r.cfg.leashImage, "--cgroup", cgroupPath)
 	r.logContainerConfig("leash", leashMounts, leashEnv)
-	return r.runDocker(ctx, args...)
+	return r.launchContainer(ctx, r.cfg.leashContainer, args...)
 }
 
 func (r *runner) logContainerConfig(role string, mounts, env []string) {
@@ -3101,18 +3108,23 @@ func (r *runner) finishInteractivePrecheckFailure(ctx context.Context, err error
 	return r.finishLifecycle(ctx, 0, err)
 }
 
-func (r *runner) execInteractive(shellBin, cmd string) (int, error) {
+func (r *runner) execInteractive(ctx context.Context, shellBin, cmd string) (int, error) {
 	tmp, err := os.CreateTemp("", "leash-runner-exec-*.log")
 	if err != nil {
 		return 0, fmt.Errorf("create temp file: %w", err)
 	}
 	defer os.Remove(tmp.Name())
+	defer tmp.Close()
 
-	execCmd := r.launcher().ExecCommand(context.Background(), shellBin, cmd, true)
+	execCmd := r.launcher().ExecCommand(ctx, shellBin, cmd, true)
 	execCmd.Stdin = os.Stdin
 	execCmd.Stdout = os.Stdout
 	execCmd.Stderr = io.MultiWriter(os.Stderr, tmp)
+	execCmd.WaitDelay = time.Second
 	err = execCmd.Run()
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
 	if err == nil {
 		return 0, nil
 	}
@@ -3165,8 +3177,7 @@ func (r *runner) manualAttachCommand(shellBin, cmd string) string {
 }
 
 // finalizeSession keeps two concerns separate:
-//   - Container teardown is best-effort. Cleanup failures log under verbose mode
-//     but never override the exit status returned by the leashed command.
+//   - Cleanup failures are returned after a successful workload.
 //   - The leashed command's exit code flows back to the caller unchanged, preserving
 //     distinct status values.
 func (r *runner) finalizeSession(stopErr error, exitCode int) error {
@@ -3178,6 +3189,9 @@ func (r *runner) finalizeSession(stopErr error, exitCode int) error {
 		// call os.Exit with the original status.
 		return &ExitCodeError{code: exitCode}
 	}
+	if stopErr != nil {
+		return fmt.Errorf("stop containers: %w", stopErr)
+	}
 	return nil
 }
 
@@ -3185,10 +3199,7 @@ func cleanupContext(ctx context.Context) context.Context {
 	if ctx == nil {
 		return context.Background()
 	}
-	if ctx.Err() != nil {
-		return context.Background()
-	}
-	return ctx
+	return context.WithoutCancel(ctx)
 }
 
 // finishLifecycle centralizes teardown so callers only pass the command result and any error;
@@ -3216,13 +3227,7 @@ func (r *runner) finishLifecycle(ctx context.Context, exitCode int, runErr error
 }
 
 func (r *runner) stopContainers(ctx context.Context) error {
-	if r.cfg.shareDir == "" {
-		if share := r.discoverShareDir(ctx); share != "" {
-			r.cfg.shareDir = share
-		}
-	}
-
-	r.launcher().Remove(ctx)
+	cleanupErr := r.launcher().Remove(ctx)
 
 	if r.cfg.shareDir != "" && !r.cfg.shareDirFromEnv {
 		if r.shareDirCreated || strings.HasPrefix(r.cfg.shareDir, r.cfg.workDir+string(os.PathSeparator)) {
@@ -3239,7 +3244,7 @@ func (r *runner) stopContainers(ctx context.Context) error {
 			r.debugf("failed to remove work dir %s: %v", r.cfg.workDir, err)
 		}
 	}
-	return nil
+	return cleanupErr
 }
 
 func (r *runner) showStatus(ctx context.Context) error {
@@ -3362,8 +3367,16 @@ var execWithInput = execWithInputImpl
 func runCommandImpl(ctx context.Context, stdout, stderr io.Writer, name string, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	return cmd.Run()
+	var diagnostic cappedProbeOutput
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	cmd.Stderr = io.MultiWriter(stderr, &diagnostic)
+	cmd.WaitDelay = time.Second
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s: %w: %s", name, err, strings.TrimSpace(diagnostic.String()))
+	}
+	return nil
 }
 
 func execWithInputImpl(ctx context.Context, bin, container, shellCommand string, input io.Reader) error {
@@ -3415,6 +3428,7 @@ var commandOutput = commandOutputImpl
 
 func commandOutputImpl(ctx context.Context, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = time.Second
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
