@@ -16,13 +16,14 @@ import (
 )
 
 type identityRecordingRuntime struct {
-	imageUserOutput string
-	imageUserErr    error
-	runs            [][]string
-	runErrors       []error
-	commands        [][]string
-	commandCtxErrs  []error
-	execCommands    []string
+	imageUserOutput   string
+	imageUserErr      error
+	cleanupContainers map[string]bool
+	runs              [][]string
+	runErrors         []error
+	commands          [][]string
+	commandCtxErrs    []error
+	execCommands      []string
 }
 
 func (rt *identityRecordingRuntime) Run(_ context.Context, args ...string) error {
@@ -35,7 +36,19 @@ func (rt *identityRecordingRuntime) Run(_ context.Context, args ...string) error
 	return nil
 }
 
-func (rt *identityRecordingRuntime) Output(_ context.Context, args ...string) (string, error) {
+func (rt *identityRecordingRuntime) Output(ctx context.Context, args ...string) (string, error) {
+	if len(args) > 0 && args[0] == "rm" {
+		rt.commands = append(rt.commands, append([]string(nil), args...))
+		rt.commandCtxErrs = append(rt.commandCtxErrs, ctx.Err())
+		delete(rt.cleanupContainers, args[len(args)-1])
+		return "", nil
+	}
+	if len(args) == 4 && args[0] == "inspect" && strings.Contains(args[2], containerSessionLabel) {
+		if rt.cleanupContainers[args[3]] {
+			return args[3] + " test-session", nil
+		}
+		return "", errors.New("No such container")
+	}
 	if len(args) >= 4 && args[0] == "image" && args[1] == "inspect" && args[3] == "{{json .Config.User}}" {
 		return rt.imageUserOutput, rt.imageUserErr
 	}
@@ -220,9 +233,11 @@ func TestContainerLauncherPromptInstallationRespectsTargetIdentity(t *testing.T)
 }
 
 func TestInteractivePrecheckFailureRemovesContainers(t *testing.T) {
-	rt := &identityRecordingRuntime{}
+	rt := &identityRecordingRuntime{cleanupContainers: map[string]bool{"target": true, "manager": true}}
 	r := &runner{
-		runtime: rt,
+		runtime:           rt,
+		containerSession:  "test-session",
+		containerLaunches: map[string]bool{"target": false, "manager": false},
 		cfg: config{
 			targetContainer: "target",
 			leashContainer:  "manager",
@@ -242,9 +257,11 @@ func TestInteractivePrecheckFailureRemovesContainers(t *testing.T) {
 }
 
 func TestCanceledProbeStillRemovesContainersWithUsableContext(t *testing.T) {
-	rt := &identityRecordingRuntime{}
+	rt := &identityRecordingRuntime{cleanupContainers: map[string]bool{"target": true, "manager": true}}
 	r := &runner{
-		runtime: rt,
+		runtime:           rt,
+		containerSession:  "test-session",
+		containerLaunches: map[string]bool{"target": false, "manager": false},
 		cfg: config{
 			targetContainer: "target",
 			leashContainer:  "manager",

@@ -2,12 +2,15 @@ package runner
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -33,13 +36,111 @@ var containerShellProbeTimeout = 5 * time.Second
 // caCertPath is where leash writes the MITM CA cert in the shared dir.
 func caCertPath(shareDir string) string { return filepath.Join(shareDir, "ca-cert.pem") }
 
-// removeContainer force-removes a container, discarding output — the teardown
-// primitive shared by Remove and stopContainers.
-func (r *runner) removeContainer(ctx context.Context, name string) {
-	cmd := r.rt().Cmd(ctx, "rm", "-f", name)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
-	_ = cmd.Run()
+const containerSessionLabel = "dev.leash.session"
+
+// launchContainer lets an in-flight create settle before honoring cancellation.
+// A timed-out client can leave work in the daemon, so cleanup keeps watching its
+// name, but only ever removes an object bearing this session's random label.
+func (r *runner) launchContainer(ctx context.Context, name string, args ...string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if r.containerSession == "" {
+		var token [16]byte
+		if _, err := rand.Read(token[:]); err != nil {
+			return fmt.Errorf("create container session: %w", err)
+		}
+		r.containerSession = hex.EncodeToString(token[:])
+	}
+	if r.containerLaunches == nil {
+		r.containerLaunches = make(map[string]bool)
+	}
+	timeout := r.cfg.bootstrapTimeout
+	if timeout <= 0 {
+		timeout = defaultBootstrapTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	if parentDeadline, ok := ctx.Deadline(); ok && parentDeadline.Before(deadline) {
+		deadline = parentDeadline
+	}
+	launchCtx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	defer cancel()
+	labeledArgs := append([]string{args[0], "--label", containerSessionLabel + "=" + r.containerSession}, args[1:]...)
+	r.containerLaunches[name] = true
+	err := r.runDocker(launchCtx, labeledArgs...)
+	if isContainerNameConflictError(err) {
+		delete(r.containerLaunches, name)
+		return err
+	}
+	// A normal CLI failure can follow a successful create (for example, a
+	// disconnected daemon response). Keep reconciling those ambiguous failures.
+	r.containerLaunches[name] = err != nil
+	if launchCtx.Err() != nil {
+		return fmt.Errorf("launch %s: %w", name, launchCtx.Err())
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
+func isContainerNameConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "container name") && (strings.Contains(msg, "already in use") || strings.Contains(msg, "already used"))
+}
+
+// removeContainer treats an already absent object as successful teardown.
+func (r *runner) removeContainer(ctx context.Context, id string) error {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	_, err := r.rt().Output(ctx, "rm", "-f", id)
+	if isNoSuchObjectError(err) {
+		return nil
+	}
+	return err
+}
+
+// ownedContainerID closes the inspect/remove name-reuse race: deletion uses the
+// immutable ID, never the reusable name that a different creator may acquire.
+func (r *runner) ownedContainerID(ctx context.Context, name string) (string, error) {
+	format := "{{.Id}} {{index .Config.Labels " + fmt.Sprintf("%q", containerSessionLabel) + "}}"
+	out, err := r.rt().Output(ctx, "inspect", "-f", format, name)
+	if isNoSuchObjectError(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(out)
+	if len(fields) != 2 || fields[1] != r.containerSession {
+		return "", nil
+	}
+	return fields[0], nil
+}
+
+func (r *runner) removeOwnedContainer(ctx context.Context, name string) error {
+	id, err := r.ownedContainerID(ctx, name)
+	if err != nil {
+		return fmt.Errorf("inspect %s during cleanup: %w", name, err)
+	}
+	if id == "" {
+		return nil
+	}
+	if err := r.removeContainer(ctx, id); err != nil {
+		return fmt.Errorf("remove %s: %w", name, err)
+	}
+	remaining, err := r.ownedContainerID(ctx, name)
+	if err != nil {
+		return fmt.Errorf("verify cleanup of %s: %w", name, err)
+	}
+	if remaining != "" {
+		return fmt.Errorf("container %q remained after cleanup", name)
+	}
+	return nil
 }
 
 // launcher owns the backend-specific enforcement-session lifecycle: stand up the
@@ -71,7 +172,7 @@ type launcher interface {
 	WaitReady(ctx context.Context) error
 	// Remove stops and reclaims the workload + enforcement. Backend-agnostic
 	// filesystem cleanup remains the runner's responsibility.
-	Remove(ctx context.Context)
+	Remove(ctx context.Context) error
 
 	// DetectShell returns the shell to run the workload with (container: probed
 	// inside the container; native: the host shell).
@@ -167,10 +268,43 @@ func (c containerLauncher) Provision(ctx context.Context, stopSignal string) (st
 	if err := c.r.spawnInjectServicesContainer(ctx); err != nil {
 		return "", err
 	}
-	for {
+	// Bound the entire retry sequence, including name/port probes.
+	timeout := c.r.cfg.bootstrapTimeout
+	if timeout <= 0 {
+		timeout = defaultBootstrapTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		if attempt == 100 {
+			return "", errors.New("container launch retry limit exceeded")
+		}
 		err := c.r.launchTargetContainer(ctx, stopSignal)
 		if err == nil {
 			break
+		}
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		if isContainerNameConflictError(err) {
+			if strings.TrimSpace(c.r.opts.containerName) != "" {
+				return "", err
+			}
+			if assignErr := c.r.assignContainerNames(ctx); assignErr != nil {
+				return "", assignErr
+			}
+			continue
+		}
+		// A port conflict can leave a created container behind. Reclaim it
+		// before retrying the same name; never turn that into a name conflict.
+		if isPortConflictError(err) {
+			if removeErr := c.r.removeOwnedContainer(ctx, c.r.cfg.targetContainer); removeErr != nil {
+				return "", errors.Join(err, removeErr)
+			}
+			c.r.containerLaunches[c.r.cfg.targetContainer] = false
 		}
 		retry, retryErr := c.r.handleListenPortRetry(ctx, err)
 		if retryErr != nil {
@@ -201,12 +335,72 @@ func (c containerLauncher) WaitReady(ctx context.Context) error {
 	return c.r.waitForEnforcementReady(ctx)
 }
 
-func (c containerLauncher) Remove(ctx context.Context) {
-	// Stop any injected plugins and remove their sockets/config files before the
-	// containers (mirrors native teardown).
+func (c containerLauncher) Remove(ctx context.Context) error {
 	c.r.teardownInjectedPlugins()
-	c.r.removeContainer(ctx, c.r.cfg.leashContainer)
-	c.r.removeContainer(ctx, c.r.cfg.targetContainer)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	names := make([]string, 0, len(c.r.containerLaunches))
+	for name := range c.r.containerLaunches {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	// Stop enforcement before the target, as in the original teardown.
+	for i, name := range names {
+		if name == c.r.cfg.leashContainer {
+			names[0], names[i] = names[i], names[0]
+			break
+		}
+	}
+	lastErrors := make(map[string]error)
+	cleanupError := func() error {
+		var err error
+		for _, name := range names {
+			err = errors.Join(err, lastErrors[name])
+		}
+		return err
+	}
+	var uncertain []string
+	for _, name := range names {
+		lastErrors[name] = c.r.removeOwnedContainer(ctx, name)
+		if c.r.containerLaunches[name] {
+			uncertain = append(uncertain, name)
+		}
+	}
+	if len(uncertain) == 0 {
+		return cleanupError()
+	}
+	window, delay := c.r.cleanupReconcileWindow, c.r.cleanupPollInterval
+	if window <= 0 {
+		window = 10 * time.Second
+	}
+	if delay <= 0 {
+		delay = 100 * time.Millisecond
+	}
+	deadline := time.Now().Add(window)
+	for {
+		remaining := time.Until(deadline)
+		if remaining < delay {
+			delay = remaining
+		}
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return errors.Join(cleanupError(), fmt.Errorf("container cleanup reconciliation: %w", ctx.Err()))
+			case <-timer.C:
+			}
+		}
+		for _, name := range uncertain {
+			// A temporarily unavailable daemon must not prevent observing a
+			// later create or cleaning the other names. Retain only errors
+			// still unresolved at the end of the bounded window.
+			lastErrors[name] = c.r.removeOwnedContainer(ctx, name)
+		}
+		if !time.Now().Before(deadline) {
+			return cleanupError()
+		}
+	}
 }
 
 func (c containerLauncher) DetectShell(ctx context.Context) (string, error) {

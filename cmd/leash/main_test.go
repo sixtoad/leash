@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/strongdm/leash/internal/resolvercontract"
@@ -10,20 +12,37 @@ import (
 
 func TestResolverSubcommandDispatch(t *testing.T) {
 	t.Parallel()
-	var stdout, stderr bytes.Buffer
-	handled, code := runResolverSubcommand(
-		[]string{"leash", "resolvers", "--runtime", "native", "--json"},
-		&stdout, &stderr,
-	)
-	if !handled || code != resolvercontract.ExitSuccess {
-		t.Fatalf("handled=%t code=%d stderr=%q", handled, code, stderr.String())
-	}
-	var document resolvercontract.Document
-	if err := json.Unmarshal(stdout.Bytes(), &document); err != nil {
-		t.Fatalf("stdout is not resolver JSON: %v (%q)", err, stdout.String())
-	}
-	if document.Runtime != "native" || document.Strategy != resolvercontract.StrategyLeashManaged {
-		t.Fatalf("document = %+v", document)
+	for _, backend := range []string{"native", "docker", "podman"} {
+		t.Run(backend, func(t *testing.T) {
+			t.Parallel()
+			var stdout, stderr bytes.Buffer
+			handled, code := runResolverSubcommand(
+				[]string{"leash", "resolvers", "--runtime", backend, "--json"},
+				&stdout, &stderr,
+			)
+			// Native resolver reporting describes Linux network namespaces;
+			// other hosts must reject it without emitting a success document.
+			if backend == "native" && runtime.GOOS != "linux" {
+				if !handled || code != resolvercontract.ExitContract || stdout.Len() != 0 || !strings.Contains(stderr.String(), "unsupported") {
+					t.Fatalf("handled=%t code=%d stdout=%q stderr=%q", handled, code, stdout.String(), stderr.String())
+				}
+				return
+			}
+			if !handled || code != resolvercontract.ExitSuccess || stderr.Len() != 0 {
+				t.Fatalf("handled=%t code=%d stderr=%q", handled, code, stderr.String())
+			}
+			var document resolvercontract.Document
+			if err := json.Unmarshal(stdout.Bytes(), &document); err != nil {
+				t.Fatalf("stdout is not resolver JSON: %v (%q)", err, stdout.String())
+			}
+			wantStrategy := resolvercontract.StrategyRuntimeManaged
+			if backend == "native" {
+				wantStrategy = resolvercontract.StrategyLeashManaged
+			}
+			if document.Runtime != backend || document.Strategy != wantStrategy {
+				t.Fatalf("document = %+v, want runtime %q strategy %q", document, backend, wantStrategy)
+			}
+		})
 	}
 }
 
