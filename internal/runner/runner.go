@@ -448,7 +448,7 @@ Environment variables:
   LEASH_SHARE_DIR              Override for the shared state directory.
   LEASH_POLICY_FILE            Policy file to mount into the runtime.
   LEASH_WORKSPACE              Overrides project workspace detection.
-  LEASH_BOOTSTRAP_TIMEOUT      Controls bootstrap timeout duration.
+  LEASH_BOOTSTRAP_TIMEOUT      Controls bootstrap timeout duration (also how long native mode waits for the LSM to attach; default 2m).
   LEASH_LISTEN                 Overrides Control UI bind address.
   LEASH_NETWORK                Docker network for the agent container (overridden by --network).
   LEASH_RUNTIME                Container runtime CLI: docker (default) or podman (overridden by --runtime).

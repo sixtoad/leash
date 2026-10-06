@@ -7,8 +7,12 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/strongdm/leash/internal/entrypoint"
 )
 
 func TestRunnerLauncherSelectsNative(t *testing.T) {
@@ -343,6 +347,51 @@ func TestNativeWaitReadyFailClosed(t *testing.T) {
 
 	if err := mk(false).WaitReady(context.Background()); err != nil {
 		t.Fatalf("WaitReady should warn-and-proceed (nil) without --require-lsm: %v", err)
+	}
+}
+
+// The native readiness wait honors the bootstrap timeout instead of a fixed
+// 10s: a slow LSM attach (large rule sets on a loaded host) must not be refused
+// while leashd is still alive and attaching.
+func TestNativeWaitReadyWaitsForSlowAttach(t *testing.T) {
+	r := &runner{}
+	r.cfg.shareDir = t.TempDir()
+	r.cfg.bootstrapTimeout = 5 * time.Second
+	r.opts.requireLSM = true
+	r.leashdExited = make(chan struct{}) // alive
+	r.logger = log.New(io.Discard, "", 0)
+	go func() {
+		time.Sleep(3 * caCertWaitDelay)
+		_ = os.WriteFile(filepath.Join(r.cfg.shareDir, entrypoint.EnforcementReadyFileName), []byte("ok"), 0o644)
+	}()
+	if err := (nativeLauncher{r: r}).WaitReady(context.Background()); err != nil {
+		t.Fatalf("WaitReady must succeed once enforcement is ready: %v", err)
+	}
+}
+
+func TestNativeWaitReadyTimesOutAtBootstrapTimeout(t *testing.T) {
+	r := &runner{}
+	r.cfg.shareDir = t.TempDir()
+	r.cfg.bootstrapTimeout = 2 * caCertWaitDelay
+	r.opts.requireLSM = true
+	r.leashdExited = make(chan struct{}) // alive, never ready
+	r.logger = log.New(io.Discard, "", 0)
+	start := time.Now()
+	err := (nativeLauncher{r: r}).WaitReady(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "LEASH_BOOTSTRAP_TIMEOUT") || !strings.Contains(err.Error(), "--require-lsm") {
+		t.Fatalf("want a fail-closed timeout naming LEASH_BOOTSTRAP_TIMEOUT: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < r.cfg.bootstrapTimeout {
+		t.Fatalf("gave up after %s, before the configured %s", elapsed, r.cfg.bootstrapTimeout)
+	}
+}
+
+func TestNativeReadyTimeoutDefault(t *testing.T) {
+	if got := nativeReadyTimeout(0); got != defaultBootstrapTimeout {
+		t.Fatalf("default = %s, want %s", got, defaultBootstrapTimeout)
+	}
+	if got := nativeReadyTimeout(42 * time.Second); got != 42*time.Second {
+		t.Fatalf("configured = %s", got)
 	}
 }
 
