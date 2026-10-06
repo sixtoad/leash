@@ -657,7 +657,13 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 	// marker — leashd writes it AFTER attaching the eBPF LSM — not the CA cert,
 	// which is published earlier: the workload must not run until Layer 1 is live
 	// (fail-closed).
-	for i := 0; i < caCertWaitAttempts; i++ {
+	// Attaching the LSM programs (kernel verification of large rule sets) can
+	// take well over 10s on a loaded host, so wait as long as the bootstrap
+	// timeout leashd itself honors (LEASH_BOOTSTRAP_TIMEOUT, default 2m). A dead
+	// leashd still fails fast below.
+	timeout := nativeReadyTimeout(n.r.cfg.bootstrapTimeout)
+	deadline := time.Now().Add(timeout)
+	for {
 		// leashd reads the bootstrap marker as JSON metadata; write a valid object.
 		_ = os.WriteFile(marker, []byte(`{"source":"native"}`+"\n"), 0o644)
 		if _, err := os.Stat(ready); err == nil {
@@ -676,9 +682,20 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if !time.Now().Before(deadline) {
+			return n.notReady(fmt.Sprintf("native enforcement was not confirmed ready after %s (raise LEASH_BOOTSTRAP_TIMEOUT if the LSM attach is slow on this host)", timeout))
+		}
 		time.Sleep(caCertWaitDelay)
 	}
-	return n.notReady(fmt.Sprintf("native enforcement was not confirmed ready after %s", time.Duration(caCertWaitAttempts)*caCertWaitDelay))
+}
+
+// nativeReadyTimeout is how long the native launcher waits for leashd's
+// enforcement-ready marker: the configured bootstrap timeout, or its default.
+func nativeReadyTimeout(configured time.Duration) time.Duration {
+	if configured <= 0 {
+		return defaultBootstrapTimeout
+	}
+	return configured
 }
 
 // notReady resolves an unconfirmed-enforcement situation: fail closed when the
