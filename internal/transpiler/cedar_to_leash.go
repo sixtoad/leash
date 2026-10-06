@@ -1,6 +1,7 @@
 package transpiler
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -21,6 +22,8 @@ import (
 type CedarToLeashTranspiler struct {
 	parser *CedarParser
 }
+
+var errFilePolicyPathTooLong = errors.New("file policy path too long")
 
 func NewCedarToLeashTranspiler() *CedarToLeashTranspiler {
 	return &CedarToLeashTranspiler{
@@ -62,6 +65,10 @@ func (t *CedarToLeashTranspiler) TranspilePolicySet(policySet *CedarPolicySet) (
 	httpRewrites := []proxy.HeaderRewriteRule{}
 
 	for _, policy := range policySet.Policies {
+		if err := t.validateFileOpenResourcePaths(policy); err != nil {
+			return nil, nil, fmt.Errorf("invalid policy %s: %w", policy.ID, err)
+		}
+
 		// Special-case: MCP server forbids compile to connect denies in v1
 		if hasMCPCallAction(policy) && policy.Effect == Forbid {
 			hosts := t.extractMCPServerHosts(policy)
@@ -97,6 +104,9 @@ func (t *CedarToLeashTranspiler) TranspilePolicySet(policySet *CedarPolicySet) (
 
 		rules, err := t.convertPolicy(policy)
 		if err != nil {
+			if errors.Is(err, errFilePolicyPathTooLong) {
+				return nil, nil, fmt.Errorf("invalid policy %s: %w", policy.ID, err)
+			}
 			fmt.Fprintf(os.Stderr, "Warning: skipping policy %s: %v\n", policy.ID, err)
 			continue
 		}
@@ -167,6 +177,9 @@ func (t *CedarToLeashTranspiler) convertPolicy(policy CedarPolicy) ([]lsm.Policy
 		for _, resource := range resources {
 			rule, err := t.buildRule(action, op, resource)
 			if err != nil {
+				if errors.Is(err, errFilePolicyPathTooLong) {
+					return nil, fmt.Errorf("build %s rule for %s %q: %w", op, resource.Type, resource.Value, err)
+				}
 				continue
 			}
 			rules = append(rules, rule)
@@ -405,6 +418,42 @@ func (t *CedarToLeashTranspiler) buildRule(action int32, operation string, resou
 }
 
 func (t *CedarToLeashTranspiler) buildFileRule(rule lsm.PolicyRule, resource Resource) (lsm.PolicyRule, error) {
+	path, isDirectory, err := normalizedFileResourcePath(resource)
+	if err != nil {
+		return rule, err
+	}
+
+	copy(rule.Path[:], path)
+	rule.PathLen = int32(len(path))
+	rule.IsDirectory = isDirectory
+
+	return rule, nil
+}
+
+func (t *CedarToLeashTranspiler) validateFileOpenResourcePaths(policy CedarPolicy) error {
+	hasFileOpen := false
+	for _, operation := range t.extractOperations(policy.Action) {
+		if operation == "open" || operation == "read" || operation == "write" {
+			hasFileOpen = true
+			break
+		}
+	}
+	if !hasFileOpen {
+		return nil
+	}
+
+	for _, resource := range t.extractResources(policy) {
+		if resource.Type != "File" && resource.Type != "Dir" {
+			continue
+		}
+		if _, _, err := normalizedFileResourcePath(resource); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func normalizedFileResourcePath(resource Resource) (string, int32, error) {
 	var path string
 	isDirectory := int32(0)
 
@@ -418,18 +467,14 @@ func (t *CedarToLeashTranspiler) buildFileRule(rule lsm.PolicyRule, resource Res
 		}
 		isDirectory = 1
 	default:
-		return rule, fmt.Errorf("invalid resource type for file operation: %s", resource.Type)
+		return "", 0, fmt.Errorf("invalid resource type for file operation: %s", resource.Type)
 	}
 
-	if len(path) >= 256 {
-		return rule, fmt.Errorf("path too long: %s", path)
+	if len(path) > lsm.MaxPolicyPathLength {
+		return "", 0, fmt.Errorf("%w: %q exceeds %d bytes after normalization", errFilePolicyPathTooLong, path, lsm.MaxPolicyPathLength)
 	}
 
-	copy(rule.Path[:], path)
-	rule.PathLen = int32(len(path))
-	rule.IsDirectory = isDirectory
-
-	return rule, nil
+	return path, isDirectory, nil
 }
 
 func (t *CedarToLeashTranspiler) buildConnectRule(rule lsm.PolicyRule, resource Resource) (lsm.PolicyRule, error) {

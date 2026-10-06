@@ -397,6 +397,150 @@ when { resource in [ Dir::"/tmp/", Dir::"/dev/", Dir::"/proc/", Dir::"/run/", Di
 	}
 }
 
+func TestRunnerLongFilePolicyEnforcement(t *testing.T) {
+	skipUnlessE2E(t)
+	targetImage := strings.TrimSpace(os.Getenv("LEASH_E2E_NONROOT_IMAGE"))
+	managerImage := strings.TrimSpace(os.Getenv("LEASH_E2E_MANAGER_IMAGE"))
+	if targetImage == "" || managerImage == "" {
+		t.Skip("set LEASH_E2E_NONROOT_IMAGE and LEASH_E2E_MANAGER_IMAGE for the long file-policy regression")
+	}
+	if os.Getuid() == 0 || os.Getgid() == 0 {
+		t.Skip("the idmapped source must be owned by a non-root host identity")
+	}
+	if _, err := exec.LookPath("script"); err != nil {
+		t.Skip("script(1) is required to allocate the interactive TTY")
+	}
+
+	bin := ensureLeashBinary(t)
+	root, err := moduleRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostDir := t.TempDir()
+	containerDir := "/home/agent/" + strings.Repeat("long-policy-segment-", 4)
+	allowedPath := filepath.Join(containerDir, "allowed.txt")
+	blockedPath := filepath.Join(containerDir, "blocked.txt")
+	if len(allowedPath) <= 64 || len(blockedPath) > maxPolicyPathBytesForTest {
+		t.Fatalf("test paths outside required long-path range: allowed=%d blocked=%d", len(allowedPath), len(blockedPath))
+	}
+
+	type policyCase struct {
+		name          string
+		writeRules    string
+		blockedMarker string
+	}
+	cases := []policyCase{
+		{
+			name: "long-forbid-overrides-parent-permit",
+			writeRules: fmt.Sprintf(`permit (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ Dir::%q ] };
+forbid (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ File::%q ] };`, containerDir+"/", blockedPath),
+			blockedMarker: "FORBID",
+		},
+		{
+			name: "long-exact-permit-does-not-authorize-sibling",
+			writeRules: fmt.Sprintf(`permit (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ File::%q ] };`, allowedPath),
+			blockedMarker: "DEFAULT_DENY",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hostAllowed := filepath.Join(hostDir, "allowed.txt")
+			hostBlocked := filepath.Join(hostDir, "blocked.txt")
+			mustWrite(t, hostAllowed, []byte("allowed-original"))
+			mustWrite(t, hostBlocked, []byte("blocked-original"))
+
+			policyPath := filepath.Join(t.TempDir(), "long-path.cedar")
+			policy := fmt.Sprintf(`permit (principal, action == Action::"FileOpen", resource)
+when { resource in [ Dir::"/usr/", Dir::"/lib/", Dir::"/lib64/", Dir::"/bin/", Dir::"/sbin/", Dir::"/etc/", Dir::"/proc/", Dir::"/sys/", Dir::"/dev/", Dir::"/run/", Dir::"/tmp/", Dir::"/leash/" ] };
+permit (principal, action == Action::"FileOpenReadOnly", resource)
+when { resource in [ Dir::"/home/agent/", Dir::%q ] };
+permit (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ Dir::"/tmp/", Dir::"/dev/", Dir::"/proc/", Dir::"/run/", Dir::"/leash/" ] };
+%s`, containerDir+"/", tc.writeRules)
+			mustWrite(t, policyPath, []byte(policy))
+
+			containerName := fmt.Sprintf("leash-e2e-long-path-%d", time.Now().UnixNano())
+			t.Cleanup(func() { dockerRmForced(t, containerName, containerName+"-leash") })
+			logDir := filepath.Join(t.TempDir(), "log")
+			workload := fmt.Sprintf(
+				"set -u; printf LEASH108_ALLOWED > %s; if printf LEASH108_UNEXPECTED > %s; then exit 41; fi; sleep 1; printf LEASH108_DONE",
+				shellQuoteForTest(allowedPath), shellQuoteForTest(blockedPath),
+			)
+			args := []string{
+				bin, "--runtime", "docker", "--require-lsm", "--image", targetImage,
+				"--leash-image", managerImage, "--policy", policyPath,
+				"--container-name", containerName,
+				"--idmap-volume", hostDir + ":" + containerDir,
+				"sh", "-lc", workload,
+			}
+			var quoted []string
+			for _, arg := range args {
+				quoted = append(quoted, shellQuoteForTest(arg))
+			}
+			cmd := exec.Command("timeout", "180", "script", "-qec", strings.Join(quoted, " "), "/dev/null")
+			cmd.Dir = root
+			cmd.Env = append(os.Environ(),
+				"LEASH_HOME="+t.TempDir(),
+				"LEASH_WORK_DIR="+filepath.Join(t.TempDir(), "work"),
+				"LEASH_LOG_DIR="+logDir,
+				"LEASH_LISTEN=",
+			)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				managerLogs, _, _ := runDockerCommand(t, 15*time.Second, "logs", containerName+"-leash")
+				t.Fatalf("long-path runner failed: %v\n%s\nmanager logs:\n%s", err, out, managerLogs)
+			}
+			if !strings.Contains(string(out), "LEASH108_DONE") {
+				t.Fatalf("long-path workload did not finish:\n%s", out)
+			}
+			if got, err := os.ReadFile(hostAllowed); err != nil || string(got) != "LEASH108_ALLOWED" {
+				t.Fatalf("allowed file = %q, err=%v", got, err)
+			}
+			if got, err := os.ReadFile(hostBlocked); err != nil || string(got) != "blocked-original" {
+				t.Fatalf("blocked file = %q, err=%v", got, err)
+			}
+
+			audit, err := os.ReadFile(filepath.Join(logDir, "events.log"))
+			if err != nil {
+				t.Fatalf("read long-path audit: %v\n%s", err, out)
+			}
+			auditText := string(audit)
+			for _, want := range []struct {
+				path     string
+				decision string
+			}{
+				{path: allowedPath, decision: "allowed"},
+				{path: blockedPath, decision: "denied"},
+			} {
+				found := false
+				for _, line := range strings.Split(auditText, "\n") {
+					if strings.Contains(line, `event=file.open:rw`) &&
+						strings.Contains(line, `path="`+want.path+`"`) &&
+						strings.Contains(line, `decision=`+want.decision) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Fatalf("%s audit missing file.open:rw path=%q decision=%s on one record:\n%s", tc.blockedMarker, want.path, want.decision, auditText)
+				}
+			}
+			for _, name := range []string{containerName, containerName + "-leash"} {
+				_, exit, _ := runDockerCommand(t, 15*time.Second, "inspect", name)
+				if exit == 0 {
+					t.Fatalf("container %s remained after long-path command", name)
+				}
+			}
+		})
+	}
+}
+
+const maxPolicyPathBytesForTest = 255
+
 func TestRunnerNonRootIdmapProcControlsRemainPolicyDenied(t *testing.T) {
 	skipUnlessE2E(t)
 	targetImage := strings.TrimSpace(os.Getenv("LEASH_E2E_NONROOT_IMAGE"))
@@ -605,6 +749,178 @@ echo LEASH103_MUTATIONS_OK`
 		_, exit, _ := runDockerCommand(t, 15*time.Second, "inspect", name)
 		if exit == 0 {
 			t.Fatalf("container %s remained after directory mutation regression", name)
+		}
+	}
+}
+
+func TestRunnerLongDirectoryMutations(t *testing.T) {
+	skipUnlessE2E(t)
+	targetImage := strings.TrimSpace(os.Getenv("LEASH_E2E_NONROOT_IMAGE"))
+	managerImage := strings.TrimSpace(os.Getenv("LEASH_E2E_MANAGER_IMAGE"))
+	if targetImage == "" || managerImage == "" {
+		t.Skip("set LEASH_E2E_NONROOT_IMAGE and LEASH_E2E_MANAGER_IMAGE for the long mutation regression")
+	}
+	if os.Getuid() == 0 || os.Getgid() == 0 {
+		t.Skip("the idmapped source must be owned by a non-root host identity")
+	}
+	if _, err := exec.LookPath("script"); err != nil {
+		t.Skip("script(1) is required to allocate the interactive TTY")
+	}
+
+	bin := ensureLeashBinary(t)
+	root, err := moduleRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostParent := t.TempDir()
+	leaf := strings.Repeat("g", 50)
+	hostDir := filepath.Join(hostParent, leaf)
+	if err := os.Mkdir(hostDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	boundaryLeaf := strings.Repeat("b", 227)
+	hostBoundaryDir := filepath.Join(hostParent, boundaryLeaf)
+	if err := os.Mkdir(hostBoundaryDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	containerParent := "/home/agent/meta"
+	containerDir := filepath.Join(containerParent, leaf)
+	lockPath := filepath.Join(containerDir, "index.lock")
+	siblingPath := containerDir + "x"
+	boundaryDir := filepath.Join(containerParent, boundaryLeaf)
+	allowed255 := filepath.Join(boundaryDir, strings.Repeat("a", 10))
+	denied256 := filepath.Join(boundaryDir, strings.Repeat("d", 11))
+	if len(containerDir) != 67 || len(lockPath) != 78 {
+		t.Fatalf("linked-worktree path shape changed: gitdir=%d lock=%d", len(containerDir), len(lockPath))
+	}
+	if len(boundaryDir) != 244 || len(allowed255) != 255 || len(denied256) != 256 {
+		t.Fatalf("runtime boundary shape changed: dir=%d allowed=%d denied=%d", len(boundaryDir), len(allowed255), len(denied256))
+	}
+	for _, name := range []string{filepath.Base(allowed255), filepath.Base(denied256)} {
+		if err := os.WriteFile(filepath.Join(hostBoundaryDir, name), []byte("boundary"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	policyPath := filepath.Join(t.TempDir(), "long-mutation.cedar")
+	policy := fmt.Sprintf(`permit (principal, action in [Action::"FileOpen", Action::"FileOpenReadOnly"], resource)
+when { resource in [ Dir::"/", Dir::%q, Dir::%q ] };
+permit (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ Dir::"/tmp/", Dir::"/dev/", Dir::"/proc/", Dir::"/run/", Dir::"/leash/", Dir::%q, Dir::%q ] };`,
+		containerDir+"/", boundaryDir+"/", containerDir+"/", boundaryDir+"/")
+	mustWrite(t, policyPath, []byte(policy))
+
+	containerName := fmt.Sprintf("leash-e2e-long-mutation-%d", time.Now().UnixNano())
+	t.Cleanup(func() { dockerRmForced(t, containerName, containerName+"-leash") })
+	workload := fmt.Sprintf(`set -eu
+test "$(id -u)" = 1001
+printf lock > %s
+rm %s
+mkdir %s/sub
+printf source > %s/sub/source
+mv %s/sub/source %s/sub/renamed
+rm %s/sub/renamed
+rmdir %s/sub
+printf boundary > %s/boundary-source
+if mv %s/boundary-source %s 2>/tmp/leash109-rename; then exit 41; fi
+test -f %s/boundary-source
+if mkdir %s 2>/tmp/leash109-mkdir; then exit 42; fi
+rm %s
+if rm %s 2>/tmp/leash109-overflow; then exit 43; fi
+test -f %s
+printf kept > %s/kept
+sleep 3
+echo LEASH109_LONG_MUTATIONS_OK`,
+		shellQuoteForTest(lockPath), shellQuoteForTest(lockPath), shellQuoteForTest(containerDir),
+		shellQuoteForTest(containerDir), shellQuoteForTest(containerDir), shellQuoteForTest(containerDir),
+		shellQuoteForTest(containerDir), shellQuoteForTest(containerDir), shellQuoteForTest(containerDir),
+		shellQuoteForTest(containerDir), shellQuoteForTest(siblingPath), shellQuoteForTest(containerDir),
+		shellQuoteForTest(siblingPath), shellQuoteForTest(allowed255), shellQuoteForTest(denied256),
+		shellQuoteForTest(denied256), shellQuoteForTest(containerDir))
+	args := []string{
+		bin, "--runtime", "docker", "--require-lsm", "--image", targetImage,
+		"--leash-image", managerImage, "--policy", policyPath, "--container-name", containerName,
+		"--idmap-volume", hostParent + ":" + containerParent, "sh", "-lc", workload,
+	}
+	var quoted []string
+	for _, arg := range args {
+		quoted = append(quoted, shellQuoteForTest(arg))
+	}
+	logDir := filepath.Join(t.TempDir(), "log")
+	cmd := exec.Command("timeout", "180", "script", "-qec", strings.Join(quoted, " "), "/dev/null")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "LEASH_HOME="+t.TempDir(), "LEASH_WORK_DIR="+filepath.Join(t.TempDir(), "work"), "LEASH_LOG_DIR="+logDir, "LEASH_LISTEN=")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		managerLogs, _, _ := runDockerCommand(t, 15*time.Second, "logs", containerName+"-leash")
+		t.Fatalf("long mutation regression failed: %v\n%s\nmanager logs:\n%s", err, out, managerLogs)
+	}
+	if !strings.Contains(string(out), "LEASH109_LONG_MUTATIONS_OK") {
+		t.Fatalf("long mutation workload did not finish:\n%s", out)
+	}
+	auditPath := filepath.Join(logDir, "events.log")
+	var audit []byte
+	auditDeadline := time.Now().Add(5 * time.Second)
+	for {
+		audit, err = os.ReadFile(auditPath)
+		if err == nil && strings.Contains(string(audit), `event=file.unlink`) && strings.Contains(string(audit), `path="<unresolved>"`) {
+			break
+		}
+		if time.Now().After(auditDeadline) {
+			if err != nil {
+				t.Fatalf("read long mutation audit: %v", err)
+			}
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	requireAuditRecord := func(event, path, decision string) {
+		t.Helper()
+		for _, line := range strings.Split(string(audit), "\n") {
+			if strings.Contains(line, "event="+event+" ") && strings.Contains(line, `path="`+path+`"`) && strings.Contains(line, "decision="+decision) {
+				return
+			}
+		}
+		t.Fatalf("long mutation audit missing correlated %s path=%q decision=%s:\n%s", event, path, decision, audit)
+	}
+	for _, want := range []struct{ event, path, decision string }{
+		{"file.unlink", lockPath, "allowed"},
+		{"file.mkdir", filepath.Join(containerDir, "sub"), "allowed"},
+		{"file.rename", filepath.Join(containerDir, "sub", "renamed"), "allowed"},
+		{"file.unlink", filepath.Join(containerDir, "sub", "renamed"), "allowed"},
+		{"file.rmdir", filepath.Join(containerDir, "sub"), "allowed"},
+		{"file.rename", siblingPath, "denied"},
+		{"file.mkdir", siblingPath, "denied"},
+		{"file.unlink", allowed255, "allowed"},
+		{"file.unlink", "<unresolved>", "denied"},
+	} {
+		requireAuditRecord(want.event, want.path, want.decision)
+	}
+	kept := filepath.Join(hostDir, "kept")
+	info, err := os.Stat(kept)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := info.Sys().(*syscall.Stat_t)
+	if owner.Uid != uint32(os.Getuid()) || owner.Gid != uint32(os.Getgid()) {
+		t.Fatalf("kept owner = %d:%d, want %d:%d", owner.Uid, owner.Gid, os.Getuid(), os.Getgid())
+	}
+	if _, err := os.Stat(filepath.Join(hostParent, leaf+"x")); !os.IsNotExist(err) {
+		t.Fatalf("undeclared sibling unexpectedly exists: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(hostBoundaryDir, filepath.Base(allowed255))); !os.IsNotExist(err) {
+		t.Fatalf("255-byte target survived allowed unlink: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(hostBoundaryDir, filepath.Base(denied256))); err != nil {
+		t.Fatalf("256-byte denied target did not survive: %v", err)
+	}
+	for _, name := range []string{containerName, containerName + "-leash"} {
+		inspect, exit, inspectErr := runDockerCommand(t, 15*time.Second, "inspect", name)
+		if inspectErr != nil && exit == -1 {
+			t.Fatalf("inspect cleanup for %s failed to execute: %v", name, inspectErr)
+		}
+		if exit != 1 {
+			t.Fatalf("container %s cleanup inspect exit=%d err=%v output=%s", name, exit, inspectErr, inspect)
 		}
 	}
 }

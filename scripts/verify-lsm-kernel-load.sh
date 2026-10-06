@@ -2,7 +2,9 @@
 # Ask the host kernel's verifier to load and attach the eBPF LSM objects that
 # are currently generated in internal/lsm -- the exact objects `go build`
 # embeds into the leash CLI -- with a policy that has open, exec and connect
-# rules (issue #110). Each module is only loaded when the policy has rules for
+# rules (issue #110), plus file-policy rules longer than 64 bytes whose permit,
+# forbid, mutation and hard-link outcomes are asserted (issues #108/#109).
+# Each module is only loaded when the policy has rules for
 # it, so a policy without an exec rule never sends lsm_exec to the verifier.
 #
 # The compiled test binary runs inside a privileged, --cgroupns=host container

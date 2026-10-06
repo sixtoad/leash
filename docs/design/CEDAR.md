@@ -125,6 +125,9 @@ Leash IR and logs use stable operation strings. Actions map as follows:
 
 Notes:
 - Directory resources must end with `/`. The transpiler normalises this; the linter warns when missing.
+- `FileOpen` file and directory resource paths may contain at most 255 bytes (a directory's trailing `/` counts); parsers and loaders reject a longer individual rule. The kernel compares every byte of every accepted rule: a rule matches each path it is a byte prefix of (a directory rule also matches the directory itself), the longest matching rule wins, and an earlier rule wins a tie. The hard-link guard (judged as a read of the source) and the directory-mutation hooks (`mkdir`, `unlink`, `rmdir`, `rename`) use the same full-length rules. A runtime path longer than 255 bytes cannot be matched and is denied.
+- `ProcessExec` resource paths are still matched by the legacy 64-byte kernel matcher (at most 64 exec rules); the exec loader rejects a longer rule or a larger rule set instead of skipping it.
+- `leash version --json` advertises both limits as `policyLimits.filePathBytes` / `policyLimits.execPathBytes` (capability `policy-path-limits`).
 - IPv6 literals and CIDR are not supported in v1 policies.
 - Hostname rules require the Leash proxy for hostname enforcement (kernel enforces IP only).
 

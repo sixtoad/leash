@@ -105,6 +105,22 @@ func (m *LSMManager) LoadAndStart() error {
 	return nil
 }
 
+// ValidateKernelPolicyLimits checks a policy set against the limits the
+// kernel programs enforce (rule counts and byte-for-byte path lengths) without
+// changing any state.
+func ValidateKernelPolicyLimits(policies *PolicySet) error {
+	if policies == nil {
+		return nil
+	}
+	if err := validateOpenPolicyRules(ConvertToFileOpenRules(policies.Open)); err != nil {
+		return fmt.Errorf("invalid open policies: %w", err)
+	}
+	if err := validateExecPolicyRules(ConvertToExecRules(policies.Exec)); err != nil {
+		return fmt.Errorf("invalid exec policies: %w", err)
+	}
+	return nil
+}
+
 func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
 	if !policies.HasOpenPolicies() {
 		// No open policies, ensure LSM is stopped
@@ -229,6 +245,11 @@ func (m *LSMManager) UpdateRuntimeRules(policies *PolicySet) error {
 		return nil
 	}
 
+	// Validate every module's kernel limits before touching any of them, so
+	// a rule one module would reject cannot leave the others half-updated.
+	if err := ValidateKernelPolicyLimits(policies); err != nil {
+		return err
+	}
 	if err := m.updateOpenLSM(policies); err != nil {
 		return err
 	}

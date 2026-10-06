@@ -18,7 +18,10 @@ func testBuild() Build {
 // wantCapabilities is the surface this build advertises, written out as literals
 // rather than obtained from the code under test, so a silent change to the list
 // fails here.
-var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume"}
+// wantPolicyLimits pins the advertised enforced policy path limits.
+var wantPolicyLimits = &PolicyLimits{FilePathBytes: 255, ExecPathBytes: 64, FileRules: 256, ExecRules: 64}
+
+var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits"}
 
 // TestEnforcingIsDerivedPerPlatform pins the criterion: `enforcing` says whether
 // *this binary* carries an enforcement path. Linux ships the eBPF LSM programs
@@ -63,7 +66,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			want: Info{
 				Version: "v0.2.0", Commit: "c686025", SourceRevision: "c686025aa1b2c3", BuiltAt: "2026-07-21T10:11:12Z",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
-				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
+				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "linux", Arch: "amd64",
 			},
 		},
 		{
@@ -73,7 +76,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			want: Info{
 				Version: "v0.2.0", Commit: "c686025", SourceRevision: "c686025aa1b2c3", BuiltAt: "2026-07-21T10:11:12Z",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
-				Capabilities: wantCapabilities, OS: "darwin", Arch: "arm64",
+				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "darwin", Arch: "arm64",
 			},
 		},
 		{
@@ -83,7 +86,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			want: Info{
 				Version: "v0.2.0", Commit: "c686025", SourceRevision: "c686025aa1b2c3", BuiltAt: "2026-07-21T10:11:12Z",
 				Enforcing: false, ContractVersion: 1, MinCompatibleContract: 0,
-				Capabilities: wantCapabilities, OS: "windows", Arch: "amd64",
+				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "windows", Arch: "amd64",
 			},
 		},
 		{
@@ -93,7 +96,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			want: Info{
 				Version: "dev-c686025", Commit: "c686025-dirty", SourceRevision: "c686025aa1b2c3-dirty", BuiltAt: "2026-07-21T10:11:12Z",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
-				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
+				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "linux", Arch: "amd64",
 			},
 		},
 		{
@@ -105,7 +108,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			want: Info{
 				Version: "dev", Commit: "abc-dirty", SourceRevision: "abc-dirty", BuiltAt: "unknown",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
-				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
+				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "linux", Arch: "amd64",
 			},
 		},
 		{
@@ -117,7 +120,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			want: Info{
 				Version: "v1.2.3-4-gabc1234", Commit: "v1.2.3-4-gabc1234", SourceRevision: "v1.2.3-4-gabc1234", BuiltAt: "unknown",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
-				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
+				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "linux", Arch: "amd64",
 			},
 		},
 		{
@@ -129,7 +132,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			want: Info{
 				Version: "dev", Commit: "unknown", SourceRevision: "unknown", BuiltAt: "unknown",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
-				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
+				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "linux", Arch: "amd64",
 			},
 		},
 		{
@@ -139,7 +142,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			want: Info{
 				Version: "unknown", Commit: "unknown", SourceRevision: "unknown", BuiltAt: "unknown",
 				Enforcing: true, ContractVersion: 1, MinCompatibleContract: 0,
-				Capabilities: wantCapabilities, OS: "linux", Arch: "amd64",
+				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "linux", Arch: "amd64",
 			},
 		},
 	}
@@ -205,7 +208,8 @@ func TestJSONWireShape(t *testing.T) {
 		"enforcing":             true,
 		"contractVersion":       float64(1), // encoding/json decodes numbers as float64
 		"minCompatibleContract": float64(0),
-		"capabilities":          []any{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume"},
+		"capabilities":          []any{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits"},
+		"policyLimits":          map[string]any{"filePathBytes": float64(255), "execPathBytes": float64(64), "fileRules": float64(256), "execRules": float64(64)},
 		"os":                    "linux",
 		"arch":                  "amd64",
 	}
@@ -701,5 +705,27 @@ func TestParseAcceptsAMinimalDocument(t *testing.T) {
 	}
 	if !got.SupportsCaller(0) || !got.SupportsCaller(1) {
 		t.Fatalf("Parse(...) document %+v refuses a caller inside [0,1]", got)
+	}
+}
+
+// TestParsePolicyLimits: a caller sizing policy paths reads policyLimits from
+// the installed binary; a document that predates it decodes with nil, which a
+// caller must treat as the legacy silent 64-byte cutoff.
+func TestParsePolicyLimits(t *testing.T) {
+	t.Parallel()
+
+	got, err := Parse([]byte(`{"version":"v1","contractVersion":1,"policyLimits":{"filePathBytes":255,"execPathBytes":64,"fileRules":256,"execRules":64}}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got.PolicyLimits == nil || *got.PolicyLimits != (PolicyLimits{FilePathBytes: 255, ExecPathBytes: 64, FileRules: 256, ExecRules: 64}) {
+		t.Fatalf("PolicyLimits = %+v, want 255/64", got.PolicyLimits)
+	}
+	legacy, err := Parse([]byte(`{"version":"v0","contractVersion":1}`))
+	if err != nil {
+		t.Fatalf("Parse legacy: %v", err)
+	}
+	if legacy.PolicyLimits != nil {
+		t.Fatalf("legacy PolicyLimits = %+v, want nil", legacy.PolicyLimits)
 	}
 }

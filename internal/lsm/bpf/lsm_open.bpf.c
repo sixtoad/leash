@@ -29,18 +29,21 @@ typedef int bool;
 // BPF map types
 #define BPF_MAP_TYPE_ARRAY 2
 #define BPF_MAP_TYPE_HASH 1
+#define BPF_MAP_TYPE_LPM_TRIE 11
 #define BPF_MAP_TYPE_PROG_ARRAY 3
 #define BPF_MAP_TYPE_RINGBUF 27
 #define BPF_MAP_TYPE_PERCPU_ARRAY 6
 #define BPF_ANY 0
+#define BPF_F_NO_PREALLOC 1
 
 char LICENSE[] SEC("license") = "GPL";
 
 #define MAX_PATH_LEN 256
-#define MAX_POLICY_PATH_LEN 64
 #define MAX_ENTRIES 8192
 // BPF verifier-friendly constant bound for policy rules (max 256 with loop-based implementation)
 #define MAX_POLICY_RULES 256
+#define MAX_OPEN_INDEX_ENTRIES (MAX_POLICY_RULES * 3 * 2)
+#define MAX_MUTATION_INDEX_ENTRIES (MAX_POLICY_RULES * 2)
 #define PROC_SUPER_MAGIC 0x9fa0
 #define OVERLAYFS_SUPER_MAGIC 0x794c7630
 
@@ -80,24 +83,36 @@ struct open_event {
     s32 result;     // Result of the open operation (0 = allowed, -EACCES = denied)
 };
 
-// Policy rule structure for BPF map
-struct policy_rule {
-    u32 action;      // 0 = deny, 1 = allow
-    u32 operation;   // 0 = open, 1 = open:ro, 2 = open:rw
+struct open_exact_rule_key {
+    u32 generation;
+    u32 operation;
     u32 path_len;
     char path[MAX_PATH_LEN];
-    u32 is_directory; // 1 if path ends with /
 };
 
-struct mutation_rule_key {
+struct open_prefix_rule_key {
+    u32 prefix_len;
+    u8 domain;
+    char path[MAX_PATH_LEN - 1];
+};
+
+struct open_index_rule {
+    u32 action;
+    u32 specificity;
+    u32 order;
+};
+
+struct mutation_prefix_rule_key {
+    u32 prefix_len;
+    u8 domain;
+    char path[MAX_PATH_LEN - 1];
+};
+
+struct mutation_exact_rule_key {
     u32 generation;
     u32 path_len;
-    char path[MAX_POLICY_PATH_LEN];
+    char path[MAX_PATH_LEN];
 };
-
-#define MUTATION_GENERIC_DENY (1U << 0)
-#define MUTATION_RW_DIR_ALLOW (1U << 1)
-#define MUTATION_RW_DIR_DENY (1U << 2)
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -121,46 +136,75 @@ struct {
     __type(value, u8);
 } allowed_cgroups SEC(".maps");
 
-// Map to store policy rules (indexed by rule number, supports up to 256 rules)
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, MAX_POLICY_RULES);
-    __type(key, u32);
-    __type(value, struct policy_rule);
-} policy_rules SEC(".maps");
-
-// Verifier-bounded mutation index derived from policy_rules by userspace. The
-// key retains the existing 64-byte policy-prefix contract; flags aggregate all
-// rules at that exact prefix so denies remain order-independent.
+// Complete path bytes are the key: the kernel map may hash the struct, but no
+// digest or probabilistic comparison participates in the security decision.
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, MAX_POLICY_RULES * 2);
-    __type(key, struct mutation_rule_key);
-    __type(value, u32);
-} mutation_rules SEC(".maps");
+    // Two generations overlap during atomic reload; each generic rule expands
+    // to all three runtime operations.
+    __uint(max_entries, MAX_OPEN_INDEX_ENTRIES);
+    __type(key, struct open_exact_rule_key);
+    __type(value, struct open_index_rule);
+} open_exact_rules SEC(".maps");
+
+// Byte-prefix rules: directory rules (trailing '/', matching descendants) and
+// file rules (matching the file and every path it is a byte prefix of), exactly
+// the historical starts-with semantics but over all 255 bytes. The kernel trie
+// returns the LONGEST matching prefix, i.e. the most specific rule. The first
+// data byte bijectively encodes generation+operation, so an inapplicable deeper
+// rule can never mask a shallower rule for the requested operation. The
+// complete LPM data is the kernel maximum 256 bytes.
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, MAX_OPEN_INDEX_ENTRIES);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct open_prefix_rule_key);
+    __type(value, struct open_index_rule);
+} open_prefix_rules SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, u32);
+    __type(value, u64);
+} active_open_generation SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 2);
+    __type(key, u32);
     __type(value, u32);
+} open_default_policy SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, MAX_MUTATION_INDEX_ENTRIES);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct mutation_prefix_rule_key);
+    __type(value, u8);
+} mutation_deny_rules SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
+    __uint(max_entries, MAX_MUTATION_INDEX_ENTRIES);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+    __type(key, struct mutation_prefix_rule_key);
+    __type(value, u8);
+} mutation_allow_rules SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_MUTATION_INDEX_ENTRIES);
+    __type(key, struct mutation_exact_rule_key);
+    __type(value, u8);
+} mutation_self_deny_rules SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u64);
 } active_mutation_generation SEC(".maps");
-
-// Map to store the number of policy rules
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, u32);
-    __type(value, u32);
-} num_rules SEC(".maps");
-
-// Map to store the default policy result (0 = deny, 1 = allow)
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, u32);
-    __type(value, u32);
-} default_policy SEC(".maps");
 
 // Container image roots use overlayfs. A declared write is first checked on
 // the overlay path, then overlayfs opens backing-store objects while completing
@@ -218,23 +262,6 @@ static __always_inline bool is_target_cgroup()
 #ifndef barrier_var
 #define barrier_var(var) asm volatile("" : "+r"(var))
 #endif
-
-// Bounded loop string comparison with disabled unrolling for BPF verifier
-static __always_inline int simple_string_starts_with(const char *s, const char *p, __u32 max_len)
-{
-    if (max_len > 64) max_len = 64;
-    // Keep the constant `i < 64` bound below: without the barrier clang may
-    // drop it as implied by the caller's length check and leave the loop bounded
-    // only by a register the verifier has no range for (issue #110).
-    barrier_var(max_len);
-
-    #pragma clang loop unroll(disable)
-    for (int i = 0; i < 64; i++) {
-        if (i >= max_len) break;          // dominates the byte loads
-        if (s[i] != p[i]) return 0;
-    }
-    return 1;
-}
 
 // Check if path is a Linux namespace FD from nsfs
 static __always_inline bool is_nsfs_path(const char *path)
@@ -321,70 +348,16 @@ static __always_inline u32 get_file_operation_type(struct file *file)
     return OP_OPEN;
 }
 
-// Clean loop-based policy check for up to 256 rules with BPF verifier compatibility
-// NOT __always_inline: kept as a real BPF-to-BPF subprogram so its 256-rule scan
-// is verified once and CALLED, not duplicated inline into every hook. Inlining it
-// into lsm_link (which also reconstructs the path) blew the verifier's 1M budget.
-static __noinline int check_path_policy(const char *path, u32 file_op_type)
-{
-    __u32 key = 0;
-    __u32 *nptr = bpf_map_lookup_elem(&num_rules, &key);
-    __u32 n = nptr ? *nptr : 0;
-    if (n == 0) {
-        // No rules defined, use default policy from userspace
-        __u32 *default_ptr = bpf_map_lookup_elem(&default_policy, &key);
-        return default_ptr ? *default_ptr : 0; // Default to deny if map lookup fails
-    }
-    if (n > 256) n = 256;
-    #pragma clang loop unroll(disable)
-    for (__u32 i = 0; i < 256; i++) {
-        if (i >= n) break;
-
-        key = i;
-        struct policy_rule *rule = bpf_map_lookup_elem(&policy_rules, &key);
-        if (!rule) continue;
-
-        __u32 len = rule->path_len;
-        if (len == 0 || len > 64) continue;
-
-        // One prefix pass to len-1, then classify the final char (one hot-path pass
-        // instead of two). Exact match (path[len-1] == rule[len-1]) covers
-        // descendants and file rules; for a directory rule, the directory ITSELF
-        // also matches — its runtime path has no trailing slash, so it ends where
-        // the rule's '/' is (path[len-1] == '\0'). That dir-itself case is why a
-        // forbidden dir's entries could otherwise be enumerated and an allowed dir
-        // wasn't listable.
-        bool matches = false;
-        bool directory_self = false;
-        if (simple_string_starts_with(path, rule->path, len - 1)) {
-            if (path[len - 1] == rule->path[len - 1]) {
-                matches = true;
-            } else if (rule->is_directory && path[len - 1] == '\0') {
-                matches = true;
-                directory_self = true;
-            }
-        }
-        if (matches) {
-            // Check if operation types match
-            if (rule->operation == OP_OPEN) {
-                // "open" matches any file operation type
-                return rule->action;
-            } else if (rule->operation == file_op_type) {
-                // Exact operation match (open:ro or open:rw)
-                return rule->action;
-            }
-            // Path matches but operation doesn't, continue to next rule
-        }
-    }
-
-    // No matching open rule found, use default policy from userspace
-    key = 0;
-    __u32 *default_ptr = bpf_map_lookup_elem(&default_policy, &key);
-    return default_ptr ? *default_ptr : 0; // Default to deny if map lookup fails
-}
-
+// Per-CPU scratch is not private to one hook invocation: a non-sleepable BPF
+// LSM program runs with migration disabled but may be preempted, and another
+// task on the same CPU can then rewrite the scratch. Every scratch user stamps
+// its pid_tgid as `owner` before writing and confirms it before enforcing an
+// allow; a changed owner denies (fail closed).
 struct mutation_lookup_scratch {
-    struct mutation_rule_key key;
+    u64 owner;
+    u64 activation_token;
+    struct mutation_prefix_rule_key prefix;
+    struct mutation_exact_rule_key exact;
 };
 
 struct {
@@ -394,51 +367,56 @@ struct {
     __type(value, struct mutation_lookup_scratch);
 } mutation_lookup_scratch_map SEC(".maps");
 
-// Evaluate every policy prefix of the target with at most 64 hash lookups,
-// instead of nesting a 64-byte comparison inside a 256-rule scan. Looking up
-// each byte prefix preserves the historical file-rule prefix behavior, while
-// the synthetic trailing slash preserves a directory rule's exact-self deny.
 static __noinline int check_mutation_policy(const char *path)
 {
     u32 zero = 0;
     struct mutation_lookup_scratch *scratch = bpf_map_lookup_elem(&mutation_lookup_scratch_map, &zero);
     if (!scratch) return 0;
-    u32 *active_generation = bpf_map_lookup_elem(&active_mutation_generation, &zero);
-    if (!active_generation) return 0;
-    __builtin_memset(&scratch->key, 0, sizeof(scratch->key));
-    // Read one immutable generation for the whole decision. Userspace stages
-    // the other generation completely before atomically flipping this value.
-    scratch->key.generation = *active_generation;
-    bool mutation_allowed = false;
+    scratch->owner = bpf_get_current_pid_tgid();
+    u64 *token_ptr = bpf_map_lookup_elem(&active_mutation_generation, &zero);
+    if (!token_ptr) return 0;
+    u64 activation_token = *token_ptr;
+    u32 active_generation = activation_token & 1;
+    scratch->activation_token = activation_token;
+    __builtin_memset(&scratch->prefix, 0, sizeof(scratch->prefix));
+    __builtin_memset(&scratch->exact, 0, sizeof(scratch->exact));
 
+    u32 path_len = 0;
+    bool terminated = false;
     #pragma clang loop unroll(disable)
-    for (u32 i = 0; i < MAX_POLICY_PATH_LEN; i++) {
+    for (int i = 0; i < MAX_PATH_LEN; i++) {
         char c = path[i];
         if (c == '\0') {
-            // A directory rule carries a trailing slash but bpf_d_path omits it
-            // for the directory itself. Only its generic deny applies here;
-            // writable-directory authority is descendant-only.
-            scratch->key.path[i] = '/';
-            scratch->key.path_len = i + 1;
-            u32 *self_flags = bpf_map_lookup_elem(&mutation_rules, &scratch->key);
-            if (self_flags && (*self_flags & MUTATION_GENERIC_DENY)) return 0;
+            path_len = i;
+            terminated = true;
             break;
         }
-
-        scratch->key.path[i] = c;
-        scratch->key.path_len = i + 1;
-        u32 *flags = bpf_map_lookup_elem(&mutation_rules, &scratch->key);
-        if (!flags) continue;
-        if (*flags & (MUTATION_GENERIC_DENY | MUTATION_RW_DIR_DENY)) return 0;
-        if (*flags & MUTATION_RW_DIR_ALLOW) mutation_allowed = true;
+        scratch->exact.path[i] = c;
+        if (i < MAX_PATH_LEN - 1) scratch->prefix.path[i] = c;
     }
+    if (!terminated || path_len == 0 || path_len > MAX_PATH_LEN - 1) return 0;
 
-    // Mutation rights never inherit the shared open default. In particular, a
-    // read/open allow on Dir::"/" must not authorize writes to every directory.
-    return mutation_allowed ? 1 : 0;
+    scratch->prefix.prefix_len = 8 + path_len * 8;
+    scratch->prefix.domain = active_generation;
+    scratch->exact.generation = active_generation;
+    scratch->exact.path_len = path_len;
+
+    // Keep nullable map lookups genuinely nested: issuing both before their
+    // identical deny branches lets LLVM merge the pointers with a verifier-
+    // prohibited bitwise OR.
+    u8 *deny = bpf_map_lookup_elem(&mutation_deny_rules, &scratch->prefix);
+    if (!deny) {
+        u8 *self_deny = bpf_map_lookup_elem(&mutation_self_deny_rules, &scratch->exact);
+        if (!self_deny) {
+            u8 *allow = bpf_map_lookup_elem(&mutation_allow_rules, &scratch->prefix);
+            return allow ? 1 : 0;
+        }
+    }
+    return 0;
 }
 
 struct mutation_scratch {
+    u64 owner;
     char parent[MAX_PATH_LEN];
     char target[MAX_PATH_LEN];
 };
@@ -449,6 +427,20 @@ struct {
     __type(key, u32);
     __type(value, struct mutation_scratch);
 } mutation_scratch_map SEC(".maps");
+
+static __noinline int mutation_generation_unchanged()
+{
+    u32 zero = 0;
+    u64 self = bpf_get_current_pid_tgid();
+    struct mutation_lookup_scratch *scratch = bpf_map_lookup_elem(&mutation_lookup_scratch_map, &zero);
+    struct mutation_scratch *paths = bpf_map_lookup_elem(&mutation_scratch_map, &zero);
+    if (!scratch || !paths) return 0;
+    barrier();
+    u64 *confirmed_token = bpf_map_lookup_elem(&active_mutation_generation, &zero);
+    if (!confirmed_token) return 0;
+    if (scratch->owner != self || paths->owner != self) return 0;
+    return *confirmed_token == scratch->activation_token;
+}
 
 // path_* hooks receive a trusted parent path plus a child dentry. Build the
 // user-visible absolute target without walking outside that mount.
@@ -498,6 +490,7 @@ static __noinline int build_mutation_path(const struct path *dir, struct dentry 
 
 static __noinline int emit_mutation_decision(const char *path, u32 operation, int allowed)
 {
+    if (!mutation_generation_unchanged()) allowed = 0;
     struct open_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
     if (!event) {
         return allowed ? 0 : -13;
@@ -528,6 +521,7 @@ static __noinline int check_directory_mutation(const struct path *dir, struct de
     if (!scratch) {
         return emit_mutation_decision(unresolved_path, operation, 0);
     }
+    scratch->owner = bpf_get_current_pid_tgid();
     if (build_mutation_path(dir, dentry, scratch->parent, scratch->target) != 0) {
         // An unresolved path cannot safely inherit a broader grant, but the
         // denial must remain actionable to the operator.
@@ -537,7 +531,7 @@ static __noinline int check_directory_mutation(const struct path *dir, struct de
     if (!allowed || emit_allowed) {
         return emit_mutation_decision(scratch->target, operation, allowed);
     }
-    return 0;
+    return mutation_generation_unchanged() ? 0 : -13;
 }
 
 static __noinline int emit_current_mutation(u32 operation, int allowed)
@@ -671,6 +665,9 @@ int BPF_PROG(lsm_rename_destination, const struct path *old_dir, struct dentry *
 struct open_path_scratch {
     int path_len;
     char path[MAX_PATH_LEN];
+    // Appended after path so the canonicalizer's verified layout is unchanged.
+    int unresolved; // the absolute path could not be resolved: deny
+    u64 owner;      // pid_tgid of the invocation that wrote this scratch
 };
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -678,6 +675,83 @@ struct {
     __type(key, u32);
     __type(value, struct open_path_scratch);
 } open_path_scratch_map SEC(".maps");
+
+struct open_index_lookup_scratch {
+    u64 owner;
+    u64 activation_token;
+    struct open_exact_rule_key exact;
+    struct open_prefix_rule_key prefix;
+};
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct open_index_lookup_scratch);
+} open_index_lookup_scratch_map SEC(".maps");
+
+// Full-length (1-255 byte) file policy decision for a NUL-terminated path in a
+// MAX_PATH_LEN-byte buffer: longest matching byte-prefix rule, a directory
+// rule also matching the directory itself, per-operation, earlier rule wins a
+// specificity tie, else the generation's default. Snapshots the activation
+// token into lookup scratch; callers re-check it before enforcing.
+static __noinline int check_open_indexed_policy(const char *path, u32 file_op_type)
+{
+    u32 zero = 0;
+    u64 *token_ptr = bpf_map_lookup_elem(&active_open_generation, &zero);
+    struct open_index_lookup_scratch *lookup = bpf_map_lookup_elem(&open_index_lookup_scratch_map, &zero);
+    if (!token_ptr || !lookup) {
+        return 0;
+    }
+    lookup->owner = bpf_get_current_pid_tgid();
+    u64 activation_token = *token_ptr;
+    u32 active_generation = activation_token & 1;
+    lookup->activation_token = activation_token;
+
+    __builtin_memset(&lookup->exact, 0, sizeof(lookup->exact));
+    __builtin_memset(&lookup->prefix, 0, sizeof(lookup->prefix));
+    u32 path_len = 0;
+    bool terminated = false;
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < MAX_PATH_LEN; i++) {
+        char c = path[i];
+        if (c == '\0') {
+            path_len = i;
+            terminated = true;
+            break;
+        }
+        lookup->exact.path[i] = c;
+        if (i < MAX_PATH_LEN - 1) lookup->prefix.path[i] = c;
+    }
+    if (!terminated || path_len == 0 || path_len > MAX_PATH_LEN - 1) {
+        return 0;
+    }
+
+    lookup->exact.generation = active_generation;
+    lookup->exact.operation = file_op_type;
+    lookup->exact.path_len = path_len;
+    lookup->prefix.prefix_len = 8 + path_len * 8;
+    lookup->prefix.domain = active_generation * 3 + file_op_type;
+
+    struct open_index_rule *exact = bpf_map_lookup_elem(&open_exact_rules, &lookup->exact);
+    struct open_index_rule *prefix = bpf_map_lookup_elem(&open_prefix_rules, &lookup->prefix);
+    u32 *default_ptr = bpf_map_lookup_elem(&open_default_policy, &active_generation);
+    u32 decision = default_ptr ? *default_ptr : 0;
+    if (exact) {
+        if (!prefix) {
+            decision = exact->action;
+        } else if (exact->specificity > prefix->specificity) {
+            decision = exact->action;
+        } else if (prefix->specificity > exact->specificity) {
+            decision = prefix->action;
+        } else {
+            decision = exact->order <= prefix->order ? exact->action : prefix->action;
+        }
+    } else if (prefix) {
+        decision = prefix->action;
+    }
+
+    return decision;
+}
 struct {
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
     __uint(max_entries, 2);
@@ -829,9 +903,18 @@ int BPF_PROG(lsm_open, struct file *file)
         return -13;
     }
     char *path = scratch->path;
+    scratch->owner = bpf_get_current_pid_tgid();
+    scratch->unresolved = 0;
 
     // Get file path first - file pointer is already trusted from BPF_PROG macro
     int ret = bpf_d_path(&file->f_path, path, MAX_PATH_LEN);
+    if (ret == -36) {
+        // -ENAMETOOLONG: the absolute path exceeds the 255-byte policy
+        // contract. Its basename (kept below for the audit record) must never
+        // be evaluated as if it were a path: no rule can match it, so the
+        // default would decide and a forbid would fail open (#108).
+        scratch->unresolved = 1;
+    }
     if (ret < 0) {
         // If d_path fails, try to at least get the filename
         struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
@@ -874,32 +957,33 @@ int BPF_PROG(lsm_open_policy, struct file *file)
     }
     char *path = scratch->path;
 
-    // Skip logging nsfs (namespace filesystem) paths
-    if (is_nsfs_path(path)) {
+    // Skip logging nsfs (namespace filesystem) paths. Only a resolved path
+    // qualifies: an unresolved one holds a bare, attacker-chosen basename.
+    if (!scratch->unresolved && is_nsfs_path(path)) {
         return 0; // Allow but don't log namespace FDs
     }
 
     // Determine file operation type from file mode
     u32 file_op_type = get_file_operation_type(file);
 
-    int policy_result = check_path_policy(path, file_op_type);
-
-    // Reserve ringbuf space
-    struct open_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-    if (!event) {
-        // Still need to enforce policy even if we can't log
-        return policy_result ? 0 : -13; // -EACCES = 13
+    int policy_result = check_open_indexed_policy(path, file_op_type);
+    if (scratch->unresolved) {
+        policy_result = 0;
     }
 
-    // Get process information
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    event->pid = pid_tgid >> 32;
-    event->tgid = pid_tgid & 0xFFFFFFFF;
-    event->timestamp = bpf_ktime_get_ns();
-    event->cgroup_id = bpf_get_current_cgroup_id();
+    // Reserve ringbuf space. Audit assembly is optional, but every path joins
+    // the same activation-token check immediately before enforcement returns.
+    struct open_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
+    if (event) {
+        // Get process information
+        u64 pid_tgid = bpf_get_current_pid_tgid();
+        event->pid = pid_tgid >> 32;
+        event->tgid = pid_tgid & 0xFFFFFFFF;
+        event->timestamp = bpf_ktime_get_ns();
+        event->cgroup_id = bpf_get_current_cgroup_id();
 
-    // Get process command name
-    bpf_get_current_comm(event->comm, sizeof(event->comm));
+        // Get process command name
+        bpf_get_current_comm(event->comm, sizeof(event->comm));
 
     // NOTE: a spoofable comm-name allowlist (apt-get / dpkg* / update*) that
     // force-allowed every file open was removed here (issue #5). comm is the
@@ -907,20 +991,35 @@ int BPF_PROG(lsm_open_policy, struct file *file)
     // which disabled ALL path enforcement. Package tooling that needs relaxed
     // access must be granted by explicit path policy, not by process name.
 
-    // Copy path to event with BPF verifier-friendly bounded loop
-    #pragma clang loop unroll(disable)
-    for (int i = 0; i < MAX_PATH_LEN; i++) {
-        event->path[i] = path[i];
-        if (path[i] == '\0') break;
+        // Copy path to event with BPF verifier-friendly bounded loop
+        #pragma clang loop unroll(disable)
+        for (int i = 0; i < MAX_PATH_LEN; i++) {
+            event->path[i] = path[i];
+            if (path[i] == '\0') break;
+        }
+
+        // Record the resolved operation so userspace can distinguish read vs write opens
+        event->operation = file_op_type;
     }
 
-    // Record the resolved operation so userspace can distinguish read vs write opens
-    event->operation = file_op_type;
+    // This fresh full-token equality is the decision linearization point. A
+    // later userspace token update is a later policy transition; any change
+    // before this point denies instead of using cleaned/reused slot entries.
+    // The owner stamps prove no other task rewrote the path or lookup scratch
+    // (preemption on this CPU) between resolution and this decision.
+    struct open_index_lookup_scratch *lookup = bpf_map_lookup_elem(&open_index_lookup_scratch_map, &zero);
+    barrier();
+    u64 *confirmed_token = bpf_map_lookup_elem(&active_open_generation, &zero);
+    u64 self = bpf_get_current_pid_tgid();
+    if (!lookup || !confirmed_token || *confirmed_token != lookup->activation_token ||
+        lookup->owner != self || scratch->owner != self) {
+        policy_result = 0;
+    }
 
-    // Set result based on policy
-    event->result = policy_result ? 0 : -13; // 0 = allowed, -EACCES = denied
-
-    bpf_ringbuf_submit(event, 0);
+    if (event) {
+        event->result = policy_result ? 0 : -13;
+        bpf_ringbuf_submit(event, 0);
+    }
 
     // Return policy decision: 0 = allow, negative = deny
     return policy_result ? 0 : -13; // -EACCES = 13
@@ -980,17 +1079,13 @@ int trace_sys_exit_open(struct bpf_raw_tracepoint_args *ctx)
 // So reconstruct the source path by walking d_parent to the filesystem root
 // (hard links are same-mount, so a single-mount walk yields the absolute path;
 // files under a nested mount resolve relative to that inner mount — a known gap).
-// Reconstruction bounds. These are tight because lsm_link inlines the 256-rule
-// check_path_policy, and the two together must stay under the verifier's 1M-insn
-// budget. COMP=40 covers git object filenames (38 hex chars); DEPTH=4 covers
+// Reconstruction bounds. These were sized for the verifier budget when lsm_link
+// ran the legacy 256-rule scan; it now uses the indexed matcher. COMP=40 covers git object filenames (38 hex chars); DEPTH=4 covers
 // .git/objects/ab/<hash> when the box/mount root is the workdir (the common
 // bind-mount case). Sources exceeding these fail OPEN (link allowed) — a residual
 // hard-link-aliasing gap tracked for a tail-call fix that would free the budget.
 #define HL_MAX_DEPTH 4
 #define HL_MAX_COMP 40
-// Only the first HL_MATCH_LEN bytes of the reconstructed path are compared
-// (check_path_policy caps rule length at 64); a safe margin over that.
-#define HL_MATCH_LEN 72
 
 // CO-RE flavor to reach vfsmount.mnt_root — struct vfsmount isn't fully defined in
 // the BTF header. The ___leash suffix makes libbpf relocate this against the
@@ -1003,9 +1098,10 @@ struct vfsmount___leash {
 // the 512-byte BPF stack limit, so they live in a per-CPU map instead (per-CPU
 // avoids races between concurrent link() calls on different CPUs).
 struct hl_scratch {
+    u64 owner;                   // pid_tgid stamp; see mutation_lookup_scratch
     char dest_abs[MAX_PATH_LEN]; // destination dir's absolute path (bpf_d_path)
     char raw[MAX_PATH_LEN];      // source within-mount path, reverse-built
-    char path[MAX_PATH_LEN];     // assembled absolute source path
+    char path[MAX_PATH_LEN * 2]; // assembled absolute source path (NUL-padded; see lsm_link)
 };
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -1119,6 +1215,7 @@ int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, st
     if (!s) {
         return -13;
     }
+    s->owner = bpf_get_current_pid_tgid();
 
     // Hard links are same-mount, so source and destination share this mount root.
     struct vfsmount___leash *vm = (void *)BPF_CORE_READ(new_dir, mnt);
@@ -1147,6 +1244,11 @@ int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, st
     }
     int strip = (dest_within_len <= 1) ? 0 : dest_within_len;
     int prefix_len = dest_abs_len - strip;
+    // Destination is the root of the "/" mount: the mount contributes no
+    // prefix. Keeping its "/" would build "//etc/..." and miss every rule.
+    if (dest_abs_len == 1) {
+        prefix_len = 0;
+    }
     if (prefix_len < 0 || prefix_len >= MAX_PATH_LEN) {
         return 0;
     }
@@ -1162,28 +1264,46 @@ int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, st
     }
     int slen = MAX_PATH_LEN - sstart; // source within-mount length
 
-    // Assemble in ONE pass: path = dest_abs[0:prefix_len] + raw[sstart:]. Only the
-    // first HL_MATCH_LEN bytes are ever compared (check_path_policy caps rule
-    // length at 64), so stop there — building the full 256 is wasted verifier
-    // work, and any rule that matches a longer path matches within its prefix.
+    // Assemble the COMPLETE source path: path = dest_abs[0:prefix_len] +
+    // raw[sstart:]. Policy rules are matched over all of their (up to 255)
+    // bytes (#108). A source whose absolute path exceeds 255 bytes cannot be
+    // opened by its real path (file_open denies unresolvable paths), so
+    // aliasing it is denied too rather than evaluated on a truncation.
+    int total = prefix_len + slen;
+    if (total <= 0) {
+        return 0;
+    }
+    if (total > MAX_PATH_LEN - 1) {
+        return -1;
+    }
+    // Two bulk copies instead of a byte loop: a per-byte loop whose exit
+    // depends on `total` hands the verifier one distinct state per possible
+    // length, each of which then re-verifies the full-length matcher (that
+    // exceeded the 1M-instruction budget). path is 2*MAX_PATH_LEN bytes so the
+    // masked offset + size is provably in bounds; the memset supplies the NUL.
+    __u32 head = prefix_len & (MAX_PATH_LEN - 1);
+    __u32 tail_off = sstart & (MAX_PATH_LEN - 1);
+    __u32 tail_len = slen & (MAX_PATH_LEN - 1);
     __builtin_memset(s->path, 0, sizeof(s->path));
-    #pragma clang loop unroll(disable)
-    for (int i = 0; i < HL_MATCH_LEN; i++) {
-        if (i >= prefix_len + slen) {
-            break;
-        }
-        char c;
-        if (i < prefix_len) {
-            c = s->dest_abs[i & (MAX_PATH_LEN - 1)];
-        } else {
-            int si = (sstart + (i - prefix_len)) & (MAX_PATH_LEN - 1);
-            c = s->raw[si];
-        }
-        s->path[i & (MAX_PATH_LEN - 1)] = c;
+    if (bpf_probe_read_kernel(s->path, head, s->dest_abs) < 0 ||
+        bpf_probe_read_kernel(s->path + head, tail_len, s->raw + tail_off) < 0) {
+        return -1; // resolved but not assemblable: fail closed
     }
 
-    // Deny the link if reading the source by its real path would be denied.
-    if (check_path_policy(s->path, OP_OPEN) != 1) {
+    // Deny the link if READING the source by its real path would be denied
+    // (the open:ro domain holds generic and read-only rules, so a read-only
+    // forbid counts), using the same full-length indexed decision as
+    // file_open, linearized on the same activation token and owner stamps.
+    int readable = check_open_indexed_policy(s->path, OP_OPEN_RO);
+    struct open_index_lookup_scratch *lookup = bpf_map_lookup_elem(&open_index_lookup_scratch_map, &zero);
+    barrier();
+    u64 *confirmed_token = bpf_map_lookup_elem(&active_open_generation, &zero);
+    u64 self = bpf_get_current_pid_tgid();
+    if (!lookup || !confirmed_token || *confirmed_token != lookup->activation_token ||
+        lookup->owner != self || s->owner != self) {
+        readable = 0;
+    }
+    if (readable != 1) {
         return -1; // -EPERM: refuse to hard-link a file the box can't read
     }
     return 0;

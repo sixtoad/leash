@@ -98,7 +98,36 @@ const (
 	// CapabilityIDMapVolume is the repeatable `--idmap-volume <src:dst[:ro]>`
 	// flag for Linux Docker workloads.
 	CapabilityIDMapVolume = "idmap-volume"
+	// CapabilityPolicyPathLimits means the document carries `policyLimits`:
+	// the longest policy path, per rule kind, that this build's kernel
+	// enforcement matches over every byte. Longer rules are rejected when the
+	// policy loads (fail closed); none is silently skipped.
+	CapabilityPolicyPathLimits = "policy-path-limits"
 )
+
+// Enforced policy path limits, in bytes of the resolved path (a directory
+// rule's trailing '/' counts). File rules (file.open / FileOpen*) are matched
+// over their full length up to the 255-byte rule ABI (issues #108/#109); exec
+// rules still use the legacy 64-byte kernel matcher. Pinned against the lsm
+// package constants by its tests.
+const (
+	FilePolicyPathBytes = 255
+	ExecPolicyPathBytes = 64
+	FilePolicyRules     = 256
+	ExecPolicyRules     = 64
+)
+
+// PolicyLimits is the `policyLimits` object of the version document.
+type PolicyLimits struct {
+	// FilePathBytes is the longest file-policy path enforced byte-for-byte.
+	FilePathBytes int `json:"filePathBytes"`
+	// ExecPathBytes is the longest exec-policy path enforced byte-for-byte.
+	ExecPathBytes int `json:"execPathBytes"`
+	// FileRules and ExecRules are the most rules of each kind a policy may
+	// hold; a larger set is rejected at load, never truncated.
+	FileRules int `json:"fileRules"`
+	ExecRules int `json:"execRules"`
+}
 
 // capabilities is the surface this build offers. Order is stable so the emitted
 // document is byte-stable across runs of the same binary.
@@ -112,6 +141,7 @@ var capabilities = []string{
 	CapabilityVersionJSON,
 	CapabilityResolverContractJSON,
 	CapabilityIDMapVolume,
+	CapabilityPolicyPathLimits,
 }
 
 // Capabilities returns the surface names this build advertises. The slice is a
@@ -135,8 +165,11 @@ type Info struct {
 	ContractVersion       int      `json:"contractVersion"`
 	MinCompatibleContract int      `json:"minCompatibleContract"`
 	Capabilities          []string `json:"capabilities"`
-	OS                    string   `json:"os"`
-	Arch                  string   `json:"arch"`
+	// PolicyLimits is absent (nil) in documents from builds that predate it;
+	// such a build silently skipped policy paths longer than 64 bytes.
+	PolicyLimits *PolicyLimits `json:"policyLimits,omitempty"`
+	OS           string        `json:"os"`
+	Arch         string        `json:"arch"`
 }
 
 // Compatibility is the verdict of comparing a caller's contract against the
@@ -346,6 +379,7 @@ func describeFor(b Build, goos, goarch string) Info {
 		ContractVersion:       ContractVersion,
 		MinCompatibleContract: MinCompatibleContract,
 		Capabilities:          Capabilities(),
+		PolicyLimits:          &PolicyLimits{FilePathBytes: FilePolicyPathBytes, ExecPathBytes: ExecPolicyPathBytes, FileRules: FilePolicyRules, ExecRules: ExecPolicyRules},
 		OS:                    goos,
 		Arch:                  goarch,
 	}

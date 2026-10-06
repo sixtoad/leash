@@ -19,6 +19,10 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 )
 
+// MaxPolicyPathLength is the longest path that fits in the userspace/BPF rule
+// ABI while retaining a trailing NUL byte for kernel-side string handling.
+const MaxPolicyPathLength = 255
+
 // enforcementSettledHook, if set, is invoked once when eBPF-LSM enforcement has
 // settled — ALL of the manager's programs have attached (or degraded). Host mode
 // installs it to release a launcher holding the workload until enforcement is
@@ -308,8 +312,11 @@ func parsePolicyLine(line string, lineNum int) (PolicyRule, error) {
 			resolved += "/"
 		}
 
-		if len(resolved) >= 256 {
-			return PolicyRule{}, fmt.Errorf("path too long (max 255 chars)")
+		if strings.IndexByte(resolved, 0) >= 0 {
+			return PolicyRule{}, fmt.Errorf("path contains a NUL byte")
+		}
+		if len(resolved) > MaxPolicyPathLength {
+			return PolicyRule{}, fmt.Errorf("path too long (max %d bytes)", MaxPolicyPathLength)
 		}
 
 		copy(rule.Path[:], resolved)

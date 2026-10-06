@@ -28,10 +28,46 @@ type OpenPolicyRule struct {
 	IsDirectory uint32
 }
 
-type mutationRuleKey struct {
+type openExactRuleKey struct {
+	Generation uint32
+	Operation  uint32
+	PathLen    uint32
+	Path       [256]byte
+}
+
+type openPrefixRuleKey struct {
+	PrefixLen uint32
+	Domain    uint8
+	Path      [MaxPolicyPathLength]byte
+}
+
+type openIndexRule struct {
+	Action      uint32
+	Specificity uint32
+	Order       uint32
+}
+
+type compiledOpenIndex struct {
+	exact  map[openExactRuleKey]openIndexRule
+	prefix map[openPrefixRuleKey]openIndexRule
+}
+
+type mutationPrefixRuleKey struct {
+	PrefixLen uint32
+	Domain    uint8
+	Path      [MaxPolicyPathLength]byte
+}
+
+type mutationExactRuleKey struct {
 	Generation uint32
 	PathLen    uint32
-	Path       [64]byte
+	Path       [256]byte
+}
+
+type compiledMutationIndex struct {
+	denies     map[mutationPrefixRuleKey]uint8
+	allows     map[mutationPrefixRuleKey]uint8
+	selfDenies map[mutationExactRuleKey]uint8
 }
 
 type openEventFingerprint struct {
@@ -65,13 +101,12 @@ const (
 	openTailCallProgramName              = "lsm_open_policy"
 	openTailCallCanonicalizerSlot        = uint32(0)
 	openTailCallPolicySlot               = uint32(1)
+	openIndexDomainBits                  = uint32(8)
+	mutationIndexDomainBits              = uint32(8)
 	mutationOpMkdir               uint32 = 3
 	mutationOpUnlink              uint32 = 4
 	mutationOpRmdir               uint32 = 5
 	mutationOpRename              uint32 = 6
-	mutationGenericDeny           uint32 = 1 << 0
-	mutationRWDirAllow            uint32 = 1 << 1
-	mutationRWDirDeny             uint32 = 1 << 2
 	// Note: Policy constants are now defined in common.go
 
 	// duplicateSuppressionWindow limits how long we treat identical payloads as retries.
@@ -89,6 +124,7 @@ type OpenLsm struct {
 	defaultPolicyResult bool // Default policy result: false=deny, true=allow
 	containerOverlay    bool
 	logMutex            sync.Mutex // Protect concurrent writes to stdout and log file
+	policyUpdateMutex   sync.Mutex // Serialize complete indexed-policy generations and publication.
 
 	// BPF program state
 	ebpfCollection *ebpf.Collection
@@ -119,41 +155,78 @@ func (l *OpenLsm) getCgroupPath() string {
 }
 
 func (l *OpenLsm) setEbpfCollection(coll *ebpf.Collection) {
+	l.policyUpdateMutex.Lock()
+	defer l.policyUpdateMutex.Unlock()
 	l.ebpfCollection = coll
 }
 
+func (l *OpenLsm) withPolicyUpdate(fn func() error) error {
+	l.policyUpdateMutex.Lock()
+	defer l.policyUpdateMutex.Unlock()
+	return fn()
+}
+
 // LoadPolicies loads file open policy rules into the LSM
-func (l *OpenLsm) LoadPolicies(policies []OpenPolicyRule) error {
+// validateOpenPolicyRules rejects any rule the kernel index could not
+// enforce exactly as written, so no accepted rule is ever silently dropped.
+func validateOpenPolicyRules(policies []OpenPolicyRule) error {
 	if len(policies) > MaxPolicyRules {
 		return fmt.Errorf("too many file open policy rules: %d exceeds maximum %d", len(policies), MaxPolicyRules)
 	}
-	l.policyRules = append([]OpenPolicyRule(nil), policies...)
-	l.numPolicyRules = len(policies)
+	for i := range policies {
+		rule := &policies[i]
+		if rule.PathLen == 0 || rule.PathLen > MaxPolicyPathLength {
+			return fmt.Errorf("invalid file open policy rule %d path length: %d (must be 1-%d)", i, rule.PathLen, MaxPolicyPathLength)
+		}
+		if bytes.IndexByte(rule.Path[:rule.PathLen], 0) >= 0 {
+			return fmt.Errorf("invalid file open policy rule %d path: contains a NUL byte", i)
+		}
+		if rule.Action != PolicyDeny && rule.Action != PolicyAllow {
+			return fmt.Errorf("invalid file open policy rule %d action: %d", i, rule.Action)
+		}
+		if rule.Operation > OpOpenRW {
+			return fmt.Errorf("invalid file open policy rule %d operation: %d", i, rule.Operation)
+		}
+		if rule.IsDirectory != 0 && rule.Path[rule.PathLen-1] != '/' {
+			return fmt.Errorf("invalid file open policy rule %d: directory path must end with '/'", i)
+		}
+	}
+	return nil
+}
+
+func (l *OpenLsm) LoadPolicies(policies []OpenPolicyRule) error {
+	if err := validateOpenPolicyRules(policies); err != nil {
+		return err
+	}
+	nextRules := append([]OpenPolicyRule(nil), policies...)
 
 	// Sort policy rules by path length (longest first) for specificity
-	sort.Slice(l.policyRules, func(i, j int) bool {
-		return l.policyRules[i].PathLen > l.policyRules[j].PathLen
+	sort.SliceStable(nextRules, func(i, j int) bool {
+		return nextRules[i].PathLen > nextRules[j].PathLen
 	})
+	nextDefaultPolicyResult := rootPathPolicy(nextRules)
 
-	// Check if root path "/" is allowed to set default policy result
-	l.checkRootPathPolicy()
-
-	fmt.Printf("Loaded %d file open policy rules\n", l.numPolicyRules)
-	if l.defaultPolicyResult {
-		fmt.Printf("Default open policy result: ALLOW (root path '/' is allowed)\n")
-	} else {
-		fmt.Printf("Default open policy result: DENY (root path '/' is not explicitly allowed)\n")
-	}
-
-	// If eBPF collection is already loaded, update the BPF maps
-	if l.ebpfCollection != nil {
-		if err := l.loadPolicyIntoBPF(l.ebpfCollection); err != nil {
-			return fmt.Errorf("failed to update BPF maps: %w", err)
+	return l.withPolicyUpdate(func() error {
+		// A failed live update must leave the published in-memory view unchanged.
+		if l.ebpfCollection != nil {
+			if err := l.loadPolicyStateIntoBPF(l.ebpfCollection, nextRules, nextDefaultPolicyResult); err != nil {
+				return fmt.Errorf("failed to update BPF maps: %w", err)
+			}
+			fmt.Printf("Updated BPF maps with new policies\n")
 		}
-		fmt.Printf("Updated BPF maps with new policies\n")
-	}
 
-	return nil
+		l.policyRules = nextRules
+		l.numPolicyRules = len(nextRules)
+		l.defaultPolicyResult = nextDefaultPolicyResult
+		fmt.Printf("Loaded %d file open policy rules\n", l.numPolicyRules)
+		if l.defaultPolicyResult {
+			fmt.Printf("Default open policy result: ALLOW (root path '/' is allowed)\n")
+		} else {
+			fmt.Printf("Default open policy result: DENY (root path '/' is not explicitly allowed)\n")
+		}
+
+		return nil
+	})
 }
 
 func (l *OpenLsm) LoadAndAttach(loader func() (*ebpf.CollectionSpec, error)) error {
@@ -230,32 +303,300 @@ func (l *OpenLsm) attachCopyUpExitTracepoint(coll *ebpf.Collection) error {
 	return nil
 }
 
-// checkRootPathPolicy checks if the root path "/" is explicitly allowed in the policy rules
-// and sets the default policy result accordingly
-func (l *OpenLsm) checkRootPathPolicy() {
-	// Default is false (deny)
-	l.defaultPolicyResult = false
-
-	// Check if any rule explicitly allows root path "/"
-	for _, rule := range l.policyRules {
+func rootPathPolicy(rules []OpenPolicyRule) bool {
+	for _, rule := range rules {
 		pathStr := string(bytes.TrimRight(rule.Path[:rule.PathLen], "\x00"))
 		if pathStr == "/" && rule.Action == PolicyAllow {
-			l.defaultPolicyResult = true
-			break
+			return true
 		}
 	}
+	return false
+}
+
+// compileOpenIndex turns the sorted rules into the kernel's full-byte indexes,
+// preserving the historical matcher semantics over every accepted byte: each
+// rule matches every path it is a byte prefix of (a directory rule carries its
+// trailing '/', so it covers descendants), a directory rule also matches the
+// directory itself, the longest matching rule wins, an earlier rule wins a
+// length tie, and only rules for the requested operation (or generic open)
+// apply. Prefix rules go to the LPM trie; directory-self matches go to the
+// exact map. Generic rules are expanded to every runtime operation.
+func compileOpenIndex(rules []OpenPolicyRule) compiledOpenIndex {
+	index := compiledOpenIndex{
+		exact:  make(map[openExactRuleKey]openIndexRule),
+		prefix: make(map[openPrefixRuleKey]openIndexRule),
+	}
+	for order, rule := range rules {
+		operations := []uint32{rule.Operation}
+		if rule.Operation == OpOpen {
+			operations = []uint32{OpOpen, OpOpenRO, OpOpenRW}
+		}
+		value := openIndexRule{
+			Action:      rule.Action,
+			Specificity: rule.PathLen,
+			Order:       uint32(order),
+		}
+		for _, operation := range operations {
+			if operation > OpOpenRW {
+				continue
+			}
+			prefixKey := openPrefixRuleKey{
+				PrefixLen: openIndexDomainBits + rule.PathLen*8,
+				Domain:    uint8(operation),
+			}
+			copy(prefixKey.Path[:], rule.Path[:rule.PathLen])
+			if _, exists := index.prefix[prefixKey]; !exists {
+				index.prefix[prefixKey] = value
+			}
+
+			if rule.IsDirectory != 0 && rule.PathLen > 1 && rule.Path[rule.PathLen-1] == '/' {
+				selfKey := openExactRuleKey{
+					Operation: operation,
+					PathLen:   rule.PathLen - 1,
+				}
+				copy(selfKey.Path[:], rule.Path[:rule.PathLen-1])
+				if _, exists := index.exact[selfKey]; !exists {
+					index.exact[selfKey] = value
+				}
+			}
+		}
+	}
+	return index
+}
+
+type openIndexStore interface {
+	activeToken() (uint64, error)
+	setActiveToken(uint64) error
+	setDefault(uint32, uint32) error
+	listExactKeys() ([]openExactRuleKey, error)
+	listPrefixKeys() ([]openPrefixRuleKey, error)
+	putExact(openExactRuleKey, openIndexRule) error
+	putPrefix(openPrefixRuleKey, openIndexRule) error
+	deleteExact(openExactRuleKey) error
+	deletePrefix(openPrefixRuleKey) error
+}
+
+type ebpfOpenIndexStore struct {
+	exact    *ebpf.Map
+	prefix   *ebpf.Map
+	active   *ebpf.Map
+	defaults *ebpf.Map
+}
+
+func newEBPFOpenIndexStore(coll *ebpf.Collection) (*ebpfOpenIndexStore, error) {
+	store := &ebpfOpenIndexStore{
+		exact:    coll.Maps["open_exact_rules"],
+		prefix:   coll.Maps["open_prefix_rules"],
+		active:   coll.Maps["active_open_generation"],
+		defaults: coll.Maps["open_default_policy"],
+	}
+	for name, resource := range map[string]*ebpf.Map{
+		"open_exact_rules":       store.exact,
+		"open_prefix_rules":      store.prefix,
+		"active_open_generation": store.active,
+		"open_default_policy":    store.defaults,
+	} {
+		if resource == nil {
+			return nil, fmt.Errorf("required %s map not found", name)
+		}
+	}
+	return store, nil
+}
+
+func (s *ebpfOpenIndexStore) activeToken() (uint64, error) {
+	key := uint32(0)
+	var token uint64
+	if err := s.active.Lookup(&key, &token); err != nil {
+		return 0, err
+	}
+	return token, nil
+}
+
+func (s *ebpfOpenIndexStore) setActiveToken(token uint64) error {
+	key := uint32(0)
+	return s.active.Put(&key, &token)
+}
+
+func (s *ebpfOpenIndexStore) setDefault(generation, action uint32) error {
+	return s.defaults.Put(&generation, &action)
+}
+
+func (s *ebpfOpenIndexStore) listExactKeys() ([]openExactRuleKey, error) {
+	iterator := s.exact.Iterate()
+	var key openExactRuleKey
+	var value openIndexRule
+	var keys []openExactRuleKey
+	for iterator.Next(&key, &value) {
+		keys = append(keys, key)
+	}
+	return keys, iterator.Err()
+}
+
+func (s *ebpfOpenIndexStore) listPrefixKeys() ([]openPrefixRuleKey, error) {
+	iterator := s.prefix.Iterate()
+	var key openPrefixRuleKey
+	var value openIndexRule
+	var keys []openPrefixRuleKey
+	for iterator.Next(&key, &value) {
+		keys = append(keys, key)
+	}
+	return keys, iterator.Err()
+}
+
+func (s *ebpfOpenIndexStore) putExact(key openExactRuleKey, value openIndexRule) error {
+	return s.exact.Put(&key, &value)
+}
+
+func (s *ebpfOpenIndexStore) putPrefix(key openPrefixRuleKey, value openIndexRule) error {
+	return s.prefix.Put(&key, &value)
+}
+
+func (s *ebpfOpenIndexStore) deleteExact(key openExactRuleKey) error {
+	return s.exact.Delete(&key)
+}
+
+func (s *ebpfOpenIndexStore) deletePrefix(key openPrefixRuleKey) error {
+	return s.prefix.Delete(&key)
+}
+
+func cleanOpenIndexGeneration(store openIndexStore, generation uint32) error {
+	exactKeys, err := store.listExactKeys()
+	if err != nil {
+		return fmt.Errorf("list exact generation %d: %w", generation, err)
+	}
+	for _, key := range exactKeys {
+		if key.Generation == generation {
+			if err := store.deleteExact(key); err != nil {
+				return fmt.Errorf("delete exact generation %d entry: %w", generation, err)
+			}
+		}
+	}
+	prefixKeys, err := store.listPrefixKeys()
+	if err != nil {
+		return fmt.Errorf("list prefix generation %d: %w", generation, err)
+	}
+	for _, key := range prefixKeys {
+		if uint32(key.Domain)/3 == generation {
+			if err := store.deletePrefix(key); err != nil {
+				return fmt.Errorf("delete prefix generation %d entry: %w", generation, err)
+			}
+		}
+	}
+	return nil
+}
+
+type openIndexReplaceResult struct {
+	cleanupDebt error
+}
+
+// tokenHeadroom keeps room for activation (+1) and a rollback (+2) without
+// wrapping; a wrapped token could repeat a value a running hook snapshotted.
+const tokenHeadroom = 2
+
+// openIndexStage is a fully staged, not yet active, file-open generation.
+type openIndexStage struct {
+	store            openIndexStore
+	active, inactive uint32
+	token            uint64 // token active when staging began
+}
+
+// stageOpenIndex writes index into the inactive generation without changing
+// what any hook observes. On error the inactive generation is cleaned.
+func stageOpenIndex(store openIndexStore, index compiledOpenIndex, defaultAllow bool) (*openIndexStage, error) {
+	activeToken, err := store.activeToken()
+	if err != nil {
+		return nil, fmt.Errorf("read active token: %w", err)
+	}
+	if activeToken > ^uint64(0)-tokenHeadroom {
+		return nil, fmt.Errorf("active token exhausted at %d", activeToken)
+	}
+	stage := &openIndexStage{store: store, active: uint32(activeToken & 1), inactive: uint32((activeToken + 1) & 1), token: activeToken}
+	if err := cleanOpenIndexGeneration(store, stage.inactive); err != nil {
+		return nil, fmt.Errorf("prepare inactive generation: %w", err)
+	}
+	defaultAction := uint32(0)
+	if defaultAllow {
+		defaultAction = 1
+	}
+	if err := store.setDefault(stage.inactive, defaultAction); err != nil {
+		return nil, stage.abort(fmt.Errorf("stage generation %d default: %w", stage.inactive, err))
+	}
+	for key, value := range index.exact {
+		key.Generation = stage.inactive
+		if err := store.putExact(key, value); err != nil {
+			return nil, stage.abort(fmt.Errorf("stage generation %d exact entry: %w", stage.inactive, err))
+		}
+	}
+	for key, value := range index.prefix {
+		key.Domain += uint8(stage.inactive * 3)
+		if err := store.putPrefix(key, value); err != nil {
+			return nil, stage.abort(fmt.Errorf("stage generation %d prefix entry: %w", stage.inactive, err))
+		}
+	}
+	return stage, nil
+}
+
+// abort discards the staged generation and returns cause (annotated with any
+// cleanup failure).
+func (s *openIndexStage) abort(cause error) error {
+	if err := cleanOpenIndexGeneration(s.store, s.inactive); err != nil {
+		return fmt.Errorf("%w (cleanup failed: %v)", cause, err)
+	}
+	return cause
+}
+
+// activate publishes the staged generation to every hook.
+func (s *openIndexStage) activate() error {
+	if err := s.store.setActiveToken(s.token + 1); err != nil {
+		return fmt.Errorf("activate token %d: %w", s.token+1, err)
+	}
+	return nil
+}
+
+// rollback re-selects the previous (still intact) generation after a
+// successful activate. It moves to token+2, which has the previous parity but
+// a never-used value, so a hook that snapshotted token+1 cannot confirm.
+func (s *openIndexStage) rollback() error {
+	return s.store.setActiveToken(s.token + 2)
+}
+
+// finish cleans the previous generation once the staged one is active. A
+// failure is cleanup debt, not a failed update: the new authority is live.
+func (s *openIndexStage) finish() error {
+	if err := cleanOpenIndexGeneration(s.store, s.active); err != nil {
+		return fmt.Errorf("clean old generation %d after committed token %d: %w", s.active, s.token+1, err)
+	}
+	return nil
+}
+
+func replaceOpenIndex(store openIndexStore, index compiledOpenIndex, defaultAllow bool) (openIndexReplaceResult, error) {
+	stage, err := stageOpenIndex(store, index, defaultAllow)
+	if err != nil {
+		return openIndexReplaceResult{}, err
+	}
+	if err := stage.activate(); err != nil {
+		return openIndexReplaceResult{}, stage.abort(err)
+	}
+	return openIndexReplaceResult{cleanupDebt: stage.finish()}, nil
 }
 
 func (l *OpenLsm) loadPolicyIntoBPF(coll *ebpf.Collection) error {
-	// Always load the default policy result into BPF map
+	return l.withPolicyUpdate(func() error {
+		return l.loadPolicyStateIntoBPF(coll, l.policyRules, l.defaultPolicyResult)
+	})
+}
+
+func (l *OpenLsm) loadPolicyStateIntoBPF(coll *ebpf.Collection, policyRules []OpenPolicyRule, defaultPolicyResult bool) error {
+	openStore, err := newEBPFOpenIndexStore(coll)
+	if err != nil {
+		return err
+	}
+	mutationStore, err := newEBPFMutationIndexStore(coll)
+	if err != nil {
+		return err
+	}
+
 	key := uint32(0)
-	defaultResult := uint32(0) // Default to deny
-	if l.defaultPolicyResult {
-		defaultResult = uint32(1) // Allow
-	}
-	if err := coll.Maps["default_policy"].Put(&key, &defaultResult); err != nil {
-		return fmt.Errorf("failed to update default_policy map: %w", err)
-	}
 	containerOverlay := uint32(0)
 	if l.containerOverlay {
 		containerOverlay = 1
@@ -263,183 +604,272 @@ func (l *OpenLsm) loadPolicyIntoBPF(coll *ebpf.Collection) error {
 	if err := coll.Maps["container_overlay_mode"].Put(&key, &containerOverlay); err != nil {
 		return fmt.Errorf("failed to update container_overlay_mode map: %w", err)
 	}
-	mutationMap := coll.Maps["mutation_rules"]
-	if mutationMap == nil {
-		return fmt.Errorf("required mutation_rules map not found")
+
+	if err := commitPolicyIndexes(mutationStore, openStore, policyRules, defaultPolicyResult); err != nil {
+		return err
 	}
-	activeMutationGeneration := coll.Maps["active_mutation_generation"]
-	if activeMutationGeneration == nil {
-		return fmt.Errorf("required active_mutation_generation map not found")
+	if len(policyRules) == 0 {
+		fmt.Printf("No policy rules to load, using default policy result: %v\n", defaultPolicyResult)
+	} else {
+		fmt.Printf("Loaded %d policy rules into BPF maps\n", len(policyRules))
 	}
-	store := &ebpfMutationRuleStore{rules: mutationMap, active: activeMutationGeneration}
-	if err := replaceMutationRules(store, compileMutationRules(l.policyRules)); err != nil {
-		return fmt.Errorf("failed to update mutation_rules map: %w", err)
-	}
-
-	if l.numPolicyRules == 0 {
-		fmt.Printf("No policy rules to load, using default policy result: %v\n", l.defaultPolicyResult)
-		return nil
-	}
-
-	// Load the number of rules
-	numRules := int32(l.numPolicyRules)
-	if err := coll.Maps["num_rules"].Put(&key, &numRules); err != nil {
-		return fmt.Errorf("failed to update num_rules map: %w", err)
-	}
-
-	fmt.Printf("Loading %d policy rules into BPF maps...\n", l.numPolicyRules)
-
-	// Load each policy rule
-	for i := 0; i < l.numPolicyRules; i++ {
-		if err := coll.Maps["policy_rules"].Put(uint32(i), &l.policyRules[i]); err != nil {
-			return fmt.Errorf("failed to update policy_rules map for rule %d: %w", i, err)
-		}
-
-		// pathStr := string(bytes.TrimRight(l.policyRules[i].Path[:], "\x00"))
-		// actionStr := "deny"
-		// if l.policyRules[i].Action == 1 {
-		// 	actionStr = "allow"
-		// }
-		// dirStr := ""
-		// if l.policyRules[i].IsDirectory == 1 {
-		// 	dirStr = " (directory)"
-		// }
-
-		// fmt.Printf("Loaded rule %d: %s %s%s\n", i, actionStr, pathStr, dirStr)
-	}
-
-	// fmt.Printf("Successfully loaded all policy rules into BPF\n")
 	return nil
 }
 
-func compileMutationRules(rules []OpenPolicyRule) map[mutationRuleKey]uint32 {
-	entries := make(map[mutationRuleKey]uint32)
-	for _, rule := range rules {
-		if rule.PathLen == 0 || rule.PathLen > uint32(len(mutationRuleKey{}.Path)) {
-			continue
-		}
-
-		var flags uint32
-		if rule.Operation == OpOpen && rule.Action == PolicyDeny {
-			flags |= mutationGenericDeny
-		}
-		if rule.IsDirectory != 0 && rule.Operation == OpOpenRW {
-			if rule.Action == PolicyDeny {
-				flags |= mutationRWDirDeny
-			} else {
-				flags |= mutationRWDirAllow
-			}
-		}
-		if flags == 0 {
-			continue
-		}
-
-		key := mutationRuleKey{PathLen: rule.PathLen}
-		copy(key.Path[:], rule.Path[:rule.PathLen])
-		entries[key] |= flags
+// commitPolicyIndexes stages BOTH the mutation and file-open indexes before
+// activating either, so a failure anywhere leaves the kernel on the previous
+// file-open AND mutation authority (unless the mutation rollback itself fails,
+// which is reported).
+func commitPolicyIndexes(mutationStore mutationIndexStore, openStore openIndexStore, policyRules []OpenPolicyRule, defaultPolicyResult bool) error {
+	mutationStage, err := stageMutationIndex(mutationStore, compileMutationIndex(policyRules))
+	if err != nil {
+		return fmt.Errorf("failed to stage indexed mutation policy: %w", err)
 	}
-	return entries
+	openStage, err := stageOpenIndex(openStore, compileOpenIndex(policyRules), defaultPolicyResult)
+	if err != nil {
+		return mutationStage.abort(fmt.Errorf("failed to stage indexed file-open policy: %w", err))
+	}
+	if err := mutationStage.activate(); err != nil {
+		return openStage.abort(mutationStage.abort(fmt.Errorf("failed to activate indexed mutation policy: %w", err)))
+	}
+	if err := openStage.activate(); err != nil {
+		cause := fmt.Errorf("failed to activate indexed file-open policy: %w", err)
+		if rollbackErr := mutationStage.rollback(); rollbackErr != nil {
+			// The mutation index is live on the new policy and cannot be
+			// withdrawn; report the split rather than claim it unchanged.
+			return fmt.Errorf("%w (mutation policy rollback failed: %v)", cause, rollbackErr)
+		}
+		return openStage.abort(mutationStage.abort(cause))
+	}
+	if debt := mutationStage.finish(); debt != nil {
+		fmt.Fprintf(os.Stderr, "Warning: indexed mutation policy committed with deferred cleanup: %v\n", debt)
+	}
+	if debt := openStage.finish(); debt != nil {
+		fmt.Fprintf(os.Stderr, "Warning: indexed file-open policy committed with deferred cleanup: %v\n", debt)
+	}
+	return nil
 }
 
-type mutationRuleStore interface {
-	activeGeneration() (uint32, error)
-	setActiveGeneration(uint32) error
-	listRuleKeys() ([]mutationRuleKey, error)
-	putRule(mutationRuleKey, uint32) error
-	deleteRule(mutationRuleKey) error
+func compileMutationIndex(rules []OpenPolicyRule) compiledMutationIndex {
+	index := compiledMutationIndex{denies: make(map[mutationPrefixRuleKey]uint8), allows: make(map[mutationPrefixRuleKey]uint8), selfDenies: make(map[mutationExactRuleKey]uint8)}
+	for _, rule := range rules {
+		if rule.PathLen == 0 || rule.PathLen > MaxPolicyPathLength {
+			continue
+		}
+		genericDeny := rule.Operation == OpOpen && rule.Action == PolicyDeny
+		rwDirectory := rule.IsDirectory != 0 && rule.Operation == OpOpenRW
+		if !genericDeny && !rwDirectory {
+			continue
+		}
+		prefix := mutationPrefixRuleKey{PrefixLen: mutationIndexDomainBits + rule.PathLen*8}
+		copy(prefix.Path[:], rule.Path[:rule.PathLen])
+		if genericDeny || (rwDirectory && rule.Action == PolicyDeny) {
+			index.denies[prefix] = 1
+		}
+		if rwDirectory && rule.Action == PolicyAllow {
+			index.allows[prefix] = 1
+		}
+		if genericDeny && rule.IsDirectory != 0 && rule.PathLen > 1 && rule.Path[rule.PathLen-1] == '/' {
+			self := mutationExactRuleKey{PathLen: rule.PathLen - 1}
+			copy(self.Path[:], rule.Path[:rule.PathLen-1])
+			index.selfDenies[self] = 1
+		}
+	}
+	return index
 }
 
-type ebpfMutationRuleStore struct {
-	rules  *ebpf.Map
-	active *ebpf.Map
+type mutationIndexStore interface {
+	activeToken() (uint64, error)
+	setActiveToken(uint64) error
+	listDenyKeys() ([]mutationPrefixRuleKey, error)
+	listAllowKeys() ([]mutationPrefixRuleKey, error)
+	listSelfDenyKeys() ([]mutationExactRuleKey, error)
+	putDeny(mutationPrefixRuleKey, uint8) error
+	putAllow(mutationPrefixRuleKey, uint8) error
+	putSelfDeny(mutationExactRuleKey, uint8) error
+	deleteDeny(mutationPrefixRuleKey) error
+	deleteAllow(mutationPrefixRuleKey) error
+	deleteSelfDeny(mutationExactRuleKey) error
 }
 
-func (s *ebpfMutationRuleStore) activeGeneration() (uint32, error) {
+type ebpfMutationIndexStore struct{ denies, allows, selfDenies, active *ebpf.Map }
+
+func newEBPFMutationIndexStore(coll *ebpf.Collection) (*ebpfMutationIndexStore, error) {
+	s := &ebpfMutationIndexStore{coll.Maps["mutation_deny_rules"], coll.Maps["mutation_allow_rules"], coll.Maps["mutation_self_deny_rules"], coll.Maps["active_mutation_generation"]}
+	for name, m := range map[string]*ebpf.Map{"mutation_deny_rules": s.denies, "mutation_allow_rules": s.allows, "mutation_self_deny_rules": s.selfDenies, "active_mutation_generation": s.active} {
+		if m == nil {
+			return nil, fmt.Errorf("required %s map not found", name)
+		}
+	}
+	return s, nil
+}
+func (s *ebpfMutationIndexStore) activeToken() (uint64, error) {
 	key := uint32(0)
-	var generation uint32
-	if err := s.active.Lookup(&key, &generation); err != nil {
+	var token uint64
+	if err := s.active.Lookup(&key, &token); err != nil {
 		return 0, err
 	}
-	return generation, nil
+	return token, nil
 }
-
-func (s *ebpfMutationRuleStore) setActiveGeneration(generation uint32) error {
+func (s *ebpfMutationIndexStore) setActiveToken(token uint64) error {
 	key := uint32(0)
-	return s.active.Put(&key, &generation)
+	return s.active.Put(&key, &token)
 }
-
-func (s *ebpfMutationRuleStore) listRuleKeys() ([]mutationRuleKey, error) {
-	iterator := s.rules.Iterate()
-	var key mutationRuleKey
-	var value uint32
-	var keys []mutationRuleKey
-	for iterator.Next(&key, &value) {
+func mutationPrefixKeys(m *ebpf.Map) ([]mutationPrefixRuleKey, error) {
+	it := m.Iterate()
+	var key mutationPrefixRuleKey
+	var value uint8
+	var keys []mutationPrefixRuleKey
+	for it.Next(&key, &value) {
 		keys = append(keys, key)
 	}
-	if err := iterator.Err(); err != nil {
-		return nil, err
+	return keys, it.Err()
+}
+func (s *ebpfMutationIndexStore) listDenyKeys() ([]mutationPrefixRuleKey, error) {
+	return mutationPrefixKeys(s.denies)
+}
+func (s *ebpfMutationIndexStore) listAllowKeys() ([]mutationPrefixRuleKey, error) {
+	return mutationPrefixKeys(s.allows)
+}
+func (s *ebpfMutationIndexStore) listSelfDenyKeys() ([]mutationExactRuleKey, error) {
+	it := s.selfDenies.Iterate()
+	var key mutationExactRuleKey
+	var value uint8
+	var keys []mutationExactRuleKey
+	for it.Next(&key, &value) {
+		keys = append(keys, key)
 	}
-	return keys, nil
+	return keys, it.Err()
+}
+func (s *ebpfMutationIndexStore) putDeny(k mutationPrefixRuleKey, v uint8) error {
+	return s.denies.Put(&k, &v)
+}
+func (s *ebpfMutationIndexStore) putAllow(k mutationPrefixRuleKey, v uint8) error {
+	return s.allows.Put(&k, &v)
+}
+func (s *ebpfMutationIndexStore) putSelfDeny(k mutationExactRuleKey, v uint8) error {
+	return s.selfDenies.Put(&k, &v)
+}
+func (s *ebpfMutationIndexStore) deleteDeny(k mutationPrefixRuleKey) error {
+	return s.denies.Delete(&k)
+}
+func (s *ebpfMutationIndexStore) deleteAllow(k mutationPrefixRuleKey) error {
+	return s.allows.Delete(&k)
+}
+func (s *ebpfMutationIndexStore) deleteSelfDeny(k mutationExactRuleKey) error {
+	return s.selfDenies.Delete(&k)
 }
 
-func (s *ebpfMutationRuleStore) putRule(key mutationRuleKey, flags uint32) error {
-	return s.rules.Put(&key, &flags)
-}
-
-func (s *ebpfMutationRuleStore) deleteRule(key mutationRuleKey) error {
-	return s.rules.Delete(&key)
-}
-
-func cleanMutationGeneration(store mutationRuleStore, generation uint32) error {
-	keys, err := store.listRuleKeys()
+func cleanMutationGeneration(store mutationIndexStore, generation uint32) error {
+	denies, err := store.listDenyKeys()
 	if err != nil {
-		return fmt.Errorf("list generation %d: %w", generation, err)
+		return fmt.Errorf("list deny generation %d: %w", generation, err)
 	}
-	for _, key := range keys {
-		if key.Generation != generation {
-			continue
-		}
-		if err := store.deleteRule(key); err != nil {
-			return fmt.Errorf("delete generation %d entry: %w", generation, err)
-		}
-	}
-	return nil
-}
-
-func replaceMutationRules(store mutationRuleStore, entries map[mutationRuleKey]uint32) error {
-	active, err := store.activeGeneration()
-	if err != nil {
-		return fmt.Errorf("read active generation: %w", err)
-	}
-	if active > 1 {
-		return fmt.Errorf("invalid active generation %d", active)
-	}
-	inactive := active ^ 1
-	if err := cleanMutationGeneration(store, inactive); err != nil {
-		return fmt.Errorf("prepare inactive generation: %w", err)
-	}
-
-	for key, flags := range entries {
-		key.Generation = inactive
-		if err := store.putRule(key, flags); err != nil {
-			cleanupErr := cleanMutationGeneration(store, inactive)
-			if cleanupErr != nil {
-				return fmt.Errorf("stage generation %d: %w (cleanup failed: %v)", inactive, err, cleanupErr)
+	for _, k := range denies {
+		if uint32(k.Domain) == generation {
+			if err := store.deleteDeny(k); err != nil {
+				return err
 			}
-			return fmt.Errorf("stage generation %d: %w", inactive, err)
 		}
 	}
-	if err := store.setActiveGeneration(inactive); err != nil {
-		cleanupErr := cleanMutationGeneration(store, inactive)
-		if cleanupErr != nil {
-			return fmt.Errorf("activate generation %d: %w (cleanup failed: %v)", inactive, err, cleanupErr)
-		}
-		return fmt.Errorf("activate generation %d: %w", inactive, err)
+	allows, err := store.listAllowKeys()
+	if err != nil {
+		return fmt.Errorf("list allow generation %d: %w", generation, err)
 	}
-	if err := cleanMutationGeneration(store, active); err != nil {
-		return fmt.Errorf("generation %d active but old generation cleanup failed: %w", inactive, err)
+	for _, k := range allows {
+		if uint32(k.Domain) == generation {
+			if err := store.deleteAllow(k); err != nil {
+				return err
+			}
+		}
+	}
+	self, err := store.listSelfDenyKeys()
+	if err != nil {
+		return fmt.Errorf("list self-deny generation %d: %w", generation, err)
+	}
+	for _, k := range self {
+		if k.Generation == generation {
+			if err := store.deleteSelfDeny(k); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+type mutationIndexReplaceResult struct{ cleanupDebt error }
+
+// mutationIndexStage mirrors openIndexStage for the mutation index.
+type mutationIndexStage struct {
+	store            mutationIndexStore
+	active, inactive uint32
+	token            uint64
+}
+
+func stageMutationIndex(store mutationIndexStore, index compiledMutationIndex) (*mutationIndexStage, error) {
+	token, err := store.activeToken()
+	if err != nil {
+		return nil, fmt.Errorf("read active token: %w", err)
+	}
+	if token > ^uint64(0)-tokenHeadroom {
+		return nil, fmt.Errorf("active token exhausted at %d", token)
+	}
+	stage := &mutationIndexStage{store: store, active: uint32(token & 1), inactive: uint32((token + 1) & 1), token: token}
+	if err := cleanMutationGeneration(store, stage.inactive); err != nil {
+		return nil, fmt.Errorf("prepare inactive generation: %w", err)
+	}
+	for k, v := range index.denies {
+		k.Domain = uint8(stage.inactive)
+		if err := store.putDeny(k, v); err != nil {
+			return nil, stage.abort(err)
+		}
+	}
+	for k, v := range index.allows {
+		k.Domain = uint8(stage.inactive)
+		if err := store.putAllow(k, v); err != nil {
+			return nil, stage.abort(err)
+		}
+	}
+	for k, v := range index.selfDenies {
+		k.Generation = stage.inactive
+		if err := store.putSelfDeny(k, v); err != nil {
+			return nil, stage.abort(err)
+		}
+	}
+	return stage, nil
+}
+
+func (s *mutationIndexStage) abort(cause error) error {
+	if err := cleanMutationGeneration(s.store, s.inactive); err != nil {
+		return fmt.Errorf("%w (cleanup failed: %v)", cause, err)
+	}
+	return cause
+}
+
+func (s *mutationIndexStage) activate() error {
+	return s.store.setActiveToken(s.token + 1)
+}
+
+func (s *mutationIndexStage) rollback() error {
+	return s.store.setActiveToken(s.token + 2)
+}
+
+func (s *mutationIndexStage) finish() error {
+	if err := cleanMutationGeneration(s.store, s.active); err != nil {
+		return fmt.Errorf("clean old generation %d after committed token %d: %w", s.active, s.token+1, err)
+	}
+	return nil
+}
+
+func replaceMutationIndex(store mutationIndexStore, index compiledMutationIndex) (mutationIndexReplaceResult, error) {
+	stage, err := stageMutationIndex(store, index)
+	if err != nil {
+		return mutationIndexReplaceResult{}, err
+	}
+	if err := stage.activate(); err != nil {
+		return mutationIndexReplaceResult{}, stage.abort(err)
+	}
+	return mutationIndexReplaceResult{cleanupDebt: stage.finish()}, nil
 }
 
 // validateEvent checks if the event data is properly formed
