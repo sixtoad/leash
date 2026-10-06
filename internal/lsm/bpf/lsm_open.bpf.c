@@ -215,10 +215,18 @@ static __always_inline bool is_target_cgroup()
     return false;
 }
 
+#ifndef barrier_var
+#define barrier_var(var) asm volatile("" : "+r"(var))
+#endif
+
 // Bounded loop string comparison with disabled unrolling for BPF verifier
 static __always_inline int simple_string_starts_with(const char *s, const char *p, __u32 max_len)
 {
     if (max_len > 64) max_len = 64;
+    // Keep the constant `i < 64` bound below: without the barrier clang may
+    // drop it as implied by the caller's length check and leave the loop bounded
+    // only by a register the verifier has no range for (issue #110).
+    barrier_var(max_len);
 
     #pragma clang loop unroll(disable)
     for (int i = 0; i < 64; i++) {
@@ -1064,6 +1072,12 @@ static __always_inline int hl_build_within(struct dentry *dentry, struct dentry 
         if (len == 0 || len >= HL_MAX_COMP) {
             return -2;
         }
+        // Issue #110: clang folds the check above into a wrapped compare on a
+        // copy of len, then drops the copy loop's constant `j < HL_MAX_COMP`
+        // bound as redundant. The verifier never learns len's range, walks j
+        // past the 40-byte comp buffer, and rejects lsm_link ("invalid read
+        // from stack R2 off=0 size=1"). Hide len's range from the optimizer.
+        barrier_var(len);
         if (off - (int)len - 1 < 1) {
             return -1;
         }

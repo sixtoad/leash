@@ -145,10 +145,22 @@ static __always_inline bool is_exec_target_cgroup()
     return false;
 }
 
+#ifndef barrier_var
+#define barrier_var(var) asm volatile("" : "+r"(var))
+#endif
+
 // Bounded loop string comparison with disabled unrolling for BPF verifier
 static __always_inline int simple_string_starts_with(const char *s, const char *p, __u32 max_len)
 {
     if (max_len > 64) max_len = 64;
+    // Issue #110: the caller already rejects path_len == 0 || > 64, and clang
+    // folds that into one wrapped unsigned compare on a copy of the length.
+    // Knowing max_len <= 64, it then drops the constant `i < 64` bound below as
+    // redundant, leaving the loop bounded only by the copy the verifier never
+    // learned a range for -- it walks i past the 256-byte stack path and
+    // rejects lsm_exec ("invalid read from stack R3 off=0 size=1"). The barrier
+    // hides max_len's range from the optimizer so the constant bound survives.
+    barrier_var(max_len);
 
     #pragma clang loop unroll(disable)
     for (int i = 0; i < 64; i++) {
@@ -246,6 +258,49 @@ static __always_inline int check_exec_policy(const char *path)
     return default_ptr ? *default_ptr : 0; // Default to deny if map lookup fails
 }
 
+// resolve_exec_path fills path with the executable's path and reports whether
+// any resolver produced a non-empty string. The whole buffer is zeroed first so
+// policy matching and the audit copy never see bytes no resolver wrote, and
+// every fallback's return value is checked rather than trusted. The fallback
+// order (d_path, bprm->filename, dentry name) is unchanged. A truncated
+// fallback string (ret == MAX_PATH_LEN) is still NUL-terminated and accepted:
+// policy rules compare at most the first 64 bytes.
+static __always_inline bool resolve_exec_path(struct linux_binprm *bprm, char *path)
+{
+    __builtin_memset(path, 0, MAX_PATH_LEN);
+
+    long ret = bpf_d_path(&bprm->file->f_path, path, MAX_PATH_LEN);
+    if (ret > 1) {
+        return true;
+    }
+
+    const char *filename = BPF_CORE_READ(bprm, filename);
+    if (filename) {
+        ret = bpf_probe_read_kernel_str(path, MAX_PATH_LEN, filename);
+        if (ret > 1) {
+            return true;
+        }
+    }
+
+    struct dentry *dentry = BPF_CORE_READ(bprm->file, f_path.dentry);
+    if (dentry) {
+        const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
+        if (name) {
+            ret = bpf_probe_read_kernel_str(path, MAX_PATH_LEN, name);
+            if (ret > 1) {
+                return true;
+            }
+        }
+    }
+
+    // Every resolver failed. A failed helper may have left partial bytes, so
+    // reset the buffer to a fixed marker: the denial is still audited (user
+    // space drops events with an empty path) without evaluating stray bytes.
+    __builtin_memset(path, 0, MAX_PATH_LEN);
+    __builtin_memcpy(path, "<unresolved>", sizeof("<unresolved>"));
+    return false;
+}
+
 SEC("lsm/bprm_check_security")
 int BPF_PROG(lsm_exec, struct linux_binprm *bprm)
 {
@@ -256,25 +311,14 @@ int BPF_PROG(lsm_exec, struct linux_binprm *bprm)
 
     struct exec_event *event;
     char path[MAX_PATH_LEN];
-    int policy_result = 0;
-    
-    // Get executable path from the file
-    int ret = bpf_d_path(&bprm->file->f_path, path, sizeof(path));
-    if (ret < 0) {
-        // If d_path fails, try to get filename from bprm
-        char *filename = BPF_CORE_READ(bprm, filename);
-        if (filename) {
-            bpf_probe_read_kernel_str(path, sizeof(path), filename);
-        } else {
-            // Last resort: try to get from dentry
-            struct dentry *dentry = BPF_CORE_READ(bprm->file, f_path.dentry);
-            const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
-            bpf_probe_read_kernel_str(path, sizeof(path), name);
-        }
+    int policy_result = 0; // deny unless policy evaluation runs and allows
+
+    // Fail closed: an executable whose path could not be resolved is never
+    // evaluated against policy (arguments temporarily disabled due to BPF size
+    // limits) and is denied through the ordinary audited path below.
+    if (resolve_exec_path(bprm, path)) {
+        policy_result = check_exec_policy(path);
     }
-    
-    // Check policy for this path (arguments temporarily disabled due to BPF size limits)
-    policy_result = check_exec_policy(path);
     
     // Reserve ringbuf space
     event = bpf_ringbuf_reserve(&exec_events, sizeof(*event), 0);

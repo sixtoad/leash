@@ -11,7 +11,13 @@ native release is one unit containing four host CLI archives and a public
 multi-arch manager image at `ghcr.io/sixtoad/leash-manager:<native-tag>`.
 The script enforces this order:
 
-1. Require a clean tree and capture the full source revision.
+1. Require a clean tree and capture the full source revision. For a fresh
+   release, generate the eBPF LSM objects and ask the host kernel to verify
+   and attach exactly those objects (the ones every CLI archive embeds) with a
+   policy holding file-open, exec and connect rules
+   (`scripts/verify-lsm-kernel-load.sh`); their hashes are pinned and
+   re-checked before the archives are built. The manager image regenerates its
+   own objects, so the manager-based gates below cannot catch this (#110).
 2. For a fresh release, build a local AMD64/ARM64 OCI layout and verify both
    child architectures, revision/version/channel/contract labels, and content
    digests before any remote mutation.

@@ -105,6 +105,20 @@ for file in \
   [ -s "$file" ] || { printf '%s\n' "release: $file missing after generation" >&2; exit 1; }
 done
 
+# The manager image regenerates its BPF objects inside its own Docker toolchain,
+# so the manager-based gates below never exercise the objects that `go build`
+# embeds into the published CLI archives (native host mode loads those). Ask
+# the host kernel to verify and attach these exact objects with open, exec and
+# connect rules before anything is published, and pin them for the archives.
+LSM_OBJECTS=(internal/lsm/lsmopen_bpfel.o internal/lsm/lsmopen_bpfeb.o
+  internal/lsm/lsmexec_bpfel.o internal/lsm/lsmexec_bpfeb.o
+  internal/lsm/lsmconnect_bpfel.o internal/lsm/lsmconnect_bpfeb.o)
+LSM_OBJECT_SUMS="$(sha256sum "${LSM_OBJECTS[@]}")"
+if (( !DRY_RUN )) && [ "$REMOTE_MODE" != resume ]; then
+  printf '%s\n' "release: verifying real host-kernel load of the CLI-embedded LSM objects..." >&2
+  timeout 10m "$RELEASE_ROOT/scripts/verify-lsm-kernel-load.sh"
+fi
+
 MANAGER_BUILD_ARGS=(
   --file Dockerfile.leash --target final-prebuilt
   --build-arg BASE_BUILD_IMAGE=build-base
@@ -261,6 +275,11 @@ for key, expected in required.items():
     if labels.get(key) != expected:
         raise SystemExit(f"manager label {key}: {labels.get(key)!r} != {expected!r}")
 PY
+
+if [ "$(sha256sum "${LSM_OBJECTS[@]}")" != "$LSM_OBJECT_SUMS" ]; then
+  printf '%s\n' "release: LSM objects changed after the host-kernel load gate; refusing to archive them" >&2
+  exit 1
+fi
 
 DIST="$TEMP/dist"
 mkdir -p "$DIST"
