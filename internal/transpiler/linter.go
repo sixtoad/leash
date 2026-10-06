@@ -145,8 +145,12 @@ func lintPolicySet(ps *CedarPolicySet) []LintIssue {
 						if r.Type == "Dir" && !strings.HasSuffix(r.Value, "/") {
 							normalizedLength++
 						}
-						if normalizedLength > lsm.MaxPolicyPathLength {
-							issues = append(issues, LintIssue{PolicyID: p.ID, Severity: LintError, Code: "path_too_long", Message: fmt.Sprintf("Normalized path length %d exceeds %d bytes.", normalizedLength, lsm.MaxPolicyPathLength), Suggestion: "Shorten the path or target a higher-level directory."})
+						limit := lsm.MaxPolicyPathLength
+						if op == "exec" {
+							limit = lsm.MaxExecPolicyPathLength
+						}
+						if normalizedLength > limit {
+							issues = append(issues, LintIssue{PolicyID: p.ID, Severity: LintError, Code: "path_too_long", Message: fmt.Sprintf("Normalized path length %d exceeds %d bytes.", normalizedLength, limit), Suggestion: "Shorten the path or target a higher-level directory."})
 						}
 					}
 					if r.Type == "Dir" && !strings.HasSuffix(r.Value, "/") {

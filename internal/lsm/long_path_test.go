@@ -117,7 +117,7 @@ func TestLongPolicyPathMatcherUsesFullByteIndexes(t *testing.T) {
 		"open_exact_rules SEC(\".maps\")",
 		"open_prefix_rules SEC(\".maps\")",
 		"check_open_indexed_policy(path, file_op_type)",
-		"check_open_indexed_policy(s->path, OP_OPEN)",
+		"check_open_indexed_policy(s->path, OP_OPEN_RO)",
 		"for (int i = 0; i < MAX_PATH_LEN; i++)",
 		"path_len > MAX_PATH_LEN - 1",
 	} {
@@ -552,16 +552,120 @@ func TestLoadPoliciesFailedLiveUpdatePreservesPublishedState(t *testing.T) {
 	}
 }
 
-func TestEmptyPolicyReloadWritesLegacyRuleCount(t *testing.T) {
-	source, err := os.ReadFile("file_open.go")
+func TestLegacyLinearMatcherStateIsGone(t *testing.T) {
+	bpfSource, err := os.ReadFile("bpf/lsm_open.bpf.c")
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := string(source)
-	count := strings.Index(body, "numPolicyRules := len(policyRules)")
-	put := strings.Index(body, `coll.Maps["num_rules"].Put`)
-	if count < 0 || put < count {
-		t.Fatal("legacy rule count is not written from every candidate policy, including empty reloads")
+	goSource, err := os.ReadFile("file_open.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, legacy := range []string{"} policy_rules SEC", "} num_rules SEC", "} default_policy SEC", "struct policy_rule {"} {
+		if strings.Contains(string(bpfSource), legacy) {
+			t.Fatalf("dead legacy matcher state %q is still declared", legacy)
+		}
+	}
+	for _, legacy := range []string{`Maps["num_rules"]`, `Maps["policy_rules"]`, `Maps["default_policy"]`} {
+		if strings.Contains(string(goSource), legacy) {
+			t.Fatalf("reload still writes dead legacy map %s", legacy)
+		}
+	}
+}
+
+func commitTestRules() []OpenPolicyRule {
+	return []OpenPolicyRule{
+		openDirectoryRuleForPath(PolicyAllow, OpOpenRW, policyPathOfLength(90, '/')),
+		openRuleForPath(PolicyDeny, OpOpen, policyPathOfLength(93, 'x')),
+	}
+}
+
+func TestCommitPolicyIndexesIsAllOrNothing(t *testing.T) {
+	t.Run("success activates both", func(t *testing.T) {
+		mutation, open := newFakeMutationIndexStore(), newFakeOpenIndexStore()
+		if err := commitPolicyIndexes(mutation, open, commitTestRules(), false); err != nil {
+			t.Fatal(err)
+		}
+		if mutation.active != 1 || open.active != 1 || len(mutation.allows) == 0 || len(open.prefix) == 0 {
+			t.Fatalf("tokens %d/%d, entries %d/%d", mutation.active, open.active, len(mutation.allows), len(open.prefix))
+		}
+	})
+	t.Run("open staging failure leaves mutation untouched", func(t *testing.T) {
+		mutation, open := newFakeMutationIndexStore(), newFakeOpenIndexStore()
+		open.failPutAt = 1
+		if err := commitPolicyIndexes(mutation, open, commitTestRules(), false); err == nil {
+			t.Fatal("failed open staging reported success")
+		}
+		if mutation.active != 0 || open.active != 0 || len(mutation.denies)+len(mutation.allows)+len(mutation.self) != 0 || len(open.prefix)+len(open.exact) != 0 {
+			t.Fatalf("failed commit changed state: tokens %d/%d", mutation.active, open.active)
+		}
+	})
+	t.Run("open activation failure rolls mutation back to a fresh token", func(t *testing.T) {
+		mutation, open := newFakeMutationIndexStore(), newFakeOpenIndexStore()
+		if err := commitPolicyIndexes(mutation, open, commitTestRules(), false); err != nil {
+			t.Fatal(err)
+		}
+		liveAllows := len(mutation.allows)
+		open.failActivation = true
+		if err := commitPolicyIndexes(mutation, open, nil, true); err == nil {
+			t.Fatal("failed open activation reported success")
+		}
+		// Token 1 -> 2 (activated) -> 3 (rolled back): generation 1 again, but
+		// a value no hook can have snapshotted during the failed attempt.
+		if mutation.active != 3 || open.active != 1 {
+			t.Fatalf("tokens after rollback = %d/%d, want 3/1", mutation.active, open.active)
+		}
+		if len(mutation.allows) != liveAllows {
+			t.Fatalf("rollback lost the live mutation generation: %d allows, want %d", len(mutation.allows), liveAllows)
+		}
+		for key := range mutation.allows {
+			if uint32(key.Domain) != uint32(mutation.active&1) {
+				t.Fatalf("staged generation %d not cleaned after rollback", key.Domain)
+			}
+		}
+	})
+}
+
+func TestValidateOpenPolicyRulesRejectsUnenforceableShapes(t *testing.T) {
+	good := openRuleForPath(PolicyAllow, OpOpenRW, "/ok")
+	badAction := good
+	badAction.Action = 2
+	badOperation := good
+	badOperation.Operation = 3
+	badDirectory := good
+	badDirectory.IsDirectory = 1 // no trailing slash
+	for name, rule := range map[string]OpenPolicyRule{"action": badAction, "operation": badOperation, "directory": badDirectory} {
+		if err := (&OpenLsm{}).LoadPolicies([]OpenPolicyRule{rule}); err == nil {
+			t.Fatalf("rule with invalid %s accepted", name)
+		}
+	}
+	if err := (&OpenLsm{}).LoadPolicies([]OpenPolicyRule{good, openDirectoryRuleForPath(PolicyDeny, OpOpen, "/dir/")}); err != nil {
+		t.Fatalf("valid rules rejected: %v", err)
+	}
+}
+
+func TestValidateKernelPolicyLimitsChecksEveryModuleBeforeUpdate(t *testing.T) {
+	execRule := func(length int) PolicyRule {
+		r := PolicyRule{Action: PolicyAllow, Operation: OpExec, PathLen: int32(length)}
+		copy(r.Path[:], policyPathOfLength(length, 'x'))
+		return r
+	}
+	openRule := PolicyRule{Action: PolicyAllow, Operation: OpOpenRW, PathLen: MaxPolicyPathLength}
+	copy(openRule.Path[:], policyPathOfLength(MaxPolicyPathLength, 'x'))
+	if err := ValidateKernelPolicyLimits(&PolicySet{Open: []PolicyRule{openRule}, Exec: []PolicyRule{execRule(MaxExecPolicyPathLength)}}); err != nil {
+		t.Fatalf("policy at both limits rejected: %v", err)
+	}
+	if err := ValidateKernelPolicyLimits(&PolicySet{Open: []PolicyRule{openRule}, Exec: []PolicyRule{execRule(MaxExecPolicyPathLength + 1)}}); err == nil {
+		t.Fatal("over-limit exec rule passed pre-update validation")
+	}
+	manager, err := os.ReadFile("manager.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(manager)
+	validate, open := strings.Index(body, "ValidateKernelPolicyLimits(policies)"), strings.Index(body, "m.updateOpenLSM(policies); err != nil")
+	if validate < 0 || open < 0 || validate > open {
+		t.Fatal("UpdateRuntimeRules must validate every module before updating any")
 	}
 }
 
@@ -638,7 +742,16 @@ func indexedOpenDecision(index compiledOpenIndex, defaultAllow bool, path string
 
 func TestOpenIndexPreservesLegacyByteSemanticsBeyond64Bytes(t *testing.T) {
 	rng := rand.New(rand.NewSource(108))
-	long := "/" + strings.Repeat("w", 70) // every generated path is > 64 bytes
+	// Bases of 71 and 247 bytes: rules reach 77 and 253 bytes (plus "/"),
+	// probes reach 79 and 255 bytes, the maximum resolvable path.
+	for _, base := range []int{71, 247} {
+		long := "/" + strings.Repeat("w", base-1)
+		checkOpenIndexAgainstLegacy(t, rng, long)
+	}
+}
+
+func checkOpenIndexAgainstLegacy(t *testing.T, rng *rand.Rand, long string) {
+	t.Helper()
 	randomTail := func(maxLen int) string {
 		var b strings.Builder
 		for i := rng.Intn(maxLen + 1); i > 0; i-- {
@@ -692,6 +805,20 @@ func TestExecPolicyRejectsRulesTheKernelWouldSkip(t *testing.T) {
 	if l.numPolicyRules != 1 || l.policyRules[0].PathLen != MaxExecPolicyPathLength {
 		t.Fatal("rejected exec policy changed the loaded state")
 	}
+	for _, length := range []int{0, -1} {
+		r := rule(2)
+		r.PathLen = int32(length)
+		if err := l.LoadPolicies([]ExecPolicyRule{r}); err == nil {
+			t.Fatalf("exec rule with path length %d accepted", length)
+		}
+	}
+	exactly := make([]ExecPolicyRule, MaxExecPolicyRules)
+	for i := range exactly {
+		exactly[i] = rule(10)
+	}
+	if err := l.LoadPolicies(exactly); err != nil {
+		t.Fatalf("%d exec rules rejected: %v", MaxExecPolicyRules, err)
+	}
 	tooMany := make([]ExecPolicyRule, MaxExecPolicyRules+1)
 	for i := range tooMany {
 		tooMany[i] = rule(10)
@@ -703,6 +830,9 @@ func TestExecPolicyRejectsRulesTheKernelWouldSkip(t *testing.T) {
 
 // The version document advertises the limits this package enforces.
 func TestAdvertisedPolicyPathLimitsMatchEnforcement(t *testing.T) {
+	if version.FilePolicyRules != MaxPolicyRules || version.ExecPolicyRules != MaxExecPolicyRules {
+		t.Fatalf("advertised file/exec rule limits %d/%d, enforced %d/%d", version.FilePolicyRules, version.ExecPolicyRules, MaxPolicyRules, MaxExecPolicyRules)
+	}
 	if version.FilePolicyPathBytes != MaxPolicyPathLength || version.ExecPolicyPathBytes != MaxExecPolicyPathLength {
 		t.Fatalf("advertised file/exec limits %d/%d, enforced %d/%d",
 			version.FilePolicyPathBytes, version.ExecPolicyPathBytes, MaxPolicyPathLength, MaxExecPolicyPathLength)

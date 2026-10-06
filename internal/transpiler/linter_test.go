@@ -155,3 +155,25 @@ func TestLint_DirectoryLengthIncludesNormalizedSlash(t *testing.T) {
 		t.Fatalf("expected trailing-slash warning alongside length error, got %+v", report.Issues)
 	}
 }
+
+func TestLint_ExecPathBeyondKernelExecLimit(t *testing.T) {
+	lint := func(length int) bool {
+		path := "/" + strings.Repeat("e", length-1)
+		report, err := LintFromString(fmt.Sprintf(`permit (principal, action == Action::"ProcessExec", resource == File::%q);`, path))
+		if err != nil {
+			t.Fatalf("lint parse failed: %v", err)
+		}
+		for _, issue := range report.Issues {
+			if issue.Code == "path_too_long" && issue.Severity == LintError {
+				return true
+			}
+		}
+		return false
+	}
+	if lint(lsm.MaxExecPolicyPathLength) {
+		t.Fatalf("%d-byte exec path flagged", lsm.MaxExecPolicyPathLength)
+	}
+	if !lint(lsm.MaxExecPolicyPathLength + 1) {
+		t.Fatalf("%d-byte exec path not flagged; the kernel exec matcher compares only %d bytes", lsm.MaxExecPolicyPathLength+1, lsm.MaxExecPolicyPathLength)
+	}
+}

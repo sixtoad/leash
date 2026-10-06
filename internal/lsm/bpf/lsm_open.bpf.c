@@ -83,15 +83,6 @@ struct open_event {
     s32 result;     // Result of the open operation (0 = allowed, -EACCES = denied)
 };
 
-// Policy rule structure for BPF map
-struct policy_rule {
-    u32 action;      // 0 = deny, 1 = allow
-    u32 operation;   // 0 = open, 1 = open:ro, 2 = open:rw
-    u32 path_len;
-    char path[MAX_PATH_LEN];
-    u32 is_directory; // 1 if path ends with /
-};
-
 struct open_exact_rule_key {
     u32 generation;
     u32 operation;
@@ -144,14 +135,6 @@ struct {
     __type(key, u64);
     __type(value, u8);
 } allowed_cgroups SEC(".maps");
-
-// Map to store policy rules (indexed by rule number, supports up to 256 rules)
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, MAX_POLICY_RULES);
-    __type(key, u32);
-    __type(value, struct policy_rule);
-} policy_rules SEC(".maps");
 
 // Complete path bytes are the key: the kernel map may hash the struct, but no
 // digest or probabilistic comparison participates in the security decision.
@@ -222,22 +205,6 @@ struct {
     __type(key, u32);
     __type(value, u64);
 } active_mutation_generation SEC(".maps");
-
-// Map to store the number of policy rules
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, u32);
-    __type(value, u32);
-} num_rules SEC(".maps");
-
-// Map to store the default policy result (0 = deny, 1 = allow)
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, u32);
-    __type(value, u32);
-} default_policy SEC(".maps");
 
 // Container image roots use overlayfs. A declared write is first checked on
 // the overlay path, then overlayfs opens backing-store objects while completing
@@ -381,7 +348,13 @@ static __always_inline u32 get_file_operation_type(struct file *file)
     return OP_OPEN;
 }
 
+// Per-CPU scratch is not private to one hook invocation: a non-sleepable BPF
+// LSM program runs with migration disabled but may be preempted, and another
+// task on the same CPU can then rewrite the scratch. Every scratch user stamps
+// its pid_tgid as `owner` before writing and confirms it before enforcing an
+// allow; a changed owner denies (fail closed).
 struct mutation_lookup_scratch {
+    u64 owner;
     u64 activation_token;
     struct mutation_prefix_rule_key prefix;
     struct mutation_exact_rule_key exact;
@@ -399,6 +372,7 @@ static __noinline int check_mutation_policy(const char *path)
     u32 zero = 0;
     struct mutation_lookup_scratch *scratch = bpf_map_lookup_elem(&mutation_lookup_scratch_map, &zero);
     if (!scratch) return 0;
+    scratch->owner = bpf_get_current_pid_tgid();
     u64 *token_ptr = bpf_map_lookup_elem(&active_mutation_generation, &zero);
     if (!token_ptr) return 0;
     u64 activation_token = *token_ptr;
@@ -441,18 +415,8 @@ static __noinline int check_mutation_policy(const char *path)
     return 0;
 }
 
-static __noinline int mutation_generation_unchanged()
-{
-    u32 zero = 0;
-    struct mutation_lookup_scratch *scratch = bpf_map_lookup_elem(&mutation_lookup_scratch_map, &zero);
-    if (!scratch) return 0;
-    barrier();
-    u64 *confirmed_token = bpf_map_lookup_elem(&active_mutation_generation, &zero);
-    if (!confirmed_token) return 0;
-    return *confirmed_token == scratch->activation_token;
-}
-
 struct mutation_scratch {
+    u64 owner;
     char parent[MAX_PATH_LEN];
     char target[MAX_PATH_LEN];
 };
@@ -463,6 +427,20 @@ struct {
     __type(key, u32);
     __type(value, struct mutation_scratch);
 } mutation_scratch_map SEC(".maps");
+
+static __noinline int mutation_generation_unchanged()
+{
+    u32 zero = 0;
+    u64 self = bpf_get_current_pid_tgid();
+    struct mutation_lookup_scratch *scratch = bpf_map_lookup_elem(&mutation_lookup_scratch_map, &zero);
+    struct mutation_scratch *paths = bpf_map_lookup_elem(&mutation_scratch_map, &zero);
+    if (!scratch || !paths) return 0;
+    barrier();
+    u64 *confirmed_token = bpf_map_lookup_elem(&active_mutation_generation, &zero);
+    if (!confirmed_token) return 0;
+    if (scratch->owner != self || paths->owner != self) return 0;
+    return *confirmed_token == scratch->activation_token;
+}
 
 // path_* hooks receive a trusted parent path plus a child dentry. Build the
 // user-visible absolute target without walking outside that mount.
@@ -543,6 +521,7 @@ static __noinline int check_directory_mutation(const struct path *dir, struct de
     if (!scratch) {
         return emit_mutation_decision(unresolved_path, operation, 0);
     }
+    scratch->owner = bpf_get_current_pid_tgid();
     if (build_mutation_path(dir, dentry, scratch->parent, scratch->target) != 0) {
         // An unresolved path cannot safely inherit a broader grant, but the
         // denial must remain actionable to the operator.
@@ -686,6 +665,9 @@ int BPF_PROG(lsm_rename_destination, const struct path *old_dir, struct dentry *
 struct open_path_scratch {
     int path_len;
     char path[MAX_PATH_LEN];
+    // Appended after path so the canonicalizer's verified layout is unchanged.
+    int unresolved; // the absolute path could not be resolved: deny
+    u64 owner;      // pid_tgid of the invocation that wrote this scratch
 };
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -695,6 +677,7 @@ struct {
 } open_path_scratch_map SEC(".maps");
 
 struct open_index_lookup_scratch {
+    u64 owner;
     u64 activation_token;
     struct open_exact_rule_key exact;
     struct open_prefix_rule_key prefix;
@@ -719,6 +702,7 @@ static __noinline int check_open_indexed_policy(const char *path, u32 file_op_ty
     if (!token_ptr || !lookup) {
         return 0;
     }
+    lookup->owner = bpf_get_current_pid_tgid();
     u64 activation_token = *token_ptr;
     u32 active_generation = activation_token & 1;
     lookup->activation_token = activation_token;
@@ -919,9 +903,18 @@ int BPF_PROG(lsm_open, struct file *file)
         return -13;
     }
     char *path = scratch->path;
+    scratch->owner = bpf_get_current_pid_tgid();
+    scratch->unresolved = 0;
 
     // Get file path first - file pointer is already trusted from BPF_PROG macro
     int ret = bpf_d_path(&file->f_path, path, MAX_PATH_LEN);
+    if (ret == -36) {
+        // -ENAMETOOLONG: the absolute path exceeds the 255-byte policy
+        // contract. Its basename (kept below for the audit record) must never
+        // be evaluated as if it were a path: no rule can match it, so the
+        // default would decide and a forbid would fail open (#108).
+        scratch->unresolved = 1;
+    }
     if (ret < 0) {
         // If d_path fails, try to at least get the filename
         struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
@@ -964,8 +957,9 @@ int BPF_PROG(lsm_open_policy, struct file *file)
     }
     char *path = scratch->path;
 
-    // Skip logging nsfs (namespace filesystem) paths
-    if (is_nsfs_path(path)) {
+    // Skip logging nsfs (namespace filesystem) paths. Only a resolved path
+    // qualifies: an unresolved one holds a bare, attacker-chosen basename.
+    if (!scratch->unresolved && is_nsfs_path(path)) {
         return 0; // Allow but don't log namespace FDs
     }
 
@@ -973,6 +967,9 @@ int BPF_PROG(lsm_open_policy, struct file *file)
     u32 file_op_type = get_file_operation_type(file);
 
     int policy_result = check_open_indexed_policy(path, file_op_type);
+    if (scratch->unresolved) {
+        policy_result = 0;
+    }
 
     // Reserve ringbuf space. Audit assembly is optional, but every path joins
     // the same activation-token check immediately before enforcement returns.
@@ -1008,10 +1005,14 @@ int BPF_PROG(lsm_open_policy, struct file *file)
     // This fresh full-token equality is the decision linearization point. A
     // later userspace token update is a later policy transition; any change
     // before this point denies instead of using cleaned/reused slot entries.
+    // The owner stamps prove no other task rewrote the path or lookup scratch
+    // (preemption on this CPU) between resolution and this decision.
     struct open_index_lookup_scratch *lookup = bpf_map_lookup_elem(&open_index_lookup_scratch_map, &zero);
     barrier();
     u64 *confirmed_token = bpf_map_lookup_elem(&active_open_generation, &zero);
-    if (!lookup || !confirmed_token || *confirmed_token != lookup->activation_token) {
+    u64 self = bpf_get_current_pid_tgid();
+    if (!lookup || !confirmed_token || *confirmed_token != lookup->activation_token ||
+        lookup->owner != self || scratch->owner != self) {
         policy_result = 0;
     }
 
@@ -1097,6 +1098,7 @@ struct vfsmount___leash {
 // the 512-byte BPF stack limit, so they live in a per-CPU map instead (per-CPU
 // avoids races between concurrent link() calls on different CPUs).
 struct hl_scratch {
+    u64 owner;                   // pid_tgid stamp; see mutation_lookup_scratch
     char dest_abs[MAX_PATH_LEN]; // destination dir's absolute path (bpf_d_path)
     char raw[MAX_PATH_LEN];      // source within-mount path, reverse-built
     char path[MAX_PATH_LEN * 2]; // assembled absolute source path (NUL-padded; see lsm_link)
@@ -1213,6 +1215,7 @@ int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, st
     if (!s) {
         return -13;
     }
+    s->owner = bpf_get_current_pid_tgid();
 
     // Hard links are same-mount, so source and destination share this mount root.
     struct vfsmount___leash *vm = (void *)BPF_CORE_READ(new_dir, mnt);
@@ -1241,6 +1244,11 @@ int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, st
     }
     int strip = (dest_within_len <= 1) ? 0 : dest_within_len;
     int prefix_len = dest_abs_len - strip;
+    // Destination is the root of the "/" mount: the mount contributes no
+    // prefix. Keeping its "/" would build "//etc/..." and miss every rule.
+    if (dest_abs_len == 1) {
+        prefix_len = 0;
+    }
     if (prefix_len < 0 || prefix_len >= MAX_PATH_LEN) {
         return 0;
     }
@@ -1256,15 +1264,17 @@ int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, st
     }
     int slen = MAX_PATH_LEN - sstart; // source within-mount length
 
-    // Assemble the COMPLETE source path in one pass: path = dest_abs[0:prefix_len]
-    // + raw[sstart:]. Policy rules are matched over all of their (up to 255)
-    // bytes (#108), so a truncated path could miss a long forbid; a source path
-    // that does not fit the 255-byte policy contract is unresolvable here and
-    // shares the reconstruction-overflow residual above (file_open itself denies
-    // any path over 255 bytes).
+    // Assemble the COMPLETE source path: path = dest_abs[0:prefix_len] +
+    // raw[sstart:]. Policy rules are matched over all of their (up to 255)
+    // bytes (#108). A source whose absolute path exceeds 255 bytes cannot be
+    // opened by its real path (file_open denies unresolvable paths), so
+    // aliasing it is denied too rather than evaluated on a truncation.
     int total = prefix_len + slen;
-    if (total <= 0 || total > MAX_PATH_LEN - 1) {
+    if (total <= 0) {
         return 0;
+    }
+    if (total > MAX_PATH_LEN - 1) {
+        return -1;
     }
     // Two bulk copies instead of a byte loop: a per-byte loop whose exit
     // depends on `total` hands the verifier one distinct state per possible
@@ -1280,14 +1290,17 @@ int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, st
         return -1; // resolved but not assemblable: fail closed
     }
 
-    // Deny the link if reading the source by its real path would be denied,
-    // using the same full-length indexed decision as file_open, linearized on
-    // the same activation token.
-    int readable = check_open_indexed_policy(s->path, OP_OPEN);
+    // Deny the link if READING the source by its real path would be denied
+    // (the open:ro domain holds generic and read-only rules, so a read-only
+    // forbid counts), using the same full-length indexed decision as
+    // file_open, linearized on the same activation token and owner stamps.
+    int readable = check_open_indexed_policy(s->path, OP_OPEN_RO);
     struct open_index_lookup_scratch *lookup = bpf_map_lookup_elem(&open_index_lookup_scratch_map, &zero);
     barrier();
     u64 *confirmed_token = bpf_map_lookup_elem(&active_open_generation, &zero);
-    if (!lookup || !confirmed_token || *confirmed_token != lookup->activation_token) {
+    u64 self = bpf_get_current_pid_tgid();
+    if (!lookup || !confirmed_token || *confirmed_token != lookup->activation_token ||
+        lookup->owner != self || s->owner != self) {
         readable = 0;
     }
     if (readable != 1) {

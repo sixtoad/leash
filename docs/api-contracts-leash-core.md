@@ -189,7 +189,9 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
   ],
   "policyLimits": {                 // enforced policy path lengths, in bytes
     "filePathBytes": 255,           // file.open rules: every byte matched; longer rules rejected at load
-    "execPathBytes": 64             // proc.exec rules: legacy matcher; longer rules rejected at load
+    "execPathBytes": 64,            // proc.exec rules: legacy matcher; longer rules rejected at load
+    "fileRules": 256,               // most file.open rules per policy
+    "execRules": 64                 // most proc.exec rules per policy
   },
   "os": "linux", "arch": "amd64"    // GOOS / GOARCH
 }
@@ -259,7 +261,7 @@ if myContract < doc.MinCompatibleContract || myContract > *doc.ContractVersion {
 
 Two traps that snippet avoids. Decoding straight into value types makes `null`, `{}` and any unrelated JSON object succeed with a zero range `[0,0]`, which a contract-0 caller reads as *compatible* — so require the fields that make it this document before trusting the numbers. And never compare leash against constants compiled into the caller: that compares the caller to itself and can only pass. The installed binary's stdout is the only thing that can disagree with you.
 
-`policyLimits` (with the `policy-path-limits` capability) tells a policy generator how long a resolved rule path may be — a directory's trailing `/` included — and still be enforced byte-for-byte. A longer rule is rejected when the policy loads, so the run fails closed rather than starting without it. A document without `policyLimits` comes from a build that silently skipped any file or exec rule longer than 64 bytes; a caller must treat 64 as that build's limit.
+`policyLimits` (with the `policy-path-limits` capability) tells a policy generator how long a resolved rule path may be — a directory's trailing `/` included — and still be enforced byte-for-byte. A longer rule (or a larger rule set) is rejected before any kernel module is updated — at startup the run fails closed, and on a live reload the previous policy stays in force. At runtime, a file whose absolute path exceeds `filePathBytes` cannot be matched byte-for-byte and is denied (file open and hard-link source alike), whatever the rules say. A policy reload is atomic across file-open and directory-mutation enforcement; a hook racing a reload is denied rather than decided on a half-loaded policy. A document without `policyLimits` comes from a build that silently skipped any file or exec rule longer than 64 bytes; a caller must treat 64 as that build's limit.
 
 `capabilities` is there because the integer over-refuses. Raising `minCompatibleContract` for one removal turns away every caller below the new floor, including those that never used the removed flag; a caller that drives only `--policy` can test for `"policy"` in the array instead of consulting the range at all. Adding a name is additive (no bump); removing one is a break (bump, and raise the floor). A pre-`capabilities` document decodes with the field empty — fall back to the range. The empty string is never a capability.
 

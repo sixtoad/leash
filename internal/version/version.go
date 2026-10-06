@@ -113,6 +113,8 @@ const (
 const (
 	FilePolicyPathBytes = 255
 	ExecPolicyPathBytes = 64
+	FilePolicyRules     = 256
+	ExecPolicyRules     = 64
 )
 
 // PolicyLimits is the `policyLimits` object of the version document.
@@ -121,6 +123,10 @@ type PolicyLimits struct {
 	FilePathBytes int `json:"filePathBytes"`
 	// ExecPathBytes is the longest exec-policy path enforced byte-for-byte.
 	ExecPathBytes int `json:"execPathBytes"`
+	// FileRules and ExecRules are the most rules of each kind a policy may
+	// hold; a larger set is rejected at load, never truncated.
+	FileRules int `json:"fileRules"`
+	ExecRules int `json:"execRules"`
 }
 
 // capabilities is the surface this build offers. Order is stable so the emitted
@@ -373,7 +379,7 @@ func describeFor(b Build, goos, goarch string) Info {
 		ContractVersion:       ContractVersion,
 		MinCompatibleContract: MinCompatibleContract,
 		Capabilities:          Capabilities(),
-		PolicyLimits:          &PolicyLimits{FilePathBytes: FilePolicyPathBytes, ExecPathBytes: ExecPolicyPathBytes},
+		PolicyLimits:          &PolicyLimits{FilePathBytes: FilePolicyPathBytes, ExecPathBytes: ExecPolicyPathBytes, FileRules: FilePolicyRules, ExecRules: ExecPolicyRules},
 		OS:                    goos,
 		Arch:                  goarch,
 	}

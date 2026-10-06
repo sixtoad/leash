@@ -167,17 +167,36 @@ func (l *OpenLsm) withPolicyUpdate(fn func() error) error {
 }
 
 // LoadPolicies loads file open policy rules into the LSM
-func (l *OpenLsm) LoadPolicies(policies []OpenPolicyRule) error {
+// validateOpenPolicyRules rejects any rule the kernel index could not
+// enforce exactly as written, so no accepted rule is ever silently dropped.
+func validateOpenPolicyRules(policies []OpenPolicyRule) error {
 	if len(policies) > MaxPolicyRules {
 		return fmt.Errorf("too many file open policy rules: %d exceeds maximum %d", len(policies), MaxPolicyRules)
 	}
 	for i := range policies {
-		if policies[i].PathLen == 0 || policies[i].PathLen > MaxPolicyPathLength {
-			return fmt.Errorf("invalid file open policy rule %d path length: %d (must be 1-%d)", i, policies[i].PathLen, MaxPolicyPathLength)
+		rule := &policies[i]
+		if rule.PathLen == 0 || rule.PathLen > MaxPolicyPathLength {
+			return fmt.Errorf("invalid file open policy rule %d path length: %d (must be 1-%d)", i, rule.PathLen, MaxPolicyPathLength)
 		}
-		if bytes.IndexByte(policies[i].Path[:policies[i].PathLen], 0) >= 0 {
+		if bytes.IndexByte(rule.Path[:rule.PathLen], 0) >= 0 {
 			return fmt.Errorf("invalid file open policy rule %d path: contains a NUL byte", i)
 		}
+		if rule.Action != PolicyDeny && rule.Action != PolicyAllow {
+			return fmt.Errorf("invalid file open policy rule %d action: %d", i, rule.Action)
+		}
+		if rule.Operation > OpOpenRW {
+			return fmt.Errorf("invalid file open policy rule %d operation: %d", i, rule.Operation)
+		}
+		if rule.IsDirectory != 0 && rule.Path[rule.PathLen-1] != '/' {
+			return fmt.Errorf("invalid file open policy rule %d: directory path must end with '/'", i)
+		}
+	}
+	return nil
+}
+
+func (l *OpenLsm) LoadPolicies(policies []OpenPolicyRule) error {
+	if err := validateOpenPolicyRules(policies); err != nil {
+		return err
 	}
 	nextRules := append([]OpenPolicyRule(nil), policies...)
 
@@ -470,53 +489,95 @@ type openIndexReplaceResult struct {
 	cleanupDebt error
 }
 
-func replaceOpenIndex(store openIndexStore, index compiledOpenIndex, defaultAllow bool) (openIndexReplaceResult, error) {
+// tokenHeadroom keeps room for activation (+1) and a rollback (+2) without
+// wrapping; a wrapped token could repeat a value a running hook snapshotted.
+const tokenHeadroom = 2
+
+// openIndexStage is a fully staged, not yet active, file-open generation.
+type openIndexStage struct {
+	store            openIndexStore
+	active, inactive uint32
+	token            uint64 // token active when staging began
+}
+
+// stageOpenIndex writes index into the inactive generation without changing
+// what any hook observes. On error the inactive generation is cleaned.
+func stageOpenIndex(store openIndexStore, index compiledOpenIndex, defaultAllow bool) (*openIndexStage, error) {
 	activeToken, err := store.activeToken()
 	if err != nil {
-		return openIndexReplaceResult{}, fmt.Errorf("read active token: %w", err)
+		return nil, fmt.Errorf("read active token: %w", err)
 	}
-	if activeToken == ^uint64(0) {
-		return openIndexReplaceResult{}, fmt.Errorf("active token exhausted at %d", activeToken)
+	if activeToken > ^uint64(0)-tokenHeadroom {
+		return nil, fmt.Errorf("active token exhausted at %d", activeToken)
 	}
-	active := uint32(activeToken & 1)
-	nextToken := activeToken + 1
-	inactive := uint32(nextToken & 1)
-	if err := cleanOpenIndexGeneration(store, inactive); err != nil {
-		return openIndexReplaceResult{}, fmt.Errorf("prepare inactive generation: %w", err)
+	stage := &openIndexStage{store: store, active: uint32(activeToken & 1), inactive: uint32((activeToken + 1) & 1), token: activeToken}
+	if err := cleanOpenIndexGeneration(store, stage.inactive); err != nil {
+		return nil, fmt.Errorf("prepare inactive generation: %w", err)
 	}
-	cleanup := func(stageErr error) error {
-		if cleanupErr := cleanOpenIndexGeneration(store, inactive); cleanupErr != nil {
-			return fmt.Errorf("%w (cleanup failed: %v)", stageErr, cleanupErr)
-		}
-		return stageErr
-	}
-
 	defaultAction := uint32(0)
 	if defaultAllow {
 		defaultAction = 1
 	}
-	if err := store.setDefault(inactive, defaultAction); err != nil {
-		return openIndexReplaceResult{}, cleanup(fmt.Errorf("stage generation %d default: %w", inactive, err))
+	if err := store.setDefault(stage.inactive, defaultAction); err != nil {
+		return nil, stage.abort(fmt.Errorf("stage generation %d default: %w", stage.inactive, err))
 	}
 	for key, value := range index.exact {
-		key.Generation = inactive
+		key.Generation = stage.inactive
 		if err := store.putExact(key, value); err != nil {
-			return openIndexReplaceResult{}, cleanup(fmt.Errorf("stage generation %d exact entry: %w", inactive, err))
+			return nil, stage.abort(fmt.Errorf("stage generation %d exact entry: %w", stage.inactive, err))
 		}
 	}
 	for key, value := range index.prefix {
-		key.Domain += uint8(inactive * 3)
+		key.Domain += uint8(stage.inactive * 3)
 		if err := store.putPrefix(key, value); err != nil {
-			return openIndexReplaceResult{}, cleanup(fmt.Errorf("stage generation %d prefix entry: %w", inactive, err))
+			return nil, stage.abort(fmt.Errorf("stage generation %d prefix entry: %w", stage.inactive, err))
 		}
 	}
-	if err := store.setActiveToken(nextToken); err != nil {
-		return openIndexReplaceResult{}, cleanup(fmt.Errorf("activate token %d: %w", nextToken, err))
+	return stage, nil
+}
+
+// abort discards the staged generation and returns cause (annotated with any
+// cleanup failure).
+func (s *openIndexStage) abort(cause error) error {
+	if err := cleanOpenIndexGeneration(s.store, s.inactive); err != nil {
+		return fmt.Errorf("%w (cleanup failed: %v)", cause, err)
 	}
-	if err := cleanOpenIndexGeneration(store, active); err != nil {
-		return openIndexReplaceResult{cleanupDebt: fmt.Errorf("clean old generation %d after committed token %d: %w", active, nextToken, err)}, nil
+	return cause
+}
+
+// activate publishes the staged generation to every hook.
+func (s *openIndexStage) activate() error {
+	if err := s.store.setActiveToken(s.token + 1); err != nil {
+		return fmt.Errorf("activate token %d: %w", s.token+1, err)
 	}
-	return openIndexReplaceResult{}, nil
+	return nil
+}
+
+// rollback re-selects the previous (still intact) generation after a
+// successful activate. It moves to token+2, which has the previous parity but
+// a never-used value, so a hook that snapshotted token+1 cannot confirm.
+func (s *openIndexStage) rollback() error {
+	return s.store.setActiveToken(s.token + 2)
+}
+
+// finish cleans the previous generation once the staged one is active. A
+// failure is cleanup debt, not a failed update: the new authority is live.
+func (s *openIndexStage) finish() error {
+	if err := cleanOpenIndexGeneration(s.store, s.active); err != nil {
+		return fmt.Errorf("clean old generation %d after committed token %d: %w", s.active, s.token+1, err)
+	}
+	return nil
+}
+
+func replaceOpenIndex(store openIndexStore, index compiledOpenIndex, defaultAllow bool) (openIndexReplaceResult, error) {
+	stage, err := stageOpenIndex(store, index, defaultAllow)
+	if err != nil {
+		return openIndexReplaceResult{}, err
+	}
+	if err := stage.activate(); err != nil {
+		return openIndexReplaceResult{}, stage.abort(err)
+	}
+	return openIndexReplaceResult{cleanupDebt: stage.finish()}, nil
 }
 
 func (l *OpenLsm) loadPolicyIntoBPF(coll *ebpf.Collection) error {
@@ -530,17 +591,12 @@ func (l *OpenLsm) loadPolicyStateIntoBPF(coll *ebpf.Collection, policyRules []Op
 	if err != nil {
 		return err
 	}
-	openIndex := compileOpenIndex(policyRules)
+	mutationStore, err := newEBPFMutationIndexStore(coll)
+	if err != nil {
+		return err
+	}
 
-	// Always load the default policy result into BPF map
 	key := uint32(0)
-	defaultResult := uint32(0) // Default to deny
-	if defaultPolicyResult {
-		defaultResult = uint32(1) // Allow
-	}
-	if err := coll.Maps["default_policy"].Put(&key, &defaultResult); err != nil {
-		return fmt.Errorf("failed to update default_policy map: %w", err)
-	}
 	containerOverlay := uint32(0)
 	if l.containerOverlay {
 		containerOverlay = 1
@@ -548,60 +604,49 @@ func (l *OpenLsm) loadPolicyStateIntoBPF(coll *ebpf.Collection, policyRules []Op
 	if err := coll.Maps["container_overlay_mode"].Put(&key, &containerOverlay); err != nil {
 		return fmt.Errorf("failed to update container_overlay_mode map: %w", err)
 	}
-	mutationStore, err := newEBPFMutationIndexStore(coll)
-	if err != nil {
+
+	if err := commitPolicyIndexes(mutationStore, openStore, policyRules, defaultPolicyResult); err != nil {
 		return err
 	}
-	mutationResult, err := replaceMutationIndex(mutationStore, compileMutationIndex(policyRules))
-	if err != nil {
-		return fmt.Errorf("failed to update indexed mutation policy: %w", err)
-	}
-	if mutationResult.cleanupDebt != nil {
-		fmt.Fprintf(os.Stderr, "Warning: indexed mutation policy committed with deferred cleanup: %v\n", mutationResult.cleanupDebt)
-	}
-
-	// Always update the legacy rule count so an empty reload cannot retain stale
-	// hard-link authority from the prior policy.
-	numPolicyRules := len(policyRules)
-	numRules := int32(numPolicyRules)
-	if err := coll.Maps["num_rules"].Put(&key, &numRules); err != nil {
-		return fmt.Errorf("failed to update num_rules map: %w", err)
-	}
-
-	if numPolicyRules > 0 {
-		fmt.Printf("Loading %d policy rules into BPF maps...\n", numPolicyRules)
-	}
-
-	// Load each policy rule
-	for i := 0; i < numPolicyRules; i++ {
-		if err := coll.Maps["policy_rules"].Put(uint32(i), &policyRules[i]); err != nil {
-			return fmt.Errorf("failed to update policy_rules map for rule %d: %w", i, err)
-		}
-
-		// pathStr := string(bytes.TrimRight(l.policyRules[i].Path[:], "\x00"))
-		// actionStr := "deny"
-		// if l.policyRules[i].Action == 1 {
-		// 	actionStr = "allow"
-		// }
-		// dirStr := ""
-		// if l.policyRules[i].IsDirectory == 1 {
-		// 	dirStr = " (directory)"
-		// }
-
-		// fmt.Printf("Loaded rule %d: %s %s%s\n", i, actionStr, pathStr, dirStr)
-	}
-	replaceResult, err := replaceOpenIndex(openStore, openIndex, defaultPolicyResult)
-	if err != nil {
-		return fmt.Errorf("failed to update indexed file-open policy: %w", err)
-	}
-	if replaceResult.cleanupDebt != nil {
-		fmt.Fprintf(os.Stderr, "Warning: indexed file-open policy committed with deferred cleanup: %v\n", replaceResult.cleanupDebt)
-	}
-	if numPolicyRules == 0 {
+	if len(policyRules) == 0 {
 		fmt.Printf("No policy rules to load, using default policy result: %v\n", defaultPolicyResult)
+	} else {
+		fmt.Printf("Loaded %d policy rules into BPF maps\n", len(policyRules))
 	}
+	return nil
+}
 
-	// fmt.Printf("Successfully loaded all policy rules into BPF\n")
+// commitPolicyIndexes stages BOTH the mutation and file-open indexes before
+// activating either, so a failure anywhere leaves the kernel on the previous
+// file-open AND mutation authority (unless the mutation rollback itself fails,
+// which is reported).
+func commitPolicyIndexes(mutationStore mutationIndexStore, openStore openIndexStore, policyRules []OpenPolicyRule, defaultPolicyResult bool) error {
+	mutationStage, err := stageMutationIndex(mutationStore, compileMutationIndex(policyRules))
+	if err != nil {
+		return fmt.Errorf("failed to stage indexed mutation policy: %w", err)
+	}
+	openStage, err := stageOpenIndex(openStore, compileOpenIndex(policyRules), defaultPolicyResult)
+	if err != nil {
+		return mutationStage.abort(fmt.Errorf("failed to stage indexed file-open policy: %w", err))
+	}
+	if err := mutationStage.activate(); err != nil {
+		return openStage.abort(mutationStage.abort(fmt.Errorf("failed to activate indexed mutation policy: %w", err)))
+	}
+	if err := openStage.activate(); err != nil {
+		cause := fmt.Errorf("failed to activate indexed file-open policy: %w", err)
+		if rollbackErr := mutationStage.rollback(); rollbackErr != nil {
+			// The mutation index is live on the new policy and cannot be
+			// withdrawn; report the split rather than claim it unchanged.
+			return fmt.Errorf("%w (mutation policy rollback failed: %v)", cause, rollbackErr)
+		}
+		return openStage.abort(mutationStage.abort(cause))
+	}
+	if debt := mutationStage.finish(); debt != nil {
+		fmt.Fprintf(os.Stderr, "Warning: indexed mutation policy committed with deferred cleanup: %v\n", debt)
+	}
+	if debt := openStage.finish(); debt != nil {
+		fmt.Fprintf(os.Stderr, "Warning: indexed file-open policy committed with deferred cleanup: %v\n", debt)
+	}
 	return nil
 }
 
@@ -754,50 +799,77 @@ func cleanMutationGeneration(store mutationIndexStore, generation uint32) error 
 
 type mutationIndexReplaceResult struct{ cleanupDebt error }
 
-func replaceMutationIndex(store mutationIndexStore, index compiledMutationIndex) (mutationIndexReplaceResult, error) {
+// mutationIndexStage mirrors openIndexStage for the mutation index.
+type mutationIndexStage struct {
+	store            mutationIndexStore
+	active, inactive uint32
+	token            uint64
+}
+
+func stageMutationIndex(store mutationIndexStore, index compiledMutationIndex) (*mutationIndexStage, error) {
 	token, err := store.activeToken()
 	if err != nil {
-		return mutationIndexReplaceResult{}, fmt.Errorf("read active token: %w", err)
+		return nil, fmt.Errorf("read active token: %w", err)
 	}
-	if token == ^uint64(0) {
-		return mutationIndexReplaceResult{}, fmt.Errorf("active token exhausted at %d", token)
+	if token > ^uint64(0)-tokenHeadroom {
+		return nil, fmt.Errorf("active token exhausted at %d", token)
 	}
-	active, next := uint32(token&1), token+1
-	inactive := uint32(next & 1)
-	if err := cleanMutationGeneration(store, inactive); err != nil {
-		return mutationIndexReplaceResult{}, fmt.Errorf("prepare inactive generation: %w", err)
-	}
-	cleanup := func(e error) error {
-		if ce := cleanMutationGeneration(store, inactive); ce != nil {
-			return fmt.Errorf("%w (cleanup failed: %v)", e, ce)
-		}
-		return e
+	stage := &mutationIndexStage{store: store, active: uint32(token & 1), inactive: uint32((token + 1) & 1), token: token}
+	if err := cleanMutationGeneration(store, stage.inactive); err != nil {
+		return nil, fmt.Errorf("prepare inactive generation: %w", err)
 	}
 	for k, v := range index.denies {
-		k.Domain = uint8(inactive)
+		k.Domain = uint8(stage.inactive)
 		if err := store.putDeny(k, v); err != nil {
-			return mutationIndexReplaceResult{}, cleanup(err)
+			return nil, stage.abort(err)
 		}
 	}
 	for k, v := range index.allows {
-		k.Domain = uint8(inactive)
+		k.Domain = uint8(stage.inactive)
 		if err := store.putAllow(k, v); err != nil {
-			return mutationIndexReplaceResult{}, cleanup(err)
+			return nil, stage.abort(err)
 		}
 	}
 	for k, v := range index.selfDenies {
-		k.Generation = inactive
+		k.Generation = stage.inactive
 		if err := store.putSelfDeny(k, v); err != nil {
-			return mutationIndexReplaceResult{}, cleanup(err)
+			return nil, stage.abort(err)
 		}
 	}
-	if err := store.setActiveToken(next); err != nil {
-		return mutationIndexReplaceResult{}, cleanup(err)
+	return stage, nil
+}
+
+func (s *mutationIndexStage) abort(cause error) error {
+	if err := cleanMutationGeneration(s.store, s.inactive); err != nil {
+		return fmt.Errorf("%w (cleanup failed: %v)", cause, err)
 	}
-	if err := cleanMutationGeneration(store, active); err != nil {
-		return mutationIndexReplaceResult{fmt.Errorf("clean old generation %d after committed token %d: %w", active, next, err)}, nil
+	return cause
+}
+
+func (s *mutationIndexStage) activate() error {
+	return s.store.setActiveToken(s.token + 1)
+}
+
+func (s *mutationIndexStage) rollback() error {
+	return s.store.setActiveToken(s.token + 2)
+}
+
+func (s *mutationIndexStage) finish() error {
+	if err := cleanMutationGeneration(s.store, s.active); err != nil {
+		return fmt.Errorf("clean old generation %d after committed token %d: %w", s.active, s.token+1, err)
 	}
-	return mutationIndexReplaceResult{}, nil
+	return nil
+}
+
+func replaceMutationIndex(store mutationIndexStore, index compiledMutationIndex) (mutationIndexReplaceResult, error) {
+	stage, err := stageMutationIndex(store, index)
+	if err != nil {
+		return mutationIndexReplaceResult{}, err
+	}
+	if err := stage.activate(); err != nil {
+		return mutationIndexReplaceResult{}, stage.abort(err)
+	}
+	return mutationIndexReplaceResult{cleanupDebt: stage.finish()}, nil
 }
 
 // validateEvent checks if the event data is properly formed

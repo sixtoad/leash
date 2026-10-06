@@ -93,10 +93,10 @@ func (l *ExecLsm) setEbpfCollection(coll *ebpf.Collection) {
 	l.ebpfCollection = coll
 }
 
-func (l *ExecLsm) LoadPolicies(policies []ExecPolicyRule) error {
-	// The kernel matcher only evaluates the first MaxExecPolicyRules rules and
-	// skips rule paths longer than MaxExecPolicyPathLength; reject both before
-	// changing any state instead of letting a rule silently disappear.
+// validateExecPolicyRules rejects what the kernel exec matcher would silently
+// skip: it evaluates only the first MaxExecPolicyRules rules and skips rule
+// paths longer than MaxExecPolicyPathLength.
+func validateExecPolicyRules(policies []ExecPolicyRule) error {
 	if len(policies) > MaxExecPolicyRules {
 		return fmt.Errorf("too many exec policy rules: %d exceeds maximum %d", len(policies), MaxExecPolicyRules)
 	}
@@ -104,6 +104,14 @@ func (l *ExecLsm) LoadPolicies(policies []ExecPolicyRule) error {
 		if policies[i].PathLen <= 0 || policies[i].PathLen > MaxExecPolicyPathLength {
 			return fmt.Errorf("invalid exec policy rule %d path length: %d (must be 1-%d)", i, policies[i].PathLen, MaxExecPolicyPathLength)
 		}
+	}
+	return nil
+}
+
+func (l *ExecLsm) LoadPolicies(policies []ExecPolicyRule) error {
+	// Reject before changing any state instead of letting a rule disappear.
+	if err := validateExecPolicyRules(policies); err != nil {
+		return err
 	}
 	l.policyRules = policies
 	l.numPolicyRules = len(policies)

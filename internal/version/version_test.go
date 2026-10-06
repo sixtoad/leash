@@ -19,7 +19,7 @@ func testBuild() Build {
 // rather than obtained from the code under test, so a silent change to the list
 // fails here.
 // wantPolicyLimits pins the advertised enforced policy path limits.
-var wantPolicyLimits = &PolicyLimits{FilePathBytes: 255, ExecPathBytes: 64}
+var wantPolicyLimits = &PolicyLimits{FilePathBytes: 255, ExecPathBytes: 64, FileRules: 256, ExecRules: 64}
 
 var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits"}
 
@@ -209,7 +209,7 @@ func TestJSONWireShape(t *testing.T) {
 		"contractVersion":       float64(1), // encoding/json decodes numbers as float64
 		"minCompatibleContract": float64(0),
 		"capabilities":          []any{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits"},
-		"policyLimits":          map[string]any{"filePathBytes": float64(255), "execPathBytes": float64(64)},
+		"policyLimits":          map[string]any{"filePathBytes": float64(255), "execPathBytes": float64(64), "fileRules": float64(256), "execRules": float64(64)},
 		"os":                    "linux",
 		"arch":                  "amd64",
 	}
@@ -714,11 +714,11 @@ func TestParseAcceptsAMinimalDocument(t *testing.T) {
 func TestParsePolicyLimits(t *testing.T) {
 	t.Parallel()
 
-	got, err := Parse([]byte(`{"version":"v1","contractVersion":1,"policyLimits":{"filePathBytes":255,"execPathBytes":64}}`))
+	got, err := Parse([]byte(`{"version":"v1","contractVersion":1,"policyLimits":{"filePathBytes":255,"execPathBytes":64,"fileRules":256,"execRules":64}}`))
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}
-	if got.PolicyLimits == nil || *got.PolicyLimits != (PolicyLimits{FilePathBytes: 255, ExecPathBytes: 64}) {
+	if got.PolicyLimits == nil || *got.PolicyLimits != (PolicyLimits{FilePathBytes: 255, ExecPathBytes: 64, FileRules: 256, ExecRules: 64}) {
 		t.Fatalf("PolicyLimits = %+v, want 255/64", got.PolicyLimits)
 	}
 	legacy, err := Parse([]byte(`{"version":"v0","contractVersion":1}`))
