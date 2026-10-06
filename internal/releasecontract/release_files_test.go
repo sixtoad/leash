@@ -357,3 +357,46 @@ func validManagerImagesWithRelease(revision, version, channel string) string {
 			"io.leash.manager.contract.min-compatible":"1"}}}
 	}`
 }
+
+// Issue #110: the manager image regenerates its own BPF objects, so the
+// manager-based load gate never sees the objects embedded in the CLI archives.
+// Those exact objects must pass a real host-kernel load (with an exec rule)
+// before publication and must not change before archiving.
+func TestReleaseVerifiesCLIEmbeddedLSMObjectsOnHostKernel(t *testing.T) {
+	release := readRepositoryFile(t, "scripts/release.sh")
+	generation := strings.Index(release, "make lsm-generate")
+	objectGate := strings.Index(release, `"$RELEASE_ROOT/scripts/verify-lsm-kernel-load.sh"`)
+	pin := strings.Index(release, `LSM_OBJECT_SUMS="$(sha256sum "${LSM_OBJECTS[@]}")"`)
+	publication := strings.Index(release, "./build/publish-docker.sh")
+	recheck := strings.Index(release, `[ "$(sha256sum "${LSM_OBJECTS[@]}")" != "$LSM_OBJECT_SUMS" ]`)
+	archive := strings.Index(release, `tar -C "$DIST" -czf`)
+	if generation < 0 || objectGate < 0 || pin < 0 || publication < 0 || recheck < 0 || archive < 0 {
+		t.Fatalf("CLI object gate missing: generation=%d pin=%d gate=%d publication=%d recheck=%d archive=%d", generation, pin, objectGate, publication, recheck, archive)
+	}
+	if !(generation < pin && pin < objectGate && objectGate < publication && publication < recheck && recheck < archive) {
+		t.Fatalf("CLI object gate out of order: generation=%d pin=%d gate=%d publication=%d recheck=%d archive=%d", generation, pin, objectGate, publication, recheck, archive)
+	}
+
+	script := readRepositoryFile(t, "scripts/verify-lsm-kernel-load.sh")
+	for _, required := range []string{
+		"go test -buildvcs=false -c",
+		"--privileged --cgroupns=host",
+		"LEASH_LSM_KERNEL_LOAD_VALIDATION=1",
+		"^--- PASS: TestKernelLoadAllModulesWithExecRule",
+	} {
+		if !strings.Contains(script, required) {
+			t.Errorf("verify-lsm-kernel-load.sh missing %q", required)
+		}
+	}
+	validation := readRepositoryFile(t, "internal/lsm/kernel_load_validation_test.go")
+	for _, rule := range []string{`"allow proc.exec /"`, `"allow file.open /usr/"`, `"allow net.send 1.1.1.1:443"`} {
+		if !strings.Contains(validation, rule) {
+			t.Errorf("kernel load validation policy missing %s", rule)
+		}
+	}
+
+	parity := readRepositoryFile(t, "scripts/verify-native-release.sh")
+	if !strings.Contains(parity, "for action in ProcessExec FileOpen NetworkConnect; do") {
+		t.Error("release parity gate must require exec, file-open and connect rules in its policy")
+	}
+}

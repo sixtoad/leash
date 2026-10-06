@@ -18,6 +18,14 @@ trap cleanup EXIT
 
 test -x "$BIN"
 test -s "$POLICY"
+# The manager only loads an LSM module when the policy has rules for it, so the
+# gate policy must keep exec, file-open and connect rules (issue #110).
+for action in ProcessExec FileOpen NetworkConnect; do
+  grep -q "Action::\"$action\"" "$POLICY" || {
+    printf '%s\n' "release gate policy $POLICY lacks a $action rule" >&2
+    exit 1
+  }
+done
 
 VERSION_JSON="$($BIN version --json)"
 VERSION_JSON="$VERSION_JSON" REVISION="$REVISION" python3 - <<'PY'
