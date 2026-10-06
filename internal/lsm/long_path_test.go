@@ -2,7 +2,9 @@ package lsm
 
 import (
 	"errors"
+	"math/rand"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -10,6 +12,7 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf"
+	"github.com/strongdm/leash/internal/version"
 )
 
 func policyPathOfLength(length int, suffix byte) string {
@@ -110,20 +113,22 @@ func TestLongPolicyPathMatcherUsesFullByteIndexes(t *testing.T) {
 		"#define MAX_OPEN_INDEX_ENTRIES (MAX_POLICY_RULES * 3 * 2)",
 		"u8 domain;",
 		"char path[MAX_PATH_LEN - 1];",
-		"lookup->directory.prefix_len = 8 + path_len * 8;",
+		"lookup->prefix.prefix_len = 8 + path_len * 8;",
 		"open_exact_rules SEC(\".maps\")",
-		"open_directory_rules SEC(\".maps\")",
-		"check_open_indexed_policy(file_op_type)",
+		"open_prefix_rules SEC(\".maps\")",
+		"check_open_indexed_policy(path, file_op_type)",
+		"check_open_indexed_policy(s->path, OP_OPEN)",
 		"for (int i = 0; i < MAX_PATH_LEN; i++)",
 		"path_len > MAX_PATH_LEN - 1",
-		"#define HL_MATCH_LEN 72",
 	} {
 		if !strings.Contains(body, required) {
 			t.Fatalf("file policy source is missing long-path contract %q", required)
 		}
 	}
-	if strings.Contains(body, "check_path_policy(path, file_op_type)") {
-		t.Fatal("file_open still routes through the legacy 64-byte hard-link matcher")
+	for _, legacy := range []string{"check_path_policy", "simple_string_starts_with", "len > 64"} {
+		if strings.Contains(body, legacy) {
+			t.Fatalf("legacy 64-byte matcher %q is still present", legacy)
+		}
 	}
 }
 
@@ -133,8 +138,8 @@ func TestOpenIndexedPolicyLinearizesOnFullActivationToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(source)
-	if got := strings.Count(body, "bpf_map_lookup_elem(&active_open_generation"); got != 2 {
-		t.Fatalf("active token reads = %d, want matcher snapshot plus hook confirmation", got)
+	if got := strings.Count(body, "bpf_map_lookup_elem(&active_open_generation"); got != 3 {
+		t.Fatalf("active token reads = %d, want matcher snapshot plus file_open and path_link confirmations", got)
 	}
 	hookStart := strings.Index(body, "int BPF_PROG(lsm_open_policy")
 	if hookStart < 0 {
@@ -146,7 +151,7 @@ func TestOpenIndexedPolicyLinearizesOnFullActivationToken(t *testing.T) {
 	}
 	hook := body[hookStart : hookStart+hookEnd]
 	lookups := []string{
-		"int policy_result = check_open_indexed_policy(file_op_type);",
+		"int policy_result = check_open_indexed_policy(path, file_op_type);",
 		"struct open_index_lookup_scratch *lookup = bpf_map_lookup_elem(&open_index_lookup_scratch_map",
 		"barrier();",
 		"u64 *confirmed_token = bpf_map_lookup_elem(&active_open_generation",
@@ -169,7 +174,7 @@ func TestOpenIndexedPolicyLinearizesOnFullActivationToken(t *testing.T) {
 		"u32 active_generation = activation_token & 1;",
 		"lookup->activation_token = activation_token;",
 		"bpf_map_lookup_elem(&open_exact_rules",
-		"bpf_map_lookup_elem(&open_directory_rules",
+		"bpf_map_lookup_elem(&open_prefix_rules",
 		"bpf_map_lookup_elem(&open_default_policy",
 	} {
 		if !strings.Contains(body, required) {
@@ -187,8 +192,8 @@ func exactIndexKey(operation uint32, path string) openExactRuleKey {
 	return key
 }
 
-func directoryIndexKey(operation uint32, path string) openDirectoryRuleKey {
-	key := openDirectoryRuleKey{
+func prefixIndexKey(operation uint32, path string) openPrefixRuleKey {
+	key := openPrefixRuleKey{
 		PrefixLen: openIndexDomainBits + uint32(len(path))*8,
 		Domain:    uint8(operation),
 	}
@@ -196,12 +201,12 @@ func directoryIndexKey(operation uint32, path string) openDirectoryRuleKey {
 	return key
 }
 
-func TestOpenDirectoryIndexKeyFitsKernelLPMContract(t *testing.T) {
-	if got := unsafe.Sizeof(openDirectoryRuleKey{}); got != 260 {
-		t.Fatalf("directory LPM key size = %d, want 260 (4-byte prefix + 256-byte data)", got)
+func TestOpenPrefixIndexKeyFitsKernelLPMContract(t *testing.T) {
+	if got := unsafe.Sizeof(openPrefixRuleKey{}); got != 260 {
+		t.Fatalf("prefix LPM key size = %d, want 260 (4-byte prefix + 256-byte data)", got)
 	}
-	if got := len(openDirectoryRuleKey{}.Path); got != MaxPolicyPathLength {
-		t.Fatalf("directory LPM path capacity = %d, want %d", got, MaxPolicyPathLength)
+	if got := len(openPrefixRuleKey{}.Path); got != MaxPolicyPathLength {
+		t.Fatalf("prefix LPM path capacity = %d, want %d", got, MaxPolicyPathLength)
 	}
 	for generation := uint32(0); generation < 2; generation++ {
 		for operation := uint32(OpOpen); operation <= OpOpenRW; operation++ {
@@ -211,7 +216,7 @@ func TestOpenDirectoryIndexKeyFitsKernelLPMContract(t *testing.T) {
 			}
 		}
 	}
-	key := directoryIndexKey(OpOpenRW, policyPathOfLength(MaxPolicyPathLength, '/'))
+	key := prefixIndexKey(OpOpenRW, policyPathOfLength(MaxPolicyPathLength, '/'))
 	if key.PrefixLen != 8+MaxPolicyPathLength*8 {
 		t.Fatalf("max path prefix bits = %d, want %d", key.PrefixLen, 8+MaxPolicyPathLength*8)
 	}
@@ -225,12 +230,15 @@ func TestCompileOpenIndexPreservesFullBytesAtEveryBoundary(t *testing.T) {
 			// Bytes outside PathLen are not policy data and must not enter the key.
 			rule.Path[length] = 0x7f
 			index := compileOpenIndex([]OpenPolicyRule{rule})
-			value, ok := index.exact[exactIndexKey(OpOpenRW, path)]
+			value, ok := index.prefix[prefixIndexKey(OpOpenRW, path)]
 			if !ok {
-				t.Fatalf("missing %d-byte exact action %d", length, action)
+				t.Fatalf("missing %d-byte prefix action %d", length, action)
 			}
 			if value.Action != action || value.Specificity != uint32(length) || value.Order != 0 {
-				t.Fatalf("%d-byte exact value = %+v", length, value)
+				t.Fatalf("%d-byte prefix value = %+v", length, value)
+			}
+			if len(index.exact) != 0 || len(index.prefix) != 1 {
+				t.Fatalf("%d-byte file rule compiled to exact=%d prefix=%d entries, want 0/1", length, len(index.exact), len(index.prefix))
 			}
 		}
 	}
@@ -246,20 +254,20 @@ func TestCompileOpenIndexPreservesOperationOrderAndDirectorySemantics(t *testing
 	}
 	index := compileOpenIndex(l.policyRules)
 
-	if got := index.exact[exactIndexKey(OpOpenRO, "/workspace/private/readme")]; got.Action != PolicyAllow || got.Specificity != uint32(len("/workspace/private/readme")) {
-		t.Fatalf("exact candidate = %+v", got)
+	if got := index.prefix[prefixIndexKey(OpOpenRO, "/workspace/private/readme")]; got.Action != PolicyAllow || got.Specificity != uint32(len("/workspace/private/readme")) {
+		t.Fatalf("file candidate = %+v", got)
 	}
 	if got := index.exact[exactIndexKey(OpOpenRO, "/workspace/private")]; got.Action != PolicyDeny || got.Specificity != uint32(len("/workspace/private/")) {
 		t.Fatalf("directory-self candidate = %+v", got)
 	}
-	if got := index.directory[directoryIndexKey(OpOpenRO, "/workspace/private/")]; got.Action != PolicyDeny {
+	if got := index.prefix[prefixIndexKey(OpOpenRO, "/workspace/private/")]; got.Action != PolicyDeny {
 		t.Fatalf("read-only child directory = %+v", got)
 	}
-	if _, exists := index.directory[directoryIndexKey(OpOpenRW, "/workspace/private/")]; exists {
+	if _, exists := index.prefix[prefixIndexKey(OpOpenRW, "/workspace/private/")]; exists {
 		t.Fatal("read-only child directory leaked into read-write operation index")
 	}
 	for _, operation := range []uint32{OpOpen, OpOpenRO, OpOpenRW} {
-		if got := index.directory[directoryIndexKey(operation, "/workspace/")]; got.Action != PolicyAllow {
+		if got := index.prefix[prefixIndexKey(operation, "/workspace/")]; got.Action != PolicyAllow {
 			t.Fatalf("generic parent for operation %d = %+v", operation, got)
 		}
 	}
@@ -269,14 +277,14 @@ func TestCompileOpenIndexPreservesOperationOrderAndDirectorySemantics(t *testing
 		openRuleForPath(PolicyDeny, OpOpen, path),
 		openRuleForPath(PolicyAllow, OpOpenRW, path),
 	})
-	if got := denyFirst.exact[exactIndexKey(OpOpenRW, path)]; got.Action != PolicyDeny || got.Order != 0 {
+	if got := denyFirst.prefix[prefixIndexKey(OpOpenRW, path)]; got.Action != PolicyDeny || got.Order != 0 {
 		t.Fatalf("same-path first rule lost precedence: %+v", got)
 	}
 	allowFirst := compileOpenIndex([]OpenPolicyRule{
 		openRuleForPath(PolicyAllow, OpOpenRW, path),
 		openRuleForPath(PolicyDeny, OpOpen, path),
 	})
-	if got := allowFirst.exact[exactIndexKey(OpOpenRW, path)]; got.Action != PolicyAllow || got.Order != 0 {
+	if got := allowFirst.prefix[prefixIndexKey(OpOpenRW, path)]; got.Action != PolicyAllow || got.Order != 0 {
 		t.Fatalf("same-path operation-specific first rule lost precedence: %+v", got)
 	}
 }
@@ -285,7 +293,7 @@ type fakeOpenIndexStore struct {
 	active         uint64
 	defaults       map[uint32]uint32
 	exact          map[openExactRuleKey]openIndexRule
-	directory      map[openDirectoryRuleKey]openIndexRule
+	prefix         map[openPrefixRuleKey]openIndexRule
 	putCalls       int
 	failPutAt      int
 	failActivation bool
@@ -311,9 +319,9 @@ func (s *fakeOpenIndexStore) listExactKeys() ([]openExactRuleKey, error) {
 	}
 	return keys, nil
 }
-func (s *fakeOpenIndexStore) listDirectoryKeys() ([]openDirectoryRuleKey, error) {
-	keys := make([]openDirectoryRuleKey, 0, len(s.directory))
-	for key := range s.directory {
+func (s *fakeOpenIndexStore) listPrefixKeys() ([]openPrefixRuleKey, error) {
+	keys := make([]openPrefixRuleKey, 0, len(s.prefix))
+	for key := range s.prefix {
 		keys = append(keys, key)
 	}
 	return keys, nil
@@ -326,12 +334,12 @@ func (s *fakeOpenIndexStore) putExact(key openExactRuleKey, value openIndexRule)
 	s.exact[key] = value
 	return nil
 }
-func (s *fakeOpenIndexStore) putDirectory(key openDirectoryRuleKey, value openIndexRule) error {
+func (s *fakeOpenIndexStore) putPrefix(key openPrefixRuleKey, value openIndexRule) error {
 	s.putCalls++
 	if s.failPutAt > 0 && s.putCalls == s.failPutAt {
-		return errors.New("directory write failed")
+		return errors.New("prefix write failed")
 	}
-	s.directory[key] = value
+	s.prefix[key] = value
 	return nil
 }
 func (s *fakeOpenIndexStore) deleteExact(key openExactRuleKey) error {
@@ -341,19 +349,19 @@ func (s *fakeOpenIndexStore) deleteExact(key openExactRuleKey) error {
 	delete(s.exact, key)
 	return nil
 }
-func (s *fakeOpenIndexStore) deleteDirectory(key openDirectoryRuleKey) error {
+func (s *fakeOpenIndexStore) deletePrefix(key openPrefixRuleKey) error {
 	if s.failDelete {
-		return errors.New("directory delete failed")
+		return errors.New("prefix delete failed")
 	}
-	delete(s.directory, key)
+	delete(s.prefix, key)
 	return nil
 }
 
 func newFakeOpenIndexStore() *fakeOpenIndexStore {
 	return &fakeOpenIndexStore{
-		defaults:  make(map[uint32]uint32),
-		exact:     make(map[openExactRuleKey]openIndexRule),
-		directory: make(map[openDirectoryRuleKey]openIndexRule),
+		defaults: make(map[uint32]uint32),
+		exact:    make(map[openExactRuleKey]openIndexRule),
+		prefix:   make(map[openPrefixRuleKey]openIndexRule),
 	}
 }
 
@@ -385,9 +393,9 @@ func TestReplaceOpenIndexFlipsOnlyAfterCompleteStaging(t *testing.T) {
 			t.Fatalf("exact key retained generation %d", key.Generation)
 		}
 	}
-	for key := range store.directory {
+	for key := range store.prefix {
 		if uint32(key.Domain)/3 != 1 {
-			t.Fatalf("directory key retained generation domain %d", key.Domain)
+			t.Fatalf("prefix key retained generation domain %d", key.Domain)
 		}
 	}
 }
@@ -415,9 +423,9 @@ func TestReplaceOpenIndexFailurePreservesActiveAuthority(t *testing.T) {
 					t.Fatal("failed transition left staged exact authority")
 				}
 			}
-			for key := range store.directory {
+			for key := range store.prefix {
 				if uint32(key.Domain)/3 == 1 {
-					t.Fatal("failed transition left staged directory authority")
+					t.Fatal("failed transition left staged prefix authority")
 				}
 			}
 		})
@@ -446,7 +454,7 @@ func TestReplaceOpenIndexUsesMonotonicTokenAndRejectsExhaustion(t *testing.T) {
 	if _, err := replaceOpenIndex(exhausted, index, false); err == nil || !strings.Contains(err.Error(), "exhausted") {
 		t.Fatalf("exhausted token error = %v, want rejection", err)
 	}
-	if exhausted.active != ^uint64(0) || len(exhausted.exact) != 0 || len(exhausted.directory) != 0 {
+	if exhausted.active != ^uint64(0) || len(exhausted.exact) != 0 || len(exhausted.prefix) != 0 {
 		t.Fatal("token exhaustion changed indexed authority")
 	}
 }
@@ -570,5 +578,133 @@ func TestLongPolicyPathSortPreservesEqualLengthOrder(t *testing.T) {
 	}
 	if l.policyRules[0] != rules[0] || l.policyRules[1] != rules[1] {
 		t.Fatal("equal-length rule order changed")
+	}
+}
+
+// legacyOpenDecision is the historical lsm_open matcher (sorted scan, byte
+// prefix, directory-self, operation filter, first match wins) WITHOUT its
+// 64-byte rule cutoff: the semantics the full-length index must preserve.
+func legacyOpenDecision(rules []OpenPolicyRule, defaultAllow bool, path string, operation uint32) uint32 {
+	for _, rule := range rules {
+		length := int(rule.PathLen)
+		rulePath := string(rule.Path[:length])
+		matches := false
+		if len(path) >= length-1 && path[:length-1] == rulePath[:length-1] {
+			if len(path) >= length && path[length-1] == rulePath[length-1] {
+				matches = true
+			} else if rule.IsDirectory != 0 && len(path) == length-1 {
+				matches = true
+			}
+		}
+		if matches && (rule.Operation == OpOpen || rule.Operation == operation) {
+			return rule.Action
+		}
+	}
+	if defaultAllow {
+		return PolicyAllow
+	}
+	return PolicyDeny
+}
+
+// indexedOpenDecision models check_open_indexed_policy over a compiled index:
+// the LPM trie's longest prefix in the operation's domain, the exact
+// directory-self entry, specificity then order, else the default.
+func indexedOpenDecision(index compiledOpenIndex, defaultAllow bool, path string, operation uint32) uint32 {
+	decision := uint32(PolicyDeny)
+	if defaultAllow {
+		decision = PolicyAllow
+	}
+	var prefix *openIndexRule
+	for length := len(path); length >= 1 && prefix == nil; length-- {
+		if value, ok := index.prefix[prefixIndexKey(operation, path[:length])]; ok {
+			prefix = &value
+		}
+	}
+	exact, hasExact := index.exact[exactIndexKey(operation, path)]
+	switch {
+	case hasExact && prefix == nil:
+		decision = exact.Action
+	case hasExact && exact.Specificity > prefix.Specificity:
+		decision = exact.Action
+	case hasExact && prefix.Specificity > exact.Specificity:
+		decision = prefix.Action
+	case hasExact && exact.Order <= prefix.Order:
+		decision = exact.Action
+	case prefix != nil:
+		decision = prefix.Action
+	}
+	return decision
+}
+
+func TestOpenIndexPreservesLegacyByteSemanticsBeyond64Bytes(t *testing.T) {
+	rng := rand.New(rand.NewSource(108))
+	long := "/" + strings.Repeat("w", 70) // every generated path is > 64 bytes
+	randomTail := func(maxLen int) string {
+		var b strings.Builder
+		for i := rng.Intn(maxLen + 1); i > 0; i-- {
+			b.WriteByte("ab/"[rng.Intn(3)])
+		}
+		return b.String()
+	}
+	for iteration := 0; iteration < 20000; iteration++ {
+		var rules []OpenPolicyRule
+		for i := rng.Intn(10) + 1; i > 0; i-- {
+			path := long + randomTail(6)
+			if rng.Intn(8) == 0 {
+				path = "/"
+			}
+			rule := openRuleForPath(uint32(rng.Intn(2)), uint32(rng.Intn(3)), path)
+			if strings.HasSuffix(path, "/") {
+				rule.IsDirectory = 1
+			}
+			rules = append(rules, rule)
+		}
+		// Same ordering LoadPolicies applies before compiling.
+		sort.SliceStable(rules, func(i, j int) bool { return rules[i].PathLen > rules[j].PathLen })
+		defaultAllow := rootPathPolicy(rules)
+		index := compileOpenIndex(rules)
+		for probe := 0; probe < 8; probe++ {
+			path := long + randomTail(8)
+			operation := uint32(rng.Intn(3))
+			want := legacyOpenDecision(rules, defaultAllow, path, operation)
+			got := indexedOpenDecision(index, defaultAllow, path, operation)
+			if got != want {
+				t.Fatalf("path %q op %d: indexed=%d legacy=%d for rules %+v", path, operation, got, want, rules)
+			}
+		}
+	}
+}
+
+func TestExecPolicyRejectsRulesTheKernelWouldSkip(t *testing.T) {
+	rule := func(length int) ExecPolicyRule {
+		path := policyPathOfLength(length, 'x')
+		r := ExecPolicyRule{Action: PolicyDeny, Operation: OpExec, PathLen: int32(length)}
+		copy(r.Path[:], path)
+		return r
+	}
+	l := &ExecLsm{}
+	if err := l.LoadPolicies([]ExecPolicyRule{rule(MaxExecPolicyPathLength)}); err != nil {
+		t.Fatalf("%d-byte exec rule rejected: %v", MaxExecPolicyPathLength, err)
+	}
+	if err := l.LoadPolicies([]ExecPolicyRule{rule(MaxExecPolicyPathLength + 1)}); err == nil {
+		t.Fatalf("%d-byte exec rule accepted; the kernel matcher would skip it", MaxExecPolicyPathLength+1)
+	}
+	if l.numPolicyRules != 1 || l.policyRules[0].PathLen != MaxExecPolicyPathLength {
+		t.Fatal("rejected exec policy changed the loaded state")
+	}
+	tooMany := make([]ExecPolicyRule, MaxExecPolicyRules+1)
+	for i := range tooMany {
+		tooMany[i] = rule(10)
+	}
+	if err := l.LoadPolicies(tooMany); err == nil {
+		t.Fatalf("%d exec rules accepted; the kernel matcher only evaluates %d", len(tooMany), MaxExecPolicyRules)
+	}
+}
+
+// The version document advertises the limits this package enforces.
+func TestAdvertisedPolicyPathLimitsMatchEnforcement(t *testing.T) {
+	if version.FilePolicyPathBytes != MaxPolicyPathLength || version.ExecPolicyPathBytes != MaxExecPolicyPathLength {
+		t.Fatalf("advertised file/exec limits %d/%d, enforced %d/%d",
+			version.FilePolicyPathBytes, version.ExecPolicyPathBytes, MaxPolicyPathLength, MaxExecPolicyPathLength)
 	}
 }

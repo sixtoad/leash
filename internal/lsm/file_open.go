@@ -35,7 +35,7 @@ type openExactRuleKey struct {
 	Path       [256]byte
 }
 
-type openDirectoryRuleKey struct {
+type openPrefixRuleKey struct {
 	PrefixLen uint32
 	Domain    uint8
 	Path      [MaxPolicyPathLength]byte
@@ -48,8 +48,8 @@ type openIndexRule struct {
 }
 
 type compiledOpenIndex struct {
-	exact     map[openExactRuleKey]openIndexRule
-	directory map[openDirectoryRuleKey]openIndexRule
+	exact  map[openExactRuleKey]openIndexRule
+	prefix map[openPrefixRuleKey]openIndexRule
 }
 
 type mutationPrefixRuleKey struct {
@@ -294,10 +294,18 @@ func rootPathPolicy(rules []OpenPolicyRule) bool {
 	return false
 }
 
+// compileOpenIndex turns the sorted rules into the kernel's full-byte indexes,
+// preserving the historical matcher semantics over every accepted byte: each
+// rule matches every path it is a byte prefix of (a directory rule carries its
+// trailing '/', so it covers descendants), a directory rule also matches the
+// directory itself, the longest matching rule wins, an earlier rule wins a
+// length tie, and only rules for the requested operation (or generic open)
+// apply. Prefix rules go to the LPM trie; directory-self matches go to the
+// exact map. Generic rules are expanded to every runtime operation.
 func compileOpenIndex(rules []OpenPolicyRule) compiledOpenIndex {
 	index := compiledOpenIndex{
-		exact:     make(map[openExactRuleKey]openIndexRule),
-		directory: make(map[openDirectoryRuleKey]openIndexRule),
+		exact:  make(map[openExactRuleKey]openIndexRule),
+		prefix: make(map[openPrefixRuleKey]openIndexRule),
 	}
 	for order, rule := range rules {
 		operations := []uint32{rule.Operation}
@@ -313,36 +321,24 @@ func compileOpenIndex(rules []OpenPolicyRule) compiledOpenIndex {
 			if operation > OpOpenRW {
 				continue
 			}
-			if rule.IsDirectory != 0 {
-				directoryKey := openDirectoryRuleKey{
-					PrefixLen: openIndexDomainBits + rule.PathLen*8,
-					Domain:    uint8(operation),
-				}
-				copy(directoryKey.Path[:], rule.Path[:rule.PathLen])
-				if _, exists := index.directory[directoryKey]; !exists {
-					index.directory[directoryKey] = value
-				}
-
-				if rule.PathLen > 1 {
-					selfKey := openExactRuleKey{
-						Operation: operation,
-						PathLen:   rule.PathLen - 1,
-					}
-					copy(selfKey.Path[:], rule.Path[:rule.PathLen-1])
-					if _, exists := index.exact[selfKey]; !exists {
-						index.exact[selfKey] = value
-					}
-				}
-				continue
+			prefixKey := openPrefixRuleKey{
+				PrefixLen: openIndexDomainBits + rule.PathLen*8,
+				Domain:    uint8(operation),
+			}
+			copy(prefixKey.Path[:], rule.Path[:rule.PathLen])
+			if _, exists := index.prefix[prefixKey]; !exists {
+				index.prefix[prefixKey] = value
 			}
 
-			exactKey := openExactRuleKey{
-				Operation: operation,
-				PathLen:   rule.PathLen,
-			}
-			copy(exactKey.Path[:], rule.Path[:rule.PathLen])
-			if _, exists := index.exact[exactKey]; !exists {
-				index.exact[exactKey] = value
+			if rule.IsDirectory != 0 && rule.PathLen > 1 && rule.Path[rule.PathLen-1] == '/' {
+				selfKey := openExactRuleKey{
+					Operation: operation,
+					PathLen:   rule.PathLen - 1,
+				}
+				copy(selfKey.Path[:], rule.Path[:rule.PathLen-1])
+				if _, exists := index.exact[selfKey]; !exists {
+					index.exact[selfKey] = value
+				}
 			}
 		}
 	}
@@ -354,30 +350,30 @@ type openIndexStore interface {
 	setActiveToken(uint64) error
 	setDefault(uint32, uint32) error
 	listExactKeys() ([]openExactRuleKey, error)
-	listDirectoryKeys() ([]openDirectoryRuleKey, error)
+	listPrefixKeys() ([]openPrefixRuleKey, error)
 	putExact(openExactRuleKey, openIndexRule) error
-	putDirectory(openDirectoryRuleKey, openIndexRule) error
+	putPrefix(openPrefixRuleKey, openIndexRule) error
 	deleteExact(openExactRuleKey) error
-	deleteDirectory(openDirectoryRuleKey) error
+	deletePrefix(openPrefixRuleKey) error
 }
 
 type ebpfOpenIndexStore struct {
-	exact     *ebpf.Map
-	directory *ebpf.Map
-	active    *ebpf.Map
-	defaults  *ebpf.Map
+	exact    *ebpf.Map
+	prefix   *ebpf.Map
+	active   *ebpf.Map
+	defaults *ebpf.Map
 }
 
 func newEBPFOpenIndexStore(coll *ebpf.Collection) (*ebpfOpenIndexStore, error) {
 	store := &ebpfOpenIndexStore{
-		exact:     coll.Maps["open_exact_rules"],
-		directory: coll.Maps["open_directory_rules"],
-		active:    coll.Maps["active_open_generation"],
-		defaults:  coll.Maps["open_default_policy"],
+		exact:    coll.Maps["open_exact_rules"],
+		prefix:   coll.Maps["open_prefix_rules"],
+		active:   coll.Maps["active_open_generation"],
+		defaults: coll.Maps["open_default_policy"],
 	}
 	for name, resource := range map[string]*ebpf.Map{
 		"open_exact_rules":       store.exact,
-		"open_directory_rules":   store.directory,
+		"open_prefix_rules":      store.prefix,
 		"active_open_generation": store.active,
 		"open_default_policy":    store.defaults,
 	} {
@@ -417,11 +413,11 @@ func (s *ebpfOpenIndexStore) listExactKeys() ([]openExactRuleKey, error) {
 	return keys, iterator.Err()
 }
 
-func (s *ebpfOpenIndexStore) listDirectoryKeys() ([]openDirectoryRuleKey, error) {
-	iterator := s.directory.Iterate()
-	var key openDirectoryRuleKey
+func (s *ebpfOpenIndexStore) listPrefixKeys() ([]openPrefixRuleKey, error) {
+	iterator := s.prefix.Iterate()
+	var key openPrefixRuleKey
 	var value openIndexRule
-	var keys []openDirectoryRuleKey
+	var keys []openPrefixRuleKey
 	for iterator.Next(&key, &value) {
 		keys = append(keys, key)
 	}
@@ -432,16 +428,16 @@ func (s *ebpfOpenIndexStore) putExact(key openExactRuleKey, value openIndexRule)
 	return s.exact.Put(&key, &value)
 }
 
-func (s *ebpfOpenIndexStore) putDirectory(key openDirectoryRuleKey, value openIndexRule) error {
-	return s.directory.Put(&key, &value)
+func (s *ebpfOpenIndexStore) putPrefix(key openPrefixRuleKey, value openIndexRule) error {
+	return s.prefix.Put(&key, &value)
 }
 
 func (s *ebpfOpenIndexStore) deleteExact(key openExactRuleKey) error {
 	return s.exact.Delete(&key)
 }
 
-func (s *ebpfOpenIndexStore) deleteDirectory(key openDirectoryRuleKey) error {
-	return s.directory.Delete(&key)
+func (s *ebpfOpenIndexStore) deletePrefix(key openPrefixRuleKey) error {
+	return s.prefix.Delete(&key)
 }
 
 func cleanOpenIndexGeneration(store openIndexStore, generation uint32) error {
@@ -456,14 +452,14 @@ func cleanOpenIndexGeneration(store openIndexStore, generation uint32) error {
 			}
 		}
 	}
-	directoryKeys, err := store.listDirectoryKeys()
+	prefixKeys, err := store.listPrefixKeys()
 	if err != nil {
-		return fmt.Errorf("list directory generation %d: %w", generation, err)
+		return fmt.Errorf("list prefix generation %d: %w", generation, err)
 	}
-	for _, key := range directoryKeys {
+	for _, key := range prefixKeys {
 		if uint32(key.Domain)/3 == generation {
-			if err := store.deleteDirectory(key); err != nil {
-				return fmt.Errorf("delete directory generation %d entry: %w", generation, err)
+			if err := store.deletePrefix(key); err != nil {
+				return fmt.Errorf("delete prefix generation %d entry: %w", generation, err)
 			}
 		}
 	}
@@ -508,10 +504,10 @@ func replaceOpenIndex(store openIndexStore, index compiledOpenIndex, defaultAllo
 			return openIndexReplaceResult{}, cleanup(fmt.Errorf("stage generation %d exact entry: %w", inactive, err))
 		}
 	}
-	for key, value := range index.directory {
+	for key, value := range index.prefix {
 		key.Domain += uint8(inactive * 3)
-		if err := store.putDirectory(key, value); err != nil {
-			return openIndexReplaceResult{}, cleanup(fmt.Errorf("stage generation %d directory entry: %w", inactive, err))
+		if err := store.putPrefix(key, value); err != nil {
+			return openIndexReplaceResult{}, cleanup(fmt.Errorf("stage generation %d prefix entry: %w", inactive, err))
 		}
 	}
 	if err := store.setActiveToken(nextToken); err != nil {

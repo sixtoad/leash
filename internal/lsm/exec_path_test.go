@@ -50,7 +50,6 @@ func TestPathComparisonLoopsKeepVerifierVisibleBounds(t *testing.T) {
 			"barrier_var(max_len);\n\n    #pragma clang loop unroll(disable)\n    for (int i = 0; i < 64; i++) {",
 		},
 		"bpf/lsm_open.bpf.c": {
-			"barrier_var(max_len);\n\n    #pragma clang loop unroll(disable)\n    for (int i = 0; i < 64; i++) {",
 			"if (len == 0 || len >= HL_MAX_COMP) {\n            return -2;\n        }",
 			"barrier_var(len);\n        if (off - (int)len - 1 < 1) {",
 		},

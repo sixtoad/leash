@@ -99,7 +99,7 @@ struct open_exact_rule_key {
     char path[MAX_PATH_LEN];
 };
 
-struct open_directory_rule_key {
+struct open_prefix_rule_key {
     u32 prefix_len;
     u8 domain;
     char path[MAX_PATH_LEN - 1];
@@ -164,16 +164,20 @@ struct {
     __type(value, struct open_index_rule);
 } open_exact_rules SEC(".maps");
 
-// The first data byte bijectively encodes generation+operation, so an
-// inapplicable deeper directory can never mask a shallower rule for the
-// requested operation. The complete LPM data is the kernel maximum 256 bytes.
+// Byte-prefix rules: directory rules (trailing '/', matching descendants) and
+// file rules (matching the file and every path it is a byte prefix of), exactly
+// the historical starts-with semantics but over all 255 bytes. The kernel trie
+// returns the LONGEST matching prefix, i.e. the most specific rule. The first
+// data byte bijectively encodes generation+operation, so an inapplicable deeper
+// rule can never mask a shallower rule for the requested operation. The
+// complete LPM data is the kernel maximum 256 bytes.
 struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __uint(max_entries, MAX_OPEN_INDEX_ENTRIES);
     __uint(map_flags, BPF_F_NO_PREALLOC);
-    __type(key, struct open_directory_rule_key);
+    __type(key, struct open_prefix_rule_key);
     __type(value, struct open_index_rule);
-} open_directory_rules SEC(".maps");
+} open_prefix_rules SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -292,24 +296,6 @@ static __always_inline bool is_target_cgroup()
 #define barrier_var(var) asm volatile("" : "+r"(var))
 #endif
 
-// The optional hard-link guard retains its separately tracked #29 bounds.
-// Ordinary file_open decisions use the full-byte indexes below instead.
-static __always_inline int simple_string_starts_with(const char *s, const char *p, __u32 max_len)
-{
-    if (max_len > 64) max_len = 64;
-    // Keep the constant `i < 64` bound below: without the barrier clang may
-    // drop it as implied by the caller's length check and leave the loop bounded
-    // only by a register the verifier has no range for (issue #110).
-    barrier_var(max_len);
-
-    #pragma clang loop unroll(disable)
-    for (int i = 0; i < 64; i++) {
-        if (i >= max_len) break;          // dominates the byte loads
-        if (s[i] != p[i]) return 0;
-    }
-    return 1;
-}
-
 // Check if path is a Linux namespace FD from nsfs
 static __always_inline bool is_nsfs_path(const char *path)
 {
@@ -393,68 +379,6 @@ static __always_inline u32 get_file_operation_type(struct file *file)
 
     // Default to general open if we can't determine
     return OP_OPEN;
-}
-
-// Clean loop-based policy check for up to 256 rules with BPF verifier compatibility
-// NOT __always_inline: kept as a real BPF-to-BPF subprogram so its 256-rule scan
-// is verified once and CALLED, not duplicated inline into every hook. Inlining it
-// into lsm_link (which also reconstructs the path) blew the verifier's 1M budget.
-static __noinline int check_path_policy(const char *path, u32 file_op_type)
-{
-    __u32 key = 0;
-    __u32 *nptr = bpf_map_lookup_elem(&num_rules, &key);
-    __u32 n = nptr ? *nptr : 0;
-    if (n == 0) {
-        // No rules defined, use default policy from userspace
-        __u32 *default_ptr = bpf_map_lookup_elem(&default_policy, &key);
-        return default_ptr ? *default_ptr : 0; // Default to deny if map lookup fails
-    }
-    if (n > 256) n = 256;
-    #pragma clang loop unroll(disable)
-    for (__u32 i = 0; i < 256; i++) {
-        if (i >= n) break;
-
-        key = i;
-        struct policy_rule *rule = bpf_map_lookup_elem(&policy_rules, &key);
-        if (!rule) continue;
-
-        __u32 len = rule->path_len;
-        if (len == 0 || len > 64) continue;
-
-        // One prefix pass to len-1, then classify the final char (one hot-path pass
-        // instead of two). Exact match (path[len-1] == rule[len-1]) covers
-        // descendants and file rules; for a directory rule, the directory ITSELF
-        // also matches — its runtime path has no trailing slash, so it ends where
-        // the rule's '/' is (path[len-1] == '\0'). That dir-itself case is why a
-        // forbidden dir's entries could otherwise be enumerated and an allowed dir
-        // wasn't listable.
-        bool matches = false;
-        bool directory_self = false;
-        if (simple_string_starts_with(path, rule->path, len - 1)) {
-            if (path[len - 1] == rule->path[len - 1]) {
-                matches = true;
-            } else if (rule->is_directory && path[len - 1] == '\0') {
-                matches = true;
-                directory_self = true;
-            }
-        }
-        if (matches) {
-            // Check if operation types match
-            if (rule->operation == OP_OPEN) {
-                // "open" matches any file operation type
-                return rule->action;
-            } else if (rule->operation == file_op_type) {
-                // Exact operation match (open:ro or open:rw)
-                return rule->action;
-            }
-            // Path matches but operation doesn't, continue to next rule
-        }
-    }
-
-    // No matching open rule found, use default policy from userspace
-    key = 0;
-    __u32 *default_ptr = bpf_map_lookup_elem(&default_policy, &key);
-    return default_ptr ? *default_ptr : 0; // Default to deny if map lookup fails
 }
 
 struct mutation_lookup_scratch {
@@ -773,7 +697,7 @@ struct {
 struct open_index_lookup_scratch {
     u64 activation_token;
     struct open_exact_rule_key exact;
-    struct open_directory_rule_key directory;
+    struct open_prefix_rule_key prefix;
 };
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -782,13 +706,17 @@ struct {
     __type(value, struct open_index_lookup_scratch);
 } open_index_lookup_scratch_map SEC(".maps");
 
-static __noinline int check_open_indexed_policy(u32 file_op_type)
+// Full-length (1-255 byte) file policy decision for a NUL-terminated path in a
+// MAX_PATH_LEN-byte buffer: longest matching byte-prefix rule, a directory
+// rule also matching the directory itself, per-operation, earlier rule wins a
+// specificity tie, else the generation's default. Snapshots the activation
+// token into lookup scratch; callers re-check it before enforcing.
+static __noinline int check_open_indexed_policy(const char *path, u32 file_op_type)
 {
     u32 zero = 0;
     u64 *token_ptr = bpf_map_lookup_elem(&active_open_generation, &zero);
-    struct open_path_scratch *path_scratch = bpf_map_lookup_elem(&open_path_scratch_map, &zero);
     struct open_index_lookup_scratch *lookup = bpf_map_lookup_elem(&open_index_lookup_scratch_map, &zero);
-    if (!token_ptr || !path_scratch || !lookup) {
+    if (!token_ptr || !lookup) {
         return 0;
     }
     u64 activation_token = *token_ptr;
@@ -796,19 +724,19 @@ static __noinline int check_open_indexed_policy(u32 file_op_type)
     lookup->activation_token = activation_token;
 
     __builtin_memset(&lookup->exact, 0, sizeof(lookup->exact));
-    __builtin_memset(&lookup->directory, 0, sizeof(lookup->directory));
+    __builtin_memset(&lookup->prefix, 0, sizeof(lookup->prefix));
     u32 path_len = 0;
     bool terminated = false;
     #pragma clang loop unroll(disable)
     for (int i = 0; i < MAX_PATH_LEN; i++) {
-        char c = path_scratch->path[i];
+        char c = path[i];
         if (c == '\0') {
             path_len = i;
             terminated = true;
             break;
         }
         lookup->exact.path[i] = c;
-        if (i < MAX_PATH_LEN - 1) lookup->directory.path[i] = c;
+        if (i < MAX_PATH_LEN - 1) lookup->prefix.path[i] = c;
     }
     if (!terminated || path_len == 0 || path_len > MAX_PATH_LEN - 1) {
         return 0;
@@ -817,25 +745,25 @@ static __noinline int check_open_indexed_policy(u32 file_op_type)
     lookup->exact.generation = active_generation;
     lookup->exact.operation = file_op_type;
     lookup->exact.path_len = path_len;
-    lookup->directory.prefix_len = 8 + path_len * 8;
-    lookup->directory.domain = active_generation * 3 + file_op_type;
+    lookup->prefix.prefix_len = 8 + path_len * 8;
+    lookup->prefix.domain = active_generation * 3 + file_op_type;
 
     struct open_index_rule *exact = bpf_map_lookup_elem(&open_exact_rules, &lookup->exact);
-    struct open_index_rule *directory = bpf_map_lookup_elem(&open_directory_rules, &lookup->directory);
+    struct open_index_rule *prefix = bpf_map_lookup_elem(&open_prefix_rules, &lookup->prefix);
     u32 *default_ptr = bpf_map_lookup_elem(&open_default_policy, &active_generation);
     u32 decision = default_ptr ? *default_ptr : 0;
     if (exact) {
-        if (!directory) {
+        if (!prefix) {
             decision = exact->action;
-        } else if (exact->specificity > directory->specificity) {
+        } else if (exact->specificity > prefix->specificity) {
             decision = exact->action;
-        } else if (directory->specificity > exact->specificity) {
-            decision = directory->action;
+        } else if (prefix->specificity > exact->specificity) {
+            decision = prefix->action;
         } else {
-            decision = exact->order <= directory->order ? exact->action : directory->action;
+            decision = exact->order <= prefix->order ? exact->action : prefix->action;
         }
-    } else if (directory) {
-        decision = directory->action;
+    } else if (prefix) {
+        decision = prefix->action;
     }
 
     return decision;
@@ -1044,7 +972,7 @@ int BPF_PROG(lsm_open_policy, struct file *file)
     // Determine file operation type from file mode
     u32 file_op_type = get_file_operation_type(file);
 
-    int policy_result = check_open_indexed_policy(file_op_type);
+    int policy_result = check_open_indexed_policy(path, file_op_type);
 
     // Reserve ringbuf space. Audit assembly is optional, but every path joins
     // the same activation-token check immediately before enforcement returns.
@@ -1150,18 +1078,13 @@ int trace_sys_exit_open(struct bpf_raw_tracepoint_args *ctx)
 // So reconstruct the source path by walking d_parent to the filesystem root
 // (hard links are same-mount, so a single-mount walk yields the absolute path;
 // files under a nested mount resolve relative to that inner mount — a known gap).
-// Reconstruction bounds. These are tight because lsm_link inlines the 256-rule
-// check_path_policy, and the two together must stay under the verifier's 1M-insn
-// budget. COMP=40 covers git object filenames (38 hex chars); DEPTH=4 covers
+// Reconstruction bounds. These were sized for the verifier budget when lsm_link
+// ran the legacy 256-rule scan; it now uses the indexed matcher. COMP=40 covers git object filenames (38 hex chars); DEPTH=4 covers
 // .git/objects/ab/<hash> when the box/mount root is the workdir (the common
 // bind-mount case). Sources exceeding these fail OPEN (link allowed) — a residual
 // hard-link-aliasing gap tracked for a tail-call fix that would free the budget.
 #define HL_MAX_DEPTH 4
 #define HL_MAX_COMP 40
-// Only the first HL_MATCH_LEN bytes of the reconstructed path are populated.
-// The shared full-length matcher sees the zeroed remainder, preserving the
-// existing #29 hard-link scope without mistaking a 64-byte prefix for a match.
-#define HL_MATCH_LEN 72
 
 // CO-RE flavor to reach vfsmount.mnt_root — struct vfsmount isn't fully defined in
 // the BTF header. The ___leash suffix makes libbpf relocate this against the
@@ -1176,7 +1099,7 @@ struct vfsmount___leash {
 struct hl_scratch {
     char dest_abs[MAX_PATH_LEN]; // destination dir's absolute path (bpf_d_path)
     char raw[MAX_PATH_LEN];      // source within-mount path, reverse-built
-    char path[MAX_PATH_LEN];     // assembled absolute source path
+    char path[MAX_PATH_LEN * 2]; // assembled absolute source path (NUL-padded; see lsm_link)
 };
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -1333,27 +1256,41 @@ int BPF_PROG(lsm_link, struct dentry *old_dentry, const struct path *new_dir, st
     }
     int slen = MAX_PATH_LEN - sstart; // source within-mount length
 
-    // Assemble in ONE pass: path = dest_abs[0:prefix_len] + raw[sstart:]. Keep
-    // the pre-existing bounded hard-link scope; #108 changes file_open matching,
-    // not the separately tracked #29 source-reconstruction contract.
+    // Assemble the COMPLETE source path in one pass: path = dest_abs[0:prefix_len]
+    // + raw[sstart:]. Policy rules are matched over all of their (up to 255)
+    // bytes (#108), so a truncated path could miss a long forbid; a source path
+    // that does not fit the 255-byte policy contract is unresolvable here and
+    // shares the reconstruction-overflow residual above (file_open itself denies
+    // any path over 255 bytes).
+    int total = prefix_len + slen;
+    if (total <= 0 || total > MAX_PATH_LEN - 1) {
+        return 0;
+    }
+    // Two bulk copies instead of a byte loop: a per-byte loop whose exit
+    // depends on `total` hands the verifier one distinct state per possible
+    // length, each of which then re-verifies the full-length matcher (that
+    // exceeded the 1M-instruction budget). path is 2*MAX_PATH_LEN bytes so the
+    // masked offset + size is provably in bounds; the memset supplies the NUL.
+    __u32 head = prefix_len & (MAX_PATH_LEN - 1);
+    __u32 tail_off = sstart & (MAX_PATH_LEN - 1);
+    __u32 tail_len = slen & (MAX_PATH_LEN - 1);
     __builtin_memset(s->path, 0, sizeof(s->path));
-    #pragma clang loop unroll(disable)
-    for (int i = 0; i < HL_MATCH_LEN; i++) {
-        if (i >= prefix_len + slen) {
-            break;
-        }
-        char c;
-        if (i < prefix_len) {
-            c = s->dest_abs[i & (MAX_PATH_LEN - 1)];
-        } else {
-            int si = (sstart + (i - prefix_len)) & (MAX_PATH_LEN - 1);
-            c = s->raw[si];
-        }
-        s->path[i & (MAX_PATH_LEN - 1)] = c;
+    if (bpf_probe_read_kernel(s->path, head, s->dest_abs) < 0 ||
+        bpf_probe_read_kernel(s->path + head, tail_len, s->raw + tail_off) < 0) {
+        return -1; // resolved but not assemblable: fail closed
     }
 
-    // Deny the link if reading the source by its real path would be denied.
-    if (check_path_policy(s->path, OP_OPEN) != 1) {
+    // Deny the link if reading the source by its real path would be denied,
+    // using the same full-length indexed decision as file_open, linearized on
+    // the same activation token.
+    int readable = check_open_indexed_policy(s->path, OP_OPEN);
+    struct open_index_lookup_scratch *lookup = bpf_map_lookup_elem(&open_index_lookup_scratch_map, &zero);
+    barrier();
+    u64 *confirmed_token = bpf_map_lookup_elem(&active_open_generation, &zero);
+    if (!lookup || !confirmed_token || *confirmed_token != lookup->activation_token) {
+        readable = 0;
+    }
+    if (readable != 1) {
         return -1; // -EPERM: refuse to hard-link a file the box can't read
     }
     return 0;

@@ -45,6 +45,10 @@ type ExecEvent struct {
 
 const (
 	MaxExecPolicyRules = 64
+	// MaxExecPolicyPathLength is the longest exec rule path the kernel exec
+	// matcher compares in full. Longer rules are rejected at load (fail
+	// closed) rather than silently skipped by the matcher.
+	MaxExecPolicyPathLength = 64
 	// Note: OpExec is now defined in common.go
 )
 
@@ -90,6 +94,17 @@ func (l *ExecLsm) setEbpfCollection(coll *ebpf.Collection) {
 }
 
 func (l *ExecLsm) LoadPolicies(policies []ExecPolicyRule) error {
+	// The kernel matcher only evaluates the first MaxExecPolicyRules rules and
+	// skips rule paths longer than MaxExecPolicyPathLength; reject both before
+	// changing any state instead of letting a rule silently disappear.
+	if len(policies) > MaxExecPolicyRules {
+		return fmt.Errorf("too many exec policy rules: %d exceeds maximum %d", len(policies), MaxExecPolicyRules)
+	}
+	for i := range policies {
+		if policies[i].PathLen <= 0 || policies[i].PathLen > MaxExecPolicyPathLength {
+			return fmt.Errorf("invalid exec policy rule %d path length: %d (must be 1-%d)", i, policies[i].PathLen, MaxExecPolicyPathLength)
+		}
+	}
 	l.policyRules = policies
 	l.numPolicyRules = len(policies)
 
