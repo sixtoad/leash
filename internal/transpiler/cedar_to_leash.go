@@ -461,6 +461,13 @@ func normalizedFileResourcePath(resource Resource) (string, int32, error) {
 	case "File":
 		path = resource.Value
 	case "Dir":
+		// Dir::"/x" becomes the directory rule "/x/" with IsDirectory=1. The
+		// trailing '/' keeps prefix matching safe (/x/ never matches /xy), and
+		// the enforcement matchers (Linux compileOpenIndex's directory-self
+		// exact entry, the macOS Directory matcher) also match the directory
+		// "/x" itself from IsDirectory, so "resource in Dir" covers opendir/
+		// stat on the root (#119). Do not emit an extra File::"/x" rule for
+		// that: file rules are byte prefixes and would authorize /xy.
 		path = resource.Value
 		if !strings.HasSuffix(path, "/") {
 			path += "/"
