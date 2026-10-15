@@ -39,21 +39,28 @@ func TestContainerExecCommandLoginShellOptIn(t *testing.T) {
 	}
 }
 
-func TestNativeWorkloadScriptShellFlag(t *testing.T) {
-	cg := "/sys/fs/cgroup/system.slice/leash-native-x.service"
-	nonLogin := nativeWorkloadScript(cg, "/wd", "bash", "-c", "claude", "alice", "", "", hardenOpts{})
-	if !strings.Contains(nonLogin, "bash -c 'exec claude'") || strings.Contains(nonLogin, "-lc") {
-		t.Fatalf("default native script should use a non-login shell: %s", nonLogin)
+// Native keeps the login shell regardless of --login-shell: leash runs under
+// sudo there, so its own PATH is root's secure_path, and the login shell is what
+// restores the dropped user's PATH (~/.local/bin, nvm, ...) for the agent. The
+// non-login default from #120 is container-only.
+func TestNativeWorkloadKeepsLoginShell(t *testing.T) {
+	if nativeWorkloadShellFlag != "-lc" {
+		t.Fatalf("nativeWorkloadShellFlag = %q, want -lc", nativeWorkloadShellFlag)
 	}
-	login := nativeWorkloadScript(cg, "/wd", "bash", "-lc", "claude", "alice", "", "", hardenOpts{})
-	if !strings.Contains(login, "bash -lc 'exec claude'") {
-		t.Fatalf("--login-shell native script should use -lc: %s", login)
+	for _, login := range []bool{false, true} {
+		n := nativeLauncher{r: &runner{cfg: config{loginShell: login}}}
+		cmd := n.workloadCommand(context.Background(), "/sys/fs/cgroup/x", "/wd", "bash", "claude")
+		joined := strings.Join(cmd.Args, " ")
+		if !strings.Contains(joined, "bash -lc '") || strings.Contains(joined, "bash -c '") {
+			t.Fatalf("native workload (loginShell=%v) must use a login shell: %s", login, joined)
+		}
 	}
-	// An unset flag falls back to the non-login default rather than emitting
+	// An unset flag falls back to the native login default rather than emitting
 	// `bash  'exec ...'` (which would run the command string as a script path).
+	cg := "/sys/fs/cgroup/system.slice/leash-native-x.service"
 	empty := nativeWorkloadScript(cg, "/wd", "bash", "", "claude", "", "", "", hardenOpts{})
-	if !strings.Contains(empty, "bash -c 'exec claude'") {
-		t.Fatalf("empty shell flag should default to -c: %s", empty)
+	if !strings.Contains(empty, "bash -lc 'exec claude'") {
+		t.Fatalf("empty shell flag should default to -lc: %s", empty)
 	}
 }
 

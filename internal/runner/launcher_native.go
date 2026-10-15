@@ -1026,8 +1026,7 @@ func (n nativeLauncher) Precheck(ctx context.Context, shellBin, cmd string) erro
 func (n nativeLauncher) InstallPromptAssets(ctx context.Context) error { return nil }
 
 // workloadCommand builds the user's command to run inside the box: placed in
-// the LSM-scoped cgroup, in workdir, via `shellBin -c "exec <cmd>"` (-lc under
-// --login-shell). When
+// the LSM-scoped cgroup, in workdir, via `shellBin -lc "exec <cmd>"`. When
 // privileged it is wrapped in `nsenter --net=<ns>` so the workload also runs in
 // the enforced network namespace (Layer 2); rootless (degraded/unenforced) it
 // runs in the user-scope cgroup without a netns.
@@ -1061,7 +1060,7 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 	if err != nil {
 		self = ""
 	}
-	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, n.r.workloadShellFlag(), cmd, n.r.workloadUser(), caCert, self, h)
+	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, nativeWorkloadShellFlag, cmd, n.r.workloadUser(), caCert, self, h)
 	if n.layer2Active() {
 		argv := n.layer2Wrap(inner) // nsenter --net + private mount ns (resolv bind)
 		return exec.CommandContext(ctx, argv[0], argv[1:]...)
@@ -1184,6 +1183,13 @@ func hasEnvKey(env []string, key string) bool {
 	return false
 }
 
+// nativeWorkloadShellFlag keeps the native workload on a login shell. Native
+// leash usually runs under sudo, so its own PATH is root's secure_path; the
+// login shell is what rebuilds the dropped user's PATH (~/.local/bin, nvm, ...)
+// for the agent. The non-login default from #120 is container-only, where the
+// image's ENV PATH is already applied by the runtime's exec.
+const nativeWorkloadShellFlag = "-lc"
+
 func nativeWorkloadScript(cgroupPath, workdir, shellBin, shellFlag, cmd, dropUser, caCert, self string, h hardenOpts) string {
 	procs := quoteShellArg(filepath.Join(cgroupPath, "cgroup.procs"))
 	innerCmd := "exec " + cmd
@@ -1201,7 +1207,7 @@ func nativeWorkloadScript(cgroupPath, workdir, shellBin, shellFlag, cmd, dropUse
 			" GIT_SSL_CAINFO=" + q + "; " + innerCmd
 	}
 	if shellFlag == "" {
-		shellFlag = "-c"
+		shellFlag = nativeWorkloadShellFlag
 	}
 	shellRun := fmt.Sprintf("%s %s %s", quoteShellArg(shellBin), shellFlag, quoteShellArg(innerCmd))
 

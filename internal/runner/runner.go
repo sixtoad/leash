@@ -116,7 +116,7 @@ type options struct {
 	allowDBus       bool            // keep DBUS_SESSION_BUS_ADDRESS + the keyring/D-Bus runtime dir
 	shareIPC        bool            // share the host IPC namespace (e.g. X MIT-SHM)
 	requireLSM      bool            // fail closed if the eBPF LSM can't attach (no proxy-only degrade)
-	loginShell      bool            // --login-shell: run the governed command via `<shell> -lc` (sources /etc/profile)
+	loginShell      bool            // --login-shell: (container) run the governed command via `<shell> -lc` (sources /etc/profile)
 	allowNamespaces bool            // skip the seccomp mount/unshare block (reopens the userns bind-mount bypass)
 	injectServices  []injectService // --inject-service: helper plugins to spawn and bind into the box
 	dropUser        string          // --user <name>: explicit native drop-user (overrides $SUDO_USER; "root" opts in to running as root)
@@ -174,10 +174,10 @@ type config struct {
 	runtime             string
 	requireLSM          bool
 	dropUser            string
-	// loginShell runs the governed command through a login shell (`-lc`).
-	// Off by default: a login shell sources /etc/profile, which on Debian/Ubuntu
-	// images resets the image's ENV PATH, and ~/.profile, which agent policy
-	// usually denies (#120).
+	// loginShell runs the container governed command through a login shell
+	// (`-lc`). Off by default: a login shell sources /etc/profile, which on
+	// Debian/Ubuntu images resets the image's ENV PATH (#120). Container-only:
+	// the native runtime always uses a login shell (nativeWorkloadShellFlag).
 	loginShell bool
 }
 
@@ -442,7 +442,7 @@ Flags:
   --network <name>                Attach the agent container to a docker network (e.g. a compose network). The leash container follows it automatically.
   --runtime <docker|podman>       Container runtime CLI to drive (defaults to docker).
   --require-lsm                   Fail if the host kernel can't run the eBPF LSM layer (default: warn and continue proxy-only).
-  --login-shell                   Run the command via a login shell (<shell> -lc), sourcing /etc/profile and ~/.profile. Default is a non-login shell (-c), which preserves the image's ENV PATH.
+  --login-shell                   (container) Run the command via a login shell (<shell> -lc), sourcing /etc/profile. Default is a non-login shell (-c), which preserves the image's ENV PATH. Native always uses a login shell.
   -V, --verbose                   Enable verbose logging (also set when -v is provided without a mount spec).
 
 Environment variables:
@@ -462,7 +462,7 @@ Environment variables:
   LEASH_EXTRA_ARGS             Additional arguments passed into leash-entry.
   LEASH_CGROUP_PATH            Override cgroup path for the leash container.
   LEASH_REQUIRE_LSM            Truthy to require the eBPF LSM layer (same as --require-lsm).
-  LEASH_LOGIN_SHELL            Truthy to run the command via a login shell (same as --login-shell).
+  LEASH_LOGIN_SHELL            Truthy to run the container command via a login shell (same as --login-shell).
   LEASH_HOME                   Base directory for persisted leash state.
 
 	Persisted mount decisions live at $XDG_CONFIG_HOME/leash/config.toml (or ~/.config/leash/config.toml). Set LEASH_HOME to override this base directory.
@@ -1433,8 +1433,9 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 	// the flag is set or LEASH_REQUIRE_LSM is truthy.
 	cfg.requireLSM = opts.requireLSM || envTruthy("LEASH_REQUIRE_LSM")
 
-	// Governed command shell mode: non-login by default so the image's (or the
-	// caller's) PATH survives; --login-shell / LEASH_LOGIN_SHELL opt back in.
+	// Container governed-command shell mode: non-login by default so the image's
+	// ENV PATH survives; --login-shell / LEASH_LOGIN_SHELL opt back in. Native
+	// ignores this and always uses a login shell.
 	cfg.loginShell = opts.loginShell || envTruthy("LEASH_LOGIN_SHELL")
 
 	// Explicit native drop-user. Falls back to $SUDO_USER at spawn time (see
@@ -3154,10 +3155,10 @@ func (r *runner) execInteractive(ctx context.Context, shellBin, cmd string) (int
 	return 0, err
 }
 
-// workloadShellFlag is the shell flag the governed command runs under: "-c"
-// (non-login) by default so the target image's ENV PATH is not reset by
-// /etc/profile and no ~/.profile read is attempted; "-lc" when the run opted in
-// to a login shell (#120).
+// workloadShellFlag is the shell flag the container governed command runs
+// under: "-c" (non-login) by default so the target image's ENV PATH is not reset
+// by /etc/profile; "-lc" when the run opted in to a login shell (#120). The
+// native runtime does not use it (see nativeWorkloadShellFlag).
 func (r *runner) workloadShellFlag() string {
 	if r.cfg.loginShell {
 		return "-lc"
