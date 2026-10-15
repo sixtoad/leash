@@ -138,6 +138,10 @@ Claude Code handling on top.
   fail-closed and proxy-only at the same level is an error.
 - **New capability `allow-proxy-only`** in `leash version --json`; its presence
   means this build fails closed by default.
+- **`contractVersion` is now `2`** (contract 2 = fail-closed-by-default posture
+  plus `--allow-proxy-only`). `minCompatibleContract` stays `0`: nothing was
+  removed, so callers written against contract 0 or 1 (e.g. Walk's
+  `walkLeashContract=1`) remain compatible.
 - **Effective enforcement level is machine-readable.** The enforcement-ready
   marker (still gated on by existence) is now a JSON document
   `{"enforcement":"lsm"|"proxy-only"|"none","layer1":…,"layer2":…,"requireLSM":…,"allowProxyOnly":…}`,

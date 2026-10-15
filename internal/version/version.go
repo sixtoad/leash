@@ -60,13 +60,19 @@ import (
 // that no longer offers it, and update the docs and the tests that pin these
 // literals in the same change.
 //
-// MinCompatibleContract is 0 today because contract 1 only added the document:
-// nothing a pre-document caller drives has been taken away. That also makes the
+// Contract 2 (issue #117) changed the meaning of running without a posture
+// flag: leash now fails closed when the eBPF LSM can't attach, and proxy-only
+// requires the new `--allow-proxy-only` (capability "allow-proxy-only").
+// `--require-lsm` stays accepted, so nothing a contract-0/1 caller drives was
+// removed.
+//
+// MinCompatibleContract is 0 today because neither contract 1 (which only added
+// the document) nor contract 2 took away anything an older caller drives. That also makes the
 // field's absence safe to read as 0 — "nothing has been removed". The integer is
 // deliberately coarse, and raising the floor over-refuses; Capabilities exists so
 // a caller can ask about the one surface element it actually drives instead.
 const (
-	ContractVersion       = 1
+	ContractVersion       = 2
 	MinCompatibleContract = 0
 )
 

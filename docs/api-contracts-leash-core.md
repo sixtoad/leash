@@ -182,7 +182,7 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
   "sourceRevision": "c686025aa1b2c3-dirty", // complete -X main.commit value for provenance checks
   "builtAt": "2026-07-21T10:11:12Z",// RFC 3339 UTC, or "unknown"
   "enforcing": true,                // does THIS BUILD carry an enforcement path
-  "contractVersion": 1,             // current CLI surface
+  "contractVersion": 2,             // current CLI surface
   "minCompatibleContract": 0,       // oldest caller contract still served
   "capabilities": [                 // surface elements a provisioner can drive
     "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "allow-proxy-only"
@@ -262,6 +262,8 @@ if myContract < doc.MinCompatibleContract || myContract > *doc.ContractVersion {
 Two traps that snippet avoids. Decoding straight into value types makes `null`, `{}` and any unrelated JSON object succeed with a zero range `[0,0]`, which a contract-0 caller reads as *compatible* — so require the fields that make it this document before trusting the numbers. And never compare leash against constants compiled into the caller: that compares the caller to itself and can only pass. The installed binary's stdout is the only thing that can disagree with you.
 
 `policyLimits` (with the `policy-path-limits` capability) tells a policy generator how long a resolved rule path may be — a directory's trailing `/` included — and still be enforced byte-for-byte. A longer rule (or a larger rule set) is rejected before any kernel module is updated — at startup the run fails closed, and on a live reload the previous policy stays in force. At runtime, a file whose absolute path exceeds `filePathBytes` cannot be matched byte-for-byte and is denied (file open and hard-link source alike), whatever the rules say. A policy reload is atomic across file-open and directory-mutation enforcement; a hook racing a reload is denied rather than decided on a half-loaded policy. A document without `policyLimits` comes from a build that silently skipped any file or exec rule longer than 64 bytes; a caller must treat 64 as that build's limit.
+
+**Contract 2** (issue #117) is the fail-closed-by-default posture: a build at contract `>= 2` refuses to run the workload when the eBPF LSM cannot attach unless `--allow-proxy-only` is passed, and advertises the `allow-proxy-only` capability. Nothing was removed, so `minCompatibleContract` stays `0` and callers written against contract 0 or 1 remain `compatible`; a caller that relies on the fail-closed default can require contract 2 (or test for the capability).
 
 `allow-proxy-only` means this build **fails closed by default** when the eBPF LSM (Layer 1) cannot attach or has no scopable cgroup: `leash run` refuses to start the workload instead of degrading to proxy-only. `--allow-proxy-only` (or `LEASH_ALLOW_PROXY_ONLY=1`) is the explicit opt-out. `--require-lsm` / `LEASH_REQUIRE_LSM` stay accepted (and `require-lsm` stays advertised) but are now redundant; a falsy `LEASH_REQUIRE_LSM` does **not** opt out. Flags beat the environment, and asking for both at the same level is an error. A build without `allow-proxy-only` has the old default (warn and continue proxy-only), so a caller that needs fail-closed on such a build must keep passing `--require-lsm`.
 

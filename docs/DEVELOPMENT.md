@@ -44,7 +44,7 @@ The Makefile, release scripts, and Docker builds all shell out to this script, s
   "sourceRevision": "c686025aa1b2c3-dirty",
   "builtAt": "2026-07-21T10:11:12Z",
   "enforcing": true,
-  "contractVersion": 1,
+  "contractVersion": 2,
   "minCompatibleContract": 0,
   "capabilities": ["policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume"],
   "os": "linux",
