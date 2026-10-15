@@ -281,9 +281,6 @@ func (l longPathTrees) verifyReload(t *testing.T, openLsm *OpenLsm, cgroupFD int
 		if err != nil {
 			t.Fatalf("reload policy line %q: %v", line, err)
 		}
-		if rule.PathLen > 1 && rule.Path[rule.PathLen-1] == '/' {
-			rule.IsDirectory = 1
-		}
 		set.Open = append(set.Open, rule)
 	}
 	if err := openLsm.LoadPolicies(ConvertToFileOpenRules(set.Open)); err != nil {
@@ -306,11 +303,6 @@ func kernelLoadPolicySet(t *testing.T, extra ...string) *PolicySet {
 		rule, err := parsePolicyLine(line, i+1)
 		if err != nil {
 			t.Fatalf("policy line %q: %v", line, err)
-		}
-		// The Cedar transpiler (the production policy path) marks a trailing-
-		// slash resource as a directory; the line parser does not.
-		if rule.PathLen > 1 && rule.Path[rule.PathLen-1] == '/' {
-			rule.IsDirectory = 1
 		}
 		switch rule.Operation {
 		case OpExec:

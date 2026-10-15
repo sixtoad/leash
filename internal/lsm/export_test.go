@@ -1,6 +1,9 @@
 package lsm
 
-import "sort"
+import (
+	"reflect"
+	"sort"
+)
 
 // OpenDecisionForTest runs rules through the same pipeline LoadPolicies uses
 // (conversion, longest-first stable sort, root default, full-byte index
@@ -12,6 +15,20 @@ func OpenDecisionForTest(rules []PolicyRule, path string, operation uint32) uint
 	converted := ConvertToFileOpenRules(rules)
 	sort.SliceStable(converted, func(i, j int) bool { return converted[i].PathLen > converted[j].PathLen })
 	return indexedOpenDecision(compileOpenIndex(converted), rootPathPolicy(converted), path, operation)
+}
+
+// SameKernelIndexesForTest reports whether two rule sets compile to identical
+// file-open and directory-mutation kernel indexes (including directory-self
+// entries and mutation grants), i.e. whether they enforce identically.
+func SameKernelIndexesForTest(a, b []PolicyRule) bool {
+	compile := func(rules []PolicyRule) (compiledOpenIndex, compiledMutationIndex, bool) {
+		converted := ConvertToFileOpenRules(rules)
+		sort.SliceStable(converted, func(i, j int) bool { return converted[i].PathLen > converted[j].PathLen })
+		return compileOpenIndex(converted), compileMutationIndex(converted), rootPathPolicy(converted)
+	}
+	openA, mutA, rootA := compile(a)
+	openB, mutB, rootB := compile(b)
+	return rootA == rootB && reflect.DeepEqual(openA, openB) && reflect.DeepEqual(mutA, mutB)
 }
 
 // ValidateOpenRulesForTest exposes the kernel-load validation for external tests.
