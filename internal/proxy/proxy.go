@@ -52,6 +52,10 @@ type MITMProxy struct {
 	// transparent netfilter redirect (e.g. the macOS NETransparentProxyProvider,
 	// which prepends the header before relaying the flow).
 	useProxyProtocol bool
+	// lookupIP resolves a Host name when a request's authority has to be tied
+	// to an IP-bound connection (plain HTTP, SNI-less TLS). nil means the
+	// default resolver; tests stub it.
+	lookupIP func(ctx context.Context, host string) ([]net.IP, error)
 }
 
 // sockaddr_in structure for SO_ORIGINAL_DST
@@ -515,12 +519,19 @@ func (p *MITMProxy) handleTransparentHTTP(clientConn net.Conn, originalDest stri
 		port = "80"
 	}
 
+	// The request is forwarded to originalDest, so its Host (or absolute-form
+	// authority) must name that destination before it is trusted for the
+	// connect policy, header rewrite or MCP policy (issue #149). Otherwise a
+	// workload could send Host: <host with injected credentials> to any IP.
+	authority := newConnAuthority(host, port, "")
+	hostname, authErr := p.verifyRequestAuthority(req, authority)
+	if authErr != nil {
+		p.rejectMisdirected(clientConn, "http", authority, req, authErr)
+		return
+	}
+
 	// Check connect policy for HTTP connections
 	portNum, _ := strconv.ParseUint(port, 10, 16)
-	hostname := req.Host // Use Host header if available, otherwise use originalDest host
-	if hostname == "" {
-		hostname = host
-	}
 
 	path := req.URL.Path
 	if path == "" {
@@ -536,25 +547,18 @@ func (p *MITMProxy) handleTransparentHTTP(clientConn net.Conn, originalDest stri
 
 	// Unique request logging removed
 
-	// Apply header rewriting rules
-	p.headerRewriter.ApplyRules(req)
+	// Apply header rewriting rules for the verified host only.
+	p.headerRewriter.ApplyRulesForHost(req, hostname)
 
 	var mcpCtx *mcpRequestContext
 	if p.mcpObserver != nil {
-		if ctx, sniffErr := p.mcpObserver.inspectHTTPRequest(req, host); sniffErr == nil {
+		if ctx, sniffErr := p.mcpObserver.inspectHTTPRequest(req, hostname); sniffErr == nil {
 			mcpCtx = ctx
 		} else {
 			log.Printf("mcp sniff (http) error: %v", sniffErr)
 		}
 	}
-	serverForPolicy := req.URL.Hostname()
-	if serverForPolicy == "" {
-		serverForPolicy = strings.TrimSpace(req.Host)
-	}
-	if serverForPolicy == "" {
-		serverForPolicy = hostname
-	}
-	if p.enforceMCPCall(clientConn, mcpCtx, serverForPolicy, hostname, port, path, query, authPresent, "http") {
+	if p.enforceMCPCall(clientConn, mcpCtx, hostname, hostname, port, path, query, authPresent, "http") {
 		return
 	}
 
@@ -704,6 +708,16 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 		}
 	}
 
+	// Every request on this connection is forwarded to targetHost, so that is
+	// the only host request-level decisions may be made for: the SNI name
+	// (connect-policy-checked above and dialed by name), or the original
+	// destination when there is no hostname SNI (issue #149).
+	authorityHost, authorityPort, splitErr := net.SplitHostPort(targetHost)
+	if splitErr != nil {
+		authorityHost, authorityPort = targetHost, destPort
+	}
+	authority := newConnAuthority(authorityHost, authorityPort, actualHostname)
+
 	// Handle HTTP requests over the TLS connection
 	bufferedReader := bufio.NewReader(tlsConn)
 
@@ -713,6 +727,16 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 			if err != io.EOF {
 				log.Printf("Error reading HTTPS request: %v", err)
 			}
+			break
+		}
+
+		// A request whose Host / absolute-form authority names another host
+		// would get that host's rewrite rules (e.g. injected credentials) while
+		// being sent to targetHost. Refuse it before any rewrite or forward;
+		// the client can retry on a connection opened for that host.
+		verifiedHost, authErr := p.verifyRequestAuthority(req, authority)
+		if authErr != nil {
+			p.rejectMisdirected(tlsConn, "https", authority, req, authErr)
 			break
 		}
 
@@ -738,22 +762,18 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 
 		var mcpCtx *mcpRequestContext
 		if p.mcpObserver != nil {
-			if ctx, sniffErr := p.mcpObserver.inspectHTTPRequest(req, host); sniffErr == nil {
+			if ctx, sniffErr := p.mcpObserver.inspectHTTPRequest(req, verifiedHost); sniffErr == nil {
 				mcpCtx = ctx
 			} else {
 				log.Printf("mcp sniff (https) error: %v", sniffErr)
 			}
 		}
-		serverForPolicy := req.URL.Hostname()
-		if serverForPolicy == "" {
-			serverForPolicy = host
-		}
-		if p.enforceMCPCall(tlsConn, mcpCtx, serverForPolicy, host, port, path, query, authPresent, "https") {
+		if p.enforceMCPCall(tlsConn, mcpCtx, verifiedHost, host, port, path, query, authPresent, "https") {
 			break
 		}
 
-		// Apply header rewriting rules
-		p.headerRewriter.ApplyRules(req)
+		// Apply header rewriting rules for the verified host only.
+		p.headerRewriter.ApplyRulesForHost(req, verifiedHost)
 
 		responseCode, _, sessionHeader, forwardErr := p.forwardTransparentHTTPS(tlsConn, req, targetHost, mcpCtx)
 
