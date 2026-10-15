@@ -8,18 +8,18 @@ import (
 
 // ALPN handling for the client-facing side of the HTTPS MITM.
 //
-// The proxy inspects HTTP/1.1 per request (header rewrite, MCP sniffing and
-// enforcement, request logging) but tunnels HTTP/2 opaquely (tunnelH2), so any
-// request-level feature is bypassed when a client negotiates h2 (issue #57).
-// To close that gap without giving up h2 for hosts that need no inspection, the
-// ALPN list offered to the client is chosen per connection from the SNI
-// hostname: hosts with a request-level feature are offered only http/1.1, so
-// the connection lands on the inspected HTTP/1.1 path; every other host keeps
-// h2 (tunneled).
+// Request-level features (header rewrite, MCP sniffing and enforcement) must
+// see every request, but an opaque h2 tunnel (tunnelH2) hides them (issue #57).
+// The decision is made per connection from the SNI hostname: hosts with no
+// request-level feature keep the h2 tunnel; for the others an h2 connection is
+// served by the h2 MITM (h2mitm.go, LEASH_PROXY_H2=inspect, the default) or,
+// with LEASH_PROXY_H2=downgrade, only http/1.1 is offered so the connection
+// lands on the inspected HTTP/1.1 path.
 
 // ALPN modes recorded on the event=http.alpn log line.
 const (
 	alpnModeTunnel    = "tunnel"    // h2 offered; an h2 connection is tunneled opaquely
+	alpnModeInspect   = "inspect"   // h2 offered; an h2 connection is served by the h2 MITM
 	alpnModeDowngrade = "downgrade" // only http/1.1 offered so requests are inspected
 	alpnModeRefuse    = "refuse"    // h2-only client to a host whose enforcement cannot be skipped
 )
@@ -86,6 +86,14 @@ func (p *MITMProxy) chooseALPN(host string, offered []string) alpnDecision {
 		return d
 	}
 
+	if p.h2InspectEnabled() {
+		// Serve h2 with full per-request inspection (h2mitm.go).
+		d.nextProto = []string{"h2", "http/1.1"}
+		d.mode = alpnModeInspect
+		return d
+	}
+
+	// LEASH_PROXY_H2=downgrade: route inspected hosts to the HTTP/1.1 path.
 	if offersH11 {
 		d.nextProto = []string{"http/1.1"}
 		d.mode = alpnModeDowngrade
