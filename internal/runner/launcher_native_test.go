@@ -308,10 +308,10 @@ func TestNativeLeashdDied(t *testing.T) {
 	r := &runner{}
 	n := nativeLauncher{r: r}
 	if n.leashdDied() {
-		t.Fatal("nil channel → not died")
+		t.Fatal("no leashd → not died")
 	}
 	ch := make(chan struct{})
-	r.leashdExited = ch
+	r.leashd = &injectedProc{done: ch}
 	if n.leashdDied() {
 		t.Fatal("open channel → not died")
 	}
@@ -332,7 +332,7 @@ func TestNativeWaitReadyFailClosed(t *testing.T) {
 		r := &runner{}
 		r.cfg.shareDir = t.TempDir() // present but no enforcement-ready marker
 		r.opts.requireLSM = require
-		r.leashdExited = exited
+		r.leashd = &injectedProc{done: exited}
 		r.logger = log.New(io.Discard, "", 0)
 		return nativeLauncher{r: r}
 	}
@@ -358,7 +358,7 @@ func TestNativeWaitReadyWaitsForSlowAttach(t *testing.T) {
 	r.cfg.shareDir = t.TempDir()
 	r.cfg.bootstrapTimeout = 5 * time.Second
 	r.opts.requireLSM = true
-	r.leashdExited = make(chan struct{}) // alive
+	r.leashd = &injectedProc{done: make(chan struct{})} // alive
 	r.logger = log.New(io.Discard, "", 0)
 	go func() {
 		time.Sleep(3 * caCertWaitDelay)
@@ -374,7 +374,7 @@ func TestNativeWaitReadyTimesOutAtBootstrapTimeout(t *testing.T) {
 	r.cfg.shareDir = t.TempDir()
 	r.cfg.bootstrapTimeout = 2 * caCertWaitDelay
 	r.opts.requireLSM = true
-	r.leashdExited = make(chan struct{}) // alive, never ready
+	r.leashd = &injectedProc{done: make(chan struct{})} // alive, never ready
 	r.logger = log.New(io.Discard, "", 0)
 	start := time.Now()
 	err := (nativeLauncher{r: r}).WaitReady(context.Background())

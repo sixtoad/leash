@@ -212,12 +212,14 @@ type runner struct {
 	// netns) rather than a netns with no route out. Native only.
 	nativeEgressFailed bool
 
-	// leashdExited is closed when the native leashd process exits (StartEnforcement
-	// starts a reaper). WaitReady selects on it to fail fast — instead of waiting
-	// out the full readiness timeout — when leashd died before enforcement went
-	// live (e.g. an LSM attach abort under --require-lsm). Nil until enforcement
-	// starts / on non-native backends.
-	leashdExited chan struct{}
+	// leashd is the native leashd host-mode process (StartEnforcement), started
+	// in its own process group with a parent-death signal and a reaper. WaitReady
+	// checks leashd.exited() to fail fast — instead of waiting out the full
+	// readiness timeout — when leashd died before enforcement went live (e.g. an
+	// LSM attach abort under --require-lsm), and every teardown path stops it via
+	// stopLeashd (#143). Nil until enforcement starts / on non-native backends.
+	leashd   *injectedProc
+	leashdMu sync.Mutex // guards leashd
 
 	// injectedPlugins are the --inject-service helper subprocesses (native), run as
 	// the invoking user. injectedEnv are the "VAR=value" pairs that point the
@@ -354,6 +356,11 @@ func execute(cmdName string, args []string) error {
 	// returns from here (keepContainers, early errors, ...). Idempotent with the
 	// launchers' Remove.
 	defer r.teardownInjectedPlugins()
+	// Same backstop for native leashd (#143). It used to rely on
+	// exec.CommandContext killing it when the run context was cancelled, but
+	// that kill runs on a goroutine that races os.Exit, so leashd (and its
+	// attached eBPF LSM) could outlive leash. stopLeashd is synchronous.
+	defer r.stopLeashd()
 
 	defer func() {
 		if !r.cfg.workDirIsTemp || r.cfg.workDir == "" || r.keepContainers {
@@ -390,8 +397,10 @@ func execute(cmdName string, args []string) error {
 				continue
 			}
 			// Forced exit skips every deferred teardown: kill the injected
-			// helpers first so they are not orphaned (#128).
+			// helpers and native leashd first so they are not orphaned
+			// (#128, #143).
 			r.killInjectedPluginsNow()
+			r.killLeashdNow()
 			os.Exit(1)
 		}
 	}()
@@ -3217,8 +3226,11 @@ func cleanupContext(ctx context.Context) context.Context {
 func (r *runner) finishLifecycle(ctx context.Context, exitCode int, runErr error) error {
 	if r.keepContainers {
 		// Kept containers outlive leash, but the injected helpers are leash's
-		// children and would only be orphaned when it exits (#128).
+		// children and would only be orphaned when it exits (#128). The same
+		// holds for native leashd: as leash's child it must not keep its eBPF
+		// LSM attached after leash exits (#143).
 		r.teardownInjectedPlugins()
+		r.stopLeashd()
 		if runErr != nil {
 			return runErr
 		}

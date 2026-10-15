@@ -168,7 +168,13 @@ func (n nativeLauncher) StartEnforcement(ctx context.Context, cgroupPath string)
 			blocker, strings.Join(argv, " "))
 	}
 
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	// Deliberately NOT exec.CommandContext: its context-driven SIGKILL runs on a
+	// goroutine that races leash's own os.Exit, so a cancelled run could exit
+	// before leashd was killed, leaving it running with the eBPF LSM attached
+	// (#143). The runner owns leashd's lifetime instead: startLeashd puts it in
+	// its own process group with a parent-death signal and a reaper, and every
+	// teardown path stops it via stopLeashd.
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = append(os.Environ(), n.leashdEnv()...)
 	// Native runs leashd in the same TTY as the (interactive) workload, so its
 	// ongoing proxy/LSM logs would corrupt the agent's TUI. Send them to a file
@@ -182,24 +188,12 @@ func (n nativeLauncher) StartEnforcement(ctx context.Context, cgroupPath string)
 	} else {
 		n.r.debugf("native: leashd log file %s: %v (discarding leashd output)", n.leashdLogPath(), err)
 	}
-	if err := cmd.Start(); err != nil {
-		if logf != nil {
-			logf.Close()
-		}
+	// The reaper also lets WaitReady fail fast if leashd dies before enforcement
+	// is ready (e.g. leashd os.Exit(1)s on an LSM attach abort under
+	// --require-lsm) instead of blocking for the whole readiness timeout.
+	if err := n.r.startLeashd(cmd, logf); err != nil {
 		return err
 	}
-	// Reap leashd and signal its exit so WaitReady can fail fast if it dies before
-	// enforcement is ready (e.g. leashd os.Exit(1)s on an LSM attach abort under
-	// --require-lsm) instead of blocking for the whole readiness timeout.
-	exited := make(chan struct{})
-	n.r.leashdExited = exited
-	go func() {
-		_ = cmd.Wait()
-		if logf != nil {
-			logf.Close()
-		}
-		close(exited)
-	}()
 	if err := n.injectServices(ctx); err != nil {
 		return err
 	}
@@ -559,16 +553,10 @@ func (r *runner) writeInjectConfig(svc injectService) (string, error) {
 
 // leashdDied reports whether the reaped leashd process has already exited.
 func (n nativeLauncher) leashdDied() bool {
-	ch := n.r.leashdExited
-	if ch == nil {
-		return false
-	}
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
+	n.r.leashdMu.Lock()
+	p := n.r.leashd
+	n.r.leashdMu.Unlock()
+	return p != nil && p.exited()
 }
 
 // leashdLogPath is where native tees leashd's stdout/stderr, off the workload's
@@ -756,6 +744,9 @@ func (n nativeLauncher) exportCACert(shareDir string) {
 // partial egress setup still cleans up.
 func (n nativeLauncher) Remove(ctx context.Context) error {
 	n.r.teardownInjectedPlugins()
+	// Stop leashd (detaching its eBPF LSM) before deleting the netns it runs
+	// in (#143).
+	n.r.stopLeashd()
 	if nativeLayer2Enabled && !n.useUserManager() {
 		n.teardownEgress(ctx)
 		_, _ = hostOutput(ctx, "ip", "netns", "del", n.netnsName())
@@ -1298,8 +1289,9 @@ func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, 
 
 // hostOutput runs a host command (systemd-run/systemctl/ip), capturing combined
 // output. Native uses host tooling directly, independent of the container
-// Runtime command wrappers.
-func hostOutput(ctx context.Context, name string, args ...string) (string, error) {
+// Runtime command wrappers. A variable so teardown tests can exercise the
+// native Remove without touching the host's netns/iptables/systemd state.
+var hostOutput = func(ctx context.Context, name string, args ...string) (string, error) {
 	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
 	return string(out), err
 }
