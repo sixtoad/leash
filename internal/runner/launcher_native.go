@@ -590,8 +590,10 @@ func (n nativeLauncher) hostLeashdArgv(self, netnsPath, cgroupPath string) []str
 	if !n.layer2Active() {
 		leashd = append(leashd, "--lsm-only")
 	}
-	if n.r.opts.requireLSM {
+	if n.r.cfg.requireLSM {
 		leashd = append(leashd, "--require-lsm")
+	} else {
+		leashd = append(leashd, "--allow-proxy-only")
 	}
 	leashd = append(leashd, "--cgroup", cgroupPath)
 	if cfgDir := strings.TrimSpace(n.r.cfg.cfgDir); cfgDir != "" {
@@ -672,6 +674,7 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 			if n.layer2Active() {
 				n.exportCACert(shareDir)
 			}
+			n.r.reportEnforcement(ready)
 			return nil
 		}
 		// Fast path: if leashd already exited it will never publish the marker, so
@@ -698,13 +701,13 @@ func nativeReadyTimeout(configured time.Duration) time.Duration {
 	return configured
 }
 
-// notReady resolves an unconfirmed-enforcement situation: fail closed when the
-// operator passed --require-lsm (refuse to run the workload unenforced), else
-// preserve the historical behavior — warn and proceed (degrade to whatever
-// enforcement did attach). The leashd log has the specifics either way.
+// notReady resolves an unconfirmed-enforcement situation: fail closed by
+// default (refuse to run the workload unenforced); only with --allow-proxy-only
+// warn and proceed (degrade to whatever enforcement did attach). The leashd log
+// has the specifics either way.
 func (n nativeLauncher) notReady(reason string) error {
-	if n.r.opts.requireLSM {
-		return fmt.Errorf("%s; refusing to run the workload unenforced (--require-lsm). See %s", reason, n.leashdLogPath())
+	if n.r.cfg.requireLSM {
+		return fmt.Errorf("%s; refusing to run the workload unenforced (fail-closed; pass --allow-proxy-only to proceed anyway). See %s", reason, n.leashdLogPath())
 	}
 	n.r.logger.Printf("Warning: %s; the workload may run before Layer 1 is active. See %s", reason, n.leashdLogPath())
 	return nil

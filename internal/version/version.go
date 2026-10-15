@@ -103,6 +103,11 @@ const (
 	// enforcement matches over every byte. Longer rules are rejected when the
 	// policy loads (fail closed); none is silently skipped.
 	CapabilityPolicyPathLimits = "policy-path-limits"
+	// CapabilityAllowProxyOnly is the `--allow-proxy-only` flag (and
+	// LEASH_ALLOW_PROXY_ONLY). Its presence also means fail-closed is the
+	// default when the eBPF LSM can't attach (issue #117): without the flag a
+	// run refuses to start proxy-only. `--require-lsm` stays accepted.
+	CapabilityAllowProxyOnly = "allow-proxy-only"
 )
 
 // Enforced policy path limits, in bytes of the resolved path (a directory
@@ -142,6 +147,7 @@ var capabilities = []string{
 	CapabilityResolverContractJSON,
 	CapabilityIDMapVolume,
 	CapabilityPolicyPathLimits,
+	CapabilityAllowProxyOnly,
 }
 
 // Capabilities returns the surface names this build advertises. The slice is a

@@ -123,6 +123,32 @@ Claude Code handling on top.
   read as unqualified good news. The document names the default and the human
   output warns when it is not the runtime the verdict is about.
 
+### Changed — fail closed by default when the eBPF LSM can't attach (#117)
+- **Behavior change.** When the eBPF LSM (Layer 1) cannot attach — kernel
+  without an active `bpf` LSM, rootless podman, or no scopable cgroup — leash
+  now **refuses to run the workload** instead of warning and continuing
+  proxy-only. This applies to the client preflight, native readiness, and
+  leashd (container and host mode).
+- **New opt-out: `--allow-proxy-only`** (env `LEASH_ALLOW_PROXY_ONLY=1`, also a
+  leashd flag) restores the old degrade: warn and continue with only the
+  fail-closed L7 proxy; filesystem/exec/socket policies are then not enforced.
+- **`--require-lsm` / `LEASH_REQUIRE_LSM` stay accepted** (and the
+  `require-lsm` capability stays advertised) but are now redundant. A falsy
+  `LEASH_REQUIRE_LSM` does not opt out. Flags beat env vars; asking for both
+  fail-closed and proxy-only at the same level is an error.
+- **New capability `allow-proxy-only`** in `leash version --json`; its presence
+  means this build fails closed by default.
+- **Effective enforcement level is machine-readable.** The enforcement-ready
+  marker (still gated on by existence) is now a JSON document
+  `{"enforcement":"lsm"|"proxy-only"|"none","layer1":…,"layer2":…,"requireLSM":…,"allowProxyOnly":…}`,
+  leashd logs an `enforcement.level` event, and the client prints
+  `leash: enforcement=<level> layer1=<state> layer2=<state>` on the diagnostic
+  stream (always under `--machine-output`, always when not `lsm`).
+- The client now always tells leashd its resolved posture
+  (`LEASH_REQUIRE_LSM=1` or `LEASH_ALLOW_PROXY_ONLY=1` in the container,
+  `--require-lsm` or `--allow-proxy-only` for native leashd), and native
+  readiness now honors `LEASH_REQUIRE_LSM` (it previously read only the flag).
+
 ### Fixed — remedy text that could break the host
 - **`leash doctor` could tell an operator to set `lsm=,bpf`** — a leading-comma
   kernel command line that *replaces* the host's LSM stack, silently disabling

@@ -251,7 +251,7 @@ Add bpf to the lsm= kernel boot parameter and reboot, on a kernel built with CON
 
 // The Layer 1 consequence, named once and used by both runtimes: this sentence
 // is the whole point of the degraded state.
-const layer1Consequence = "eBPF LSM enforcement (Layer 1) is unavailable, so filesystem, exec and socket policy will NOT be enforced; only the fail-closed egress proxy (Layer 2) applies."
+const layer1Consequence = "eBPF LSM enforcement (Layer 1) is unavailable, so filesystem, exec and socket policy will NOT be enforced; only the fail-closed egress proxy (Layer 2) applies. `leash run` refuses to start in this state unless --allow-proxy-only is passed."
 
 // Prerequisites issue #23 names that this command does not verify. Declared
 // rather than silently omitted, so "ready" is read for exactly what it means.
@@ -344,10 +344,10 @@ func evaluateNative(h Host) NativeReport {
 
 	// Native gets the same three-state treatment as the container runtime, on
 	// the same axis, because the real code paths behave the same way: an
-	// inactive bpf LSM is a *warning* in decideBPFLSM (only --require-lsm makes
-	// it fatal) and classifyNativeRuntime never consults the LSM at all. So on
-	// a Linux host with systemd, root and no Layer 1, `leash run` starts and
-	// enforces proxy-only. Reporting that as "cannot enforce with ANY runtime"
+	// inactive bpf LSM is fatal by default in decideBPFLSM but only a *warning*
+	// under --allow-proxy-only (issue #117), and classifyNativeRuntime never
+	// consults the LSM at all. So on a Linux host with systemd, root and no
+	// Layer 1, `leash run --allow-proxy-only` starts and enforces proxy-only. Reporting that as "cannot enforce with ANY runtime"
 	// (which is what the all-or-nothing rule did) is a false negative of
 	// exactly the kind CAP-1 forbids in the other direction.
 	switch {

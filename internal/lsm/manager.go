@@ -16,7 +16,7 @@ type LSMManager struct {
 	logger     *SharedLogger
 
 	// requireLSM makes an eBPF LSM attach failure fatal instead of degrading to
-	// proxy-only enforcement.
+	// proxy-only enforcement. True unless proxy-only was explicitly allowed.
 	requireLSM      bool
 	containerRootfs bool
 
@@ -53,19 +53,22 @@ func NewLSMManager(cgroupPath string, logger *SharedLogger, requireLSM bool) *LS
 
 // handleAttachFailure decides what happens when an eBPF LSM program fails to
 // attach (most often because the kernel doesn't have "bpf" as an active LSM).
-// With requireLSM it is fatal; otherwise leash degrades to proxy-only (Layer 2,
-// fail-closed) and continues, warning loudly once.
+// Fail-closed is the default (issue #117): unless proxy-only was explicitly
+// allowed (--allow-proxy-only / LEASH_ALLOW_PROXY_ONLY) it is fatal. With the
+// opt-out, leash degrades to proxy-only (Layer 2, fail-closed) and continues,
+// warning loudly once.
 func (m *LSMManager) handleAttachFailure(label string, err error) {
 	if m.requireLSM {
-		fmt.Fprintf(os.Stderr, "leash: FATAL: %s LSM failed to attach and --require-lsm is set: %v\n", label, err)
+		fmt.Fprintf(os.Stderr, "leash: FATAL: %s LSM failed to attach; refusing to run the workload unenforced (pass --allow-proxy-only to continue proxy-only): %v\n", label, err)
 		os.Exit(1)
 	}
+	markLayer1Degraded()
 	// The attach attempt is counted as settled by the defer in
 	// LoadAndAttachBPFWithSetup (fires on failure too), so no Done() here.
 	m.degradeOnce.Do(func() {
 		fmt.Fprintf(os.Stderr, "leash: WARNING: eBPF LSM enforcement (Layer 1) is unavailable (%s: %v).\n", label, err)
-		fmt.Fprintf(os.Stderr, "leash: continuing in degraded proxy-only mode — filesystem/exec/socket policies are NOT enforced; the L7 proxy (Layer 2) remains active and fail-closed.\n")
-		fmt.Fprintf(os.Stderr, "leash: enable the bpf LSM (lsm=...,bpf in the kernel cmdline) or pass --require-lsm to make this fatal.\n")
+		fmt.Fprintf(os.Stderr, "leash: continuing in degraded proxy-only mode because --allow-proxy-only is set — filesystem/exec/socket policies are NOT enforced; the L7 proxy (Layer 2) remains active and fail-closed.\n")
+		fmt.Fprintf(os.Stderr, "leash: enable the bpf LSM (lsm=...,bpf in the kernel cmdline), or drop --allow-proxy-only / LEASH_ALLOW_PROXY_ONLY to make this fatal.\n")
 	})
 }
 

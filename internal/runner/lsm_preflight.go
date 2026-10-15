@@ -106,11 +106,10 @@ If this kernel has CONFIG_BPF_LSM, add bpf to the lsm= boot parameter and reboot
 }
 
 // preflightHostKernel checks whether the host kernel can host leash's eBPF LSM
-// layer (Layer 1). Following leash's defense-in-depth model — where the MITM
-// proxy (Layer 2) is fail-closed and independent — a missing Layer 1 is NOT
-// fatal by default: leash warns loudly and continues with proxy-only
-// enforcement. `--require-lsm` (or LEASH_REQUIRE_LSM) flips this to a hard stop
-// for environments that mandate full enforcement.
+// layer (Layer 1). A missing Layer 1 is fatal by default (issue #117): leash
+// refuses to run the workload unenforced. `--allow-proxy-only` (or
+// LEASH_ALLOW_PROXY_ONLY) opts out: leash warns loudly and continues with only
+// the fail-closed MITM proxy (Layer 2).
 //
 // The check is only meaningful for a local Linux host-kernel runtime: the
 // agent's container shares the host kernel, so /sys here describes the kernel
@@ -141,8 +140,8 @@ func (r *runner) preflightHostKernel() error {
 	return nil
 }
 
-// decideBPFLSM turns a status into either a fatal error (when requireLSM) or a
-// loud warning (the default proxy-only degrade). For bpfLSMActive it returns
+// decideBPFLSM turns a status into either a fatal error (when requireLSM, the
+// default) or a loud warning (the --allow-proxy-only degrade). For bpfLSMActive it returns
 // ("", nil). Pure, so the warn-vs-fail policy is unit-testable.
 func decideBPFLSM(status bpfLSMStatus, active []string, requireLSM bool) (string, error) {
 	if status == bpfLSMActive {
@@ -150,9 +149,9 @@ func decideBPFLSM(status bpfLSMStatus, active []string, requireLSM bool) (string
 	}
 	advice := bpfLSMAdvice(status, active)
 	if requireLSM {
-		return "", fmt.Errorf("eBPF LSM enforcement (Layer 1) is unavailable and --require-lsm is set, so leash will not start.\n%s", advice)
+		return "", fmt.Errorf("eBPF LSM enforcement (Layer 1) is unavailable, so leash will not start (fail-closed; --require-lsm is the default). Pass --allow-proxy-only to run with only the L7 proxy.\n%s", advice)
 	}
-	return "WARNING: eBPF LSM enforcement (Layer 1) is unavailable; continuing with proxy-only enforcement (Layer 2 is fail-closed). Filesystem/exec/socket policies will NOT be enforced — pass --require-lsm to require Layer 1.\n" + advice, nil
+	return "WARNING: eBPF LSM enforcement (Layer 1) is unavailable; continuing with proxy-only enforcement because --allow-proxy-only is set (Layer 2 is fail-closed). Filesystem/exec/socket policies will NOT be enforced.\n" + advice, nil
 }
 
 // LSMState is the tri-state answer to "is leash's Layer 1 (eBPF LSM) available
