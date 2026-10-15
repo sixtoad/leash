@@ -730,14 +730,7 @@ func leashdFailureReason(path string) string {
 	if err != nil {
 		return ""
 	}
-	lines := strings.Split(string(data), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.TrimSpace(lines[i])
-		if idx := strings.Index(line, "FATAL:"); idx >= 0 {
-			return strings.TrimSpace(line[idx+len("FATAL:"):])
-		}
-	}
-	return ""
+	return lastFatalLine(string(data))
 }
 
 // notReadyVerdict is notReady's pure decision. Without Layer 2 (rootless, or

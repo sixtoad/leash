@@ -2972,20 +2972,19 @@ func (r *runner) waitForEnforcementReady(ctx context.Context) error {
 			return fmt.Errorf("enforcement readiness timed out after %s (target=%s, leash=%s)", r.cfg.bootstrapTimeout, targetState, leashState)
 		}
 
+		// Check the leash sidecar first: when leashd refuses (fail-closed) it
+		// exits, and the target often follows; reporting the target first would
+		// hide the leashd reason.
+		if state := r.containerSummary(ctx, r.cfg.leashContainer); isTerminalStatus(state) {
+			return r.leashContainerExitError(ctx, state)
+		}
+
 		if state := r.containerSummary(ctx, r.cfg.targetContainer); isTerminalStatus(state) {
 			logs := r.containerLogs(ctx, r.cfg.targetContainer)
 			if logs != "" {
 				return fmt.Errorf("target container terminated before enforcement was ready (state=%s).\nRecent docker logs (%s):\n%s", state, r.cfg.targetContainer, indentLines(logs, "  "))
 			}
 			return fmt.Errorf("target container terminated before enforcement was ready (state=%s). Inspect docker logs %s", state, r.cfg.targetContainer)
-		}
-
-		if state := r.containerSummary(ctx, r.cfg.leashContainer); isTerminalStatus(state) {
-			logs := r.containerLogs(ctx, r.cfg.leashContainer)
-			if logs != "" {
-				return fmt.Errorf("leash container terminated before enforcement was ready (state=%s).\nRecent docker logs (%s):\n%s", state, r.cfg.leashContainer, indentLines(logs, "  "))
-			}
-			return fmt.Errorf("leash container terminated before enforcement was ready (state=%s). Inspect docker logs %s", state, r.cfg.leashContainer)
 		}
 
 		select {
@@ -3031,6 +3030,75 @@ func (r *runner) containerLogs(ctx context.Context, name string) string {
 		return "(no output)"
 	}
 	return out
+}
+
+// leashContainerLogTailLines bounds how much of the sidecar's log is echoed.
+const leashContainerLogTailLines = 40
+
+// leashContainerExitError reports a leash sidecar that stopped before the
+// enforcement-ready marker appeared: its state/exit code, leashd's last FATAL
+// reason (e.g. a fail-closed refusal) and a bounded, sanitized log tail.
+func (r *runner) leashContainerExitError(ctx context.Context, state string) error {
+	logs := r.containerLogs(ctx, r.cfg.leashContainer)
+	fatal := lastFatalLine(logs)
+	msg := fmt.Sprintf("leash container stopped before enforcement was ready (state=%s)", state)
+	if fatal != "" {
+		msg += ": " + fatal
+	}
+	if tail := boundedLogTail(logs, leashContainerLogTailLines); tail != "" {
+		return fmt.Errorf("%s.\nRecent logs (%s, last %d lines):\n%s", msg, r.cfg.leashContainer, leashContainerLogTailLines, indentLines(tail, "  "))
+	}
+	return fmt.Errorf("%s. Inspect logs of %s", msg, r.cfg.leashContainer)
+}
+
+// lastFatalLine returns the text after the last "FATAL:" marker in a log, with
+// control characters stripped. Overlaps with PR #136's target diagnostics; the
+// second of the two to merge should consolidate the helpers.
+func lastFatalLine(text string) string {
+	lines := strings.Split(text, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := sanitizeLogLine(lines[i])
+		if idx := strings.Index(line, "FATAL:"); idx >= 0 {
+			return strings.TrimSpace(line[idx+len("FATAL:"):])
+		}
+	}
+	return ""
+}
+
+// boundedLogTail keeps the last n lines of a log, sanitized for a terminal.
+func boundedLogTail(text string, n int) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	for i := range lines {
+		lines[i] = sanitizeLogLine(lines[i])
+	}
+	return strings.Join(lines, "\n")
+}
+
+// sanitizeLogLine drops ANSI escape sequences and control characters (keeping
+// tabs) so container output cannot repaint the operator's terminal.
+func sanitizeLogLine(line string) string {
+	var b strings.Builder
+	inEscape := false
+	for _, c := range line {
+		switch {
+		case inEscape:
+			if (c >= '@' && c <= '~') && c != '[' {
+				inEscape = false
+			}
+		case c == 0x1b:
+			inEscape = true
+		case c == '\t' || c >= 0x20 && c != 0x7f:
+			b.WriteRune(c)
+		}
+	}
+	return strings.TrimRight(b.String(), " ")
 }
 
 func indentLines(text, prefix string) string {
