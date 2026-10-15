@@ -54,6 +54,21 @@ var onLSMAttached func()
 // leashd always sets it explicitly before the first attach.
 var requireLSM bool
 
+// failClosedRemedy is appended to fatal attach messages. leashd replaces it
+// with enforcement.FailClosedRemedy for the session's real state (e.g. the
+// proxy being off, where --allow-proxy-only cannot help).
+var failClosedRemedy = "pass --allow-proxy-only to continue with only the L7 proxy"
+
+// SetFailClosedRemedy sets the remediation text for fatal attach failures.
+func SetFailClosedRemedy(s string) {
+	if s != "" {
+		failClosedRemedy = s
+	}
+}
+
+// FailClosedRemedy returns the current remediation text.
+func FailClosedRemedy() string { return failClosedRemedy }
+
 // SetRequireLSM selects fail-closed (true) vs degrade-to-proxy (false) behavior
 // for LSM attach failures. Call once at startup before enforcement begins.
 func SetRequireLSM(v bool) { requireLSM = v }
@@ -503,7 +518,7 @@ func LoadAndAttachBPFWithSetup(
 		// with file/exec/connect enforcement silently degraded to proxy-only.
 		// Exiting here (not after notify) closes the release race.
 		if retErr != nil && requireLSM {
-			fmt.Fprintf(os.Stderr, "FATAL: eBPF LSM enforcement is unavailable; refusing to run unenforced (pass --allow-proxy-only to continue with only the L7 proxy): %v\n", retErr)
+			fmt.Fprintf(os.Stderr, "FATAL: eBPF LSM enforcement is unavailable (%v); refusing to run unenforced (%s)\n", retErr, failClosedRemedy)
 			os.Exit(1)
 		}
 		// Record the degrade before reporting the attempt settled, so the

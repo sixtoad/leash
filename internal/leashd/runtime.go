@@ -106,6 +106,7 @@ func Main(args []string) error {
 	// Select fail-closed vs degrade-to-proxy for LSM attach failures before any
 	// attach happens.
 	lsm.SetRequireLSM(cfg.failClosed())
+	lsm.SetFailClosedRemedy(enforcement.FailClosedRemedy(!cfg.LSMOnly))
 
 	if err := preFlight(cfg); err != nil {
 		return err

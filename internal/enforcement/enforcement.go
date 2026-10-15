@@ -171,20 +171,35 @@ func Describe(layer1Available, layer2Active, requireLSM bool) Status {
 // --allow-proxy-only only permits degrading to the proxy, not past it. With
 // fail-closed in effect, anything other than "lsm" is refused.
 func (s Status) Check(requireLSM bool) error {
+	remedy := FailClosedRemedy(s.Layer2 == LayerActive)
 	switch {
 	case s.Enforcement == LevelNone:
-		return fmt.Errorf("enforcement=%s (layer1=%s layer2=%s)%s: no layer enforces policy; refusing to run the workload", s.Enforcement, s.Layer1, s.Layer2, s.reasonSuffix())
+		return fmt.Errorf("%s; no layer enforces policy, refusing to run the workload (%s)", s.describe(), remedy)
 	case requireLSM && s.Enforcement != LevelLSM:
-		return fmt.Errorf("enforcement=%s (layer1=%s layer2=%s)%s but fail-closed is in effect; refusing to run the workload unenforced (pass --allow-proxy-only to accept proxy-only)", s.Enforcement, s.Layer1, s.Layer2, s.reasonSuffix())
+		return fmt.Errorf("%s; fail-closed is in effect, refusing to run the workload unenforced (%s)", s.describe(), remedy)
 	}
 	return nil
 }
 
-func (s Status) reasonSuffix() string {
-	if s.Reason == "" {
-		return ""
+// describe renders "enforcement=… (layer1=… layer2=…)[: reason]" with the
+// reason's own trailing punctuation trimmed so callers can join cleanly.
+func (s Status) describe() string {
+	out := fmt.Sprintf("enforcement=%s (layer1=%s layer2=%s)", s.Enforcement, s.Layer1, s.Layer2)
+	if r := strings.TrimRight(strings.TrimSpace(s.Reason), ".;:, "); r != "" {
+		out += ": " + r
 	}
-	return ": " + s.Reason + ";"
+	return out
+}
+
+// FailClosedRemedy is the remediation for a fail-closed refusal. It depends
+// on whether the L7 proxy (Layer 2) is running: with the proxy off (native
+// --lsm-only — unprivileged, or the egress setup failed) --allow-proxy-only
+// cannot help, so suggesting it would mislead.
+func FailClosedRemedy(layer2Active bool) string {
+	if !layer2Active {
+		return "enable the bpf LSM; the L7 proxy is not available in this session (--lsm-only: unprivileged or the native egress setup failed), so proxy-only is not possible even with --allow-proxy-only — fix the egress setup or run as root to make it an option"
+	}
+	return "enable the bpf LSM, or pass --allow-proxy-only to continue with only the L7 proxy"
 }
 
 // Narrow lowers Layer 1 to unavailable (with reason) if it was reported

@@ -112,6 +112,58 @@ func TestClassifyLSMList(t *testing.T) {
 	}
 }
 
+// Review nits from the real-kernel re-check: the remedy must match the
+// session (no "--allow-proxy-only" advice when the proxy is off), and the
+// reason must join without stray punctuation.
+func TestCheckMessages(t *testing.T) {
+	_, inactive := ClassifyLSMList([]byte("lockdown,capability,yama,apparmor"), nil)
+
+	// --allow-proxy-only set, proxy off (--lsm-only): level none.
+	none := Describe(false, false, false)
+	none.Reason = inactive
+	err := none.Check(false)
+	if err == nil {
+		t.Fatal("none must be refused")
+	}
+	msg := err.Error()
+	for _, want := range []string{
+		`enforcement=none (layer1=unavailable layer2=disabled): "bpf" is not among the active LSMs`,
+		"boot parameter; no layer enforces policy, refusing to run the workload",
+		"proxy-only is not possible even with --allow-proxy-only",
+		"fix the egress setup or run as root",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("none message missing %q:\n%s", want, msg)
+		}
+	}
+	for _, bad := range []string{";:", ";;", "pass --allow-proxy-only to continue"} {
+		if strings.Contains(msg, bad) {
+			t.Fatalf("none message contains %q:\n%s", bad, msg)
+		}
+	}
+
+	// Fail-closed with the proxy up: suggest the opt-out.
+	proxy := Describe(false, true, true)
+	proxy.Reason = "an eBPF LSM program failed to attach (see the leashd log)."
+	err = proxy.Check(true)
+	if err == nil {
+		t.Fatal("proxy-only under fail-closed must be refused")
+	}
+	msg = err.Error()
+	if !strings.Contains(msg, "(see the leashd log); fail-closed is in effect, refusing to run the workload unenforced (enable the bpf LSM, or pass --allow-proxy-only to continue with only the L7 proxy)") {
+		t.Fatalf("fail-closed message:\n%s", msg)
+	}
+	if strings.Contains(msg, ".;") {
+		t.Fatalf("stray punctuation:\n%s", msg)
+	}
+
+	// No reason: no dangling colon.
+	bare := Describe(false, false, false)
+	if msg := bare.Check(false).Error(); !strings.HasPrefix(msg, "enforcement=none (layer1=unavailable layer2=disabled); no layer") {
+		t.Fatalf("bare message: %s", msg)
+	}
+}
+
 func TestNarrowNeverRaises(t *testing.T) {
 	full := Describe(true, true, true)
 	n := full.Narrow("client preflight: bpf inactive")

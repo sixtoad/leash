@@ -61,7 +61,7 @@ func NewLSMManager(cgroupPath string, logger *SharedLogger, requireLSM bool) *LS
 // warning — is only reachable when the proxy is actually running.
 func (m *LSMManager) handleAttachFailure(label string, err error) {
 	if m.requireLSM {
-		fmt.Fprintf(os.Stderr, "leash: FATAL: %s LSM failed to attach; refusing to run the workload unenforced (pass --allow-proxy-only to continue proxy-only): %v\n", label, err)
+		fmt.Fprintf(os.Stderr, "leash: FATAL: %s LSM failed to attach (%v); refusing to run the workload unenforced (%s)\n", label, err, failClosedRemedy)
 		os.Exit(1)
 	}
 	markLayer1Degraded()

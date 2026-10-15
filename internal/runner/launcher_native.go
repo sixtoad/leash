@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/strongdm/leash/internal/enforcement"
 	"github.com/strongdm/leash/internal/entrypoint"
 	"github.com/strongdm/leash/internal/leashd/listen"
 	"github.com/strongdm/leash/internal/resolvercontract"
@@ -738,10 +739,10 @@ func leashdFailureReason(path string) string {
 // so --allow-proxy-only cannot apply: proceeding would run with no enforcement.
 func notReadyVerdict(reason string, requireLSM, layer2Active bool, logPath string, logger *log.Logger) error {
 	if !layer2Active {
-		return fmt.Errorf("%s; refusing to run the workload unenforced (fail-closed: the L7 proxy is not active in this session, so proxy-only is not possible even with --allow-proxy-only). See %s", reason, logPath)
+		return fmt.Errorf("%s; refusing to run the workload unenforced (fail-closed: %s). See %s", reason, enforcement.FailClosedRemedy(false), logPath)
 	}
 	if requireLSM {
-		return fmt.Errorf("%s; refusing to run the workload unenforced (fail-closed; pass --allow-proxy-only to proceed with only the L7 proxy). See %s", reason, logPath)
+		return fmt.Errorf("%s; refusing to run the workload unenforced (fail-closed: %s). See %s", reason, enforcement.FailClosedRemedy(true), logPath)
 	}
 	if logger != nil {
 		logger.Printf("Warning: %s; continuing proxy-only (--allow-proxy-only): the workload may run before Layer 1 is active. See %s", reason, logPath)

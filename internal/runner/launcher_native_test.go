@@ -382,6 +382,16 @@ func TestNotReadyVerdict(t *testing.T) {
 		if err != nil && !strings.Contains(err.Error(), "fail-closed") {
 			t.Fatalf("%s: error should say fail-closed: %v", tc.name, err)
 		}
+		// The remedy must reflect the session: with the proxy off,
+		// --allow-proxy-only is not offered as the way out.
+		if err != nil && !tc.layer2 {
+			if strings.Contains(err.Error(), "pass --allow-proxy-only") || !strings.Contains(err.Error(), "fix the egress setup or run as root") {
+				t.Fatalf("%s: wrong remedy for proxy-off session: %v", tc.name, err)
+			}
+		}
+		if err != nil && tc.layer2 && !strings.Contains(err.Error(), "pass --allow-proxy-only") {
+			t.Fatalf("%s: proxy-up session should offer --allow-proxy-only: %v", tc.name, err)
+		}
 	}
 }
 
