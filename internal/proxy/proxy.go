@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"log"
@@ -56,6 +57,21 @@ type MITMProxy struct {
 	// to an IP-bound connection (plain HTTP, SNI-less TLS). nil means the
 	// default resolver; tests stub it.
 	lookupIP func(ctx context.Context, host string) ([]net.IP, error)
+	// upstreamDialContext dials origin TCP connections for the HTTPS paths. nil
+	// means the marked dialer (SO_MARK on Linux, plain dial elsewhere); tests
+	// point it at a local origin.
+	upstreamDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+	// upstreamRootCAs verifies origin certificates; nil means the system roots.
+	upstreamRootCAs *x509.CertPool
+}
+
+// dialUpstream opens a TCP connection to an origin, marked on Linux so the
+// netfilter redirect skips the proxy's own traffic.
+func (p *MITMProxy) dialUpstream(ctx context.Context, network, addr string) (net.Conn, error) {
+	if p.upstreamDialContext != nil {
+		return p.upstreamDialContext(ctx, network, addr)
+	}
+	return createMarkedDialer().DialContext(ctx, network, addr)
 }
 
 // sockaddr_in structure for SO_ORIGINAL_DST
@@ -110,9 +126,7 @@ func createMarkedDialer() *net.Dialer {
 // connection was permitted via its destination IP, issue #154). An empty
 // serverName falls back to addr's host.
 func (p *MITMProxy) createMarkedTLSConnection(addr, serverName string) (*tls.Conn, error) {
-	markedDialer := createMarkedDialer()
-
-	conn, err := markedDialer.DialContext(context.Background(), "tcp", addr)
+	conn, err := p.dialUpstream(context.Background(), "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +141,7 @@ func (p *MITMProxy) createMarkedTLSConnection(addr, serverName string) (*tls.Con
 	// Trim brackets for IPv6 literals
 	serverName = strings.Trim(serverName, "[]")
 
-	tlsConn := tls.Client(conn, &tls.Config{ServerName: serverName})
+	tlsConn := tls.Client(conn, &tls.Config{ServerName: serverName, RootCAs: p.upstreamRootCAs})
 
 	return tlsConn, nil
 }
@@ -635,16 +649,21 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 	}
 
 	var actualHostname string
+	var alpn alpnDecision
 
-	// Wrap the connection with TLS using dynamic certificate generation.
-	// NextProtos advertises both h2 and http/1.1 so that clients using ALPN
-	// (e.g. the Cursor CLI, gRPC) complete the handshake successfully. After
-	// the handshake we inspect NegotiatedProtocol and tunnel h2 connections
-	// transparently instead of attempting HTTP/1.1 MITM (which would fail with
-	// "malformed HTTP request/response" errors on the HTTP/2 binary framing).
+	getCert := func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return p.getCertificate(actualHostname)
+	}
+
+	// The ALPN list is chosen per connection from the SNI hostname (issue #57).
+	// Hosts with a request-level feature (header rewrite, MCP policy/observability)
+	// are offered only http/1.1 so their requests go through the inspected
+	// HTTP/1.1 path below; other hosts are offered h2 + http/1.1 so clients using
+	// ALPN (e.g. the Cursor CLI, gRPC) still get h2, which is tunneled
+	// transparently after the handshake instead of being parsed as HTTP/1.1
+	// (which would fail with "malformed HTTP request/response" errors).
 	tlsConfig := &tls.Config{
-		NextProtos: []string{"h2", "http/1.1"},
-		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 			// Use the SNI (Server Name Indication) to get the correct hostname
 			actualHostname = hello.ServerName
 			if actualHostname == "" {
@@ -656,8 +675,11 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 					actualHostname = strings.Trim(host, "[]")
 				}
 			}
-
-			return p.getCertificate(actualHostname)
+			alpn = p.chooseALPN(actualHostname, hello.SupportedProtos)
+			return &tls.Config{
+				NextProtos:     alpn.nextProto,
+				GetCertificate: getCert,
+			}, nil
 		},
 	}
 
@@ -666,9 +688,11 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 
 	// Handle the TLS connection
 	if err := tlsConn.Handshake(); err != nil {
+		p.logALPNDecision(alpn, "", err)
 		log.Printf("TLS handshake error for %s: %v", originalDest, err)
 		return
 	}
+	p.logALPNDecision(alpn, tlsConn.ConnectionState().NegotiatedProtocol, nil)
 
 	// Resolve destination + SNI hostname and enforce the connect policy BEFORE
 	// anything else — crucially before the h2 tunnel below. Previously the h2
@@ -794,8 +818,7 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 func (p *MITMProxy) tunnelH2(clientConn net.Conn, upstream tlsUpstream) {
 	targetHost := upstream.addr
 
-	markedDialer := createMarkedDialer()
-	rawConn, err := markedDialer.DialContext(context.Background(), "tcp", targetHost)
+	rawConn, err := p.dialUpstream(context.Background(), "tcp", targetHost)
 	if err != nil {
 		log.Printf("h2 tunnel: failed to connect to %s: %v", targetHost, err)
 		return
@@ -807,6 +830,7 @@ func (p *MITMProxy) tunnelH2(clientConn net.Conn, upstream tlsUpstream) {
 	originConn := tls.Client(rawConn, &tls.Config{
 		ServerName: serverName,
 		NextProtos: []string{"h2", "http/1.1"},
+		RootCAs:    p.upstreamRootCAs,
 	})
 	if err := originConn.Handshake(); err != nil {
 		log.Printf("h2 tunnel: TLS handshake to origin %s failed: %v", targetHost, err)
