@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -113,13 +112,12 @@ func (l *ExecLsm) LoadPolicies(policies []ExecPolicyRule) error {
 	if err := validateExecPolicyRules(policies); err != nil {
 		return err
 	}
-	l.policyRules = policies
+	l.policyRules = append([]ExecPolicyRule(nil), policies...)
 	l.numPolicyRules = len(policies)
 
-	// Sort policy rules by path length (longest first) for specificity
-	sort.Slice(l.policyRules, func(i, j int) bool {
-		return l.policyRules[i].PathLen > l.policyRules[j].PathLen
-	})
+	// Longest path first; at equal length deny before allow (#135). The BPF
+	// scan takes the first match, so this order is the precedence.
+	sortExecRulesByPrecedence(l.policyRules)
 
 	// Check if root path "/" is allowed to set default policy result
 	l.checkRootPathPolicy()

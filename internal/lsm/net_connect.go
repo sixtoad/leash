@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -249,13 +248,9 @@ func (l *ConnectLsm) LoadPolicies(policies []ConnectPolicyRule, defaultOverride 
 	l.policyRules = expanded
 	l.numPolicyRules = len(expanded)
 
-	// Sort by port then IP for readability (optional)
-	sort.Slice(l.policyRules, func(i, j int) bool {
-		if l.policyRules[i].DestPort == l.policyRules[j].DestPort {
-			return l.policyRules[i].DestIP < l.policyRules[j].DestIP
-		}
-		return l.policyRules[i].DestPort < l.policyRules[j].DestPort
-	})
+	// The BPF scan takes the first match: every deny goes first so a matching
+	// forbid always wins (#135), then by port and IP for a stable order.
+	sortConnectBPFRulesByPrecedence(l.policyRules)
 
 	if !explicitDefault {
 		// Check if root path "/" is allowed to set default policy result
@@ -520,7 +515,8 @@ type SimplePolicyChecker struct {
 // NewSimplePolicyChecker creates a new policy checker with the given rules
 func NewSimplePolicyChecker(rules []ConnectPolicyRule, defaultPolicy bool, mcpRules []MCPPolicyRule) *SimplePolicyChecker {
 	return &SimplePolicyChecker{
-		rules:         rules,
+		// First match wins below; denies first so forbid overrides permit (#135).
+		rules:         connectRulesByPrecedence(rules),
 		defaultPolicy: defaultPolicy,
 		mcpRules:      normalizeMCPRules(mcpRules),
 	}
@@ -629,6 +625,8 @@ func normalizeMCPRules(rules []MCPPolicyRule) []MCPPolicyRule {
 			Tool:   tool,
 		})
 	}
+	// CheckMCPCall takes the first match; denies first (#135).
+	mcpRulesByPrecedence(out)
 	return out
 }
 

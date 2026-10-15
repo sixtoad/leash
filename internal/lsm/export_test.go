@@ -1,19 +1,16 @@
 package lsm
 
-import (
-	"reflect"
-	"sort"
-)
+import "reflect"
 
 // OpenDecisionForTest runs rules through the same pipeline LoadPolicies uses
-// (conversion, longest-first stable sort, root default, full-byte index
+// (conversion, precedence sort, root default, full-byte index
 // compilation) and evaluates path/operation with the userspace model of
 // check_open_indexed_policy. It lets external tests (package lsm_test) check
 // front-end output (Cedar, line format) against enforcement semantics without
 // a kernel.
 func OpenDecisionForTest(rules []PolicyRule, path string, operation uint32) uint32 {
 	converted := ConvertToFileOpenRules(rules)
-	sort.SliceStable(converted, func(i, j int) bool { return converted[i].PathLen > converted[j].PathLen })
+	sortOpenRulesByPrecedence(converted)
 	return indexedOpenDecision(compileOpenIndex(converted), rootPathPolicy(converted), path, operation)
 }
 
@@ -23,7 +20,7 @@ func OpenDecisionForTest(rules []PolicyRule, path string, operation uint32) uint
 func SameKernelIndexesForTest(a, b []PolicyRule) bool {
 	compile := func(rules []PolicyRule) (compiledOpenIndex, compiledMutationIndex, bool) {
 		converted := ConvertToFileOpenRules(rules)
-		sort.SliceStable(converted, func(i, j int) bool { return converted[i].PathLen > converted[j].PathLen })
+		sortOpenRulesByPrecedence(converted)
 		return compileOpenIndex(converted), compileMutationIndex(converted), rootPathPolicy(converted)
 	}
 	openA, mutA, rootA := compile(a)
