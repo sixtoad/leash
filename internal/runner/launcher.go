@@ -316,6 +316,11 @@ func (c containerLauncher) Provision(ctx context.Context, stopSignal string) (st
 		}
 		return "", err
 	}
+	// Fail closed if the engine accepted but did not apply a requested limit,
+	// and report what it applied (#116).
+	if err := c.r.verifyTargetResourceLimits(ctx); err != nil {
+		return "", err
+	}
 	if err := c.r.prepareIDMapVolumes(ctx); err != nil {
 		return "", err
 	}

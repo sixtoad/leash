@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/pelletier/go-toml/v2"
@@ -216,10 +217,48 @@ func decodeConfig(data []byte, path string, cfg *Config) error {
 				cfg.EnvVars[trimmedKey] = strVal
 			}
 		}
+		if rawRes, present := leash["resources"]; present {
+			resTable, ok := rawRes.(map[string]any)
+			if !ok {
+				return fmt.Errorf("parse leash.resources: expected table")
+			}
+			for key, rawVal := range resTable {
+				val, err := resourceValueString(rawVal)
+				if err != nil {
+					return fmt.Errorf("parse leash.resources.%s: %w", key, err)
+				}
+				switch key {
+				case "cpus":
+					cfg.Resources.CPUs = val
+				case "memory":
+					cfg.Resources.Memory = val
+				case "pids_limit":
+					cfg.Resources.PidsLimit = val
+				default:
+					return fmt.Errorf("parse leash.resources.%s: unknown key (supported: cpus, memory, pids_limit)", key)
+				}
+			}
+		}
 	}
 
 	cfg.ensureInitialized()
 	return nil
+}
+
+// resourceValueString accepts a resource limit written as a TOML string or
+// number (cpus = 1.5, pids_limit = 256, memory = "2g") and returns it as text;
+// the runner validates the value itself.
+func resourceValueString(v any) (string, error) {
+	switch t := v.(type) {
+	case string:
+		return strings.TrimSpace(t), nil
+	case int64:
+		return strconv.FormatInt(t, 10), nil
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64), nil
+	default:
+		return "", fmt.Errorf("expected string or number, got %T", v)
+	}
 }
 
 // LoadWithOverlay loads the global XDG configuration and then, if a
@@ -425,6 +464,24 @@ func buildPersisted(cfg Config) persistedConfig {
 			}
 			result.Leash["envvars"] = envCopy
 		}
+	}
+
+	// Persist resource limits so a Save of a loaded config doesn't drop them.
+	res := make(map[string]string)
+	if v := strings.TrimSpace(cfg.Resources.CPUs); v != "" {
+		res["cpus"] = v
+	}
+	if v := strings.TrimSpace(cfg.Resources.Memory); v != "" {
+		res["memory"] = v
+	}
+	if v := strings.TrimSpace(cfg.Resources.PidsLimit); v != "" {
+		res["pids_limit"] = v
+	}
+	if len(res) > 0 {
+		if result.Leash == nil {
+			result.Leash = make(map[string]any)
+		}
+		result.Leash["resources"] = res
 	}
 
 	return result
