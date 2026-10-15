@@ -193,19 +193,42 @@ func (m *LSMManager) updateExecLSM(policies *PolicySet) error {
 	return nil
 }
 
-func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
-	var defaultOverride *bool
+// connectDefaultOverride decides the kernel connect LSM's default verdict
+// override for a policy set. It is a pure function so the decision can be unit
+// tested without a kernel.
+//
+//   - An explicit default (e.g. `forbid ... Host::"*"`) always wins.
+//   - With connect rules present and no explicit default, nil is returned and
+//     ConnectLsm.LoadPolicies derives the default from the rules (an allow
+//     wildcard `Host::"*"` or an any-destination allow => allow, else deny).
+//   - With NO connect rules, the kernel mirrors the proxy's default
+//     (ConnectDefaultAllow, which is false unless the policy explicitly
+//     permitted network access). A nil override with empty rules makes
+//     LoadPolicies fall back to deny.
+//
+// The connect LSM is always attached (issue #118): a policy that never mentions
+// the network must not leave IPv4 egress unenforced.
+func connectDefaultOverride(policies *PolicySet) *bool {
+	if policies == nil {
+		return nil
+	}
 	if policies.ConnectDefaultExplicit {
 		val := policies.ConnectDefaultAllow
-		defaultOverride = &val
+		return &val
 	}
+	if len(policies.Connect) == 0 && policies.ConnectDefaultAllow {
+		val := true
+		return &val
+	}
+	return nil
+}
 
+func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
+	defaultOverride := connectDefaultOverride(policies)
+	rules := ConvertToConnectRules(policies.Connect)
 	if !policies.HasConnectPolicies() {
-		if m.connectLsm != nil {
-			fmt.Printf("No connect policies found, connect LSM will continue with empty rules\n")
-			return m.connectLsm.LoadPolicies([]ConnectPolicyRule{}, defaultOverride)
-		}
-		return nil
+		fmt.Printf("No connect policies found; connect LSM enforces the default (deny unless network is explicitly permitted)\n")
+		rules = []ConnectPolicyRule{}
 	}
 
 	if m.connectLsm == nil {
@@ -215,7 +238,7 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to create connect LSM: %w", err)
 		}
 
-		if err := m.connectLsm.LoadPolicies(ConvertToConnectRules(policies.Connect), defaultOverride); err != nil {
+		if err := m.connectLsm.LoadPolicies(rules, defaultOverride); err != nil {
 			return fmt.Errorf("failed to load connect policies: %w", err)
 		}
 
@@ -225,11 +248,10 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 				m.handleAttachFailure("connect", err)
 			}
 		}()
-	} else {
-		return m.connectLsm.LoadPolicies(ConvertToConnectRules(policies.Connect), defaultOverride)
+		return nil
 	}
 
-	return nil
+	return m.connectLsm.LoadPolicies(rules, defaultOverride)
 }
 
 // UpdateRuntimeRules updates all LSM modules with new runtime rules

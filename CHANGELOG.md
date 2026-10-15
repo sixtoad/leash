@@ -144,6 +144,18 @@ Claude Code handling on top.
   fields recomputed from the statuses rather than trusted from the document.
 
 ### Changed
+- **Behavior change — egress is denied when a policy has no `NetworkConnect`
+  rules (#118).** The kernel connect LSM is now always created and attached.
+  Previously a policy with file/exec rules but no network rules never attached
+  it, so every outbound IPv4 connection that was not redirected through the
+  proxy (anything other than TCP 80/443, including raw TCP and UDP) was
+  allowed. The kernel default now mirrors the proxy's default: **deny**, unless
+  the policy explicitly permits network access
+  (`permit (principal, action == Action::"NetworkConnect", resource) when { resource in [ Host::"*" ] };`)
+  or sets an explicit default. As with policies that already had connect rules,
+  this also denies DNS and loopback from the target unless the resolver /
+  address is permitted. Policies that relied on the old implicit allow must add
+  explicit `NetworkConnect` permits.
 - **`enforcing` is derived per platform** rather than a compile-time `true`. It
   reports whether *this binary* carries an enforcement path: `true` on linux
   (eBPF LSM programs + MITM proxy) and `true` on darwin, whose runtime
