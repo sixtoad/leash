@@ -8,6 +8,8 @@
 
 MITM_PORT=${1:-18000}
 LEASH_PORT=${2:-}
+# TARGET_CGROUP is relative to the cgroup2 root (e.g. system.slice/foo.service);
+# xt_cgroup resolves --path against the unified hierarchy root, not /sys/fs/cgroup.
 TARGET_CGROUP=${3:-}
 PROXY_MARK=${PROXY_MARK:-0x2000}
 
