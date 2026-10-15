@@ -156,6 +156,21 @@ Claude Code handling on top.
   this also denies DNS and loopback from the target unless the resolver /
   address is permitted. Policies that relied on the old implicit allow must add
   explicit `NetworkConnect` permits.
+- **Behavior change — file opens and execs are denied when a policy has no
+  file / exec rules.** The kernel file-open LSM (which also carries the
+  directory-mutation and link hooks) and the exec LSM are now always created
+  and attached, like the connect LSM above (#139). Previously a policy with no
+  `FileOpen*` rules (or no `ProcessExec` rules) never attached that program, so
+  the whole category was unenforced, while removing the last rule from an
+  already-attached program denied it. The kernel default is now Cedar's:
+  **deny**, unless the policy permits the root path
+  (`permit (principal, action == Action::"ProcessExec", resource) when { resource in [ Dir::"/" ] };`,
+  likewise for the `FileOpen*` actions). Each category is decided only from its
+  own rules. The workload's own start (launcher shell, leash helpers, dynamic
+  loader and libraries, `/proc`) runs under policy, so a policy must permit what
+  the workload needs in every category, as policies with file rules already
+  had to. The built-in bootstrap policy (no policy file) permits `Dir::"/"` for
+  both and is unaffected.
 - **`enforcing` is derived per platform** rather than a compile-time `true`. It
   reports whether *this binary* carries an enforcement path: `true` on linux
   (eBPF LSM programs + MITM proxy) and `true` on darwin, whose runtime
