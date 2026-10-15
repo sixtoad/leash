@@ -45,7 +45,7 @@ type MITMProxy struct {
 	sharedLogger   *lsm.SharedLogger // Shared event logger
 	policyChecker  PolicyChecker     // Connect policy enforcement
 	httpClient     *http.Client      // Custom HTTP client with marked connections
-	tlsDialer      func(string) (*tls.Conn, error)
+	tlsDialer      func(addr, serverName string) (*tls.Conn, error)
 	mcpObserver    *mcpObserver
 	// useProxyProtocol makes the proxy read the original destination from a PROXY
 	// protocol v1 header instead of SO_ORIGINAL_DST. Used on platforms without a
@@ -104,19 +104,25 @@ func createMarkedDialer() *net.Dialer {
 	}
 }
 
-// createMarkedTLSConnection creates a TLS connection with marked socket to avoid proxy loops
-func (p *MITMProxy) createMarkedTLSConnection(targetHost string) (*tls.Conn, error) {
+// createMarkedTLSConnection creates a TLS connection with marked socket to
+// avoid proxy loops. addr is dialed; serverName is sent as SNI and the origin
+// certificate is verified against it (it may differ from addr's host when the
+// connection was permitted via its destination IP, issue #154). An empty
+// serverName falls back to addr's host.
+func (p *MITMProxy) createMarkedTLSConnection(addr, serverName string) (*tls.Conn, error) {
 	markedDialer := createMarkedDialer()
 
-	conn, err := markedDialer.DialContext(context.Background(), "tcp", targetHost)
+	conn, err := markedDialer.DialContext(context.Background(), "tcp", addr)
 	if err != nil {
 		return nil, err
 	}
 
-	// Extract hostname for SNI; handle IPv6 [addr]:port correctly
-	serverName := targetHost
-	if h, _, err := net.SplitHostPort(targetHost); err == nil {
-		serverName = h
+	if serverName == "" {
+		// Extract hostname for SNI; handle IPv6 [addr]:port correctly
+		serverName = addr
+		if h, _, err := net.SplitHostPort(addr); err == nil {
+			serverName = h
+		}
 	}
 	// Trim brackets for IPv6 literals
 	serverName = strings.Trim(serverName, "[]")
@@ -687,36 +693,26 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 		return
 	}
 
+	// Pick a dial destination the policy actually permitted: the SNI name when
+	// the name itself is permitted, otherwise the original destination IP with
+	// the SNI preserved for the upstream handshake (issue #154).
+	upstream := p.selectTLSUpstream(actualHostname, originalDest, destHost, destPort, uint16(portNum))
+
 	// Policy passed. If the client negotiated HTTP/2 via ALPN, tunnel transparently
 	// to the origin. Full h2 MITM (framing, HPACK, flow control) is complex; the
 	// tunnel preserves h2 semantics, and the connect policy above already gated it.
 	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
-		p.tunnelH2(tlsConn, originalDest, actualHostname)
+		p.tunnelH2(tlsConn, upstream)
 		return
 	}
 
-	// HTTP/1.1 path: resolve the upstream target for the per-request MITM below.
-	// Use the hostname from SNI if available, otherwise fall back to originalDest.
-	targetHost := actualHostname
-	if targetHost == "" || net.ParseIP(targetHost) != nil {
-		targetHost = originalDest
-	} else {
-		// For hostname, preserve port from originalDest
-		_, port, err := net.SplitHostPort(originalDest)
-		if err == nil {
-			targetHost = net.JoinHostPort(targetHost, port)
-		}
-	}
-
-	// Every request on this connection is forwarded to targetHost, so that is
-	// the only host request-level decisions may be made for: the SNI name
-	// (connect-policy-checked above and dialed by name), or the original
-	// destination when there is no hostname SNI (issue #149).
-	authorityHost, authorityPort, splitErr := net.SplitHostPort(targetHost)
-	if splitErr != nil {
-		authorityHost, authorityPort = targetHost, destPort
-	}
-	authority := newConnAuthority(authorityHost, authorityPort, actualHostname)
+	// Every request on this connection is forwarded to the upstream, which is
+	// authenticated as upstream.serverName on the upstream handshake, so that
+	// is the only host request-level decisions may be made for: the SNI name,
+	// or the original destination when there is no hostname SNI (issue #149).
+	authority := newConnAuthority(upstream.serverName, destPort, actualHostname)
+	// targetHost is the request authority (URL host) sent upstream.
+	targetHost := net.JoinHostPort(authority.host, destPort)
 
 	// Handle HTTP requests over the TLS connection
 	bufferedReader := bufio.NewReader(tlsConn)
@@ -775,7 +771,7 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 		// Apply header rewriting rules for the verified host only.
 		p.headerRewriter.ApplyRulesForHost(req, verifiedHost)
 
-		responseCode, _, sessionHeader, forwardErr := p.forwardTransparentHTTPS(tlsConn, req, targetHost, mcpCtx)
+		responseCode, _, sessionHeader, forwardErr := p.forwardTransparentHTTPS(tlsConn, req, upstream, mcpCtx)
 
 		if mcpCtx != nil {
 			outcome := classifyOutcome(responseCode, forwardErr)
@@ -793,15 +789,10 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 // with h2 in NextProtos, and the two sides are piped together.
 //
 // Policy enforcement (connect allow/deny) has already happened in
-// handleTransparentHTTPS before this function is called.
-func (p *MITMProxy) tunnelH2(clientConn net.Conn, originalDest, targetHostname string) {
-	targetHost := originalDest
-	if targetHostname != "" {
-		_, port, err := net.SplitHostPort(originalDest)
-		if err == nil {
-			targetHost = net.JoinHostPort(targetHostname, port)
-		}
-	}
+// handleTransparentHTTPS before this function is called, and upstream is the
+// destination it permitted (issue #154).
+func (p *MITMProxy) tunnelH2(clientConn net.Conn, upstream tlsUpstream) {
+	targetHost := upstream.addr
 
 	markedDialer := createMarkedDialer()
 	rawConn, err := markedDialer.DialContext(context.Background(), "tcp", targetHost)
@@ -811,12 +802,7 @@ func (p *MITMProxy) tunnelH2(clientConn net.Conn, originalDest, targetHostname s
 	}
 	defer rawConn.Close()
 
-	serverName := targetHostname
-	if serverName == "" {
-		if h, _, err := net.SplitHostPort(targetHost); err == nil {
-			serverName = strings.Trim(h, "[]")
-		}
-	}
+	serverName := strings.Trim(upstream.serverName, "[]")
 
 	originConn := tls.Client(rawConn, &tls.Config{
 		ServerName: serverName,
@@ -849,13 +835,14 @@ func (p *MITMProxy) tunnelH2(clientConn net.Conn, originalDest, targetHostname s
 	wg.Wait()
 }
 
-func (p *MITMProxy) forwardTransparentHTTPS(clientConn net.Conn, req *http.Request, targetHost string, mcpCtx *mcpRequestContext) (int, string, string, error) {
+func (p *MITMProxy) forwardTransparentHTTPS(clientConn net.Conn, req *http.Request, upstream tlsUpstream, mcpCtx *mcpRequestContext) (int, string, string, error) {
+	targetHost := upstream.addr
 	// Create marked TLS connection to target to avoid proxy loops
 	dialer := p.tlsDialer
 	if dialer == nil {
 		dialer = p.createMarkedTLSConnection
 	}
-	targetConn, err := dialer(targetHost)
+	targetConn, err := dialer(upstream.addr, upstream.serverName)
 	if err != nil {
 		log.Printf("Error connecting to target %s: %v", targetHost, err)
 		return 0, "", "", err
