@@ -103,6 +103,10 @@ const (
 	// enforcement matches over every byte. Longer rules are rejected when the
 	// policy loads (fail closed); none is silently skipped.
 	CapabilityPolicyPathLimits = "policy-path-limits"
+	// CapabilityAuthzSocket means `--inject-service` accepts authz=<Ns> (and
+	// id=) and leashd serves that plugin a private Cedar authorization socket
+	// speaking protocol v1 (pkg/authz, docs/design/AUTHZ-SERVICE.md).
+	CapabilityAuthzSocket = "authz-socket"
 )
 
 // Enforced policy path limits, in bytes of the resolved path (a directory
@@ -142,6 +146,7 @@ var capabilities = []string{
 	CapabilityResolverContractJSON,
 	CapabilityIDMapVolume,
 	CapabilityPolicyPathLimits,
+	CapabilityAuthzSocket,
 }
 
 // Capabilities returns the surface names this build advertises. The slice is a

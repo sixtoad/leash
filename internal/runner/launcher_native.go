@@ -167,8 +167,16 @@ func (n nativeLauncher) StartEnforcement(ctx context.Context, cgroupPath string)
 			blocker, strings.Join(argv, " "))
 	}
 
+	// The authz sockets must be described before leashd starts: it binds them.
+	if err := n.r.prepareAuthz(); err != nil {
+		return err
+	}
+	authzEnv, err := n.r.authzLeashdEnv()
+	if err != nil {
+		return err
+	}
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
-	cmd.Env = append(os.Environ(), n.leashdEnv()...)
+	cmd.Env = append(append(os.Environ(), n.leashdEnv()...), authzEnv...)
 	// Native runs leashd in the same TTY as the (interactive) workload, so its
 	// ongoing proxy/LSM logs would corrupt the agent's TUI. Send them to a file
 	// instead — the container path sends leashd logs to the runtime, not the
@@ -259,7 +267,14 @@ func (n nativeLauncher) injectOne(ctx context.Context, svc injectService) error 
 func (r *runner) checkInjectDuplicates(backend string) error {
 	seenSocket := make(map[string]bool, len(r.opts.injectServices))
 	seenEnv := make(map[string]bool, len(r.opts.injectServices))
+	seenID := make(map[string]bool, len(r.opts.injectServices))
 	for _, svc := range r.opts.injectServices {
+		if len(svc.authz) > 0 {
+			if seenID[svc.authzID()] {
+				return fmt.Errorf("%s: duplicate --inject-service authz id %q (set id=)", backend, svc.authzID())
+			}
+			seenID[svc.authzID()] = true
+		}
 		if seenSocket[svc.socket] {
 			return fmt.Errorf("%s: duplicate --inject-service socket %q", backend, svc.socket)
 		}
@@ -332,9 +347,13 @@ func (r *runner) spawnInjectService(ctx context.Context, svc injectService) erro
 	if err != nil {
 		return err
 	}
+	if err := r.prepareAuthz(); err != nil {
+		return err
+	}
 	injectEnv := []string{
 		injectSocketEnv + "=" + svc.socket,
 	}
+	injectEnv = append(injectEnv, r.authzPluginEnv(svc)...)
 	if configFile != "" {
 		injectEnv = append(injectEnv, injectConfigFileEnv+"="+configFile)
 	}
@@ -433,6 +452,7 @@ func (r *runner) teardownInjectedPlugins() {
 	for _, sock := range r.injectedCleanup {
 		_ = os.Remove(sock)
 	}
+	r.teardownAuthz()
 }
 
 // removeStaleSocket removes a leftover plugin socket so the plugin can bind fresh.
