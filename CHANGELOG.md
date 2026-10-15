@@ -163,6 +163,14 @@ Claude Code handling on top.
   would make the two diverge: `-e LEASH_REQUIRE_LSM` / `-e
   LEASH_ALLOW_PROXY_ONLY` and posture flags inside `LEASH_EXTRA_ARGS`.
 - The enforcement-ready marker is written atomically (temp file + rename).
+- **Layer 1 is reported active only when the kernel confirms it.** On a kernel
+  with `CONFIG_BPF_LSM=y` but `bpf` not in `/sys/kernel/security/lsm` (Ubuntu
+  24.04's default) the LSM programs attach and are never invoked; leashd now
+  also requires `bpf` in the active list (an unreadable list counts as not
+  active), so that case fails closed by default and reports `proxy-only` with
+  a `reason` under `--allow-proxy-only`. The client's own preflight can only
+  narrow the reported level, and a native refusal now echoes leashd's FATAL
+  reason instead of only pointing at the log.
 
 ### Fixed — remedy text that could break the host
 - **`leash doctor` could tell an operator to set `lsm=,bpf`** — a leading-comma

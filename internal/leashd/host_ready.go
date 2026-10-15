@@ -21,7 +21,8 @@ func enableEnforcementReady(cfg *runtimeConfig) {
 	var once sync.Once
 	lsm.SetEnforcementSettledHook(func() {
 		once.Do(func() {
-			st := effectiveEnforcement(cfg, lsm.Layer1Degraded(), lsm.Layer1AttachedPrograms())
+			lsmState, lsmReason := enforcement.ClassifyLSMList(readActiveLSMList())
+			st := effectiveEnforcement(cfg, lsm.Layer1Degraded(), lsm.Layer1AttachedPrograms(), lsmState, lsmReason)
 			// Never publish the release marker for a level the posture forbids
 			// (e.g. "none": --allow-proxy-only with the proxy also off, or no
 			// LSM program attached under fail-closed). Exiting without the
@@ -36,17 +37,42 @@ func enableEnforcementReady(cfg *runtimeConfig) {
 	})
 }
 
+// readActiveLSMList reads the kernel's active-LSM list. In container mode the
+// leash sidecar mounts securityfs itself (see configureNetwork), so this reads
+// the host kernel's list; a read failure is treated as "not confirmed" and
+// fails closed under the default posture. Tests substitute a fake.
+var readActiveLSMList = func() ([]byte, error) { return os.ReadFile(enforcement.ActiveLSMPath) }
+
 // effectiveEnforcement states the enforcement level once every LSM attach has
-// settled. Layer 1 counts as available only with a scopable cgroup, no attach
-// failure and at least one attached program; Layer 2 is off in --lsm-only
-// mode.
-func effectiveEnforcement(cfg *runtimeConfig, layer1Degraded bool, attachedPrograms int) enforcement.Status {
-	layer1 := !layer1Degraded && attachedPrograms > 0
-	if cfg == nil {
-		return enforcement.Describe(layer1, true, true)
+// settled. Layer 1 counts as active only with a scopable cgroup, no attach
+// failure, at least one attached program AND "bpf" confirmed in the kernel's
+// active-LSM list — attach success alone proves nothing (CONFIG_BPF_LSM=y with
+// bpf inactive attaches programs that are never invoked). Layer 2 is off in
+// --lsm-only mode.
+func effectiveEnforcement(cfg *runtimeConfig, layer1Degraded bool, attachedPrograms int, lsmState enforcement.LSMListState, lsmReason string) enforcement.Status {
+	reason := ""
+	switch {
+	case cfg != nil && strings.TrimSpace(cfg.CgroupPath) == "":
+		reason = "no scopable cgroup for the workload, so eBPF LSM enforcement cannot be scoped to it"
+	case layer1Degraded:
+		reason = "an eBPF LSM program failed to attach (see the leashd log)"
+	case attachedPrograms <= 0:
+		reason = "no eBPF LSM program is attached"
+	case lsmState != enforcement.LSMListActive:
+		reason = lsmReason
+		if reason == "" {
+			reason = "the bpf LSM could not be confirmed active"
+		}
 	}
-	layer1 = layer1 && strings.TrimSpace(cfg.CgroupPath) != ""
-	return enforcement.Describe(layer1, !cfg.LSMOnly, cfg.failClosed())
+	layer1 := reason == ""
+	var st enforcement.Status
+	if cfg == nil {
+		st = enforcement.Describe(layer1, true, true)
+	} else {
+		st = enforcement.Describe(layer1, !cfg.LSMOnly, cfg.failClosed())
+	}
+	st.Reason = reason
+	return st
 }
 
 func statusFields(st enforcement.Status) map[string]any {
@@ -56,6 +82,7 @@ func statusFields(st enforcement.Status) map[string]any {
 		"layer2":         st.Layer2,
 		"requireLSM":     st.RequireLSM,
 		"allowProxyOnly": st.AllowProxyOnly,
+		"reason":         st.Reason,
 	}
 }
 
@@ -71,7 +98,7 @@ func enableHostMode() {
 // effective enforcement level (issue #117). Also called on the
 // skip-enforcement path.
 func writeEnforcementReadyMarker(dir string, status enforcement.Status) {
-	log.Printf("leash: effective enforcement: %s (layer1=%s layer2=%s requireLSM=%t)", status.Enforcement, status.Layer1, status.Layer2, status.RequireLSM)
+	log.Printf("leash: effective enforcement: %s (layer1=%s layer2=%s requireLSM=%t)%s", status.Enforcement, status.Layer1, status.Layer2, status.RequireLSM, reasonNote(status.Reason))
 	logPolicyEvent("enforcement.level", statusFields(status))
 	if strings.TrimSpace(dir) == "" {
 		return
@@ -84,6 +111,13 @@ func writeEnforcementReadyMarker(dir string, status enforcement.Status) {
 	if err := writeFileAtomic(path, append(data, '\n'), 0o644); err != nil {
 		log.Printf("Warning: failed to write enforcement-ready marker %s: %v", path, err)
 	}
+}
+
+func reasonNote(reason string) string {
+	if reason == "" {
+		return ""
+	}
+	return ": " + reason
 }
 
 // writeFileAtomic writes via a temp file in the same directory and renames it

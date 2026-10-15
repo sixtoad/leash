@@ -130,6 +130,9 @@ func (r *runner) preflightHostKernel() error {
 		return nil
 	}
 	status := classifyBPFLSM(active, readKernelConfigBPFLSM())
+	if status != bpfLSMActive {
+		r.layer1PreflightDown = fmt.Sprintf("bpf is not an active LSM on this host (%s)", strings.Join(active, ","))
+	}
 	warn, err := decideBPFLSM(status, active, r.cfg.requireLSM)
 	if err != nil {
 		return err

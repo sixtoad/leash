@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -706,7 +707,37 @@ func nativeReadyTimeout(configured time.Duration) time.Duration {
 // AND an active Layer 2 warn and proceed (degrade to the proxy). The leashd log
 // has the specifics either way.
 func (n nativeLauncher) notReady(reason string) error {
+	if detail := leashdFailureReason(n.leashdLogPath()); detail != "" {
+		reason += " (leashd: " + detail + ")"
+	}
 	return notReadyVerdict(reason, n.r.cfg.requireLSM, n.layer2Active(), n.leashdLogPath(), n.r.logger)
+}
+
+// leashdFailureReason returns the last FATAL line from the leashd log, so a
+// refusal names the cause instead of only pointing at the log. Reads at most
+// the final 64 KiB.
+func leashdFailureReason(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	const tail = 64 << 10
+	if info, err := f.Stat(); err == nil && info.Size() > tail {
+		_, _ = f.Seek(info.Size()-tail, io.SeekStart)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(data), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if idx := strings.Index(line, "FATAL:"); idx >= 0 {
+			return strings.TrimSpace(line[idx+len("FATAL:"):])
+		}
+	}
+	return ""
 }
 
 // notReadyVerdict is notReady's pure decision. Without Layer 2 (rootless, or

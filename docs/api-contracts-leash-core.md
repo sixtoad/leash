@@ -271,9 +271,10 @@ Two traps that snippet avoids. Decoding straight into value types makes `null`, 
 
 ```jsonc
 {"enforcement": "lsm", "layer1": "active", "layer2": "active", "requireLSM": true, "allowProxyOnly": false}
+// when Layer 1 is not active, a "reason" string says why
 ```
 
-`enforcement` is `lsm` (Layer 1 attached), `proxy-only` (Layer 1 unavailable, only reachable with `--allow-proxy-only`) or `none` (enforcement skipped). `layer1` is `active` | `unavailable`; `layer2` is `active` | `disabled` (`--lsm-only`). The client prints `leash: enforcement=<level> layer1=<state> layer2=<state>` on the diagnostic stream — always under `--machine-output` (stderr), always when the level is not `lsm`, otherwise with `--verbose`. An older leashd writes a bare `ready` line, for which nothing is printed.
+`enforcement` is `lsm` (Layer 1 active: every LSM program attached, at least one did, the workload has a scopable cgroup, **and** `bpf` is listed in `/sys/kernel/security/lsm` — attach success alone is not enough, since with `CONFIG_BPF_LSM=y` but bpf inactive the programs attach and never run; an unreadable list counts as not active), `proxy-only` (Layer 1 unavailable, only reachable with `--allow-proxy-only`) or `none` (enforcement skipped). `layer1` is `active` | `unavailable`; `layer2` is `active` | `disabled` (`--lsm-only`). The client prints `leash: enforcement=<level> layer1=<state> layer2=<state>` on the diagnostic stream — always under `--machine-output` (stderr), always when the level is not `lsm`, otherwise with `--verbose`. An older leashd writes a bare `ready` line, for which nothing is printed.
 
 `capabilities` is there because the integer over-refuses. Raising `minCompatibleContract` for one removal turns away every caller below the new floor, including those that never used the removed flag; a caller that drives only `--policy` can test for `"policy"` in the array instead of consulting the range at all. Adding a name is additive (no bump); removing one is a break (bump, and raise the floor). A pre-`capabilities` document decodes with the field empty — fall back to the range. The empty string is never a capability.
 

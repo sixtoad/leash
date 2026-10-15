@@ -2,8 +2,10 @@ package leashd
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/strongdm/leash/internal/enforcement"
@@ -36,7 +38,7 @@ func TestEffectiveEnforcement(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := tc.cfg
-			st := effectiveEnforcement(&cfg, tc.degraded, tc.attached)
+			st := effectiveEnforcement(&cfg, tc.degraded, tc.attached, enforcement.LSMListActive, "")
 			if st.Enforcement != tc.want || st.Layer2 != tc.layer2 {
 				t.Fatalf("got %+v, want enforcement=%s layer2=%s", st, tc.want, tc.layer2)
 			}
@@ -45,6 +47,52 @@ func TestEffectiveEnforcement(t *testing.T) {
 			}
 			if err := st.Check(st.RequireLSM); (err == nil) != tc.releasable {
 				t.Fatalf("Check = %v, releasable want %v", err, tc.releasable)
+			}
+		})
+	}
+}
+
+// Real-kernel finding on #117 (Ubuntu 24.04, 6.8.0): with CONFIG_BPF_LSM=y but
+// bpf not in the active list, every program attaches yet no hook runs. Layer 1
+// must not be reported active from attach success alone.
+func TestEffectiveEnforcementRequiresActiveBPFLSM(t *testing.T) {
+	orig := readActiveLSMList
+	t.Cleanup(func() { readActiveLSMList = orig })
+
+	cases := []struct {
+		name       string
+		list       string
+		readErr    error
+		allowProxy bool
+		want       string
+		releasable bool
+	}{
+		{name: "bpf active", list: "lockdown,capability,yama,apparmor,bpf\n", want: enforcement.LevelLSM, releasable: true},
+		{name: "bpf inactive, fail-closed", list: "lockdown,capability,landlock,yama,apparmor\n", want: enforcement.LevelProxyOnly, releasable: false},
+		{name: "bpf inactive, proxy-only allowed", list: "lockdown,capability,landlock,yama,apparmor\n", allowProxy: true, want: enforcement.LevelProxyOnly, releasable: true},
+		{name: "list unreadable, fail-closed", readErr: errors.New("no such file or directory"), want: enforcement.LevelProxyOnly, releasable: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			readActiveLSMList = func() ([]byte, error) { return []byte(tc.list), tc.readErr }
+			cfg := runtimeConfig{CgroupPath: "/sys/fs/cgroup/x", RequireLSM: !tc.allowProxy}
+			state, reason := enforcement.ClassifyLSMList(readActiveLSMList())
+			// Every program attached successfully: only the LSM list decides.
+			st := effectiveEnforcement(&cfg, false, 3, state, reason)
+			if st.Enforcement != tc.want {
+				t.Fatalf("enforcement = %s, want %s (%+v)", st.Enforcement, tc.want, st)
+			}
+			err := st.Check(st.RequireLSM)
+			if (err == nil) != tc.releasable {
+				t.Fatalf("Check = %v, releasable want %v", err, tc.releasable)
+			}
+			if st.Enforcement != enforcement.LevelLSM {
+				if st.Reason == "" {
+					t.Fatal("a non-lsm level must carry a reason")
+				}
+				if err != nil && !strings.Contains(err.Error(), st.Reason) {
+					t.Fatalf("refusal must echo the reason %q: %v", st.Reason, err)
+				}
 			}
 		})
 	}

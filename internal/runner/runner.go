@@ -212,6 +212,10 @@ type runner struct {
 	// during Provision, so StartEnforcement/exec fall back to LSM-only (host
 	// netns) rather than a netns with no route out. Native only.
 	nativeEgressFailed bool
+	// layer1PreflightDown is the client preflight's reason the bpf LSM is not
+	// active on this host ("" when active or not determinable). It can only
+	// narrow the level leashd reports, never raise it.
+	layer1PreflightDown string
 
 	// leashdExited is closed when the native leashd process exits (StartEnforcement
 	// starts a reaper). WaitReady selects on it to fail fast — instead of waiting
@@ -3095,6 +3099,9 @@ func formatEnforcementLine(st enforcement.Status) string {
 // the release when leashd's level is weaker than the client's posture allows.
 func (r *runner) reportEnforcement(marker string) error {
 	st, ok := readEnforcementStatus(marker)
+	if ok && r.layer1PreflightDown != "" {
+		st = st.Narrow("client preflight: " + r.layer1PreflightDown)
+	}
 	if ok && (st.Enforcement != enforcement.LevelLSM || r.opts.machineOutput || r.verbose) {
 		r.diagnosticln(formatEnforcementLine(st))
 	}

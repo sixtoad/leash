@@ -2,6 +2,7 @@ package enforcement
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -74,14 +75,58 @@ func TestDescribe(t *testing.T) {
 		l1, l2, require bool
 		want            Status
 	}{
-		{true, true, true, Status{LevelLSM, LayerActive, LayerActive, true, false}},
-		{true, false, true, Status{LevelLSM, LayerActive, LayerDisabled, true, false}},
-		{false, true, false, Status{LevelProxyOnly, LayerUnavailable, LayerActive, false, true}},
-		{false, false, false, Status{LevelNone, LayerUnavailable, LayerDisabled, false, true}},
+		{true, true, true, Status{LevelLSM, LayerActive, LayerActive, true, false, ""}},
+		{true, false, true, Status{LevelLSM, LayerActive, LayerDisabled, true, false, ""}},
+		{false, true, false, Status{LevelProxyOnly, LayerUnavailable, LayerActive, false, true, ""}},
+		{false, false, false, Status{LevelNone, LayerUnavailable, LayerDisabled, false, true, ""}},
 	}
 	for _, tc := range cases {
 		if got := Describe(tc.l1, tc.l2, tc.require); got != tc.want {
 			t.Errorf("Describe(%v,%v,%v) = %+v, want %+v", tc.l1, tc.l2, tc.require, got, tc.want)
 		}
+	}
+}
+
+func TestClassifyLSMList(t *testing.T) {
+	cases := []struct {
+		name string
+		data string
+		err  error
+		want LSMListState
+	}{
+		{"bpf active", "lockdown,capability,landlock,yama,apparmor,bpf\n", nil, LSMListActive},
+		// Ubuntu 24.04 default: CONFIG_BPF_LSM=y but bpf not active.
+		{"bpf compiled but inactive", "lockdown,capability,landlock,yama,apparmor\n", nil, LSMListInactive},
+		{"bpf-like name is not bpf", "bpfx,apparmor", nil, LSMListInactive},
+		{"empty list", "  \n", nil, LSMListUnknown},
+		{"unreadable", "", errors.New("permission denied"), LSMListUnknown},
+	}
+	for _, tc := range cases {
+		got, reason := ClassifyLSMList([]byte(tc.data), tc.err)
+		if got != tc.want {
+			t.Errorf("%s: state = %v, want %v", tc.name, got, tc.want)
+		}
+		if (got == LSMListActive) != (reason == "") {
+			t.Errorf("%s: reason %q inconsistent with state %v", tc.name, reason, got)
+		}
+	}
+}
+
+func TestNarrowNeverRaises(t *testing.T) {
+	full := Describe(true, true, true)
+	n := full.Narrow("client preflight: bpf inactive")
+	if n.Enforcement != LevelProxyOnly || n.Layer1 != LayerUnavailable || n.Reason == "" {
+		t.Fatalf("narrowed = %+v", n)
+	}
+	if err := n.Check(true); err == nil || !strings.Contains(err.Error(), "bpf inactive") {
+		t.Fatalf("narrowed status must be refused under fail-closed with the reason: %v", err)
+	}
+	proxy := Describe(false, true, false)
+	proxy.Reason = "orig"
+	if got := proxy.Narrow("other"); got != proxy {
+		t.Fatalf("Narrow must not change an already-unavailable layer: %+v", got)
+	}
+	if got := Describe(true, false, true).Narrow("x"); got.Enforcement != LevelNone {
+		t.Fatalf("narrowing lsm-only must give none, got %+v", got)
 	}
 }

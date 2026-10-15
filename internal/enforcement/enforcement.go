@@ -98,6 +98,45 @@ type Status struct {
 	Layer2         string `json:"layer2"`
 	RequireLSM     bool   `json:"requireLSM"`
 	AllowProxyOnly bool   `json:"allowProxyOnly"`
+	// Reason says why Layer 1 is not active (empty when it is).
+	Reason string `json:"reason,omitempty"`
+}
+
+// LSMListState is what the kernel's active-LSM list says about "bpf". Attach
+// success alone proves nothing: with CONFIG_BPF_LSM=y but bpf absent from the
+// active list (Ubuntu 24.04's default), BPF LSM programs attach and are never
+// invoked, so Layer 1 is only active when the list confirms it.
+type LSMListState int
+
+const (
+	// LSMListUnknown: the list could not be read (securityfs not mounted or
+	// unreadable). Treated as not active: fail closed under the default.
+	LSMListUnknown LSMListState = iota
+	// LSMListInactive: the list was read and "bpf" is not in it.
+	LSMListInactive
+	// LSMListActive: "bpf" is an active LSM.
+	LSMListActive
+)
+
+// ActiveLSMPath is the kernel's active-LSM list.
+const ActiveLSMPath = "/sys/kernel/security/lsm"
+
+// ClassifyLSMList interprets the contents of ActiveLSMPath (or the error
+// reading it) and returns a human-readable reason when bpf is not active.
+func ClassifyLSMList(data []byte, readErr error) (LSMListState, string) {
+	if readErr != nil {
+		return LSMListUnknown, fmt.Sprintf("cannot read the active LSM list %s (%v), so the bpf LSM cannot be confirmed active", ActiveLSMPath, readErr)
+	}
+	list := strings.TrimSpace(string(data))
+	if list == "" {
+		return LSMListUnknown, fmt.Sprintf("the active LSM list %s is empty, so the bpf LSM cannot be confirmed active", ActiveLSMPath)
+	}
+	for _, name := range strings.Split(list, ",") {
+		if strings.TrimSpace(name) == "bpf" {
+			return LSMListActive, ""
+		}
+	}
+	return LSMListInactive, fmt.Sprintf(`"bpf" is not among the active LSMs (%s): eBPF LSM programs can attach but are never invoked; add bpf to the lsm= boot parameter`, list)
 }
 
 // Describe derives the effective enforcement level. layer1Available
@@ -134,9 +173,29 @@ func Describe(layer1Available, layer2Active, requireLSM bool) Status {
 func (s Status) Check(requireLSM bool) error {
 	switch {
 	case s.Enforcement == LevelNone:
-		return fmt.Errorf("enforcement=%s (layer1=%s layer2=%s): no layer enforces policy; refusing to run the workload", s.Enforcement, s.Layer1, s.Layer2)
+		return fmt.Errorf("enforcement=%s (layer1=%s layer2=%s)%s: no layer enforces policy; refusing to run the workload", s.Enforcement, s.Layer1, s.Layer2, s.reasonSuffix())
 	case requireLSM && s.Enforcement != LevelLSM:
-		return fmt.Errorf("enforcement=%s (layer1=%s layer2=%s) but fail-closed is in effect; refusing to run the workload unenforced (pass --allow-proxy-only to accept proxy-only)", s.Enforcement, s.Layer1, s.Layer2)
+		return fmt.Errorf("enforcement=%s (layer1=%s layer2=%s)%s but fail-closed is in effect; refusing to run the workload unenforced (pass --allow-proxy-only to accept proxy-only)", s.Enforcement, s.Layer1, s.Layer2, s.reasonSuffix())
 	}
 	return nil
+}
+
+func (s Status) reasonSuffix() string {
+	if s.Reason == "" {
+		return ""
+	}
+	return ": " + s.Reason + ";"
+}
+
+// Narrow lowers Layer 1 to unavailable (with reason) if it was reported
+// active. It never raises a level, so combining independent observations
+// (leashd's and the client's) can only make the result more conservative.
+func (s Status) Narrow(reason string) Status {
+	if s.Layer1 != LayerActive {
+		return s
+	}
+	n := Describe(false, s.Layer2 == LayerActive, s.RequireLSM)
+	n.AllowProxyOnly = s.AllowProxyOnly
+	n.Reason = reason
+	return n
 }
