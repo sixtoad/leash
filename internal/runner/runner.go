@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -222,7 +223,8 @@ type runner struct {
 	// the invoking user. injectedEnv are the "VAR=value" pairs that point the
 	// workload at each plugin's socket. injectedCleanup are host paths (sockets) to
 	// remove on teardown. All empty when --inject-service is unused.
-	injectedPlugins []*exec.Cmd
+	injectedPlugins []*injectedProc
+	injectMu        sync.Mutex // guards injectedPlugins
 	injectedEnv     []string
 	injectedCleanup []string
 
@@ -348,6 +350,11 @@ func execute(cmdName string, args []string) error {
 		return err
 	}
 
+	// Backstop: no --inject-service helper may outlive the run, whatever path
+	// returns from here (keepContainers, early errors, ...). Idempotent with the
+	// launchers' Remove.
+	defer r.teardownInjectedPlugins()
+
 	defer func() {
 		if !r.cfg.workDirIsTemp || r.cfg.workDir == "" || r.keepContainers {
 			return
@@ -382,6 +389,9 @@ func execute(cmdName string, args []string) error {
 				cancel()
 				continue
 			}
+			// Forced exit skips every deferred teardown: kill the injected
+			// helpers first so they are not orphaned (#128).
+			r.killInjectedPluginsNow()
 			os.Exit(1)
 		}
 	}()
@@ -3206,6 +3216,9 @@ func cleanupContext(ctx context.Context) context.Context {
 // it stops containers unless keepContainers is set and preserves the command's exit semantics.
 func (r *runner) finishLifecycle(ctx context.Context, exitCode int, runErr error) error {
 	if r.keepContainers {
+		// Kept containers outlive leash, but the injected helpers are leash's
+		// children and would only be orphaned when it exits (#128).
+		r.teardownInjectedPlugins()
 		if runErr != nil {
 			return runErr
 		}

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/strongdm/leash/internal/entrypoint"
@@ -351,17 +352,27 @@ func (r *runner) spawnInjectService(ctx context.Context, svc injectService) erro
 		cmdEnv = append(os.Environ(), r.invokingUserEnv()...)
 		cmdEnv = append(cmdEnv, injectEnv...)
 	}
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	// Deliberately NOT exec.CommandContext: cancelling ctx (e.g. on SIGINT/SIGTERM)
+	// would SIGKILL only the direct child (often `runuser`), orphaning the plugin
+	// beneath it. The runner owns the helper's lifetime; teardownInjectedPlugins
+	// stops it on every teardown path (#128).
+	cmd := exec.Command(argv[0], argv[1:]...)
 	if cmdEnv != nil {
 		cmd.Env = cmdEnv
 	}
-	if logf, err := os.Create(r.injectLogPath(svc)); err == nil {
+	logf, err := os.Create(r.injectLogPath(svc))
+	if err == nil {
 		cmd.Stdout, cmd.Stderr = logf, logf
+	} else {
+		logf = nil
 	}
-	if err := cmd.Start(); err != nil {
+	proc, err := startInjectedProc(svc.plugin, cmd, logf)
+	if err != nil {
 		return fmt.Errorf("native: start inject-service plugin %q: %w", svc.plugin, err)
 	}
-	r.injectedPlugins = append(r.injectedPlugins, cmd)
+	r.injectMu.Lock()
+	r.injectedPlugins = append(r.injectedPlugins, proc)
+	r.injectMu.Unlock()
 	r.injectedCleanup = append(r.injectedCleanup, svc.socket)
 	if configFile != "" {
 		r.injectedCleanup = append(r.injectedCleanup, configFile)
@@ -374,6 +385,9 @@ func (r *runner) spawnInjectService(ctx context.Context, svc injectService) erro
 		}
 		if _, err := os.Stat(svc.socket); err == nil {
 			return nil
+		}
+		if proc.exited() {
+			return fmt.Errorf("native: inject-service plugin %q exited before creating socket %s (see %s)", svc.plugin, svc.socket, r.injectLogPath(svc))
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -406,32 +420,35 @@ func (r *runner) spawnInjectServicesContainer(ctx context.Context) error {
 }
 
 // teardownInjectedPlugins stops every injected plugin and removes its socket/config
-// files. Shared by the native and container launchers' Remove. Each plugin is
-// signalled (SIGINT) for a clean teardown, then force-killed after a grace period
-// so teardown can't hang.
+// files. Called from both launchers' Remove and, as a backstop, when Run returns
+// (covering keepContainers and any early-return path), so it is idempotent. Each
+// helper's process group gets SIGTERM, then SIGKILL after injectStopGrace, and the
+// direct child is reaped, so no helper outlives the run (#128).
 func (r *runner) teardownInjectedPlugins() {
-	for _, cmd := range r.injectedPlugins {
-		if cmd == nil || cmd.Process == nil {
-			continue
-		}
-		// Signal (not kill) so the plugin can tear down cleanly, but don't wait
-		// forever: give it a grace period, then force-kill so teardown can't hang.
-		_ = cmd.Process.Signal(os.Interrupt)
-		done := make(chan struct{})
-		go func(c *exec.Cmd) {
-			_ = c.Wait()
-			close(done)
-		}(cmd)
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
+	r.injectMu.Lock()
+	procs := append([]*injectedProc(nil), r.injectedPlugins...)
+	r.injectMu.Unlock()
+	for _, p := range procs {
+		if !p.stop(injectStopGrace, injectKillWait) {
+			r.debugf("inject-service plugin %q (pid %d) did not exit after SIGKILL", p.name, p.cmd.Process.Pid)
 		}
 	}
 	// Remove every injected socket / config file regardless of wait outcome.
 	for _, sock := range r.injectedCleanup {
 		_ = os.Remove(sock)
+	}
+}
+
+// killInjectedPluginsNow SIGKILLs every helper's process group without waiting.
+// Used on the forced-exit path (a second interrupt calls os.Exit, skipping the
+// orderly teardown); safe to call concurrently with teardownInjectedPlugins.
+func (r *runner) killInjectedPluginsNow() {
+	r.injectMu.Lock()
+	defer r.injectMu.Unlock()
+	for _, p := range r.injectedPlugins {
+		if !p.exited() {
+			p.signalGroup(syscall.SIGKILL)
+		}
 	}
 }
 
