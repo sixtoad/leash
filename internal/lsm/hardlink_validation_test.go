@@ -15,10 +15,14 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/cilium/ebpf"
 )
 
 func hlRule(action, op int32, path string) PolicyRule {
@@ -28,6 +32,87 @@ func hlRule(action, op int32, path string) PolicyRule {
 		r.IsDirectory = 1
 	}
 	return r
+}
+
+// hlAttach starts the open LSM and waits until its attach attempt has SETTLED,
+// i.e. every program — including the optional lsm_link hard-link guard, which
+// attaches LAST, after all required programs — is attached or skipped.
+//
+// The tests used to treat "lsm_open denies the secret" as readiness. lsm_open
+// is the first program attached and lsm_link the last, so that signal can fire
+// before the guard exists, and a link probed in that window is allowed: a false
+// FAIL (#144). It then asserts that lsm_link really is attached in this
+// process, so a kernel without CONFIG_SECURITY_PATH (or a guard that failed
+// verification and was dropped as optional) fails with that diagnosis instead
+// of a misleading "hard link SUCCEEDED".
+func hlAttach(t *testing.T, l *OpenLsm) <-chan error {
+	t.Helper()
+	settled := make(chan struct{})
+	var once sync.Once
+	onLSMAttached = func() { once.Do(func() { close(settled) }) }
+	t.Cleanup(func() { onLSMAttached = nil })
+
+	// Count links held before this attach: an earlier guard test in the same
+	// process leaves its programs attached, so require NEW links.
+	before := hlLinkedProgramNames(t)
+	attachErr := make(chan error, 1)
+	go func() { attachErr <- l.LoadAndAttach(loadLsmOpen) }()
+	select {
+	case <-settled:
+	case e := <-attachErr:
+		t.Fatalf("LSM attach returned early: %v", e)
+	case <-time.After(60 * time.Second):
+		t.Fatalf("open LSM attach did not settle within 60s")
+	}
+	linked := hlLinkedProgramNames(t)
+	for _, name := range []string{"lsm_open", "lsm_link"} {
+		if linked[name] <= before[name] {
+			t.Fatalf("%s is not attached after the open LSM settled (linked programs: %v). "+
+				"lsm_link needs CONFIG_SECURITY_PATH and must pass the verifier; check stderr for "+
+				"'optional LSM hook' messages", name, linked)
+		}
+	}
+	return attachErr
+}
+
+// hlLinkedProgramNames counts, by program name, the BPF links this process
+// holds, read from /proc/self/fdinfo (each bpf_link fd reports its prog_id).
+func hlLinkedProgramNames(t *testing.T) map[string]int {
+	t.Helper()
+	names := map[string]int{}
+	fds, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("list /proc/self/fd: %v", err)
+	}
+	for _, fd := range fds {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", fd.Name()))
+		if err != nil || target != "anon_inode:bpf_link" {
+			continue
+		}
+		info, err := os.ReadFile(filepath.Join("/proc/self/fdinfo", fd.Name()))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(info), "\n") {
+			value, ok := strings.CutPrefix(line, "prog_id:")
+			if !ok {
+				continue
+			}
+			id, err := strconv.ParseUint(strings.TrimSpace(value), 10, 32)
+			if err != nil {
+				continue
+			}
+			prog, err := ebpf.NewProgramFromID(ebpf.ProgramID(id))
+			if err != nil {
+				continue
+			}
+			if pi, err := prog.Info(); err == nil {
+				names[pi.Name]++
+			}
+			prog.Close()
+		}
+	}
+	return names
 }
 
 // box cgroup for is_target_cgroup scoping; cgroup v2 line is "0::/<rel>".
@@ -87,8 +172,7 @@ func TestHardlinkGuardValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	attachErr := make(chan error, 1)
-	go func() { attachErr <- l.LoadAndAttach(loadLsmOpen) }()
+	attachErr := hlAttach(t, l)
 
 	// Readiness: selective enforcement live — secret denied AND readable allowed.
 	ready := false
@@ -192,8 +276,7 @@ func TestHardlinkGuardNestedMount(t *testing.T) {
 	if err := l.LoadPolicies(rules); err != nil {
 		t.Fatal(err)
 	}
-	attachErr := make(chan error, 1)
-	go func() { attachErr <- l.LoadAndAttach(loadLsmOpen) }()
+	attachErr := hlAttach(t, l)
 
 	ready := false
 	deadline := time.Now().Add(15 * time.Second)

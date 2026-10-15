@@ -159,6 +159,7 @@ func (l longPathTrees) prepare(t *testing.T) {
 	t.Cleanup(func() {
 		_ = syscall.Unmount(l.mountM, syscall.MNT_DETACH)
 		_ = syscall.Unmount(longPathRoot, syscall.MNT_DETACH)
+		_ = os.Remove(longPathRoot) // the empty mount point on the root fs
 	})
 	for _, dir := range []string{longPathRoot + "/s", longPathRoot + "/e", filepath.Dir(l.blockedA), l.sealedA, l.sealedA + "x",
 		l.dirB, l.siblingB, filepath.Dir(l.file200), filepath.Dir(l.file255), filepath.Dir(l.deepM)} {
@@ -289,13 +290,22 @@ func (l longPathTrees) verifyReload(t *testing.T, openLsm *OpenLsm, cgroupFD int
 	if err := openLsm.LoadPolicies(ConvertToFileOpenRules(set.Open)); err != nil {
 		t.Fatalf("live reload: %v", err)
 	}
+	// The mount-root link cases must target "/" itself (the prefix-stripping
+	// edge case), so the aliases cannot live in a temp dir: name them per run
+	// and remove them so a rerun on the same host starts clean (#144).
+	passwdAlias := fmt.Sprintf("/leash-passwd-alias-%d", os.Getpid())
+	debianAlias := fmt.Sprintf("/leash-debian-alias-%d", os.Getpid())
+	for _, alias := range []string{passwdAlias, debianAlias} {
+		_ = os.Remove(alias)
+		t.Cleanup(func() { _ = os.Remove(alias) })
+	}
 	runBoxCases(t, cgroupFD, []boxCase{
 		{"reload: read short file outside forbidden mount (root allow)", boxRead, []string{l.okA}, true, ""},
 		{"reload: read short file under forbidden 146-byte mount", boxRead, []string{l.shallowM}, false, ""},
 		{"reload: read >255-byte path under forbidden mount (no basename fallback)", boxRead, []string{l.deepM}, false, ""},
 		{"reload: read /etc/passwd under read-only forbid", boxRead, []string{"/etc/passwd"}, false, ""},
-		{"reload: hard-link read-only-forbidden file into / (mount root)", boxLink, []string{"/etc/passwd", "/passwd-alias"}, false, eperm},
-		{"reload: hard-link readable file into / (mount root)", boxLink, []string{"/etc/debian_version", "/debian-alias"}, true, ""},
+		{"reload: hard-link read-only-forbidden file into / (mount root)", boxLink, []string{"/etc/passwd", passwdAlias}, false, eperm},
+		{"reload: hard-link readable file into / (mount root)", boxLink, []string{"/etc/debian_version", debianAlias}, true, ""},
 	})
 }
 
