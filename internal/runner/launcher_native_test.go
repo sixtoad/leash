@@ -218,8 +218,8 @@ func TestNativeWorkloadScript(t *testing.T) {
 	cg := "/sys/fs/cgroup/system.slice/leash-native-x.service"
 
 	// Unhardened (rootless path): plain placement — no ns/mask/scrub/harden.
-	plain := nativeWorkloadScript(cg, "/wd", "bash", "claude", "", "", "/opt/leash", hardenOpts{})
-	if !strings.Contains(plain, "cgroup.procs") || !strings.Contains(plain, "exec bash -lc") {
+	plain := nativeWorkloadScript(cg, "/wd", "bash", "-c", "claude", "", "", "/opt/leash", hardenOpts{})
+	if !strings.Contains(plain, "cgroup.procs") || !strings.Contains(plain, "exec bash -c") {
 		t.Fatalf("plain script missing cgroup join / exec: %s", plain)
 	}
 	for _, unexpected := range []string{"unshare", "runuser", "mount -t tmpfs", "NODE_EXTRA_CA_CERTS", "env -u", "--harden-exec"} {
@@ -230,7 +230,7 @@ func TestNativeWorkloadScript(t *testing.T) {
 
 	// Hardened default (root): masks + fresh PID+IPC ns + full scrub + CA export +
 	// the seccomp re-exec wrapper (blocks the userns→bind-mount path-LSM bypass).
-	h := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "/share/ca-cert.pem",
+	h := nativeWorkloadScript(cg, "/wd", "bash", "-c", "claude", "alice", "/share/ca-cert.pem",
 		"/opt/leash", hardenOpts{enabled: true, uid: "1000"})
 	for _, want := range []string{
 		"mount -t tmpfs -o uid=1000,mode=0700 tmpfs /run/user/1000",
@@ -263,14 +263,14 @@ func TestNativeWorkloadScript(t *testing.T) {
 
 	// Hardened but no self path (os.Executable failed): degrade gracefully — the
 	// session isolation still applies, but no seccomp re-exec.
-	noSelf := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "", "", hardenOpts{enabled: true, uid: "1000"})
+	noSelf := nativeWorkloadScript(cg, "/wd", "bash", "-c", "claude", "alice", "", "", hardenOpts{enabled: true, uid: "1000"})
 	if strings.Contains(noSelf, "--harden-exec") {
 		t.Fatalf("no-self script must not contain harden-exec: %s", noSelf)
 	}
 
 	// GUI opt-outs: --allow-display + --share-ipc → no X11 mask, DISPLAY kept, no
 	// IPC ns; but D-Bus stays masked/scrubbed (not opted out).
-	gui := nativeWorkloadScript(cg, "/wd", "bash", "app", "alice", "",
+	gui := nativeWorkloadScript(cg, "/wd", "bash", "-c", "app", "alice", "",
 		"/opt/leash", hardenOpts{enabled: true, uid: "1000", allowDisplay: true, shareIPC: true})
 	for _, unexpected := range []string{"/tmp/.X11-unix", "--ipc", "-u DISPLAY", "-u XAUTHORITY"} {
 		if strings.Contains(gui, unexpected) {
@@ -289,7 +289,7 @@ func TestNativeWorkloadScript(t *testing.T) {
 
 	// --allow-namespaces opts out of ONLY the seccomp block: no harden-exec, but
 	// the session isolation (PID/IPC ns, masks, runuser) stays on.
-	ns := nativeWorkloadScript(cg, "/wd", "bash", "claude", "alice", "",
+	ns := nativeWorkloadScript(cg, "/wd", "bash", "-c", "claude", "alice", "",
 		"/opt/leash", hardenOpts{enabled: true, uid: "1000", allowNamespaces: true})
 	if strings.Contains(ns, "--harden-exec") {
 		t.Fatalf("allow-namespaces script must not seccomp-harden: %s", ns)

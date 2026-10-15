@@ -177,7 +177,8 @@ type launcher interface {
 	// DetectShell returns the shell to run the workload with (container: probed
 	// inside the container; native: the host shell).
 	DetectShell(ctx context.Context) (string, error)
-	// ExecCommand builds the command that runs `shellBin -lc "exec cmd"` inside
+	// ExecCommand builds the command that runs `shellBin -c "exec cmd"` (or -lc
+	// under --login-shell) inside
 	// the enforced box. The runner runs it and handles the exit code, so the exec
 	// UX stays backend-agnostic. interactive requests a TTY.
 	ExecCommand(ctx context.Context, shellBin, cmd string, interactive bool) *exec.Cmd
@@ -537,7 +538,7 @@ func (c containerLauncher) execCommandWithStdinKind(ctx context.Context, shellBi
 		// group with SIGTTIN. Pipes and redirected files retain -i below.
 		flag = ""
 	}
-	return c.r.rt().Cmd(ctx, c.r.targetWorkloadExecArgs(flag, shellBin, "-lc", "exec "+cmd)...)
+	return c.r.rt().Cmd(ctx, c.r.targetWorkloadExecArgs(flag, shellBin, c.r.workloadShellFlag(), "exec "+cmd)...)
 }
 
 func (c containerLauncher) Precheck(ctx context.Context, shellBin, cmd string) error {

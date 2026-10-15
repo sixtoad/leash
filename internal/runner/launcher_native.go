@@ -1026,7 +1026,8 @@ func (n nativeLauncher) Precheck(ctx context.Context, shellBin, cmd string) erro
 func (n nativeLauncher) InstallPromptAssets(ctx context.Context) error { return nil }
 
 // workloadCommand builds the user's command to run inside the box: placed in
-// the LSM-scoped cgroup, in workdir, via `shellBin -lc "exec <cmd>"`. When
+// the LSM-scoped cgroup, in workdir, via `shellBin -c "exec <cmd>"` (-lc under
+// --login-shell). When
 // privileged it is wrapped in `nsenter --net=<ns>` so the workload also runs in
 // the enforced network namespace (Layer 2); rootless (degraded/unenforced) it
 // runs in the user-scope cgroup without a netns.
@@ -1060,7 +1061,7 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 	if err != nil {
 		self = ""
 	}
-	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.r.workloadUser(), caCert, self, h)
+	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, n.r.workloadShellFlag(), cmd, n.r.workloadUser(), caCert, self, h)
 	if n.layer2Active() {
 		argv := n.layer2Wrap(inner) // nsenter --net + private mount ns (resolv bind)
 		return exec.CommandContext(ctx, argv[0], argv[1:]...)
@@ -1183,7 +1184,7 @@ func hasEnvKey(env []string, key string) bool {
 	return false
 }
 
-func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, self string, h hardenOpts) string {
+func nativeWorkloadScript(cgroupPath, workdir, shellBin, shellFlag, cmd, dropUser, caCert, self string, h hardenOpts) string {
 	procs := quoteShellArg(filepath.Join(cgroupPath, "cgroup.procs"))
 	innerCmd := "exec " + cmd
 	if caCert != "" {
@@ -1199,7 +1200,10 @@ func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, 
 			" REQUESTS_CA_BUNDLE=" + q +
 			" GIT_SSL_CAINFO=" + q + "; " + innerCmd
 	}
-	shellRun := fmt.Sprintf("%s -lc %s", quoteShellArg(shellBin), quoteShellArg(innerCmd))
+	if shellFlag == "" {
+		shellFlag = "-c"
+	}
+	shellRun := fmt.Sprintf("%s %s %s", quoteShellArg(shellBin), shellFlag, quoteShellArg(innerCmd))
 
 	// Scrub the session env vars that leak the keyring/GUI location — unless the
 	// matching allow flag keeps them.
