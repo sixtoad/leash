@@ -54,6 +54,21 @@ func TestResolveRequireLSM(t *testing.T) {
 	}
 }
 
+func TestStatusCheck(t *testing.T) {
+	if err := Describe(true, false, true).Check(true); err != nil {
+		t.Fatalf("lsm under fail-closed must pass: %v", err)
+	}
+	if err := Describe(false, true, false).Check(false); err != nil {
+		t.Fatalf("proxy-only when allowed must pass: %v", err)
+	}
+	if err := Describe(false, true, true).Check(true); err == nil {
+		t.Fatal("proxy-only under fail-closed must be refused")
+	}
+	if err := Describe(false, false, false).Check(false); err == nil {
+		t.Fatal("none must be refused even with proxy-only allowed")
+	}
+}
+
 func TestDescribe(t *testing.T) {
 	cases := []struct {
 		l1, l2, require bool

@@ -348,8 +348,40 @@ func TestNativeWaitReadyFailClosed(t *testing.T) {
 		t.Fatalf("error should say fail-closed and name the --allow-proxy-only opt-out: %v", err)
 	}
 
-	if err := mk(false).WaitReady(context.Background()); err != nil {
-		t.Fatalf("WaitReady should warn-and-proceed (nil) with --allow-proxy-only: %v", err)
+	// With --allow-proxy-only the verdict depends on whether Layer 2 is up in
+	// this session (root + egress); either way it must match notReadyVerdict.
+	n := mk(false)
+	err = n.WaitReady(context.Background())
+	if n.layer2Active() && err != nil {
+		t.Fatalf("WaitReady should warn-and-proceed (nil) with --allow-proxy-only and Layer 2 active: %v", err)
+	}
+	if !n.layer2Active() && err == nil {
+		t.Fatal("WaitReady must refuse with --allow-proxy-only when Layer 2 is off (nothing would enforce)")
+	}
+}
+
+// Review finding on #117: --allow-proxy-only must not release a workload when
+// the proxy is also off (rootless / egress failure -> leashd --lsm-only).
+func TestNotReadyVerdict(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	cases := []struct {
+		name            string
+		require, layer2 bool
+		wantErr         bool
+	}{
+		{"fail-closed, proxy up", true, true, true},
+		{"fail-closed, proxy off", true, false, true},
+		{"allow proxy-only, proxy up", false, true, false},
+		{"allow proxy-only, proxy off", false, false, true},
+	}
+	for _, tc := range cases {
+		err := notReadyVerdict("not ready", tc.require, tc.layer2, "/tmp/x.log", logger)
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("%s: err = %v, wantErr %v", tc.name, err, tc.wantErr)
+		}
+		if err != nil && !strings.Contains(err.Error(), "fail-closed") {
+			t.Fatalf("%s: error should say fail-closed: %v", tc.name, err)
+		}
 	}
 }
 

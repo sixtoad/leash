@@ -105,7 +105,7 @@ func Main(args []string) error {
 
 	// Select fail-closed vs degrade-to-proxy for LSM attach failures before any
 	// attach happens.
-	lsm.SetRequireLSM(cfg.RequireLSM)
+	lsm.SetRequireLSM(cfg.failClosed())
 
 	if err := preFlight(cfg); err != nil {
 		return err
@@ -157,6 +157,14 @@ type runtimeConfig struct {
 	RequireLSM       bool
 	MCPConfig        proxy.MCPConfig
 	TelemetryConfig  otel.Config
+}
+
+// failClosed reports whether an unavailable eBPF LSM must stop the run. It is
+// the resolved posture (RequireLSM), forced on in --lsm-only mode: with the L7
+// proxy off there is nothing to degrade to, so --allow-proxy-only cannot apply
+// and proceeding would release the workload with no enforcement at all.
+func (cfg *runtimeConfig) failClosed() bool {
+	return cfg.RequireLSM || cfg.LSMOnly
 }
 
 type runtimeState struct {
@@ -326,7 +334,10 @@ func preFlight(cfg *runtimeConfig) error {
 		// still enforces L7 policy, and the control-plane block falls back to a
 		// namespace-wide rule. Mirrors the cgroup-unavailable network fallback
 		// (#66). See issue #67.
-		if cfg.RequireLSM {
+		if cfg.LSMOnly {
+			return fmt.Errorf("no cgroup path: eBPF LSM enforcement (file/exec/connect) cannot be scoped to the workload and the L7 proxy is off (--lsm-only); refusing to run it with no enforcement")
+		}
+		if cfg.failClosed() {
 			return fmt.Errorf("no cgroup path: eBPF LSM enforcement (file/exec/connect) cannot be scoped to the workload; refusing to run it unenforced. Pass --allow-proxy-only (or LEASH_ALLOW_PROXY_ONLY=1) to run with only the L7 proxy")
 		}
 		log.Println("leash: WARNING: no cgroup path; running in degraded proxy-only mode — kernel LSM enforcement (file/exec/connect) disabled, L7 proxy enforcement remains active")
@@ -424,7 +435,7 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 
 	// Fail closed on an eBPF LSM attach failure unless proxy-only was
 	// explicitly allowed (resolved once in parseConfig, issue #117).
-	lsmManager := lsm.NewLSMManager(cfg.CgroupPath, logger, cfg.RequireLSM)
+	lsmManager := lsm.NewLSMManager(cfg.CgroupPath, logger, cfg.failClosed())
 	lsmManager.SetContainerRootfs(!cfg.HostMode)
 	lsm.BumpMemlockRlimit()
 

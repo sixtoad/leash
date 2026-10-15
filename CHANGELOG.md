@@ -152,6 +152,17 @@ Claude Code handling on top.
   (`LEASH_REQUIRE_LSM=1` or `LEASH_ALLOW_PROXY_ONLY=1` in the container,
   `--require-lsm` or `--allow-proxy-only` for native leashd), and native
   readiness now honors `LEASH_REQUIRE_LSM` (it previously read only the flag).
+- **`--allow-proxy-only` never releases an unenforced workload.** When the L7
+  proxy is also off (native `--lsm-only`: rootless, or egress setup failed),
+  there is nothing to degrade to, so an LSM attach failure stays fatal and
+  native readiness refuses. leashd also refuses to publish the ready marker for
+  a level the posture forbids — `none`, or anything but `lsm` under
+  fail-closed, including when no LSM program attached at all.
+- **The client cross-checks leashd's reported level** against its own posture
+  and refuses to release on a mismatch, and rejects posture overrides that
+  would make the two diverge: `-e LEASH_REQUIRE_LSM` / `-e
+  LEASH_ALLOW_PROXY_ONLY` and posture flags inside `LEASH_EXTRA_ARGS`.
+- The enforcement-ready marker is written atomically (temp file + rename).
 
 ### Fixed — remedy text that could break the host
 - **`leash doctor` could tell an operator to set `lsm=,bpf`** — a leading-comma

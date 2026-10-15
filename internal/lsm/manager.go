@@ -56,7 +56,9 @@ func NewLSMManager(cgroupPath string, logger *SharedLogger, requireLSM bool) *LS
 // Fail-closed is the default (issue #117): unless proxy-only was explicitly
 // allowed (--allow-proxy-only / LEASH_ALLOW_PROXY_ONLY) it is fatal. With the
 // opt-out, leash degrades to proxy-only (Layer 2, fail-closed) and continues,
-// warning loudly once.
+// warning loudly once. leashd forces requireLSM in --lsm-only mode (no proxy
+// to degrade to), so the non-fatal branch — and its "L7 proxy remains active"
+// warning — is only reachable when the proxy is actually running.
 func (m *LSMManager) handleAttachFailure(label string, err error) {
 	if m.requireLSM {
 		fmt.Fprintf(os.Stderr, "leash: FATAL: %s LSM failed to attach; refusing to run the workload unenforced (pass --allow-proxy-only to continue proxy-only): %v\n", label, err)

@@ -510,6 +510,8 @@ func LoadAndAttachBPFWithSetup(
 		// enforcement-ready marker states the effective level correctly.
 		if retErr != nil {
 			markLayer1Degraded()
+		} else {
+			markLayer1Attached()
 		}
 		notifyLSMAttached()
 	}

@@ -1433,6 +1433,9 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 		return cfg, nil, err
 	}
 	cfg.requireLSM = requireLSM
+	if err := validatePostureOverrides(opts.envVars, cfg.extraArgs); err != nil {
+		return cfg, nil, err
+	}
 
 	// Explicit native drop-user. Falls back to $SUDO_USER at spawn time (see
 	// workloadUser); a native root run with neither is refused in Preflight so the
@@ -2956,8 +2959,7 @@ func (r *runner) waitForEnforcementReady(ctx context.Context) error {
 					r.diagnosticln("Enforcement ready.")
 				}
 			}
-			r.reportEnforcement(marker)
-			return nil
+			return r.reportEnforcement(marker)
 		}
 
 		if time.Now().After(deadline) {
@@ -3088,16 +3090,15 @@ func formatEnforcementLine(st enforcement.Status) string {
 }
 
 // reportEnforcement states the effective enforcement level once the workload
-// is about to be released: always in --machine-output mode (on stderr) and
-// whenever Layer 1 is not active; otherwise only with --verbose.
-func (r *runner) reportEnforcement(marker string) {
+// is about to be released — always in --machine-output mode (on stderr) and
+// whenever Layer 1 is not active; otherwise only with --verbose — and refuses
+// the release when leashd's level is weaker than the client's posture allows.
+func (r *runner) reportEnforcement(marker string) error {
 	st, ok := readEnforcementStatus(marker)
-	if !ok {
-		return
-	}
-	if st.Enforcement != enforcement.LevelLSM || r.opts.machineOutput || r.verbose {
+	if ok && (st.Enforcement != enforcement.LevelLSM || r.opts.machineOutput || r.verbose) {
 		r.diagnosticln(formatEnforcementLine(st))
 	}
+	return checkReleasedEnforcement(st, ok, r.cfg.requireLSM)
 }
 
 func describeBootstrapMarker(path string) string {

@@ -5,6 +5,7 @@ package enforcement
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -124,4 +125,18 @@ func Describe(layer1Available, layer2Active, requireLSM bool) Status {
 		st.Enforcement = LevelNone
 	}
 	return st
+}
+
+// Check reports whether a workload may be released at this level under the
+// given posture. "none" is never acceptable — no layer enforces policy, and
+// --allow-proxy-only only permits degrading to the proxy, not past it. With
+// fail-closed in effect, anything other than "lsm" is refused.
+func (s Status) Check(requireLSM bool) error {
+	switch {
+	case s.Enforcement == LevelNone:
+		return fmt.Errorf("enforcement=%s (layer1=%s layer2=%s): no layer enforces policy; refusing to run the workload", s.Enforcement, s.Layer1, s.Layer2)
+	case requireLSM && s.Enforcement != LevelLSM:
+		return fmt.Errorf("enforcement=%s (layer1=%s layer2=%s) but fail-closed is in effect; refusing to run the workload unenforced (pass --allow-proxy-only to accept proxy-only)", s.Enforcement, s.Layer1, s.Layer2)
+	}
+	return nil
 }
