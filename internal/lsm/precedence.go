@@ -98,10 +98,30 @@ func sortConnectBPFRulesByPrecedence(rules []ConnectPolicyRuleBPF) {
 	})
 }
 
+// IsConnectDefaultRule reports whether rule is the bare Host::"*" connect rule
+// (no IP, no port). Leash writes the connect default as
+// `permit|forbid ... resource == Host::"*"` and applyConnectDefaults turns it
+// into PolicySet.ConnectDefaultAllow/Explicit; the rule itself stays in
+// PolicySet.Connect. It is the default, not a matching rule: ordered first, a
+// default-deny would otherwise shadow every permit (#135).
+func IsConnectDefaultRule(rule PolicyRule) bool {
+	return isConnectDefault(rule.DestIP, rule.DestPort, rule.Hostname[:], rule.HostnameLen)
+}
+
+func isConnectDefault(ip uint32, port uint16, hostname []byte, hostnameLen int32) bool {
+	return ip == 0 && port == 0 && hostnameLen == 1 && hostname[0] == '*'
+}
+
 // connectRulesByPrecedence returns a copy of userspace connect rules with
-// every deny before every allow, keeping the given order otherwise.
+// every deny before every allow, keeping the given order otherwise. The
+// Host::"*" default rule is dropped; the caller passes the default separately.
 func connectRulesByPrecedence(rules []ConnectPolicyRule) []ConnectPolicyRule {
-	out := append([]ConnectPolicyRule(nil), rules...)
+	out := make([]ConnectPolicyRule, 0, len(rules))
+	for _, r := range rules {
+		if !isConnectDefault(r.DestIP, r.DestPort, r.Hostname[:], r.HostnameLen) {
+			out = append(out, r)
+		}
+	}
 	sort.SliceStable(out, func(i, j int) bool {
 		less, _ := denyFirst(uint32(out[i].Action), uint32(out[j].Action))
 		return less

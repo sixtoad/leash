@@ -130,6 +130,8 @@ Notes:
 - `leash version --json` advertises both limits as `policyLimits.filePathBytes` / `policyLimits.execPathBytes` (capability `policy-path-limits`).
 - IPv6 literals and CIDR are not supported in v1 policies.
 - Hostname rules require the Leash proxy for hostname enforcement (kernel enforces IP only).
+- `NetworkConnect` and `McpCall` have no specificity order: any matching `forbid` wins over every matching `permit`, regardless of rule order. The bare `Host::"*"` resource is the connect default (`permit` = default allow, `forbid` = default deny), not a rule, so `forbid Host::"*"` plus `permit Host::"api.example.com"` allows only that host.
+- The kernel enforces hostname rules on the IPs they resolve to. If a forbidden host and a permitted host share an IP (common behind a CDN), the kernel denies that IP, so the permitted host is blocked too. Use the proxy's hostname rules, not a hostname `forbid`, for hosts that share an IP with permitted ones.
 
 ## File Access Examples
 

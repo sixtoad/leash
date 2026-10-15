@@ -215,6 +215,11 @@ func (l *ConnectLsm) LoadPolicies(policies []ConnectPolicyRule, defaultOverride 
 			}
 			continue
 		}
+		// forbid Host::"*" is the explicit default deny (applyConnectDefaults
+		// sets the override), not a rule to resolve.
+		if isConnectDefault(rule.DestIP, rule.DestPort, rule.Hostname[:], rule.HostnameLen) {
+			continue
+		}
 		ips, err := net.LookupIP(hostname)
 		if err != nil {
 			failedResolves++

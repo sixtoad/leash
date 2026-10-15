@@ -5,7 +5,30 @@ import (
 	"testing"
 
 	"github.com/strongdm/leash/internal/lsm"
+	"github.com/strongdm/leash/internal/transpiler"
 )
+
+// Leash's own default-deny (`forbid ... resource == Host::"*"`) is the
+// default, not a network rule: a deny-first "*" would shadow the allowlist.
+func TestConvertPolicyToMacRules_ConnectDefaultIsNotANetworkRule(t *testing.T) {
+	for _, defaultAllow := range []bool{false, true} {
+		action := int32(lsm.PolicyAllow)
+		if defaultAllow {
+			action = lsm.PolicyDeny
+		}
+		r := lsm.PolicyRule{Action: action, Operation: lsm.OpConnect, HostnameLen: int32(len("api.openai.com"))}
+		copy(r.Hostname[:], "api.openai.com")
+		written := transpiler.PolicySetToCedar(&lsm.PolicySet{Connect: []lsm.PolicyRule{r}, ConnectDefaultAllow: defaultAllow, ConnectDefaultExplicit: true})
+		set, _, err := transpiler.NewCedarToLeashTranspiler().TranspileFromString(written)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, network := ConvertPolicyToMacRules(set)
+		if len(network) != 1 || network[0].TargetValue != "api.openai.com" || network[0].Action != actionString(action) {
+			t.Fatalf("default allow %v: network rules %+v, want only api.openai.com\n%s", defaultAllow, network, written)
+		}
+	}
+}
 
 // Issue #135: the macOS network filter returns the first matching rule, so a
 // forbid must reach it ahead of every permit, whatever the input order.
