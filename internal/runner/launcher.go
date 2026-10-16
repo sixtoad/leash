@@ -245,10 +245,10 @@ type containerLauncher struct {
 func (c containerLauncher) Name() string { return c.r.rt().Name() }
 
 func (c containerLauncher) PullImages(ctx context.Context) error {
-	if err := c.r.ensureLocalImage(ctx, c.r.cfg.targetImage); err != nil {
+	if err := c.r.ensureLocalImage(ctx, "target", c.r.cfg.targetImage); err != nil {
 		return err
 	}
-	if err := c.r.ensureLocalImage(ctx, c.r.cfg.leashImage); err != nil {
+	if err := c.r.ensureLocalImage(ctx, "manager", c.r.cfg.leashImage); err != nil {
 		return err
 	}
 	// Validate the privileged manager immediately after it is available and
