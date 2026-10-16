@@ -481,6 +481,11 @@ func (l *ConnectLsm) handleEvent(data []byte) {
 
 	// Create destination string
 	destStr := JoinConnectTarget(destIP, destPort)
+	if event.Family != afInet && event.Family != afInet6 && event.Family != 0 {
+		// A non-IP socket family (packet, vsock, ...) decided by the connect
+		// default: there is no address to show.
+		destStr = fmt.Sprintf("family=%d", event.Family)
+	}
 
 	// Add hostname if available
 	hostnameStr := ""
