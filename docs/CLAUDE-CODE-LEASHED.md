@@ -11,7 +11,7 @@ upstream-eligible slice (`feat/runtime-native-poc`).
 **Download a prebuilt binary** from the GitHub Release (recommended — no toolchain):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sixtoad/leash/walk-integration/scripts/leash-install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sixtoad/leash/main/scripts/leash-install.sh | bash
 ```
 
 Detects your OS/arch, installs `leash` to `~/.local/bin` (override `LEASH_DEST`,
