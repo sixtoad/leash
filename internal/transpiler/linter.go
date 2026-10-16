@@ -68,10 +68,15 @@ func lintStrict(ps *cedarlib.PolicySet) []LintIssue {
 	if err != nil {
 		return []LintIssue{{Severity: LintError, Code: "invalid_policy", Message: err.Error()}}
 	}
-	if _, err := CompileKernel(ps, eng); err != nil {
+	_, warnings, err := CompileKernelReport(ps, eng)
+	if err != nil {
 		return []LintIssue{{Severity: LintError, Code: "not_enforceable", Message: err.Error(), Suggestion: "Policies on file, exec and connect actions may only test resource membership (`resource in ...`) and the action; see docs/design/AUTHZ-SERVICE.md."}}
 	}
-	return nil
+	var issues []LintIssue
+	for _, w := range warnings {
+		issues = append(issues, LintIssue{PolicyID: w.Policy, Severity: LintWarning, Code: "kernel_stricter", Message: w.Path + ": " + w.Message})
+	}
+	return issues
 }
 
 func lintPolicySet(ps *CedarPolicySet) []LintIssue {

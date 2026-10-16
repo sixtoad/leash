@@ -94,7 +94,15 @@ func randomStrictFilePolicy(rng *rand.Rand) string {
 	return fmt.Sprintf("@leash_semantics(\"cedar\")\n%s (principal, %s, %s) %s;", effect, pick(rng, kpActions), scope, strings.Join(conds, " "))
 }
 
-func compileStrict(t *testing.T, text string) (*engine.Engine, *lsm.PolicySet, error) {
+func warnedPaths(ws []transpiler.KernelWarning) map[string]bool {
+	out := map[string]bool{}
+	for _, w := range ws {
+		out[w.Path] = true
+	}
+	return out
+}
+
+func compileStrict(t *testing.T, text string) (*engine.Engine, *lsm.PolicySet, map[string]bool, error) {
 	t.Helper()
 	ps, err := cedar.NewPolicySetFromBytes("strict.cedar", []byte(text))
 	if err != nil {
@@ -104,8 +112,8 @@ func compileStrict(t *testing.T, text string) (*engine.Engine, *lsm.PolicySet, e
 	if err != nil {
 		t.Fatalf("engine: %v\n%s", err, text)
 	}
-	ir, err := transpiler.CompileKernel(ps, eng)
-	return eng, ir, err
+	ir, warnings, err := transpiler.CompileKernelReport(ps, eng)
+	return eng, ir, warnedPaths(warnings), err
 }
 
 func kernelProbePath(rng *rand.Rand) string {
@@ -121,7 +129,10 @@ func kernelProbePath(rng *rand.Rand) string {
 	return p
 }
 
-func checkKernelParity(t *testing.T, rng *rand.Rand, text string, eng *engine.Engine, ir *lsm.PolicySet, probes int) int {
+// checkKernelParity: the kernel decides like Cedar everywhere, except that
+// a mutation may be denied where Cedar allows it at a warned exact path or
+// below a loose FilePrefix (both documented); never the reverse.
+func checkKernelParity(t *testing.T, rng *rand.Rand, text string, eng *engine.Engine, ir *lsm.PolicySet, warned map[string]bool, probes int) int {
 	t.Helper()
 	k, err := lsm.NewKernelForTest(ir)
 	if err != nil {
@@ -149,7 +160,7 @@ func checkKernelParity(t *testing.T, rng *rand.Rand, text string, eng *engine.En
 		for _, m := range []string{path, path + "/n", path + "n"} {
 			n++
 			got, want := k.Mutation(m), eng.DecideMutation(m).Allow
-			if got != want && !(want && !got && belowLooseFilePrefix(text, m)) {
+			if got != want && !(want && !got && (warned[m] || belowLooseFilePrefix(text, m))) {
 				t.Fatalf("mutation %q: kernel=%v cedar=%v\npolicy:\n%s\nrules: %v", m, got, want, text, ruleStrings(ir.Open))
 			}
 		}
@@ -199,7 +210,7 @@ func TestKernelCompileMatchesCedarForStrictPolicies(t *testing.T) {
 			lines = append(lines, randomStrictFilePolicy(rng))
 		}
 		text := strings.Join(lines, "\n")
-		eng, ir, err := compileStrict(t, text)
+		eng, ir, warned, err := compileStrict(t, text)
 		if err != nil {
 			if !strings.Contains(err.Error(), "not enforceable by the kernel") {
 				t.Fatalf("unexpected compile error: %v\n%s", err, text)
@@ -211,7 +222,7 @@ func TestKernelCompileMatchesCedarForStrictPolicies(t *testing.T) {
 			continue
 		}
 		sets++
-		decisions += checkKernelParity(t, rng, text, eng, ir, 40)
+		decisions += checkKernelParity(t, rng, text, eng, ir, warned, 40)
 	}
 	t.Logf("%d random strict policy sets (%d rejected as not kernel-enforceable), %d decisions: kernel == cedar.Authorize", sets, rejected, decisions)
 }
@@ -251,12 +262,12 @@ func TestKernelCompileMatchesCedarForConnect(t *testing.T) {
 			lines = append(lines, randomStrictConnectPolicy(rng))
 		}
 		text := strings.Join(lines, "\n")
-		eng, ir, err := compileStrict(t, text)
+		eng, ir, warned, err := compileStrict(t, text)
 		if err != nil {
 			t.Fatalf("compile: %v\n%s", err, text)
 		}
 		sets++
-		decisions += checkKernelParity(t, rng, text, eng, ir, 30)
+		decisions += checkKernelParity(t, rng, text, eng, ir, warned, 30)
 	}
 	t.Logf("%d random strict connect sets, %d decisions: kernel == cedar.Authorize (IP rules; hostnames reach the kernel via DNS)", sets, decisions)
 }
@@ -265,7 +276,7 @@ func TestKernelCompileMatchesCedarForConnect(t *testing.T) {
 // -> RewriteLegacy -> CompileKernel -> kernel loaders == cedar.Authorize.
 func TestKernelCompileOfRewrittenLegacyPolicies(t *testing.T) {
 	rng := rand.New(rand.NewSource(1432))
-	sets, decisions, rejected := 0, 0, 0
+	sets, decisions, warnedSets := 0, 0, 0
 	for i := 0; i < 2000; i++ {
 		var lines []string
 		for n := rng.Intn(8) + 1; n > 0; n-- {
@@ -284,23 +295,15 @@ func TestKernelCompileOfRewrittenLegacyPolicies(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		ir, err := transpiler.CompileKernel(rw.Policies, eng)
+		ir, warnings, err := transpiler.CompileKernelReport(rw.Policies, eng)
 		if err != nil {
-			// The only rewritten-legacy shape the kernel cannot enforce: a
-			// mutation Cedar allows at one path (a directory itself) that a
-			// byte-prefix forbid denies around it: the table has no exact
-			// allow.
-			if !strings.Contains(err.Error(), "directory mutations") {
-				t.Fatalf("a rewritten legacy policy must compile for the kernel: %v\nlegacy:\n%s\nstrict:\n%s", err, text, rw.Text)
-			}
-			if rejected == 0 {
-				t.Logf("example rejection: %v\nlegacy:\n%s", err, text)
-			}
-			rejected++
-			continue
+			t.Fatalf("a rewritten legacy policy must compile for the kernel: %v\nlegacy:\n%s\nstrict:\n%s", err, text, rw.Text)
+		}
+		if len(warnings) > 0 {
+			warnedSets++
 		}
 		sets++
-		decisions += checkKernelParity(t, rng, rw.Text, eng, ir, 40)
+		decisions += checkKernelParity(t, rng, rw.Text, eng, ir, warnedPaths(warnings), 40)
 	}
-	t.Logf("%d rewritten legacy sets (%d rejected: a mutation allowed at one path the table can only deny), %d decisions: kernel == cedar.Authorize", sets, rejected, decisions)
+	t.Logf("%d rewritten legacy sets (%d with a warned exact-path mutation over-denial), %d decisions: kernel == cedar.Authorize, or stricter only where documented", sets, warnedSets, decisions)
 }
