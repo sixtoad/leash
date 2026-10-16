@@ -2463,6 +2463,10 @@ func splitResourceLiteral(literal string) (string, string, bool) {
 	if lit == "" {
 		return "", "", false
 	}
+	// The ID starts at the first quote and may contain "::" (an IPv6 host).
+	if q := strings.LastIndex(lit, `::"`) + 2; q >= 4 {
+		return lit[:q-2], cleanCedarLiteral(lit[q:]), true
+	}
 	parts := strings.Split(lit, "::")
 	if len(parts) == 0 {
 		return "", "", false

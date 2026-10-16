@@ -351,13 +351,22 @@ func (t *CedarToLeashTranspiler) parseResource(resourceStr string) *Resource {
 	}
 	// Normalize escaped quotes produced by cedar AST serialization
 	clean := strings.ReplaceAll(resourceStr, `\"`, `"`)
-	parts := strings.Split(clean, "::")
-	if len(parts) < 2 {
-		return nil
+	// The entity ID is the quoted string after the last `::"`: an ID may
+	// itself contain "::" (an IPv6 address), and parseEntityString renders a
+	// nested type as MCP::"Server::"id".
+	head, valuePart := clean, ""
+	if i := strings.LastIndex(clean, `::"`); i >= 0 {
+		head, valuePart = clean[:i], clean[i+2:]
+	} else {
+		parts := strings.Split(clean, "::")
+		if len(parts) < 2 {
+			return nil
+		}
+		head, valuePart = strings.Join(parts[:len(parts)-1], "::"), strings.TrimSpace(parts[len(parts)-1])
 	}
-	valuePart := strings.TrimSpace(parts[len(parts)-1])
-	typeParts := make([]string, len(parts)-1)
-	for i, part := range parts[:len(parts)-1] {
+	parts := strings.Split(head, "::")
+	typeParts := make([]string, len(parts))
+	for i, part := range parts {
 		typeParts[i] = strings.Trim(strings.TrimSpace(part), `"`)
 	}
 	rawType := strings.TrimSpace(strings.Join(typeParts, "::"))
