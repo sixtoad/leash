@@ -401,15 +401,25 @@ static __noinline int check_mutation_policy(const char *path)
     scratch->exact.generation = active_generation;
     scratch->exact.path_len = path_len;
 
+    // Each trie returns its longest matching prefix; its value is that
+    // prefix's specificity (#142: the rule's length; 1 for tables derived
+    // from open rules, where every deny then outranks every allow). The
+    // longer of the allow and the deny wins, a tie denies, and an exact
+    // deny always denies.
+    //
     // Keep nullable map lookups genuinely nested: issuing both before their
     // identical deny branches lets LLVM merge the pointers with a verifier-
     // prohibited bitwise OR.
+    u32 deny_specificity = 0;
     u8 *deny = bpf_map_lookup_elem(&mutation_deny_rules, &scratch->prefix);
-    if (!deny) {
-        u8 *self_deny = bpf_map_lookup_elem(&mutation_self_deny_rules, &scratch->exact);
-        if (!self_deny) {
-            u8 *allow = bpf_map_lookup_elem(&mutation_allow_rules, &scratch->prefix);
-            return allow ? 1 : 0;
+    if (deny) {
+        deny_specificity = *deny;
+    }
+    u8 *self_deny = bpf_map_lookup_elem(&mutation_self_deny_rules, &scratch->exact);
+    if (!self_deny) {
+        u8 *allow = bpf_map_lookup_elem(&mutation_allow_rules, &scratch->prefix);
+        if (allow) {
+            return *allow > deny_specificity ? 1 : 0;
         }
     }
     return 0;

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -184,11 +183,17 @@ func validateOpenPolicyRules(policies []OpenPolicyRule) error {
 		if rule.Action != PolicyDeny && rule.Action != PolicyAllow {
 			return fmt.Errorf("invalid file open policy rule %d action: %d", i, rule.Action)
 		}
-		if rule.Operation > OpOpenRW {
+		if rule.Operation > OpOpenRW && rule.Operation != OpMutation {
 			return fmt.Errorf("invalid file open policy rule %d operation: %d", i, rule.Operation)
 		}
-		if rule.IsDirectory != 0 && rule.Path[rule.PathLen-1] != '/' {
+		if rule.Operation == OpMutation && (rule.IsDirectory == 1 || (rule.IsDirectory == ExactPath && rule.Action != PolicyDeny)) {
+			return fmt.Errorf("invalid file mutation rule %d: a prefix, or an exact deny", i)
+		}
+		if rule.IsDirectory == 1 && rule.Path[rule.PathLen-1] != '/' {
 			return fmt.Errorf("invalid file open policy rule %d: directory path must end with '/'", i)
+		}
+		if rule.IsDirectory > ExactPath {
+			return fmt.Errorf("invalid file open policy rule %d: kind %d", i, rule.IsDirectory)
 		}
 	}
 	return nil
@@ -200,10 +205,8 @@ func (l *OpenLsm) LoadPolicies(policies []OpenPolicyRule) error {
 	}
 	nextRules := append([]OpenPolicyRule(nil), policies...)
 
-	// Sort policy rules by path length (longest first) for specificity
-	sort.SliceStable(nextRules, func(i, j int) bool {
-		return nextRules[i].PathLen > nextRules[j].PathLen
-	})
+	// Longest path first; at equal length deny before allow (#135).
+	sortOpenRulesByPrecedence(nextRules)
 	nextDefaultPolicyResult := rootPathPolicy(nextRules)
 
 	return l.withPolicyUpdate(func() error {
@@ -306,7 +309,8 @@ func (l *OpenLsm) attachCopyUpExitTracepoint(coll *ebpf.Collection) error {
 func rootPathPolicy(rules []OpenPolicyRule) bool {
 	for _, rule := range rules {
 		pathStr := string(bytes.TrimRight(rule.Path[:rule.PathLen], "\x00"))
-		if pathStr == "/" && rule.Action == PolicyAllow {
+		// An exact rule on "/" covers only the root directory itself.
+		if pathStr == "/" && rule.Action == PolicyAllow && rule.IsDirectory != ExactPath && rule.Operation <= OpOpenRW {
 			return true
 		}
 	}
@@ -317,10 +321,16 @@ func rootPathPolicy(rules []OpenPolicyRule) bool {
 // preserving the historical matcher semantics over every accepted byte: each
 // rule matches every path it is a byte prefix of (a directory rule carries its
 // trailing '/', so it covers descendants), a directory rule also matches the
-// directory itself, the longest matching rule wins, an earlier rule wins a
-// length tie, and only rules for the requested operation (or generic open)
+// directory itself, the longest matching rule wins, a deny wins a length tie
+// (see below), and only rules for the requested operation (or generic open)
 // apply. Prefix rules go to the LPM trie; directory-self matches go to the
 // exact map. Generic rules are expanded to every runtime operation.
+//
+// When two rules claim the same key (same path and operation, or a generic
+// rule and an operation-specific rule on the same path) a deny wins over an
+// allow regardless of their order (#135); between equal actions the earlier
+// rule is kept. Callers sort with sortOpenRulesByPrecedence first, which puts
+// that deny earlier anyway, so the explicit check only guards other callers.
 func compileOpenIndex(rules []OpenPolicyRule) compiledOpenIndex {
 	index := compiledOpenIndex{
 		exact:  make(map[openExactRuleKey]openIndexRule),
@@ -340,28 +350,46 @@ func compileOpenIndex(rules []OpenPolicyRule) compiledOpenIndex {
 			if operation > OpOpenRW {
 				continue
 			}
+			if rule.IsDirectory == ExactPath {
+				// Exact path only: above every prefix of the path (at most
+				// PathLen), level with a directory-self entry.
+				exactKey := openExactRuleKey{Operation: operation, PathLen: rule.PathLen}
+				copy(exactKey.Path[:], rule.Path[:rule.PathLen])
+				exactValue := value
+				exactValue.Specificity = rule.PathLen + 1
+				if existing, exists := index.exact[exactKey]; !exists || overridesOpenIndexRule(exactValue, existing) {
+					index.exact[exactKey] = exactValue
+				}
+				continue
+			}
 			prefixKey := openPrefixRuleKey{
 				PrefixLen: openIndexDomainBits + rule.PathLen*8,
 				Domain:    uint8(operation),
 			}
 			copy(prefixKey.Path[:], rule.Path[:rule.PathLen])
-			if _, exists := index.prefix[prefixKey]; !exists {
+			if existing, exists := index.prefix[prefixKey]; !exists || overridesOpenIndexRule(value, existing) {
 				index.prefix[prefixKey] = value
 			}
 
-			if rule.IsDirectory != 0 && rule.PathLen > 1 && rule.Path[rule.PathLen-1] == '/' {
+			if rule.IsDirectory == 1 && rule.PathLen > 1 && rule.Path[rule.PathLen-1] == '/' {
 				selfKey := openExactRuleKey{
 					Operation: operation,
 					PathLen:   rule.PathLen - 1,
 				}
 				copy(selfKey.Path[:], rule.Path[:rule.PathLen-1])
-				if _, exists := index.exact[selfKey]; !exists {
+				if existing, exists := index.exact[selfKey]; !exists || overridesOpenIndexRule(value, existing) {
 					index.exact[selfKey] = value
 				}
 			}
 		}
 	}
 	return index
+}
+
+// overridesOpenIndexRule reports whether candidate replaces existing for the
+// same index key: forbid overrides permit.
+func overridesOpenIndexRule(candidate, existing openIndexRule) bool {
+	return candidate.Action == PolicyDeny && existing.Action != PolicyDeny
 }
 
 type openIndexStore interface {
@@ -652,13 +680,48 @@ func commitPolicyIndexes(mutationStore mutationIndexStore, openStore openIndexSt
 
 func compileMutationIndex(rules []OpenPolicyRule) compiledMutationIndex {
 	index := compiledMutationIndex{denies: make(map[mutationPrefixRuleKey]uint8), allows: make(map[mutationPrefixRuleKey]uint8), selfDenies: make(map[mutationExactRuleKey]uint8)}
+	// Compiled mutation rules are the whole table (#142).
+	compiled := false
+	for _, rule := range rules {
+		if rule.Operation != OpMutation || rule.PathLen == 0 || rule.PathLen > MaxPolicyPathLength {
+			continue
+		}
+		compiled = true
+		if rule.IsDirectory == ExactPath {
+			self := mutationExactRuleKey{PathLen: rule.PathLen}
+			copy(self.Path[:], rule.Path[:rule.PathLen])
+			index.selfDenies[self] = 1
+			continue
+		}
+		// The value is the prefix's specificity: check_mutation_policy
+		// lets the longer of the matching allow and deny win (tie: deny).
+		prefix := mutationPrefixRuleKey{PrefixLen: mutationIndexDomainBits + rule.PathLen*8}
+		copy(prefix.Path[:], rule.Path[:rule.PathLen])
+		if rule.Action == PolicyDeny {
+			index.denies[prefix] = uint8(rule.PathLen)
+		} else {
+			index.allows[prefix] = uint8(rule.PathLen)
+		}
+	}
+	if compiled {
+		return index
+	}
 	for _, rule := range rules {
 		if rule.PathLen == 0 || rule.PathLen > MaxPolicyPathLength {
 			continue
 		}
 		genericDeny := rule.Operation == OpOpen && rule.Action == PolicyDeny
-		rwDirectory := rule.IsDirectory != 0 && rule.Operation == OpOpenRW
+		rwDirectory := rule.IsDirectory == 1 && rule.Operation == OpOpenRW
 		if !genericDeny && !rwDirectory {
+			continue
+		}
+		if rule.IsDirectory == ExactPath {
+			// An exact deny covers mutations of that path only.
+			if genericDeny {
+				self := mutationExactRuleKey{PathLen: rule.PathLen}
+				copy(self.Path[:], rule.Path[:rule.PathLen])
+				index.selfDenies[self] = 1
+			}
 			continue
 		}
 		prefix := mutationPrefixRuleKey{PrefixLen: mutationIndexDomainBits + rule.PathLen*8}
@@ -669,7 +732,7 @@ func compileMutationIndex(rules []OpenPolicyRule) compiledMutationIndex {
 		if rwDirectory && rule.Action == PolicyAllow {
 			index.allows[prefix] = 1
 		}
-		if genericDeny && rule.IsDirectory != 0 && rule.PathLen > 1 && rule.Path[rule.PathLen-1] == '/' {
+		if genericDeny && rule.IsDirectory == 1 && rule.PathLen > 1 && rule.Path[rule.PathLen-1] == '/' {
 			self := mutationExactRuleKey{PathLen: rule.PathLen - 1}
 			copy(self.Path[:], rule.Path[:rule.PathLen-1])
 			index.selfDenies[self] = 1

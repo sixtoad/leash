@@ -46,7 +46,7 @@ The Makefile, release scripts, and Docker builds all shell out to this script, s
   "enforcing": true,
   "contractVersion": 2,
   "minCompatibleContract": 0,
-  "capabilities": ["policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume"],
+  "capabilities": ["policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits"],
   "os": "linux",
   "arch": "amd64"
 }

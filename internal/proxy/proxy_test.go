@@ -419,7 +419,7 @@ func TestHandleTransparentHTTPSAllowedForwardsResponse(t *testing.T) {
 	}
 
 	dialOnce := sync.Once{}
-	proxy.tlsDialer = func(string) (*tls.Conn, error) {
+	proxy.tlsDialer = func(string, string) (*tls.Conn, error) {
 		var conn *tls.Conn
 		dialOnce.Do(func() {
 			conn = targetClientTLS

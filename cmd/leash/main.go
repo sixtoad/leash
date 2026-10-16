@@ -16,6 +16,7 @@ import (
 	"github.com/strongdm/leash/internal/hardening"
 	"github.com/strongdm/leash/internal/idmap"
 	"github.com/strongdm/leash/internal/leashd"
+	"github.com/strongdm/leash/internal/policycli"
 	"github.com/strongdm/leash/internal/resolvercontract"
 	"github.com/strongdm/leash/internal/runner"
 	"github.com/strongdm/leash/internal/telemetry/statsig"
@@ -87,6 +88,8 @@ func main() {
 				log.Fatal(err)
 			}
 			return
+		case "policy": // `policy migrate [--write] <file>`: legacy policy file -> strict Cedar (#142).
+			os.Exit(policycli.Main(args[2:], os.Stdout, os.Stderr))
 		case "doctor": // node readiness self-check; exit 0 enforces, 3 runs proxy-only, 1 cannot run at all.
 			os.Exit(doctor.Main(args[2:], os.Stdout, os.Stderr))
 		case "--harden-exec": // internal: seccomp-harden this process, then exec the workload.

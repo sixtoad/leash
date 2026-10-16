@@ -125,6 +125,8 @@ type httpsHarness struct {
 	dials  atomic.Int32
 	mu     sync.Mutex
 	origin []*http.Request
+	// dialed records the (addr, serverName) of every upstream dial.
+	dialed [][2]string
 	logs   *capturingBroadcaster
 }
 
@@ -142,8 +144,11 @@ func newHTTPSHarness(t *testing.T, rewriteHost string) *httpsHarness {
 	proxy.SetPolicyChecker(stubPolicyChecker{allowConnect: true})
 	h := &httpsHarness{t: t, proxy: proxy, logs: capture}
 	originCert := generateTestCertificate(t, "origin.test")
-	proxy.tlsDialer = func(string) (*tls.Conn, error) {
+	proxy.tlsDialer = func(addr, serverName string) (*tls.Conn, error) {
 		h.dials.Add(1)
+		h.mu.Lock()
+		h.dialed = append(h.dialed, [2]string{addr, serverName})
+		h.mu.Unlock()
 		c, s := net.Pipe()
 		go func() {
 			srv := tls.Server(s, &tls.Config{Certificates: []tls.Certificate{originCert}})
