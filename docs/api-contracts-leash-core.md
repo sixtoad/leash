@@ -185,7 +185,7 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
   "contractVersion": 2,             // current CLI surface
   "minCompatibleContract": 0,       // oldest caller contract still served
   "capabilities": [                 // surface elements a provisioner can drive
-    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "allow-proxy-only"
+    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "allow-proxy-only"
   ],
   "policyLimits": {                 // enforced policy path lengths, in bytes
     "filePathBytes": 255,           // file.open rules: every byte matched; longer rules rejected at load
@@ -275,6 +275,8 @@ Two traps that snippet avoids. Decoding straight into value types makes `null`, 
 ```
 
 `enforcement` is `lsm` (Layer 1 active: every LSM program attached, at least one did, the workload has a scopable cgroup, **and** `bpf` is listed in `/sys/kernel/security/lsm` — attach success alone is not enough, since with `CONFIG_BPF_LSM=y` but bpf inactive the programs attach and never run; an unreadable list counts as not active), `proxy-only` (Layer 1 unavailable, only reachable with `--allow-proxy-only`) or `none` (enforcement skipped). `layer1` is `active` | `unavailable`; `layer2` is `active` | `disabled` (`--lsm-only`). The client prints `leash: enforcement=<level> layer1=<state> layer2=<state>` on the diagnostic stream — always under `--machine-output` (stderr), always when the level is not `lsm`, otherwise with `--verbose`. An older leashd writes a bare `ready` line, for which nothing is printed.
+
+`container-resource-limits` means this build accepts target-container limits: `--cpus <n>` (decimal CPUs), `--memory <n[b|k|m|g]>` (hard cap, minimum `6m`; swap is pinned to the same value) and `--pids-limit <n>` (positive integer). They can also come from `LEASH_CPUS` / `LEASH_MEMORY` / `LEASH_PIDS_LIMIT` or a `[leash.resources]` table (`cpus`, `memory`, `pids_limit`) in the global config or `.leash.toml`. Precedence is per field: flag, then env, then config. An invalid value fails the run before anything is provisioned. The limits apply only to the docker/podman runtimes: the native runtime refuses them instead of ignoring them. Once the target container starts, leash reads `HostConfig` back from the engine and fails closed if a requested limit was not applied. Otherwise it writes one line to the diagnostics stream (stderr under `--machine-output`) with the fields in a fixed order and unset limits omitted, e.g. `event=runner.resource-limits status=applied cpus=1.5 nano_cpus=1500000000 memory=512m memory_bytes=536870912 pids_limit=256`.
 
 `capabilities` is there because the integer over-refuses. Raising `minCompatibleContract` for one removal turns away every caller below the new floor, including those that never used the removed flag; a caller that drives only `--policy` can test for `"policy"` in the array instead of consulting the range at all. Adding a name is additive (no bump); removing one is a break (bump, and raise the floor). A pre-`capabilities` document decodes with the field empty — fall back to the range. The empty string is never a capability.
 

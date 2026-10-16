@@ -52,6 +52,23 @@ Running Leash from `/Users/alice/src/app` generates the following effective set 
 
 Only the last value for a given key is emitted, so the CLI example above would replace the project-scoped `DOTENV_PATH` while preserving `OPENAI_API_KEY` and `BACKEND_URL`.
 
+## Proxy: HTTP/2 handling (`LEASH_PROXY_H2`)
+
+The MITM proxy (Linux `leashd`, macOS `darwind`) picks the ALPN protocols it offers each agent TLS connection from the SNI host. A host is *inspected* when a request-level feature applies to it: a header-rewrite rule for that host, any MCP policy rule, or MCP observability (`LEASH_MCP_OBS` not `off`, the default is `basic`, so by default every host is inspected).
+
+| Client offers | Host | Result |
+| --- | --- | --- |
+| `http/1.1` only (or no ALPN) | any | HTTP/1.1 MITM (unchanged) |
+| `h2` | not inspected | h2 tunneled opaquely to the origin; only the connect allow/deny applies |
+| `h2` | inspected | depends on `LEASH_PROXY_H2`, below |
+
+`LEASH_PROXY_H2`, read from the proxy process's environment (`leashd`, or the `darwind` daemon on macOS):
+
+- `inspect` (default; also used for unset or unknown values): h2 is terminated at the proxy. Each stream gets the same handling as an HTTP/1.1 request (MCP sniff and `tools/call` enforcement, header rewrite, `http.request`/`mcp.*` logging) and is forwarded with an h2-capable client that uses whatever the origin negotiates (h2, or HTTP/1.1 for origins without h2). Bodies are streamed both ways. The only reading ahead is the MCP sniffer, the same as on HTTP/1.1: JSON bodies up to `LEASH_MCP_SNIFF_LIMIT`, SSE while it streams. Trailers, flow control and concurrent streams are kept (up to 250 streams per client connection, the `net/http` default). An MCP denial answers only that stream with `403`; the connection stays open. Each stream's `:authority` must match the connection's verified host, the same check as HTTP/1.1. That host is the SNI name, or, without a hostname SNI, a name that resolves to the destination IP. A mismatch, including h2 connection coalescing onto another host, gets `421 Misdirected Request` before any rewrite and is logged as `event=http.misdirected`. The client then opens a new connection for that host, which goes through its own connect-policy check. Rewrite rules and MCP policy apply to the verified host. Upstream connections dial the destination the connect policy permitted (the original IP, with the SNI kept for the upstream handshake, when only an IP rule permitted the connection). They are pooled per client connection. Client connections with no open streams close after 2 minutes idle.
+- `downgrade`: an escape hatch for clients the h2 MITM breaks. Inspected hosts are offered only `http/1.1`, so the connection takes the HTTP/1.1 path. A client that offers **only** h2 (e.g. gRPC) to a host with a rewrite rule or MCP policy fails the handshake (`no_application_protocol`) rather than being tunneled past the rule. With observability as the only feature, it is tunneled.
+
+Every decision for a client that offered h2 is logged as `event=http.alpn` with `alpn_offered`, `alpn_advertised`, `alpn_negotiated`, `alpn_mode` (`inspect`, `tunnel`, `downgrade` or `refuse`) and `reasons` (`header_rewrite`, `mcp_policy`, `mcp_observe`, `client_h2_only`).
+
 ## Supported Tools
 
 Leash automatically manages mounts for the following subcommands:

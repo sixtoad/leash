@@ -172,6 +172,36 @@ Claude Code handling on top.
   narrow the reported level, and a native refusal now echoes leashd's FATAL
   reason instead of only pointing at the log.
 
+### Fixed — HTTP/2 clients bypassed header rewrite and MCP enforcement (#57)
+- **Full HTTP/2 MITM.** The proxy used to offer `h2, http/1.1` to every client
+  and tunnel any h2 connection opaquely, so header-rewrite rules, MCP
+  `tools/call` policy and MCP observability never saw requests from h2 clients
+  (curl, browsers, gRPC, most SDKs). Only the connect allow/deny applied. Now,
+  when a request-level feature applies to the SNI host (a rewrite rule for the
+  host, any MCP policy, or MCP observability not `off`), the proxy terminates
+  h2. Each stream gets the same handling as an HTTP/1.1 request (MCP sniff and
+  enforcement, header rewrite, `http.request`/`mcp.*` logging), then goes
+  upstream over h2, or HTTP/1.1 when the origin lacks h2. Bodies stream both
+  ways (SSE, gRPC, large uploads); trailers, flow control and concurrent
+  streams are kept. An MCP denial answers only its own stream. Each stream's
+  `:authority` goes through the same verified-authority check as HTTP/1.1
+  (#149): a mismatch gets `421` before any rewrite, so coalesced h2
+  connections cannot carry requests past the connect policy. Rewrite and MCP
+  policy use the verified host. Upstream connections dial the destination the
+  connect policy permitted (#154: the original IP, with SNI preserved, when
+  only an IP rule permitted it). The pool is per client connection, so it is
+  never shared across connections with different permitted destinations. Hosts with no
+  request-level feature keep the opaque h2 tunnel. Same code on Linux and macOS
+  (darwind runs this proxy behind the transparent-proxy extension).
+- **`LEASH_PROXY_H2=inspect|downgrade`** (default `inspect`). `downgrade` is an
+  escape hatch: inspected hosts are offered only `http/1.1`, so connections take
+  the HTTP/1.1 path. An h2-only client (gRPC) to a host with a rewrite rule or
+  MCP policy is refused at the handshake rather than tunneled past the rule.
+  See [`docs/CONFIG.md`](docs/CONFIG.md#proxy-http2-handling-leash_proxy_h2).
+- Each ALPN decision for a client that offered h2 is logged as
+  `event=http.alpn` with `alpn_offered`, `alpn_advertised`, `alpn_negotiated`,
+  `alpn_mode` (`inspect`/`tunnel`/`downgrade`/`refuse`) and `reasons`.
+
 ### Fixed — remedy text that could break the host
 - **`leash doctor` could tell an operator to set `lsm=,bpf`** — a leading-comma
   kernel command line that *replaces* the host's LSM stack, silently disabling
