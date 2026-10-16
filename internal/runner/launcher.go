@@ -322,7 +322,22 @@ func (c containerLauncher) Provision(ctx context.Context, stopSignal string) (st
 }
 
 func (c containerLauncher) StartEnforcement(ctx context.Context, cgroupPath string) error {
-	return c.r.launchLeashContainer(ctx, cgroupPath)
+	// The sidecar joins the target's network namespace, so a target that died in
+	// its bootstrap entrypoint makes the runtime reject the sidecar with "cannot
+	// join network namespace of a non running container", hiding the real error.
+	// Check before launching, and again if the launch fails (the target may die
+	// in between), surfacing the target's exit code and log tail as the primary
+	// error while it still exists (#81).
+	if tbe := c.r.targetBootstrapFailure(ctx, "during bootstrap, before the leash sidecar could start", nil); tbe != nil {
+		return tbe
+	}
+	if err := c.r.launchLeashContainer(ctx, cgroupPath); err != nil {
+		if tbe := c.r.targetBootstrapFailure(ctx, "during bootstrap, before the leash sidecar could start", fmt.Errorf("leash sidecar launch failed: %w", err)); tbe != nil {
+			return tbe
+		}
+		return err
+	}
+	return nil
 }
 
 func (c containerLauncher) WaitReady(ctx context.Context) error {

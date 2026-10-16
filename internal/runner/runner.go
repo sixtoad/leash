@@ -2960,9 +2960,8 @@ func (r *runner) waitForEnforcementReady(ctx context.Context) error {
 		}
 
 		if state := r.containerSummary(ctx, r.cfg.targetContainer); isTerminalStatus(state) {
-			logs := r.containerLogs(ctx, r.cfg.targetContainer)
-			if logs != "" {
-				return fmt.Errorf("target container terminated before enforcement was ready (state=%s).\nRecent docker logs (%s):\n%s", state, r.cfg.targetContainer, indentLines(logs, "  "))
+			if tbe := r.targetBootstrapFailure(ctx, "before enforcement was ready", nil); tbe != nil {
+				return tbe
 			}
 			return fmt.Errorf("target container terminated before enforcement was ready (state=%s). Inspect docker logs %s", state, r.cfg.targetContainer)
 		}
@@ -3009,11 +3008,12 @@ func (r *runner) containerSummary(ctx context.Context, name string) string {
 }
 
 func (r *runner) containerLogs(ctx context.Context, name string) string {
-	out, err := r.rt().Output(ctx, "logs", "--tail", "200", name)
+	out, err := r.rt().Output(ctx, "logs", "--tail", strconv.Itoa(targetLogTailLines), name)
 	if err != nil {
 		return fmt.Sprintf("unavailable: %v", err)
 	}
-	out = strings.TrimSpace(out)
+	// Bounded and credential-redacted, like the target excerpt (#81).
+	out = sanitizeContainerLogs(out)
 	if out == "" {
 		return "(no output)"
 	}
