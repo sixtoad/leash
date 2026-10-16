@@ -99,6 +99,7 @@ type ConnectEvent struct {
 	Protocol     uint32    // IPPROTO_TCP, IPPROTO_UDP
 	DestIP       uint32    // Canonical IPv4 value a<<24|b<<16|c<<8|d
 	DestPort     uint16    // Host-order destination port
+	_            [2]byte   // C alignment padding; binary.Read adds none implicitly
 	Result       int32     // Result of the connect operation (0 = allowed, -EACCES = denied)
 	DestHostname [128]byte // Resolved hostname if available
 }
@@ -554,25 +555,7 @@ func (pc *SimplePolicyChecker) CheckConnect(hostname string, ip string, port uin
 
 		// Check hostname match if hostname is provided and rule has hostname restriction
 		if rule.HostnameLen > 0 {
-			ruleHostname := string(bytes.TrimRight(rule.Hostname[:], "\x00"))
-
-			if rule.IsWildcard == 1 {
-				// Wildcard matching (*.example.com)
-				if len(ruleHostname) >= 2 && ruleHostname[:2] == "*." {
-					suffix := ruleHostname[2:]
-					if strings.HasSuffix(hostname, suffix) {
-						// Ensure it's a proper subdomain match
-						if len(hostname) > len(suffix) {
-							matches = true
-						}
-					}
-				}
-			} else {
-				// Exact hostname match
-				if hostname == ruleHostname || ruleHostname == "*" {
-					matches = true
-				}
-			}
+			matches = connectHostnameMatches(&rule, hostname)
 		} else {
 			// No hostname restriction, matches if IP and port match
 			matches = true
@@ -587,6 +570,23 @@ func (pc *SimplePolicyChecker) CheckConnect(hostname string, ip string, port uin
 
 	// No rule matched, use default policy
 	return pc.defaultPolicy
+}
+
+// connectHostnameMatches reports whether a rule's hostname covers hostname.
+// Names compare case-insensitively and a trailing dot is ignored. A wildcard
+// "*.example.com" needs a label boundary: it matches a.example.com and
+// a.b.example.com, not the apex example.com and not evilexample.com.
+func connectHostnameMatches(rule *ConnectPolicyRule, hostname string) bool {
+	ruleHost := strings.ToLower(string(bytes.TrimRight(rule.Hostname[:rule.HostnameLen], "\x00")))
+	if ruleHost == "*" {
+		return true
+	}
+	host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
+	if rule.IsWildcard == 1 && strings.HasPrefix(ruleHost, "*.") {
+		suffix := ruleHost[1:] // ".example.com"
+		return len(host) > len(suffix) && strings.HasSuffix(host, suffix)
+	}
+	return host == ruleHost
 }
 
 // CheckMCPCall evaluates whether an MCP tools/call should be allowed, matching on server and tool.
