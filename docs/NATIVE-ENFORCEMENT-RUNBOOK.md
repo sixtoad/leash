@@ -72,7 +72,7 @@ Confirm after reboot: `cat /sys/kernel/security/lsm` must now include `bpf`.
 ## 3. Install the binary
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/sixtoad/leash/walk-integration/scripts/leash-install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/sixtoad/leash/main/scripts/leash-install.sh | bash
 # or from source:  scripts/install-leash.sh   (or  sudo scripts/install-leash.sh /usr/local/bin)
 ```
 

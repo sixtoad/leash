@@ -3,7 +3,7 @@
 # leash-install.sh — download a prebuilt leash binary from the GitHub Release and
 # install it onto your PATH. Detects OS/arch and grabs the latest release asset.
 #
-#   curl -fsSL https://raw.githubusercontent.com/sixtoad/leash/walk-integration/scripts/leash-install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/sixtoad/leash/main/scripts/leash-install.sh | bash
 #
 # Env:  LEASH_REPO (default sixtoad/leash), LEASH_DEST (default ~/.local/bin),
 #       LEASH_TAG  (default: latest release)
