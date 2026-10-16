@@ -4,7 +4,6 @@ import (
 	"errors"
 	"math/rand"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -284,8 +283,9 @@ func TestCompileOpenIndexPreservesOperationOrderAndDirectorySemantics(t *testing
 		openRuleForPath(PolicyAllow, OpOpenRW, path),
 		openRuleForPath(PolicyDeny, OpOpen, path),
 	})
-	if got := allowFirst.prefix[prefixIndexKey(OpOpenRW, path)]; got.Action != PolicyAllow || got.Order != 0 {
-		t.Fatalf("same-path operation-specific first rule lost precedence: %+v", got)
+	// Forbid overrides permit on the same key whatever the input order (#135).
+	if got := allowFirst.prefix[prefixIndexKey(OpOpenRW, path)]; got.Action != PolicyDeny || got.Order != 1 {
+		t.Fatalf("same-path deny lost to an earlier allow: %+v", got)
 	}
 }
 
@@ -773,7 +773,7 @@ func checkOpenIndexAgainstLegacy(t *testing.T, rng *rand.Rand, long string) {
 			rules = append(rules, rule)
 		}
 		// Same ordering LoadPolicies applies before compiling.
-		sort.SliceStable(rules, func(i, j int) bool { return rules[i].PathLen > rules[j].PathLen })
+		sortOpenRulesByPrecedence(rules)
 		defaultAllow := rootPathPolicy(rules)
 		index := compileOpenIndex(rules)
 		for probe := 0; probe < 8; probe++ {

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -200,10 +199,8 @@ func (l *OpenLsm) LoadPolicies(policies []OpenPolicyRule) error {
 	}
 	nextRules := append([]OpenPolicyRule(nil), policies...)
 
-	// Sort policy rules by path length (longest first) for specificity
-	sort.SliceStable(nextRules, func(i, j int) bool {
-		return nextRules[i].PathLen > nextRules[j].PathLen
-	})
+	// Longest path first; at equal length deny before allow (#135).
+	sortOpenRulesByPrecedence(nextRules)
 	nextDefaultPolicyResult := rootPathPolicy(nextRules)
 
 	return l.withPolicyUpdate(func() error {
@@ -317,10 +314,16 @@ func rootPathPolicy(rules []OpenPolicyRule) bool {
 // preserving the historical matcher semantics over every accepted byte: each
 // rule matches every path it is a byte prefix of (a directory rule carries its
 // trailing '/', so it covers descendants), a directory rule also matches the
-// directory itself, the longest matching rule wins, an earlier rule wins a
-// length tie, and only rules for the requested operation (or generic open)
+// directory itself, the longest matching rule wins, a deny wins a length tie
+// (see below), and only rules for the requested operation (or generic open)
 // apply. Prefix rules go to the LPM trie; directory-self matches go to the
 // exact map. Generic rules are expanded to every runtime operation.
+//
+// When two rules claim the same key (same path and operation, or a generic
+// rule and an operation-specific rule on the same path) a deny wins over an
+// allow regardless of their order (#135); between equal actions the earlier
+// rule is kept. Callers sort with sortOpenRulesByPrecedence first, which puts
+// that deny earlier anyway, so the explicit check only guards other callers.
 func compileOpenIndex(rules []OpenPolicyRule) compiledOpenIndex {
 	index := compiledOpenIndex{
 		exact:  make(map[openExactRuleKey]openIndexRule),
@@ -345,7 +348,7 @@ func compileOpenIndex(rules []OpenPolicyRule) compiledOpenIndex {
 				Domain:    uint8(operation),
 			}
 			copy(prefixKey.Path[:], rule.Path[:rule.PathLen])
-			if _, exists := index.prefix[prefixKey]; !exists {
+			if existing, exists := index.prefix[prefixKey]; !exists || overridesOpenIndexRule(value, existing) {
 				index.prefix[prefixKey] = value
 			}
 
@@ -355,13 +358,19 @@ func compileOpenIndex(rules []OpenPolicyRule) compiledOpenIndex {
 					PathLen:   rule.PathLen - 1,
 				}
 				copy(selfKey.Path[:], rule.Path[:rule.PathLen-1])
-				if _, exists := index.exact[selfKey]; !exists {
+				if existing, exists := index.exact[selfKey]; !exists || overridesOpenIndexRule(value, existing) {
 					index.exact[selfKey] = value
 				}
 			}
 		}
 	}
 	return index
+}
+
+// overridesOpenIndexRule reports whether candidate replaces existing for the
+// same index key: forbid overrides permit.
+func overridesOpenIndexRule(candidate, existing openIndexRule) bool {
+	return candidate.Action == PolicyDeny && existing.Action != PolicyDeny
 }
 
 type openIndexStore interface {

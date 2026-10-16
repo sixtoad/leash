@@ -3,6 +3,7 @@ package macsync
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/google/uuid"
@@ -75,6 +76,11 @@ func ConvertPolicyToMacRules(policy *lsm.PolicySet) ([]messages.MacPolicyRule, [
 	}
 
 	for _, rule := range policy.Connect {
+		// Host::"*" is the connect default (PolicySet.ConnectDefaultAllow),
+		// not a rule; deny-first ordering must not turn it into one (#135).
+		if lsm.IsConnectDefaultRule(rule) {
+			continue
+		}
 		action := actionString(rule.Action)
 		if action == "" {
 			continue
@@ -93,6 +99,14 @@ func ConvertPolicyToMacRules(policy *lsm.PolicySet) ([]messages.MacPolicyRule, [
 	}
 
 	macRules = append(macRules, firmlinkVariants(macRules)...)
+
+	// The Network Extension filter returns the first matching rule, so every
+	// deny goes first: a matching forbid always wins, whatever the input order
+	// (#135). File/exec rules are re-sorted by the ES extension
+	// (ruleSortComparator), which already ranks deny before allow.
+	sort.SliceStable(networkRules, func(i, j int) bool {
+		return networkRules[i].Action == "deny" && networkRules[j].Action != "deny"
+	})
 
 	return macRules, networkRules
 }

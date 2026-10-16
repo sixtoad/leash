@@ -702,7 +702,26 @@ func (p *CedarParser) ParseFromNamedString(name, content string) (*CedarPolicySe
 func (p *CedarParser) extractPoliciesFromNativeSet(nativePolicySet *cedarlib.PolicySet) ([]CedarPolicy, error) {
 	policies := make([]CedarPolicy, 0)
 
-	for policyID, nativePolicy := range nativePolicySet.Map() {
+	// PolicySet.Map is a Go map; iterate in source order (then ID) so the
+	// transpiled rule order is the same on every run (#135).
+	policyMap := nativePolicySet.Map()
+	ids := make([]cedarlib.PolicyID, 0, len(policyMap))
+	for policyID := range policyMap {
+		ids = append(ids, policyID)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		a, b := policyMap[ids[i]].Position(), policyMap[ids[j]].Position()
+		if a.Filename != b.Filename {
+			return a.Filename < b.Filename
+		}
+		if a.Offset != b.Offset {
+			return a.Offset < b.Offset
+		}
+		return ids[i] < ids[j]
+	})
+
+	for _, policyID := range ids {
+		nativePolicy := policyMap[policyID]
 		policy, err := p.extractPolicyFromAST(string(policyID), nativePolicy)
 		if err != nil {
 			return nil, fmt.Errorf("failed to extract policy %s: %w", policyID, err)

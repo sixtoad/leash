@@ -125,11 +125,13 @@ Leash IR and logs use stable operation strings. Actions map as follows:
 
 Notes:
 - Directory resources must end with `/`. The transpiler normalises this; the linter warns when missing.
-- `FileOpen` file and directory resource paths may contain at most 255 bytes (a directory's trailing `/` counts); parsers and loaders reject a longer individual rule. The kernel compares every byte of every accepted rule: a rule matches each path it is a byte prefix of (a directory rule also matches the directory itself), the longest matching rule wins, and an earlier rule wins a tie. The hard-link guard (judged as a read of the source) and the directory-mutation hooks (`mkdir`, `unlink`, `rmdir`, `rename`) use the same full-length rules. A runtime path longer than 255 bytes cannot be matched and is denied.
+- `FileOpen` file and directory resource paths may contain at most 255 bytes (a directory's trailing `/` counts); parsers and loaders reject a longer individual rule. The kernel compares every byte of every accepted rule: a rule matches each path it is a byte prefix of (a directory rule also matches the directory itself), the longest matching rule wins, and at equal length a forbid beats a permit regardless of rule order. The hard-link guard (judged as a read of the source) and the directory-mutation hooks (`mkdir`, `unlink`, `rmdir`, `rename`) use the same full-length rules. A runtime path longer than 255 bytes cannot be matched and is denied.
 - `ProcessExec` resource paths are still matched by the legacy 64-byte kernel matcher (at most 64 exec rules); the exec loader rejects a longer rule or a larger rule set instead of skipping it.
 - `leash version --json` advertises both limits as `policyLimits.filePathBytes` / `policyLimits.execPathBytes` (capability `policy-path-limits`).
 - IPv6 literals and CIDR are not supported in v1 policies.
 - Hostname rules require the Leash proxy for hostname enforcement (kernel enforces IP only).
+- `NetworkConnect` and `McpCall` have no specificity order: any matching `forbid` wins over every matching `permit`, regardless of rule order. The bare `Host::"*"` resource is the connect default (`permit` = default allow, `forbid` = default deny), not a rule, so `forbid Host::"*"` plus `permit Host::"api.example.com"` allows only that host.
+- The kernel enforces hostname rules on the IPs they resolve to. If a forbidden host and a permitted host share an IP (common behind a CDN), the kernel denies that IP, so the permitted host is blocked too. Use the proxy's hostname rules, not a hostname `forbid`, for hosts that share an IP with permitted ones.
 
 ## File Access Examples
 

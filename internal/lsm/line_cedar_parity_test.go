@@ -2,7 +2,7 @@ package lsm_test
 
 import (
 	"fmt"
-	"sort"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -69,19 +69,6 @@ func singleFileRule(t *testing.T, set *lsm.PolicySet) lsm.PolicyRule {
 	return rules[0]
 }
 
-func canonicalize(rules []lsm.PolicyRule) {
-	sort.SliceStable(rules, func(i, j int) bool {
-		a, b := string(rules[i].Path[:rules[i].PathLen]), string(rules[j].Path[:rules[j].PathLen])
-		if a != b {
-			return a < b
-		}
-		if rules[i].Operation != rules[j].Operation {
-			return rules[i].Operation < rules[j].Operation
-		}
-		return rules[i].Action < rules[j].Action
-	})
-}
-
 func describe(r lsm.PolicyRule) string {
 	return fmt.Sprintf("{action=%d op=%d path=%q len=%d dir=%d}", r.Action, r.Operation, string(r.Path[:r.PathLen]), r.PathLen, r.IsDirectory)
 }
@@ -131,11 +118,6 @@ func TestLineFormatMatchesCedarWholePolicy(t *testing.T) {
 	if err := lsm.ValidateOpenRulesForTest(lineOpen); err != nil {
 		t.Fatalf("kernel validation rejected line-format rules: %v", err)
 	}
-	// The Cedar parser iterates a policy map, so its rule order is not
-	// stable; canonicalize both sides (no two pairs share a path, so order
-	// carries no tie-break meaning here).
-	canonicalize(cedarSet.Open)
-	canonicalize(lineOpen)
 	if !lsm.SameKernelIndexesForTest(cedarSet.Open, lineOpen) {
 		t.Fatal("Cedar and line-format policies compile to different kernel indexes")
 	}
@@ -179,6 +161,32 @@ func TestLineFormatDirectoryRuleCoversDirectoryItself(t *testing.T) {
 	for _, tc := range cases {
 		if got := lsm.OpenDecisionForTest(rules, tc.path, tc.op); got != tc.want {
 			t.Errorf("decision(%q, op=%d) = %d, want %d", tc.path, tc.op, got, tc.want)
+		}
+	}
+}
+
+// Issue #135: the Cedar transpiler keeps source order on every run, and a
+// forbid beats a permit on the same path and operation whichever comes first
+// in the source.
+func TestCedarSamePathForbidWinsInEitherSourceOrder(t *testing.T) {
+	t.Parallel()
+	w := parityRoot + "/work"
+	permit := cedarRule("permit", "FileOpen", "Dir", w+"/shared") + cedarRule("permit", "FileOpenReadOnly", "File", w+"/notes.txt")
+	forbid := cedarRule("forbid", "FileOpenReadOnly", "Dir", w+"/shared") + cedarRule("forbid", "FileOpen", "File", w+"/notes.txt")
+	for name, policy := range map[string]string{"permit first": permit + forbid, "forbid first": forbid + permit} {
+		first := transpileCedar(t, policy)
+		for i := 0; i < 50; i++ {
+			if again := transpileCedar(t, policy); !reflect.DeepEqual(again, first) {
+				t.Fatalf("%s: transpile %d produced a different rule set", name, i)
+			}
+		}
+		for _, probe := range []string{w + "/shared", w + "/shared/f", w + "/notes.txt"} {
+			if got := lsm.OpenDecisionForTest(first.Open, probe, lsm.OpOpenRO); got != lsm.PolicyDeny {
+				t.Errorf("%s: read %q = %d, want deny", name, probe, got)
+			}
+		}
+		if got := lsm.OpenDecisionForTest(first.Open, w+"/shared/f", lsm.OpOpenRW); got != lsm.PolicyAllow {
+			t.Errorf("%s: write under permitted dir = %d, want allow", name, got)
 		}
 	}
 }
