@@ -166,6 +166,7 @@ type runtimeState struct {
 	mitmProxy         *proxy.MITMProxy
 	lsmManager        *lsm.LSMManager
 	policyManager     *policy.Manager
+	decisions         *policy.Decisions // the engine shared by the proxy and the authz socket
 	policyWatcherStop func()
 	policyReady       atomic.Bool
 	closeOnce         sync.Once
@@ -437,12 +438,12 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 		return nil, fmt.Errorf("failed to parse Cedar policy: %w", err)
 	}
 
-	connectRules := lsm.ConvertToConnectRules(initialPolicy.LSMPolicies.Connect)
-	defaultAllow := connectDefaultAllow(initialPolicy.LSMPolicies)
-	policyChecker := lsm.NewSimplePolicyChecker(connectRules, defaultAllow, initialPolicy.LSMPolicies.MCP)
+	// One engine per policy change, shared by the proxy and the authz socket (#142).
+	decisions := &policy.Decisions{}
+	initialEngine := decisions.Publish(initialPolicy.Compilation.Engine)
 
 	// n.b. This kicks off certificate creation.
-	mitmProxy, err := proxy.NewMITMProxy(cfg.ProxyPort, headerRewriter, policyChecker, logger, cfg.MCPConfig)
+	mitmProxy, err := proxy.NewMITMProxy(cfg.ProxyPort, headerRewriter, initialEngine, logger, cfg.MCPConfig)
 	if err != nil {
 		logger.Close()
 		return nil, fmt.Errorf("failed to create MITM proxy: %w", err)
@@ -459,13 +460,14 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 		headerRewriter:    headerRewriter,
 		mitmProxy:         mitmProxy,
 		lsmManager:        lsmManager,
+		decisions:         decisions,
 		bootstrapPath:     filepath.Join(leashDir, entrypoint.BootstrapReadyFileName),
 		telemetryProvider: telemetryProvider,
 	}
 
-	policyManager := policy.NewManager(lsmManager, func(rules *lsm.PolicySet, httpRules []proxy.HeaderRewriteRule) {
-		state.headerRewriter.SetRules(httpRules)
-		applyPolicyToProxy(state.mitmProxy, rules)
+	policyManager := policy.NewManager(lsmManager, func(active *cedarutil.Compilation) {
+		state.headerRewriter.SetRules(active.HTTPRules)
+		state.decisions.Publish(active.Engine, state.mitmProxy.SetEngine)
 	})
 
 	if err := policyManager.UpdateFileRules(initialPolicy.LSMPolicies, initialPolicy.HTTPRewrites); err != nil {
@@ -755,19 +757,6 @@ func (rt *runtimeState) configureNetwork() error {
 		log.Printf("Warning: Failed to mount tracefs: %v", err)
 	}
 	return nil
-}
-
-func connectDefaultAllow(policies *lsm.PolicySet) bool {
-	if policies == nil {
-		return false
-	}
-	return policies.ConnectDefaultAllow
-}
-
-func applyPolicyToProxy(mitmproxy *proxy.MITMProxy, rules *lsm.PolicySet) {
-	connectRules := lsm.ConvertToConnectRules(rules.Connect)
-	defaultAllow := connectDefaultAllow(rules)
-	mitmproxy.SetPolicyChecker(lsm.NewSimplePolicyChecker(connectRules, defaultAllow, rules.MCP))
 }
 
 const proxyMark = "0x2000"

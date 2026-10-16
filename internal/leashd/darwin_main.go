@@ -94,8 +94,8 @@ func MainDarwin(args []string) error {
 	headerRewriter := proxy.NewHeaderRewriter()
 	headerRewriter.SetSharedLogger(logger)
 
-	policyManager := policy.NewManager(nil, func(_ *lsm.PolicySet, httpRules []proxy.HeaderRewriteRule) {
-		headerRewriter.SetRules(httpRules)
+	policyManager := policy.NewManager(nil, func(active *cedarutil.Compilation) {
+		headerRewriter.SetRules(active.HTTPRules)
 	})
 
 	if err := policyManager.UpdateFileRules(cfg.LSMPolicies, cfg.HTTPRewrites); err != nil {

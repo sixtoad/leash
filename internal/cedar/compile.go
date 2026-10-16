@@ -9,14 +9,32 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	cedarlib "github.com/cedar-policy/cedar-go"
+
+	"github.com/strongdm/leash/internal/engine"
 	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/proxy"
 	"github.com/strongdm/leash/internal/transpiler"
 )
 
-// Compilation represents Cedar policies compiled into LSM and proxy rule sets.
+// Compilation is a Cedar policy layer ready to enforce (#142): the strict
+// Cedar the engine evaluates, the engine, and the kernel tables compiled from
+// the same strict set.
 type Compilation struct {
-	Cedar     string
+	// Cedar is the source text.
+	Cedar string
+	// Semantics is how the source was read (legacy files are rewritten).
+	Semantics transpiler.Semantics
+	// Strict is the policy set every userspace decision evaluates.
+	Strict *cedarlib.PolicySet
+	// StrictText is Strict as Cedar text (the rewrite, for a legacy file).
+	StrictText string
+	// Rewrite describes the legacy rewrite (nil for a strict file).
+	Rewrite *transpiler.RewriteReport
+	// Engine decides userspace requests over Strict.
+	Engine *engine.Engine
+	// Policies are the kernel tables compiled from Strict; Policies.Source
+	// is the source, which policy.Manager merges layers by.
 	Policies  *lsm.PolicySet
 	HTTPRules []proxy.HeaderRewriteRule
 }
@@ -79,19 +97,19 @@ func CompileFile(path string) (*Compilation, error) {
 	return compilation, nil
 }
 
-// CompileString compiles Cedar text into Leash policy primitives. The provided
-// name is used for error reporting (typically a file path).
+// CompileString compiles one Cedar layer: parse, read its semantics
+// (@leash_semantics), rewrite a legacy file to strict Cedar, build the engine
+// and compile the kernel tables. Any failure is an *ErrorDetail; nothing is
+// skipped. The provided name is used for error reporting (typically a file
+// path).
 func CompileString(name, cedar string) (*Compilation, error) {
-	tr := transpiler.NewCedarToLeashTranspiler()
-	policies, httpRules, err := tr.TranspileFromNamedString(name, cedar)
+	comp, err := CompileLayers([]Layer{{Source: &lsm.PolicySource{Name: name, Text: cedar}}})
 	if err != nil {
 		return nil, formatCedarError(err, name, cedar)
 	}
-	return &Compilation{
-		Cedar:     cedar,
-		Policies:  policies,
-		HTTPRules: httpRules,
-	}, nil
+	comp.Cedar = cedar
+	comp.Policies.Source = &lsm.PolicySource{Name: name, Text: cedar}
+	return comp, nil
 }
 
 func formatCedarError(err error, filePath, cedar string) *ErrorDetail {

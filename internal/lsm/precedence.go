@@ -7,8 +7,9 @@ import (
 
 // Rule precedence (#135).
 //
-// Every matcher in this package (the BPF scans, the compiled file-open index
-// and the userspace proxy checker) takes the first matching rule. The front
+// Every kernel matcher in this package (the BPF scans and the compiled
+// file-open index) takes the first matching rule. (Userspace decisions are
+// Cedar's, through package engine, #142.) The front
 // ends do not guarantee an order (the Cedar parser used to iterate a Go map),
 // so the order is fixed here, and the matchers follow it whatever order they
 // were given:
@@ -110,30 +111,4 @@ func IsConnectDefaultRule(rule PolicyRule) bool {
 
 func isConnectDefault(ip uint32, port uint16, hostname []byte, hostnameLen int32) bool {
 	return ip == 0 && port == 0 && hostnameLen == 1 && hostname[0] == '*'
-}
-
-// connectRulesByPrecedence returns a copy of userspace connect rules with
-// every deny before every allow, keeping the given order otherwise. The
-// Host::"*" default rule is dropped; the caller passes the default separately.
-func connectRulesByPrecedence(rules []ConnectPolicyRule) []ConnectPolicyRule {
-	out := make([]ConnectPolicyRule, 0, len(rules))
-	for _, r := range rules {
-		if !isConnectDefault(r.DestIP, r.DestPort, r.Hostname[:], r.HostnameLen) {
-			out = append(out, r)
-		}
-	}
-	sort.SliceStable(out, func(i, j int) bool {
-		less, _ := denyFirst(uint32(out[i].Action), uint32(out[j].Action))
-		return less
-	})
-	return out
-}
-
-// mcpRulesByPrecedence orders MCP rules in place with every deny before every
-// allow, keeping the given order otherwise.
-func mcpRulesByPrecedence(rules []MCPPolicyRule) {
-	sort.SliceStable(rules, func(i, j int) bool {
-		less, _ := denyFirst(uint32(rules[i].Action), uint32(rules[j].Action))
-		return less
-	})
 }

@@ -318,7 +318,7 @@ func Parse(document []byte) (Info, error) {
 //     intercepting MITM proxy.
 //   - darwin: the same MITM proxy — the darwin runtime constructs it and pushes
 //     policy into it (internal/darwind/runtime_darwin.go, NewMITMProxy /
-//     applyPolicyToProxy) — alongside the separately installed Endpoint Security
+//     policy.Decisions.Publish) — alongside the separately installed Endpoint Security
 //     and Network Extension components it coordinates with.
 //
 // Any other target is a build with no enforcement path at all.

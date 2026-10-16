@@ -238,6 +238,23 @@ func TestPreFlightRejectsWorldReadableKey(t *testing.T) {
 	}
 }
 
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func TestPreFlightLogsMountSummary(t *testing.T) {
 	t.Parallel()
 
@@ -247,7 +264,9 @@ func TestPreFlightLogsMountSummary(t *testing.T) {
 	_, _ = provisionLeashEnv(t)
 
 	originalWriter := log.Writer()
-	var buf bytes.Buffer
+	// Parallel tests log through the global logger too: read the capture
+	// under the same lock its writes take.
+	var buf lockedBuffer
 	log.SetOutput(&buf)
 	t.Cleanup(func() { log.SetOutput(originalWriter) })
 
