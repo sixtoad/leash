@@ -201,7 +201,7 @@ func lowerLegacyPolicy(layer string, p CedarPolicy, report *RewriteReport) (*leg
 
 	sc, err := engine.ClassifyActions(native)
 	if err != nil {
-		return nil, fmt.Errorf("invalid policy %s (%s): %w", p.ID, u.source, err)
+		return nil, fmt.Errorf("policy %s at %s:1: %w", engine.DisplayID(cedarlib.PolicyID(p.ID), native), u.source, err)
 	}
 	if len(sc.Namespaces) > 0 {
 		// Plugin actions always had Cedar semantics (#142).
