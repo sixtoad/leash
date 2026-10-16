@@ -52,8 +52,10 @@ func TestDirectoryMutationHooksRequireWritableDirectoryRules(t *testing.T) {
 		"bpf_map_lookup_elem(&mutation_self_deny_rules, &scratch->exact)",
 		"bpf_map_lookup_elem(&active_mutation_generation, &zero)",
 		"u64 activation_token = *token_ptr;",
-		"if (!deny) {",
+		"deny_specificity = *deny;",
 		"if (!self_deny) {",
+		// Longest prefix between the allow and the deny trie; a tie denies (#142).
+		"return *allow > deny_specificity ? 1 : 0;",
 		"if (!scratch) return 0;",
 		"if (!confirmed_token) return 0;",
 		"*confirmed_token == scratch->activation_token",

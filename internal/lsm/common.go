@@ -113,10 +113,11 @@ const (
 	// (mkdir, unlink, rmdir, rename source and destination), compiled by
 	// transpiler.CompileKernel from the Cedar decisions (#142): an allow
 	// prefix, a deny prefix, or (IsDirectory == ExactPath) an exact deny.
-	// The kernel denies a mutation under any deny prefix or exact deny, else
-	// allows it under any allow prefix, else denies. When a set has no
-	// OpMutation rule (rules built in code), the table is derived from the
-	// open rules as before.
+	// The longest matching prefix decides (a tie denies), an exact deny
+	// always denies, no match denies. When a set has no OpMutation rule
+	// (rules built in code), the table is derived from the open rules as
+	// before, with every prefix at specificity 1, so any deny outranks any
+	// allow there, as it always did.
 	OpMutation = 5
 )
 

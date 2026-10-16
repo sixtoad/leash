@@ -287,9 +287,14 @@ func TestKernelCompileOfRewrittenLegacyPolicies(t *testing.T) {
 		ir, err := transpiler.CompileKernel(rw.Policies, eng)
 		if err != nil {
 			// The only rewritten-legacy shape the kernel cannot enforce: a
-			// mutation permit nested in a forbid nested in a permit.
+			// mutation Cedar allows at one path (a directory itself) that a
+			// byte-prefix forbid denies around it: the table has no exact
+			// allow.
 			if !strings.Contains(err.Error(), "directory mutations") {
 				t.Fatalf("a rewritten legacy policy must compile for the kernel: %v\nlegacy:\n%s\nstrict:\n%s", err, text, rw.Text)
+			}
+			if rejected == 0 {
+				t.Logf("example rejection: %v\nlegacy:\n%s", err, text)
 			}
 			rejected++
 			continue
@@ -297,5 +302,5 @@ func TestKernelCompileOfRewrittenLegacyPolicies(t *testing.T) {
 		sets++
 		decisions += checkKernelParity(t, rng, rw.Text, eng, ir, 40)
 	}
-	t.Logf("%d rewritten legacy sets (%d rejected: mutation permit nested in forbid nested in permit), %d decisions: kernel == cedar.Authorize", sets, rejected, decisions)
+	t.Logf("%d rewritten legacy sets (%d rejected: a mutation allowed at one path the table can only deny), %d decisions: kernel == cedar.Authorize", sets, rejected, decisions)
 }

@@ -76,24 +76,9 @@ func (k *KernelForTest) Open(path string, op uint32) bool {
 }
 
 // Mutation models check_mutation_policy (mkdir, unlink, rmdir, each side of
-// rename) over the compiled mutation index: denied under any deny prefix or
-// exact deny, else allowed under any allow prefix.
+// rename) over the compiled mutation index; see mutationDecision.
 func (k *KernelForTest) Mutation(path string) bool {
-	under := func(keys map[mutationPrefixRuleKey]uint8) bool {
-		for key := range keys {
-			n := int(key.PrefixLen-mutationIndexDomainBits) / 8
-			if n <= len(path) && path[:n] == string(key.Path[:n]) {
-				return true
-			}
-		}
-		return false
-	}
-	self := mutationExactRuleKey{PathLen: uint32(len(path))}
-	copy(self.Path[:], path)
-	if under(k.mutation.denies) || k.mutation.selfDenies[self] != 0 {
-		return false
-	}
-	return under(k.mutation.allows)
+	return mutationDecision(k.mutation, path)
 }
 
 // Link models the hard-link guard: the source must be readable (a read-only

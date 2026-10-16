@@ -2,6 +2,56 @@ package lsm
 
 import "testing"
 
+// mutationDecision models check_mutation_policy over a compiled mutation
+// index: each trie yields its longest matching prefix, whose value is its
+// specificity; an exact deny denies; otherwise the allow wins only when it is
+// strictly more specific than the deny (none counts as 0).
+func mutationDecision(idx compiledMutationIndex, path string) bool {
+	longest := func(keys map[mutationPrefixRuleKey]uint8) (uint8, bool) {
+		bestLen, val, found := -1, uint8(0), false
+		for key, v := range keys {
+			n := int(key.PrefixLen-mutationIndexDomainBits) / 8
+			if n <= len(path) && path[:n] == string(key.Path[:n]) && n > bestLen {
+				bestLen, val, found = n, v, true
+			}
+		}
+		return val, found
+	}
+	self := mutationExactRuleKey{PathLen: uint32(len(path))}
+	copy(self.Path[:], path)
+	if idx.selfDenies[self] != 0 {
+		return false
+	}
+	deny, _ := longest(idx.denies)
+	allow, ok := longest(idx.allows)
+	return ok && allow > deny
+}
+
+// The mutation table compiled from Cedar is longest-prefix: a permit nested
+// in a forbid nested in a permit allows mutations; a table derived from open
+// rules (specificity 1 everywhere) keeps any deny above any allow.
+func TestMutationTableIsLongestPrefix(t *testing.T) {
+	mut := func(action uint32, path string) OpenPolicyRule {
+		r := OpenPolicyRule{Action: action, Operation: OpMutation, PathLen: uint32(len(path))}
+		copy(r.Path[:], path)
+		return r
+	}
+	idx := compileMutationIndex([]OpenPolicyRule{mut(PolicyAllow, "/"), mut(PolicyDeny, "/srv/"), mut(PolicyAllow, "/srv/ok/")})
+	for path, want := range map[string]bool{"/x": true, "/srv/x": false, "/srv/ok/x": true, "/srv/okx": false} {
+		if got := mutationDecision(idx, path); got != want {
+			t.Errorf("compiled %s: %v, want %v", path, got, want)
+		}
+	}
+	legacy := compileMutationIndex([]OpenPolicyRule{
+		openDirectoryRuleForPath(PolicyAllow, OpOpenRW, "/"),
+		openDirectoryRuleForPath(PolicyDeny, OpOpen, "/srv/"),
+		openDirectoryRuleForPath(PolicyAllow, OpOpenRW, "/srv/ok/"),
+	})
+	if mutationDecision(legacy, "/srv/ok/x") || !mutationDecision(legacy, "/x") {
+		t.Error("a derived table keeps deny-first")
+	}
+}
+
 // Compiled mutation rules are the whole mutation table: the open rules are
 // not consulted when one is present (#142).
 func TestCompiledMutationRulesAreTheWholeTable(t *testing.T) {
