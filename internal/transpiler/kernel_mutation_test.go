@@ -59,13 +59,16 @@ forbid (principal, action in Action::"FileOpen", resource == File::"/etc/hosts")
 		}
 	}
 
-	// A permit nested in a forbid nested in a permit cannot be enforced by
-	// the deny-first mutation table.
-	_, err := compileKernelText(t, `@leash_semantics("cedar")
+	// A permit nested in a forbid nested in a permit (a legacy exception):
+	// the longest-prefix table expresses it.
+	ir, err := compileKernelText(t, `@leash_semantics("cedar")
 permit (principal, action in Action::"FileOpen", resource in Dir::"/");
 forbid (principal, action in Action::"FileOpen", resource in Dir::"/srv/") unless { resource in Dir::"/srv/ok/" };
 permit (principal, action in Action::"FileOpen", resource in Dir::"/srv/ok/");`)
-	if err == nil || !strings.Contains(err.Error(), "directory mutations") || !strings.Contains(err.Error(), "/srv/ok/") {
-		t.Fatalf("got %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(mutationRules(ir), "|"); got != "allow file.mutate /|deny file.mutate /srv/|allow file.mutate /srv/ok/|deny file.mutate /srv (exact)" {
+		t.Fatalf("got %s", got)
 	}
 }

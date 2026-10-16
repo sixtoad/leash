@@ -693,12 +693,14 @@ func compileMutationIndex(rules []OpenPolicyRule) compiledMutationIndex {
 			index.selfDenies[self] = 1
 			continue
 		}
+		// The value is the prefix's specificity: check_mutation_policy
+		// lets the longer of the matching allow and deny win (tie: deny).
 		prefix := mutationPrefixRuleKey{PrefixLen: mutationIndexDomainBits + rule.PathLen*8}
 		copy(prefix.Path[:], rule.Path[:rule.PathLen])
 		if rule.Action == PolicyDeny {
-			index.denies[prefix] = 1
+			index.denies[prefix] = uint8(rule.PathLen)
 		} else {
-			index.allows[prefix] = 1
+			index.allows[prefix] = uint8(rule.PathLen)
 		}
 	}
 	if compiled {
