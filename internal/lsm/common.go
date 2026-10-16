@@ -64,7 +64,7 @@ type PolicyRule struct {
 	Operation   int32 // 0 = open, 1 = open:ro, 2 = open:rw, 3 = exec, 4 = connect
 	PathLen     int32
 	Path        [256]byte
-	IsDirectory int32 // 1 if path ends with /
+	IsDirectory int32 // 1 if path ends with / (prefix plus directory self); ExactPath for an exact-path file-open rule
 
 	// Argument matching (only used for exec operations)
 	ArgCount    int32       // Number of args to match (0 = match any)
@@ -88,6 +88,14 @@ type MCPPolicyRule struct {
 	Tool   string // empty matches any tool
 }
 
+// ExactPath in PolicyRule.IsDirectory marks a file-open rule that matches
+// exactly its path, nothing below it (#142): it compiles to an entry of the
+// kernel's exact map, with a specificity above any prefix of that path.
+// An exact exec rule instead ends its path with a NUL byte: the exec matcher
+// compares rule bytes against the NUL-terminated resolved path, so the NUL
+// only matches where the path ends.
+const ExactPath = 2
+
 const (
 	PolicyDeny  = 0
 	PolicyAllow = 1
@@ -98,6 +106,16 @@ const (
 	OpOpenRW  = 2 // open:rw (any write mode)
 	OpExec    = 3 // exec
 	OpConnect = 4 // connect
+	// OpMutation rules (in PolicySet.Open) are the directory-mutation table
+	// (mkdir, unlink, rmdir, rename source and destination), compiled by
+	// transpiler.CompileKernel from the Cedar decisions (#142): an allow
+	// prefix, a deny prefix, or (IsDirectory == ExactPath) an exact deny.
+	// The longest matching prefix decides (a tie denies), an exact deny
+	// always denies, no match denies. When a set has no OpMutation rule
+	// (rules built in code), the table is derived from the open rules as
+	// before, with every prefix at specificity 1, so any deny outranks any
+	// allow there, as it always did.
+	OpMutation = 5
 )
 
 // PolicySet holds separated policy rules by operation type
@@ -111,6 +129,23 @@ type PolicySet struct {
 	// ConnectDefaultExplicit tracks whether the default posture was explicitly configured in the policy file.
 	ConnectDefaultAllow    bool
 	ConnectDefaultExplicit bool
+}
+
+// Clone returns a copy of the set whose rule slices do not alias ps. Every
+// layer that copies a PolicySet uses it, so a new rule kind cannot be dropped
+// by a copy that forgot it.
+func (ps *PolicySet) Clone() *PolicySet {
+	if ps == nil {
+		return &PolicySet{}
+	}
+	return &PolicySet{
+		Open:                   append([]PolicyRule(nil), ps.Open...),
+		Exec:                   append([]PolicyRule(nil), ps.Exec...),
+		Connect:                append([]PolicyRule(nil), ps.Connect...),
+		MCP:                    append([]MCPPolicyRule(nil), ps.MCP...),
+		ConnectDefaultAllow:    ps.ConnectDefaultAllow,
+		ConnectDefaultExplicit: ps.ConnectDefaultExplicit,
+	}
 }
 
 // String returns the canonical string representation of a PolicyRule
@@ -132,6 +167,8 @@ func (pr *PolicyRule) String() string {
 		operation = "proc.exec"
 	case OpConnect:
 		operation = "net.send"
+	case OpMutation:
+		operation = "file.mutate"
 	}
 
 	var target string

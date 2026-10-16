@@ -141,7 +141,10 @@ func execRuleForTest(action int32, path string, args ...string) ExecPolicyRule {
 // arguments only deny on an argument match and otherwise fall through).
 func execDecision(rules []ExecPolicyRule, defaultAllow bool, path string, args []string) int32 {
 	for _, r := range rules {
-		if !strings.HasPrefix(path, string(r.Path[:r.PathLen])) {
+		// check_exec_policy compares rule bytes against the NUL-terminated
+		// resolved path: a rule ending in NUL (an exact path) matches only
+		// where the path ends.
+		if !strings.HasPrefix(path+"\x00", string(r.Path[:r.PathLen])) {
 			continue
 		}
 		if r.ArgCount == 0 {

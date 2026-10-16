@@ -40,7 +40,7 @@ func ConvertPolicyToMacRules(policy *lsm.PolicySet) ([]messages.MacPolicyRule, [
 			Kind:   "processExec",
 			Action: action,
 		}
-		if rule.IsDirectory != 0 {
+		if rule.IsDirectory == 1 {
 			macRule.ExecutablePath = "*"
 			macRule.Directory = path
 		} else {
@@ -50,6 +50,9 @@ func ConvertPolicyToMacRules(policy *lsm.PolicySet) ([]messages.MacPolicyRule, [
 	}
 
 	for _, rule := range policy.Open {
+		if rule.Operation == lsm.OpMutation {
+			continue // the Linux directory-mutation table; ES derives creates from the open rules
+		}
 		action := actionString(rule.Action)
 		if action == "" {
 			continue
@@ -67,7 +70,7 @@ func ConvertPolicyToMacRules(policy *lsm.PolicySet) ([]messages.MacPolicyRule, [
 			ExecutablePath: "*",
 			CoversCreates:  coversCreates,
 		}
-		if rule.IsDirectory != 0 {
+		if rule.IsDirectory == 1 {
 			macRule.Directory = path
 		} else {
 			macRule.FilePath = path
