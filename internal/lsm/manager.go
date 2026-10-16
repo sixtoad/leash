@@ -300,6 +300,13 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 }
 
 // UpdateRuntimeRules updates all LSM modules with new runtime rules
+// EnforcesKernelPolicy reports whether UpdateRuntimeRules programs the kernel
+// (a scopable cgroup is configured). Without one it is a no-op (degraded
+// proxy-only mode), so kernel limits do not apply.
+func (m *LSMManager) EnforcesKernelPolicy() bool {
+	return m != nil && m.cgroupPath != ""
+}
+
 func (m *LSMManager) UpdateRuntimeRules(policies *PolicySet) error {
 	m.reloadMutex.Lock()
 	defer m.reloadMutex.Unlock()

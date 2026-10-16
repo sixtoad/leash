@@ -72,7 +72,12 @@ func main() {
 		case "--daemon": // "Secret" flag to run leashd.
 			daemonArgs := append([]string{args[0]}, args[2:]...)
 			if err := leashd.Main(daemonArgs); err != nil {
-				log.Fatal(err)
+				// Full (possibly multi-line) error for the log, then a one-line
+				// FATAL tag the native and container launchers extract as the
+				// refusal reason.
+				log.Print(err)
+				fmt.Fprintln(os.Stderr, leashd.FatalLine(err))
+				os.Exit(1)
 			}
 			return
 		case "--darwin": // macOS path.

@@ -118,6 +118,9 @@ func CompileString(name, cedar string) (*Compilation, error) {
 	}
 	comp.Cedar = cedar
 	comp.Policies.Source = &lsm.PolicySource{Name: name, Text: cedar}
+	if detail := unknownEntityError(name, cedar, comp); detail != nil {
+		return nil, detail
+	}
 	return comp, nil
 }
 

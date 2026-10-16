@@ -1701,6 +1701,12 @@ func (r *runner) rt() Runtime {
 }
 
 func (r *runner) startContainers(ctx context.Context) error {
+	// A policy that cannot load must stop the run before anything is
+	// provisioned, under every runtime and posture (issue #162). The staged
+	// copy is checked again after syncPolicyFile.
+	if err := r.validateSourcePolicy(); err != nil {
+		return err
+	}
 	if err := r.launcher().Preflight(); err != nil {
 		return err
 	}
@@ -1746,6 +1752,9 @@ func (r *runner) startContainers(ctx context.Context) error {
 	if err := os.Remove(bootstrapMarker); err == nil {
 		r.debugf("removed stale bootstrap marker at %s", bootstrapMarker)
 	}
+	if err := clearStaleEnforcementMarker(r.cfg.shareDir); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(r.cfg.logDir, 0o755); err != nil {
 		return fmt.Errorf("create log dir: %w", err)
 	}
@@ -1757,6 +1766,9 @@ func (r *runner) startContainers(ctx context.Context) error {
 	}
 
 	if err := r.syncPolicyFile(); err != nil {
+		return err
+	}
+	if err := r.validateStagedPolicy(); err != nil {
 		return err
 	}
 

@@ -528,6 +528,7 @@ func (api *policyAPI) handlePatch(w http.ResponseWriter, r *http.Request) {
 		if softLSMError(err) {
 			logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
 		} else {
+			_ = api.mgr.UpdateFileRules(prevFile, prevHTTP) // keep the previous policy
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
@@ -663,6 +664,7 @@ func (api *policyAPI) handlePersistPolicies(w http.ResponseWriter, r *http.Reque
 		if softLSMError(err) {
 			logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
 		} else {
+			_ = api.mgr.UpdateFileRules(prevFile, prevHTTP) // keep the previous policy
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}

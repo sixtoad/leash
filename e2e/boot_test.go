@@ -959,8 +959,7 @@ func TestRunnerPrivateMountIsolation(t *testing.T) {
 	bin := ensureLeashBinary(t)
 	shareDir := t.TempDir()
 	policyPath := filepath.Join(t.TempDir(), "policy.cedar")
-	mustWrite(t, policyPath, []byte(`permit (principal, action == Action::"ProcessLaunch", resource)
-when { resource in [ Process::"/bin/sh" ] };`))
+	mustWrite(t, policyPath, []byte(`permit (principal, action == Action::"ProcessExec", resource in Dir::"/");`))
 
 	targetName := fmt.Sprintf("leash-e2e-target-%d", time.Now().UnixNano())
 	leashName := fmt.Sprintf("leash-e2e-manager-%d", time.Now().UnixNano())

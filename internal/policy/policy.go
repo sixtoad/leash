@@ -168,6 +168,11 @@ func ParseHTTPRuleString(ruleStr string) (*proxy.HeaderRewriteRule, error) {
 // compiler (#142). Nothing of such a change is applied.
 var ErrCompile = errors.New("policy does not compile")
 
+// ErrRejected marks a policy change refused before it was committed because
+// the kernel would not accept it (#162). Like ErrCompile, nothing of it is
+// applied: the previous policy stays active everywhere.
+var ErrRejected = errors.New("policy rejected, previous policy kept")
+
 // Manager holds the policy layers (the file and the runtime overlay) as
 // Cedar and keeps one active policy compiled from them (#142): the legacy
 // layers are rewritten to strict Cedar together, the strict layers are added
@@ -246,6 +251,11 @@ func (m *Manager) change(mutate func(file, runtime **lsm.PolicySet, fileHTTP, ru
 	if err != nil {
 		return err
 	}
+	// A set the kernel would reject is refused before anything changes: the
+	// previous rules stay active in the manager, the LSM and the proxy (#162).
+	if err := m.validateKernelLimits(active); err != nil {
+		return err
+	}
 
 	m.runtimeMutex.Lock()
 	m.fileRules, m.runtimeRules = file, runtime
@@ -297,6 +307,20 @@ func (m *Manager) SetRuntimeOnly(enabled bool) error {
 	return m.change(func(_, _ **lsm.PolicySet, _, _ *[]proxy.HeaderRewriteRule, runtimeOnly *bool) {
 		*runtimeOnly = enabled
 	})
+}
+
+// validateKernelLimits checks a compiled policy against the kernel's limits
+// before it is committed, so a rejected update never reaches the proxy or
+// leaves the LSM modules half-updated. Only meaningful with an LSM to enforce
+// them.
+func (m *Manager) validateKernelLimits(active *cedar.Compilation) error {
+	if m.lsmManager == nil || !m.lsmManager.EnforcesKernelPolicy() || active == nil {
+		return nil
+	}
+	if err := lsm.ValidateKernelPolicyLimits(active.Policies); err != nil {
+		return fmt.Errorf("%w: %w", ErrRejected, err)
+	}
+	return nil
 }
 
 func (m *Manager) apply(active *cedar.Compilation) error {
