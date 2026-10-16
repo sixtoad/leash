@@ -1077,7 +1077,7 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 	if err != nil {
 		self = ""
 	}
-	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.r.workloadUser(), caCert, self, h)
+	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, nativeWorkloadShellFlag, cmd, n.r.workloadUser(), caCert, self, h)
 	if n.layer2Active() {
 		argv := n.layer2Wrap(inner) // nsenter --net + private mount ns (resolv bind)
 		return exec.CommandContext(ctx, argv[0], argv[1:]...)
@@ -1200,7 +1200,14 @@ func hasEnvKey(env []string, key string) bool {
 	return false
 }
 
-func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, self string, h hardenOpts) string {
+// nativeWorkloadShellFlag keeps the native workload on a login shell. Native
+// leash usually runs under sudo, so its own PATH is root's secure_path; the
+// login shell is what rebuilds the dropped user's PATH (~/.local/bin, nvm, ...)
+// for the agent. The non-login default from #120 is container-only, where the
+// image's ENV PATH is already applied by the runtime's exec.
+const nativeWorkloadShellFlag = "-lc"
+
+func nativeWorkloadScript(cgroupPath, workdir, shellBin, shellFlag, cmd, dropUser, caCert, self string, h hardenOpts) string {
 	procs := quoteShellArg(filepath.Join(cgroupPath, "cgroup.procs"))
 	innerCmd := "exec " + cmd
 	if caCert != "" {
@@ -1216,7 +1223,10 @@ func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, 
 			" REQUESTS_CA_BUNDLE=" + q +
 			" GIT_SSL_CAINFO=" + q + "; " + innerCmd
 	}
-	shellRun := fmt.Sprintf("%s -lc %s", quoteShellArg(shellBin), quoteShellArg(innerCmd))
+	if shellFlag == "" {
+		shellFlag = nativeWorkloadShellFlag
+	}
+	shellRun := fmt.Sprintf("%s %s %s", quoteShellArg(shellBin), shellFlag, quoteShellArg(innerCmd))
 
 	// Scrub the session env vars that leak the keyring/GUI location — unless the
 	// matching allow flag keeps them.
