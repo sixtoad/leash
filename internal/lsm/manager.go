@@ -160,15 +160,26 @@ func ValidateKernelPolicyLimits(policies *PolicySet) error {
 	return nil
 }
 
+// The file-open and exec LSMs are always created and attached, like the connect
+// LSM (#118, #139). Previously a policy with no file (or no exec) rules never created
+// that program, so the whole category was unenforced (fail open) instead of
+// taking Cedar's default (deny) -- while removing the last rule from an
+// already-attached program did deny. The no-rule default is now derived exactly
+// as it is with rules: deny unless the policy explicitly permits the root path
+// "/" (rootPathPolicy / execDefaultAllow). The file-open program also carries
+// the directory-mutation and link hooks, which are enforced in the same case.
+//
+// Bootstrapping: the workload's own start (launcher shell, leash helpers, the
+// dynamic loader and libraries, runc's /proc access in container mode) runs in
+// the governed cgroup, so a policy must permit what the workload needs to start
+// in every category, exactly as policies with rules in that category already
+// must. The built-in bootstrap policy (no policy file) permits Dir::"/" for
+// file open and exec and is unaffected.
 func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
+	rules := ConvertToFileOpenRules(policies.Open)
 	if !policies.HasOpenPolicies() {
-		// No open policies, ensure LSM is stopped
-		if m.openLsm != nil {
-			fmt.Printf("No open policies found, open LSM will continue with empty rules\n")
-			// Just reload with empty rules instead of stopping
-			return m.openLsm.LoadPolicies([]OpenPolicyRule{})
-		}
-		return nil
+		fmt.Printf("No file open policies found; file open LSM enforces the default (deny unless Dir::\"/\" is explicitly permitted)\n")
+		rules = []OpenPolicyRule{}
 	}
 
 	if m.openLsm == nil {
@@ -181,7 +192,7 @@ func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
 		m.openLsm.containerOverlay = m.containerRootfs
 
 		// Load policies and start in background
-		if err := m.openLsm.LoadPolicies(ConvertToFileOpenRules(policies.Open)); err != nil {
+		if err := m.openLsm.LoadPolicies(rules); err != nil {
 			return fmt.Errorf("failed to load open policies: %w", err)
 		}
 
@@ -191,21 +202,17 @@ func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
 				m.handleAttachFailure("file-open", err)
 			}
 		})
-	} else {
-		// Update existing policies
-		return m.openLsm.LoadPolicies(ConvertToFileOpenRules(policies.Open))
+		return nil
 	}
 
-	return nil
+	return m.openLsm.LoadPolicies(rules)
 }
 
 func (m *LSMManager) updateExecLSM(policies *PolicySet) error {
+	rules := ConvertToExecRules(policies.Exec)
 	if !policies.HasExecPolicies() {
-		if m.execLsm != nil {
-			fmt.Printf("No exec policies found, exec LSM will continue with empty rules\n")
-			return m.execLsm.LoadPolicies([]ExecPolicyRule{})
-		}
-		return nil
+		fmt.Printf("No exec policies found; exec LSM enforces the default (deny unless Dir::\"/\" is explicitly permitted)\n")
+		rules = []ExecPolicyRule{}
 	}
 
 	if m.execLsm == nil {
@@ -215,7 +222,7 @@ func (m *LSMManager) updateExecLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to create exec LSM: %w", err)
 		}
 
-		if err := m.execLsm.LoadPolicies(ConvertToExecRules(policies.Exec)); err != nil {
+		if err := m.execLsm.LoadPolicies(rules); err != nil {
 			return fmt.Errorf("failed to load exec policies: %w", err)
 		}
 
@@ -225,26 +232,48 @@ func (m *LSMManager) updateExecLSM(policies *PolicySet) error {
 				m.handleAttachFailure("exec", err)
 			}
 		})
-	} else {
-		return m.execLsm.LoadPolicies(ConvertToExecRules(policies.Exec))
+		return nil
 	}
 
+	return m.execLsm.LoadPolicies(rules)
+}
+
+// connectDefaultOverride decides the kernel connect LSM's default verdict
+// override for a policy set. It is a pure function so the decision can be unit
+// tested without a kernel.
+//
+//   - An explicit default (e.g. `forbid ... Host::"*"`) always wins.
+//   - With connect rules present and no explicit default, nil is returned and
+//     ConnectLsm.LoadPolicies derives the default from the rules (an allow
+//     wildcard `Host::"*"` or an any-destination allow => allow, else deny).
+//   - With NO connect rules, the kernel mirrors the proxy's default
+//     (ConnectDefaultAllow, which is false unless the policy explicitly
+//     permitted network access). A nil override with empty rules makes
+//     LoadPolicies fall back to deny.
+//
+// The connect LSM is always attached (issue #118): a policy that never mentions
+// the network must not leave IPv4 egress unenforced.
+func connectDefaultOverride(policies *PolicySet) *bool {
+	if policies == nil {
+		return nil
+	}
+	if policies.ConnectDefaultExplicit {
+		val := policies.ConnectDefaultAllow
+		return &val
+	}
+	if len(policies.Connect) == 0 && policies.ConnectDefaultAllow {
+		val := true
+		return &val
+	}
 	return nil
 }
 
 func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
-	var defaultOverride *bool
-	if policies.ConnectDefaultExplicit {
-		val := policies.ConnectDefaultAllow
-		defaultOverride = &val
-	}
-
+	defaultOverride := connectDefaultOverride(policies)
+	rules := ConvertToConnectRules(policies.Connect)
 	if !policies.HasConnectPolicies() {
-		if m.connectLsm != nil {
-			fmt.Printf("No connect policies found, connect LSM will continue with empty rules\n")
-			return m.connectLsm.LoadPolicies([]ConnectPolicyRule{}, defaultOverride)
-		}
-		return nil
+		fmt.Printf("No connect policies found; connect LSM enforces the default (deny unless network is explicitly permitted)\n")
+		rules = []ConnectPolicyRule{}
 	}
 
 	if m.connectLsm == nil {
@@ -254,7 +283,7 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to create connect LSM: %w", err)
 		}
 
-		if err := m.connectLsm.LoadPolicies(ConvertToConnectRules(policies.Connect), defaultOverride); err != nil {
+		if err := m.connectLsm.LoadPolicies(rules, defaultOverride); err != nil {
 			return fmt.Errorf("failed to load connect policies: %w", err)
 		}
 
@@ -264,11 +293,10 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 				m.handleAttachFailure("connect", err)
 			}
 		})
-	} else {
-		return m.connectLsm.LoadPolicies(ConvertToConnectRules(policies.Connect), defaultOverride)
+		return nil
 	}
 
-	return nil
+	return m.connectLsm.LoadPolicies(rules, defaultOverride)
 }
 
 // UpdateRuntimeRules updates all LSM modules with new runtime rules

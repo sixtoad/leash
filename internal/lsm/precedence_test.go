@@ -299,7 +299,7 @@ func TestProxyConnectAndMCPPrecedenceIsOrderIndependentAndDenyWins(t *testing.T)
 		{Action: PolicyAllow, Server: "other.example.com", Tool: ""},
 	}
 	for i := 0; i < precedenceShuffles; i++ {
-		pc := NewSimplePolicyChecker(shuffled(rng, connect), false, shuffled(rng, mcp))
+		pc := newLegacyChecker(shuffled(rng, connect), false, shuffled(rng, mcp))
 		if pc.CheckConnect("api.example.com", "", 443) {
 			t.Fatalf("shuffle %d: wildcard forbid lost to an exact permit", i)
 		}

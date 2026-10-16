@@ -13,7 +13,6 @@ import (
 
 	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/policy"
-	"github.com/strongdm/leash/internal/proxy"
 )
 
 func setupLeashDirs(t *testing.T) string {
@@ -126,7 +125,7 @@ func extractCaretCoords(t *testing.T, src string) (string, int, int) {
 func TestPoliciesCORSOptions(t *testing.T) {
 	t.Parallel()
 	mux := http.NewServeMux()
-	mgr := policy.NewManager(nil, func(*lsm.PolicySet, []proxy.HeaderRewriteRule) {})
+	mgr := policy.NewManager(nil, nil)
 	api := newPolicyAPI(mgr, "", nil, nil, nil)
 	api.register(mux)
 

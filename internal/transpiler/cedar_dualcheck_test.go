@@ -4,8 +4,21 @@ import (
 	"testing"
 
 	cedar "github.com/cedar-policy/cedar-go"
-	"github.com/strongdm/leash/internal/lsm"
+
+	"github.com/strongdm/leash/internal/engine"
 )
+
+// legacyEngine is the engine the proxy decides with for a legacy policy
+// text: the rewrite to strict Cedar, evaluated by cedar.Authorize.
+func legacyEngine(t *testing.T, text string) *engine.Engine {
+	t.Helper()
+	rw := rewriteText(t, text)
+	e, err := engine.New(rw.Policies)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
 
 // Compare Cedar Authorize vs IR decision for DnsZone mapping. We intentionally
 // exercise a known divergence at the apex host and assert our linter warns.
@@ -34,7 +47,8 @@ func TestDual_CedarDnsZone_vs_IRWildcard_ApexDivergenceWarned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transpile failed: %v", err)
 	}
-	checker := lsm.NewSimplePolicyChecker(lsm.ConvertToConnectRules(ps.Connect), false, ps.MCP)
+	_ = ps
+	checker := legacyEngine(t, cedarText)
 
 	// Cedar entities: DnsZone parent of both apex and subdomain
 	zone := cedar.NewEntityUID("Net::DnsZone", "example.com")
@@ -86,7 +100,8 @@ func TestDual_CedarHostnameLike_vs_IRWildcard_Aligned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transpile failed: %v", err)
 	}
-	checker := lsm.NewSimplePolicyChecker(lsm.ConvertToConnectRules(ps.Connect), false, ps.MCP)
+	_ = ps
+	checker := legacyEngine(t, cedarText)
 
 	psCedar, _ := cedar.NewPolicySetFromBytes("p", []byte(cedarText))
 	entities := cedar.EntityMap{}

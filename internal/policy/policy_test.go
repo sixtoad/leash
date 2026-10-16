@@ -8,7 +8,6 @@ import (
 
 	cedarutil "github.com/strongdm/leash/internal/cedar"
 	"github.com/strongdm/leash/internal/lsm"
-	"github.com/strongdm/leash/internal/proxy"
 )
 
 func TestParseValidCedar(t *testing.T) {
@@ -35,11 +34,22 @@ forbid (
 	if cfg.LSMPolicies == nil {
 		t.Fatal("expected LSMPolicies to be populated")
 	}
-	if len(cfg.LSMPolicies.Open) != 1 {
-		t.Fatalf("expected one open rule, got %d", len(cfg.LSMPolicies.Open))
+	open := 0
+	for _, r := range cfg.LSMPolicies.Open {
+		if r.Operation != lsm.OpMutation {
+			open++
+		}
 	}
-	if len(cfg.LSMPolicies.Exec) != 1 {
-		t.Fatalf("expected one exec rule, got %d", len(cfg.LSMPolicies.Exec))
+	if open != 1 {
+		t.Fatalf("expected one open rule, got %d", open)
+	}
+	// The forbid is the default deny already: the kernel tables compiled from
+	// the strict policy need no exec rule for it (#142).
+	if len(cfg.LSMPolicies.Exec) != 0 {
+		t.Fatalf("expected no exec rule, got %d", len(cfg.LSMPolicies.Exec))
+	}
+	if eng := cfg.Compilation.Engine; eng.DecideExec("/bin/sh").Allow || !eng.DecideOpen("/tmp/x", "FileOpenReadWrite").Allow {
+		t.Fatal("engine decisions do not match the policy")
 	}
 	if len(cfg.LSMPolicies.Connect) != 0 {
 		t.Fatalf("expected no connect rules, got %d", len(cfg.LSMPolicies.Connect))
@@ -87,7 +97,7 @@ func writeTempCedar(t *testing.T, content string) string {
 func TestManagerDedupeConnectRules(t *testing.T) {
 	t.Parallel()
 
-	mgr := NewManager(nil, func(*lsm.PolicySet, []proxy.HeaderRewriteRule) {})
+	mgr := NewManager(nil, nil)
 
 	allowAny := lsm.PolicyRule{Action: lsm.PolicyAllow, Operation: lsm.OpConnect}
 	copy(allowAny.Hostname[:], "*")

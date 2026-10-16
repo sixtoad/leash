@@ -107,7 +107,7 @@ func TestLiteralConnectPolicyUsesCanonicalAddressAndPort(t *testing.T) {
 		t.Fatalf("BPF map value = ip %#08x port %d, want ip %#08x port 443", loaded.DestIP, loaded.DestPort, asymmetricIPv4)
 	}
 
-	checker := NewSimplePolicyChecker(ConvertToConnectRules([]PolicyRule{*rule}), false, nil)
+	checker := newLegacyChecker(ConvertToConnectRules([]PolicyRule{*rule}), false, nil)
 	if !checker.CheckConnect("", "192.168.1.1", 443) {
 		t.Fatal("literal policy did not match its canonical address and port")
 	}

@@ -3,6 +3,7 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -15,6 +16,8 @@ import (
 
 // Config is the parsed policy content split for different subsystems.
 type Config struct {
+	// Compilation is the compiled file: strict Cedar, engine, kernel tables.
+	Compilation  *cedar.Compilation
 	LSMPolicies  *lsm.PolicySet
 	HTTPRewrites []proxy.HeaderRewriteRule
 	Cedar        string
@@ -35,6 +38,7 @@ func Parse(path string) (*Config, error) {
 	}
 
 	return &Config{
+		Compilation:  compilation,
 		LSMPolicies:  compilation.Policies,
 		HTTPRewrites: compilation.HTTPRules,
 		Cedar:        compilation.Cedar,
@@ -159,283 +163,195 @@ func ParseHTTPRuleString(ruleStr string) (*proxy.HeaderRewriteRule, error) {
 	}, nil
 }
 
-// Manager manages both file-based and runtime policy rules
+// ErrCompile marks a policy change that does not compile: the layers merge
+// into a policy that fails the legacy rewrite, the engine or the kernel
+// compiler (#142). Nothing of such a change is applied.
+var ErrCompile = errors.New("policy does not compile")
+
+// Manager holds the policy layers (the file and the runtime overlay) as
+// Cedar and keeps one active policy compiled from them (#142): the legacy
+// layers are rewritten to strict Cedar together, the strict layers are added
+// as written, and one engine and one set of kernel tables are built from the
+// result. Every change recompiles the merge; a change that does not compile
+// is rejected with ErrCompile and the previous policy stays active.
 type Manager struct {
 	fileRules        *lsm.PolicySet
 	fileHTTPRules    []proxy.HeaderRewriteRule
 	runtimeRules     *lsm.PolicySet
 	runtimeHTTPRules []proxy.HeaderRewriteRule
-	runtimeMutex     sync.RWMutex
 	runtimeOnly      bool // when true, active rules are runtime-only (ignore file layer)
+	active           *cedar.Compilation
+	lastRewrite      string
+	lastWarnings     string
+	runtimeMutex     sync.RWMutex
+
+	// applyMutex orders changes: compile, commit and apply happen as one
+	// step, so subsystems see policy changes in order.
+	applyMutex sync.Mutex
 
 	// Subsystem references for live updates
-	lsmManager   *lsm.LSMManager
-	proxyUpdater func(*lsm.PolicySet, []proxy.HeaderRewriteRule) // Callback to update proxy
+	lsmManager *lsm.LSMManager
+	onChange   func(*cedar.Compilation) // receives every newly active policy
 }
 
-// NewManager creates a new policy manager
-func NewManager(lsmManager *lsm.LSMManager, proxyUpdater func(*lsm.PolicySet, []proxy.HeaderRewriteRule)) *Manager {
-	return &Manager{
+// NewManager creates a new policy manager. onChange receives every newly
+// active policy (kernel tables, engine, HTTP rewrites), in order.
+func NewManager(lsmManager *lsm.LSMManager, onChange func(active *cedar.Compilation)) *Manager {
+	m := &Manager{
 		fileRules:        &lsm.PolicySet{},
 		fileHTTPRules:    []proxy.HeaderRewriteRule{},
 		runtimeRules:     &lsm.PolicySet{},
 		runtimeHTTPRules: []proxy.HeaderRewriteRule{},
 		lsmManager:       lsmManager,
-		proxyUpdater:     proxyUpdater,
+		onChange:         onChange,
 	}
+	active, err := m.compile(m.fileRules, m.fileHTTPRules, m.runtimeRules, m.runtimeHTTPRules, false)
+	if err != nil {
+		panic(fmt.Sprintf("policy: the empty policy does not compile: %v", err))
+	}
+	m.active = active
+	return m
 }
 
 // PolicySetCompat is a type alias to expose *lsm.PolicySet to external packages with minimal coupling.
 type PolicySetCompat = lsm.PolicySet
 
-// AddRule adds a rule at runtime
-func (m *Manager) AddRule(ruleStr string) error {
-	m.runtimeMutex.Lock()
-	defer m.runtimeMutex.Unlock()
-
-	// Check if it's an HTTP rewrite rule
-	if strings.Contains(ruleStr, "http.rewrite") {
-		httpRule, err := ParseHTTPRuleString(ruleStr)
-		if err != nil {
-			return fmt.Errorf("invalid HTTP rule: %w", err)
-		}
-		m.runtimeHTTPRules = append(m.runtimeHTTPRules, *httpRule)
-	} else {
-		// LSM rule
-		rule, err := lsm.ParseRuleString(ruleStr)
-		if err != nil {
-			return fmt.Errorf("invalid LSM rule: %w", err)
-		}
-
-		// Add to appropriate rule set
-		switch rule.Operation {
-		case lsm.OpOpen, lsm.OpOpenRO, lsm.OpOpenRW:
-			m.runtimeRules.Open = append(m.runtimeRules.Open, *rule)
-		case lsm.OpExec:
-			m.runtimeRules.Exec = append(m.runtimeRules.Exec, *rule)
-		case lsm.OpConnect:
-			m.runtimeRules.Connect = append(m.runtimeRules.Connect, *rule)
-		}
+func (m *Manager) compile(file *lsm.PolicySet, fileHTTP []proxy.HeaderRewriteRule, runtime *lsm.PolicySet, runtimeHTTP []proxy.HeaderRewriteRule, runtimeOnly bool) (*cedar.Compilation, error) {
+	var layers []cedar.Layer
+	if !runtimeOnly {
+		layers = append(layers, cedar.LayerOf(file, fileHTTP))
 	}
-
-	return m.applyChanges()
+	layers = append(layers, cedar.LayerOf(runtime, runtimeHTTP))
+	active, err := cedar.CompileLayers(layers)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrCompile, err)
+	}
+	return active, nil
 }
 
-// RemoveRule removes a rule at runtime
-func (m *Manager) RemoveRule(ruleStr string) error {
-	m.runtimeMutex.Lock()
-	defer m.runtimeMutex.Unlock()
+// change compiles the layers with mutate applied and, when they compile,
+// commits and applies them.
+func (m *Manager) change(mutate func(file, runtime **lsm.PolicySet, fileHTTP, runtimeHTTP *[]proxy.HeaderRewriteRule, runtimeOnly *bool)) error {
+	m.applyMutex.Lock()
+	defer m.applyMutex.Unlock()
 
-	// Check if it's an HTTP rewrite rule
-	if strings.Contains(ruleStr, "http.rewrite") {
-		m.runtimeHTTPRules = m.removeHTTPRuleFromSlice(m.runtimeHTTPRules, ruleStr)
-	} else {
-		// Remove from LSM runtime rules by string comparison
-		m.runtimeRules.Open = m.removeLSMRuleFromSlice(m.runtimeRules.Open, ruleStr)
-		m.runtimeRules.Exec = m.removeLSMRuleFromSlice(m.runtimeRules.Exec, ruleStr)
-		m.runtimeRules.Connect = m.removeLSMRuleFromSlice(m.runtimeRules.Connect, ruleStr)
+	m.runtimeMutex.RLock()
+	file, runtime := m.fileRules, m.runtimeRules
+	fileHTTP, runtimeHTTP := m.fileHTTPRules, m.runtimeHTTPRules
+	runtimeOnly := m.runtimeOnly
+	m.runtimeMutex.RUnlock()
+
+	mutate(&file, &runtime, &fileHTTP, &runtimeHTTP, &runtimeOnly)
+	active, err := m.compile(file, fileHTTP, runtime, runtimeHTTP, runtimeOnly)
+	if err != nil {
+		return err
 	}
 
-	return m.applyChanges()
+	m.runtimeMutex.Lock()
+	m.fileRules, m.runtimeRules = file, runtime
+	m.fileHTTPRules, m.runtimeHTTPRules = fileHTTP, runtimeHTTP
+	m.runtimeOnly = runtimeOnly
+	m.active = active
+	m.runtimeMutex.Unlock()
+
+	return m.apply(active)
 }
 
-// GetActiveRules returns the merged file and runtime rules
+// GetActiveRules returns the active kernel tables and HTTP rewrites.
 func (m *Manager) GetActiveRules() (*lsm.PolicySet, []proxy.HeaderRewriteRule) {
 	m.runtimeMutex.RLock()
 	defer m.runtimeMutex.RUnlock()
-
-	if m.runtimeOnly {
-		// In runtime-only mode, ignore file layer completely
-		rr := &lsm.PolicySet{
-			Open:                   append([]lsm.PolicyRule(nil), m.runtimeRules.Open...),
-			Exec:                   append([]lsm.PolicyRule(nil), m.runtimeRules.Exec...),
-			Connect:                append([]lsm.PolicyRule(nil), m.runtimeRules.Connect...),
-			MCP:                    append([]lsm.MCPPolicyRule(nil), m.runtimeRules.MCP...),
-			ConnectDefaultAllow:    m.runtimeRules.ConnectDefaultAllow,
-			ConnectDefaultExplicit: m.runtimeRules.ConnectDefaultExplicit,
-		}
-		rh := append([]proxy.HeaderRewriteRule(nil), m.runtimeHTTPRules...)
-		return rr, rh
-	}
-
-	mergedLSM := &lsm.PolicySet{
-		Open:                   append([]lsm.PolicyRule{}, m.runtimeRules.Open...),
-		Exec:                   append([]lsm.PolicyRule{}, m.runtimeRules.Exec...),
-		Connect:                append([]lsm.PolicyRule{}, m.runtimeRules.Connect...),
-		MCP:                    append([]lsm.MCPPolicyRule{}, m.runtimeRules.MCP...),
-		ConnectDefaultAllow:    m.fileRules.ConnectDefaultAllow,
-		ConnectDefaultExplicit: m.fileRules.ConnectDefaultExplicit,
-	}
-	mergedLSM.Open = append(mergedLSM.Open, m.fileRules.Open...)
-	mergedLSM.Exec = append(mergedLSM.Exec, m.fileRules.Exec...)
-	mergedLSM.Connect = append(mergedLSM.Connect, m.fileRules.Connect...)
-	mergedLSM.MCP = append(mergedLSM.MCP, m.fileRules.MCP...)
-
-	mergedLSM.Open = dedupeLSMRules(mergedLSM.Open)
-	mergedLSM.Exec = dedupeLSMRules(mergedLSM.Exec)
-	mergedLSM.Connect = dedupeConnectRules(mergedLSM.Connect)
-	mergedLSM.MCP = dedupeMCPRules(mergedLSM.MCP)
-	if m.runtimeRules.ConnectDefaultExplicit {
-		mergedLSM.ConnectDefaultAllow = m.runtimeRules.ConnectDefaultAllow
-		mergedLSM.ConnectDefaultExplicit = true
-	} else if !mergedLSM.ConnectDefaultExplicit && m.runtimeRules.ConnectDefaultAllow {
-		mergedLSM.ConnectDefaultAllow = true
-	}
-
-	mergedHTTP := append(m.fileHTTPRules, m.runtimeHTTPRules...)
-
-	return mergedLSM, mergedHTTP
+	return m.active.Policies.Clone(), append([]proxy.HeaderRewriteRule(nil), m.active.HTTPRules...)
 }
 
-// UpdateFileRules updates the file-based rules
+// Active returns the active policy: the merged strict Cedar, its engine and
+// kernel tables. It is immutable.
+func (m *Manager) Active() *cedar.Compilation {
+	m.runtimeMutex.RLock()
+	defer m.runtimeMutex.RUnlock()
+	return m.active
+}
+
+// UpdateFileRules replaces the file layer. A PolicySet compiled from Cedar
+// (cedar.CompileString) carries its source; one built in code is a legacy
+// IR layer.
 func (m *Manager) UpdateFileRules(newFileRules *lsm.PolicySet, newHTTPRules []proxy.HeaderRewriteRule) error {
-	m.runtimeMutex.Lock()
-	m.fileRules = newFileRules
-	m.fileHTTPRules = newHTTPRules
-	m.runtimeMutex.Unlock()
-
-	return m.applyChanges()
+	return m.change(func(file, _ **lsm.PolicySet, fileHTTP, _ *[]proxy.HeaderRewriteRule, _ *bool) {
+		*file = newFileRules.Clone()
+		*fileHTTP = append([]proxy.HeaderRewriteRule(nil), newHTTPRules...)
+	})
 }
 
-// Helper functions
-
-func (m *Manager) removeLSMRuleFromSlice(rules []lsm.PolicyRule, ruleStr string) []lsm.PolicyRule {
-	var result []lsm.PolicyRule
-	for _, rule := range rules {
-		if rule.String() != ruleStr {
-			result = append(result, rule)
-		}
-	}
-	return result
-}
-
-func (m *Manager) removeHTTPRuleFromSlice(rules []proxy.HeaderRewriteRule, ruleStr string) []proxy.HeaderRewriteRule {
-	var result []proxy.HeaderRewriteRule
-	for _, rule := range rules {
-		if rule.String() != ruleStr {
-			result = append(result, rule)
-		}
-	}
-	return result
-}
-
-func dedupeLSMRules(rules []lsm.PolicyRule) []lsm.PolicyRule {
-	seen := make(map[string]struct{}, len(rules))
-	result := make([]lsm.PolicyRule, 0, len(rules))
-	for _, rule := range rules {
-		key := rule.String()
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		result = append(result, rule)
-	}
-	return result
-}
-
-func dedupeConnectRules(rules []lsm.PolicyRule) []lsm.PolicyRule {
-	seen := make(map[string]struct{}, len(rules))
-	denies := make([]lsm.PolicyRule, 0, len(rules))
-	allows := make([]lsm.PolicyRule, 0, len(rules))
-	for _, rule := range rules {
-		key := rule.String()
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		if rule.Action == lsm.PolicyDeny {
-			denies = append(denies, rule)
-		} else {
-			allows = append(allows, rule)
-		}
-	}
-	return append(denies, allows...)
-}
-
-func dedupeMCPRules(rules []lsm.MCPPolicyRule) []lsm.MCPPolicyRule {
-	seen := make(map[string]struct{}, len(rules))
-	result := make([]lsm.MCPPolicyRule, 0, len(rules))
-	for _, rule := range rules {
-		key := fmt.Sprintf("%d|%s|%s", rule.Action, rule.Server, rule.Tool)
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		result = append(result, rule)
-	}
-	return result
-}
-
-func (m *Manager) applyChanges() error {
-	activeRules, activeHTTPRules := m.GetActiveRules()
-
-	// Attempt LSM update; record error but do not short-circuit proxy updates so
-	// that the userspace proxy reflects current policy even on non-Linux hosts
-	// or early bootstrap when LSM may be unavailable.
-	var lsmErr error
-	if m.lsmManager != nil {
-		if err := m.lsmManager.UpdateRuntimeRules(activeRules); err != nil {
-			lsmErr = fmt.Errorf("failed to update LSM: %w", err)
-		}
-	}
-
-	// Always update proxy to keep networking consistent with active rules
-	if m.proxyUpdater != nil {
-		m.proxyUpdater(activeRules, activeHTTPRules)
-	}
-
-	return lsmErr
-}
-
-// SetRuntimeRules replaces the current runtime rule layers atomically.
+// SetRuntimeRules replaces the runtime layer.
 func (m *Manager) SetRuntimeRules(newLSM *lsm.PolicySet, newHTTP []proxy.HeaderRewriteRule) error {
-	m.runtimeMutex.Lock()
-	// Defensive copies
-	rr := &lsm.PolicySet{
-		Open:                   append([]lsm.PolicyRule(nil), newLSM.Open...),
-		Exec:                   append([]lsm.PolicyRule(nil), newLSM.Exec...),
-		Connect:                append([]lsm.PolicyRule(nil), newLSM.Connect...),
-		MCP:                    append([]lsm.MCPPolicyRule(nil), newLSM.MCP...),
-		ConnectDefaultAllow:    newLSM.ConnectDefaultAllow,
-		ConnectDefaultExplicit: newLSM.ConnectDefaultExplicit,
-	}
-	rh := append([]proxy.HeaderRewriteRule(nil), newHTTP...)
-	m.runtimeRules = rr
-	m.runtimeHTTPRules = rh
-	m.runtimeMutex.Unlock()
-	return m.applyChanges()
+	return m.change(func(_, runtime **lsm.PolicySet, _, runtimeHTTP *[]proxy.HeaderRewriteRule, _ *bool) {
+		*runtime = newLSM.Clone()
+		*runtimeHTTP = append([]proxy.HeaderRewriteRule(nil), newHTTP...)
+	})
 }
 
 // SetRuntimeOnly toggles whether the Manager should ignore the file layer when
 // computing active rules. When enabled, only runtime rules are applied to the
 // LSM/proxy; file rules continue to be tracked and exposed via Snapshot() for UI.
 func (m *Manager) SetRuntimeOnly(enabled bool) error {
-	m.runtimeMutex.Lock()
-	m.runtimeOnly = enabled
-	m.runtimeMutex.Unlock()
-	return m.applyChanges()
+	return m.change(func(_, _ **lsm.PolicySet, _, _ *[]proxy.HeaderRewriteRule, runtimeOnly *bool) {
+		*runtimeOnly = enabled
+	})
+}
+
+func (m *Manager) apply(active *cedar.Compilation) error {
+	m.logRewrite(active)
+
+	// Attempt LSM update; record error but do not short-circuit proxy updates so
+	// that the userspace proxy reflects current policy even on non-Linux hosts
+	// or early bootstrap when LSM may be unavailable.
+	var lsmErr error
+	if m.lsmManager != nil {
+		if err := m.lsmManager.UpdateRuntimeRules(active.Policies.Clone()); err != nil {
+			lsmErr = fmt.Errorf("failed to update LSM: %w", err)
+		}
+	}
+	if m.onChange != nil {
+		m.onChange(active)
+	}
+	return lsmErr
+}
+
+// logRewrite logs what the legacy rewrite changed and where the kernel is
+// stricter than Cedar, once per distinct result.
+func (m *Manager) logRewrite(active *cedar.Compilation) {
+	var warnings []string
+	for _, w := range active.Warnings {
+		warnings = append(warnings, w.String())
+	}
+	if key := strings.Join(warnings, "\n"); key != m.lastWarnings {
+		m.lastWarnings = key
+		for _, w := range warnings {
+			log.Printf("policy: warning: kernel stricter than Cedar: %s", w)
+		}
+	}
+	if active.Rewrite == nil {
+		m.lastRewrite = ""
+		return
+	}
+	lines := active.Rewrite.Summary()
+	key := strings.Join(lines, "\n")
+	if key == m.lastRewrite {
+		return
+	}
+	m.lastRewrite = key
+	log.Printf("policy: legacy Leash semantics rewritten to strict Cedar (%d forbids gained exceptions); run `leash policy migrate` to make it explicit", len(active.Rewrite.Exceptions))
+	for _, line := range lines {
+		log.Printf("policy: legacy rewrite: %s", line)
+	}
 }
 
 // Snapshot returns copies of file and runtime rule layers for safe inspection.
 func (m *Manager) Snapshot() (fileLSM *lsm.PolicySet, fileHTTP []proxy.HeaderRewriteRule, runtimeLSM *lsm.PolicySet, runtimeHTTP []proxy.HeaderRewriteRule) {
 	m.runtimeMutex.RLock()
 	defer m.runtimeMutex.RUnlock()
-	fl := &lsm.PolicySet{
-		Open:                   append([]lsm.PolicyRule(nil), m.fileRules.Open...),
-		Exec:                   append([]lsm.PolicyRule(nil), m.fileRules.Exec...),
-		Connect:                append([]lsm.PolicyRule(nil), m.fileRules.Connect...),
-		MCP:                    append([]lsm.MCPPolicyRule(nil), m.fileRules.MCP...),
-		ConnectDefaultAllow:    m.fileRules.ConnectDefaultAllow,
-		ConnectDefaultExplicit: m.fileRules.ConnectDefaultExplicit,
-	}
-	rl := &lsm.PolicySet{
-		Open:                   append([]lsm.PolicyRule(nil), m.runtimeRules.Open...),
-		Exec:                   append([]lsm.PolicyRule(nil), m.runtimeRules.Exec...),
-		Connect:                append([]lsm.PolicyRule(nil), m.runtimeRules.Connect...),
-		MCP:                    append([]lsm.MCPPolicyRule(nil), m.runtimeRules.MCP...),
-		ConnectDefaultAllow:    m.runtimeRules.ConnectDefaultAllow,
-		ConnectDefaultExplicit: m.runtimeRules.ConnectDefaultExplicit,
-	}
+	fl := m.fileRules.Clone()
+	rl := m.runtimeRules.Clone()
 	fh := append([]proxy.HeaderRewriteRule(nil), m.fileHTTPRules...)
 	rh := append([]proxy.HeaderRewriteRule(nil), m.runtimeHTTPRules...)
 	return fl, fh, rl, rh

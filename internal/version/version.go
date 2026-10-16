@@ -116,6 +116,11 @@ const (
 	// read back from the engine (fail closed on mismatch) and reported on stderr
 	// as an `event=runner.resource-limits status=applied ...` line.
 	CapabilityContainerResourceLimits = "container-resource-limits"
+
+	// CapabilityAuthzSocket means `--inject-service` accepts authz=<Ns> (and
+	// id=) and leashd serves that plugin a private Cedar authorization socket
+	// speaking protocol v1 (pkg/authz, docs/design/AUTHZ-SERVICE.md).
+	CapabilityAuthzSocket = "authz-socket"
 	// CapabilityAllowProxyOnly is the `--allow-proxy-only` flag (and
 	// LEASH_ALLOW_PROXY_ONLY). Its presence also means fail-closed is the
 	// default when the eBPF LSM can't attach (issue #117): without the flag a
@@ -161,6 +166,7 @@ var capabilities = []string{
 	CapabilityIDMapVolume,
 	CapabilityPolicyPathLimits,
 	CapabilityContainerResourceLimits,
+	CapabilityAuthzSocket,
 	CapabilityAllowProxyOnly,
 }
 
@@ -338,7 +344,7 @@ func Parse(document []byte) (Info, error) {
 //     intercepting MITM proxy.
 //   - darwin: the same MITM proxy — the darwin runtime constructs it and pushes
 //     policy into it (internal/darwind/runtime_darwin.go, NewMITMProxy /
-//     applyPolicyToProxy) — alongside the separately installed Endpoint Security
+//     policy.Decisions.Publish) — alongside the separately installed Endpoint Security
 //     and Network Extension components it coordinates with.
 //
 // Any other target is a build with no enforcement path at all.

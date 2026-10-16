@@ -21,13 +21,13 @@ func testBuild() Build {
 // wantPolicyLimits pins the advertised enforced policy path limits.
 var wantPolicyLimits = &PolicyLimits{FilePathBytes: 255, ExecPathBytes: 64, FileRules: 256, ExecRules: 64}
 
-var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "allow-proxy-only"}
+var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "allow-proxy-only"}
 
 // TestEnforcingIsDerivedPerPlatform pins the criterion: `enforcing` says whether
 // *this binary* carries an enforcement path. Linux ships the eBPF LSM programs
 // plus the MITM proxy; darwin ships and drives the same MITM proxy
 // (internal/darwind/runtime_darwin.go builds it with NewMITMProxy and pushes
-// policy into it via applyPolicyToProxy), so claiming false there would deny
+// policy into it via policy.Decisions.Publish), so claiming false there would deny
 // enforcement the binary demonstrably performs.
 func TestEnforcingIsDerivedPerPlatform(t *testing.T) {
 	t.Parallel()
@@ -208,7 +208,7 @@ func TestJSONWireShape(t *testing.T) {
 		"enforcing":             true,
 		"contractVersion":       float64(2), // encoding/json decodes numbers as float64
 		"minCompatibleContract": float64(0),
-		"capabilities":          []any{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "allow-proxy-only"},
+		"capabilities":          []any{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "allow-proxy-only"},
 		"policyLimits":          map[string]any{"filePathBytes": float64(255), "execPathBytes": float64(64), "fileRules": float64(256), "execRules": float64(64)},
 		"os":                    "linux",
 		"arch":                  "amd64",

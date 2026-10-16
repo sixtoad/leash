@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"net"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -336,69 +334,73 @@ func (l *ConnectLsm) LoadAndAttach(loader func() (*ebpf.CollectionSpec, error)) 
 	return LoadAndAttachBPFWithSetup(l, loader, config, customSetup)
 }
 
+// connectMapPutter is the one map operation loadPolicyIntoBPF needs; an
+// *ebpf.Map satisfies it, and tests substitute an in-memory model.
+type connectMapPutter interface {
+	Put(key, value interface{}) error
+}
+
 func (l *ConnectLsm) loadPolicyIntoBPF(coll *ebpf.Collection) error {
-	// Always load the default policy result into BPF map
+	return l.writePolicyMaps(func(name string) connectMapPutter {
+		if m := coll.Maps[name]; m != nil {
+			return m
+		}
+		return nil
+	})
+}
+
+// writePolicyMaps pushes the current policy into the connect maps. The rule
+// count is ALWAYS written — including zero — so a reload that drops to no
+// connect rules (or whose hostnames all fail to resolve) retires the
+// previously loaded kernel rules instead of leaving them live (#118 review).
+// Rules are written before the count so a growing set never exposes
+// unwritten slots; entries beyond the count are ignored by the program.
+func (l *ConnectLsm) writePolicyMaps(lookup func(string) connectMapPutter) error {
+	get := func(name string) (connectMapPutter, error) {
+		m := lookup(name)
+		if m == nil {
+			return nil, fmt.Errorf("BPF map %s not found", name)
+		}
+		return m, nil
+	}
+
 	key := uint32(0)
 	defaultResult := uint32(0) // Default to deny
 	if l.defaultPolicyResult {
 		defaultResult = uint32(1) // Allow
 	}
-	if err := coll.Maps["connect_default_policy"].Put(&key, &defaultResult); err != nil {
+	defMap, err := get("connect_default_policy")
+	if err != nil {
+		return err
+	}
+	if err := defMap.Put(&key, &defaultResult); err != nil {
 		return fmt.Errorf("failed to update connect_default_policy map: %w", err)
 	}
 
-	if l.numPolicyRules == 0 {
-		fmt.Printf("No connect policy rules to load, using default policy result: %v\n", l.defaultPolicyResult)
-		return nil
+	numMap, err := get("connect_num_rules")
+	if err != nil {
+		return err
 	}
 
-	// Load the number of rules
+	if l.numPolicyRules > 0 {
+		rulesMap, err := get("connect_policy_rules")
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Loading %d connect policy rules into BPF maps...\n", l.numPolicyRules)
+		for i := 0; i < l.numPolicyRules; i++ {
+			if err := rulesMap.Put(uint32(i), &l.policyRules[i]); err != nil {
+				return fmt.Errorf("failed to update connect_policy_rules map for rule %d: %w", i, err)
+			}
+		}
+	} else {
+		fmt.Printf("No connect policy rules to load, using default policy result: %v\n", l.defaultPolicyResult)
+	}
+
 	numRules := int32(l.numPolicyRules)
-	if err := coll.Maps["connect_num_rules"].Put(&key, &numRules); err != nil {
+	if err := numMap.Put(&key, &numRules); err != nil {
 		return fmt.Errorf("failed to update connect_num_rules map: %w", err)
 	}
-
-	fmt.Printf("Loading %d connect policy rules into BPF maps...\n", l.numPolicyRules)
-
-	// Load each policy rule
-	for i := 0; i < l.numPolicyRules; i++ {
-		if err := coll.Maps["connect_policy_rules"].Put(uint32(i), &l.policyRules[i]); err != nil {
-			return fmt.Errorf("failed to update connect_policy_rules map for rule %d: %w", i, err)
-		}
-
-		// actionStr := "deny"
-		// if l.policyRules[i].Action == PolicyAllow {
-		// 	actionStr = "allow"
-		// }
-
-		// var targetStr string
-		// if l.policyRules[i].DestIP != 0 {
-		// 	// IP-based rule
-		// 	ip := make(net.IP, 4)
-		// 	binary.BigEndian.PutUint32(ip, l.policyRules[i].DestIP)
-		// 	targetStr = ip.String()
-		// } else if l.policyRules[i].HostnameLen > 0 {
-		// 	// Hostname-based rule
-		// 	hostname := string(bytes.TrimRight(l.policyRules[i].Hostname[:], "\x00"))
-		// 	targetStr = hostname
-		// } else {
-		// 	targetStr = "*" // Any destination
-		// }
-
-		// portStr := ""
-		// if l.policyRules[i].DestPort != 0 {
-		// 	portStr = fmt.Sprintf(":%d", l.policyRules[i].DestPort)
-		// }
-
-		// wildcardStr := ""
-		// if l.policyRules[i].IsWildcard == 1 {
-		// 	wildcardStr = " (wildcard)"
-		// }
-
-		// fmt.Printf("Loaded connect rule %d: %s connect %s%s%s\n", i, actionStr, targetStr, portStr, wildcardStr)
-	}
-
-	// fmt.Printf("Successfully loaded all connect policy rules into BPF\n")
 	return nil
 }
 
@@ -509,152 +511,6 @@ func (l *ConnectLsm) GetDNSCache() map[uint32]string {
 		cache[ip] = hostname
 	}
 	return cache
-}
-
-// SimplePolicyChecker implements a basic policy checker for MITMProxy integration
-type SimplePolicyChecker struct {
-	rules         []ConnectPolicyRule
-	defaultPolicy bool // true = allow, false = deny
-	mcpRules      []MCPPolicyRule
-}
-
-// NewSimplePolicyChecker creates a new policy checker with the given rules
-func NewSimplePolicyChecker(rules []ConnectPolicyRule, defaultPolicy bool, mcpRules []MCPPolicyRule) *SimplePolicyChecker {
-	return &SimplePolicyChecker{
-		// First match wins below; denies first so forbid overrides permit (#135).
-		rules:         connectRulesByPrecedence(rules),
-		defaultPolicy: defaultPolicy,
-		mcpRules:      normalizeMCPRules(mcpRules),
-	}
-}
-
-// CheckConnect implements the PolicyChecker interface for MITMProxy
-func (pc *SimplePolicyChecker) CheckConnect(hostname string, ip string, port uint16) bool {
-	// Convert IP string to uint32 for comparison
-	var ipNum uint32
-	if ipAddr := net.ParseIP(ip); ipAddr != nil {
-		ipNum, _ = canonicalIPv4(ipAddr)
-	}
-
-	// Check each rule (rules should be sorted by specificity)
-	for _, rule := range pc.rules {
-		matches := false
-
-		// Check IP match (0 means any IP, for hostname-only rules)
-		if rule.DestIP != 0 && rule.DestIP != ipNum {
-			continue
-		}
-
-		// Check port match (0 means any port)
-		if rule.DestPort != 0 && rule.DestPort != port {
-			continue
-		}
-
-		// Check hostname match if hostname is provided and rule has hostname restriction
-		if rule.HostnameLen > 0 {
-			matches = connectHostnameMatches(&rule, hostname)
-		} else {
-			// No hostname restriction, matches if IP and port match
-			matches = true
-		}
-
-		if matches {
-			return rule.Action == PolicyAllow
-		}
-	}
-
-	log.Printf("CheckConnect: no rule matched, using default policy: %v", pc.defaultPolicy)
-
-	// No rule matched, use default policy
-	return pc.defaultPolicy
-}
-
-// connectHostnameMatches reports whether a rule's hostname covers hostname.
-// Names compare case-insensitively and a trailing dot is ignored. A wildcard
-// "*.example.com" needs a label boundary: it matches a.example.com and
-// a.b.example.com, not the apex example.com and not evilexample.com.
-func connectHostnameMatches(rule *ConnectPolicyRule, hostname string) bool {
-	ruleHost := strings.ToLower(string(bytes.TrimRight(rule.Hostname[:rule.HostnameLen], "\x00")))
-	if ruleHost == "*" {
-		return true
-	}
-	host := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
-	if rule.IsWildcard == 1 && strings.HasPrefix(ruleHost, "*.") {
-		suffix := ruleHost[1:] // ".example.com"
-		return len(host) > len(suffix) && strings.HasSuffix(host, suffix)
-	}
-	return host == ruleHost
-}
-
-// CheckMCPCall evaluates whether an MCP tools/call should be allowed, matching on server and tool.
-func (pc *SimplePolicyChecker) CheckMCPCall(server string, tool string) bool {
-	if len(pc.mcpRules) == 0 {
-		return true
-	}
-	host := normalizeServer(server)
-	toolName := strings.ToLower(strings.TrimSpace(tool))
-	for _, rule := range pc.mcpRules {
-		if rule.Server != "" && host != rule.Server {
-			continue
-		}
-		if rule.Tool != "" && toolName != rule.Tool {
-			continue
-		}
-		return rule.Action == PolicyAllow
-	}
-	return true
-}
-
-// HasMCPPolicies indicates whether any MCP rules are configured.
-func (pc *SimplePolicyChecker) HasMCPPolicies() bool {
-	return len(pc.mcpRules) > 0
-}
-
-func normalizeMCPRules(rules []MCPPolicyRule) []MCPPolicyRule {
-	if len(rules) == 0 {
-		return nil
-	}
-	out := make([]MCPPolicyRule, 0, len(rules))
-	seen := make(map[string]struct{})
-	for _, rule := range rules {
-		server := normalizeServer(rule.Server)
-		tool := strings.ToLower(strings.TrimSpace(rule.Tool))
-		key := fmt.Sprintf("%d|%s|%s", rule.Action, server, tool)
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		out = append(out, MCPPolicyRule{
-			Action: rule.Action,
-			Server: server,
-			Tool:   tool,
-		})
-	}
-	// CheckMCPCall takes the first match; denies first (#135).
-	mcpRulesByPrecedence(out)
-	return out
-}
-
-func normalizeServer(server string) string {
-	s := strings.TrimSpace(server)
-	if s == "" {
-		return ""
-	}
-	s = strings.ToLower(s)
-	if strings.Contains(s, "://") {
-		if u, err := url.Parse(s); err == nil {
-			if host := u.Hostname(); host != "" {
-				s = host
-			}
-		}
-	}
-	if strings.Contains(s, "/") {
-		s = strings.SplitN(s, "/", 2)[0]
-	}
-	if host, _, err := net.SplitHostPort(s); err == nil && host != "" {
-		s = host
-	}
-	return strings.TrimSpace(s)
 }
 
 // resolveHostnamesFromPolicies proactively resolves hostnames from connect policies
