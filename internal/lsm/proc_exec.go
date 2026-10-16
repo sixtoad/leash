@@ -146,18 +146,22 @@ func (l *ExecLsm) LoadPolicies(policies []ExecPolicyRule) error {
 
 // checkRootPathPolicy checks if the root path "/" is explicitly allowed in the policy rules
 func (l *ExecLsm) checkRootPathPolicy() {
-	// Default is false (deny)
-	l.defaultPolicyResult = false
+	l.defaultPolicyResult = execDefaultAllow(l.policyRules)
+}
 
-	// Check if any rule explicitly allows root path "/"
-	for _, rule := range l.policyRules {
+// execDefaultAllow is the exec LSM's default verdict for a rule set: allow only
+// when a rule explicitly permits the root path "/" (Cedar
+// `permit ... ProcessExec ... Dir::"/"`), otherwise deny. An empty rule set is
+// deny (Cedar's default). Pure, so the decision is unit tested without a kernel.
+func execDefaultAllow(rules []ExecPolicyRule) bool {
+	for _, rule := range rules {
 		// Untrimmed: an exact rule on "/" ends in a NUL and covers only "/".
 		pathStr := string(rule.Path[:rule.PathLen])
 		if pathStr == "/" && rule.Action == PolicyAllow {
-			l.defaultPolicyResult = true
-			break
+			return true
 		}
 	}
+	return false
 }
 
 func (l *ExecLsm) LoadAndAttach(loader func() (*ebpf.CollectionSpec, error)) error {

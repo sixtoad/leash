@@ -155,15 +155,26 @@ func ValidateKernelPolicyLimits(policies *PolicySet) error {
 	return nil
 }
 
+// The file-open and exec LSMs are always created and attached, like the connect
+// LSM (#118, #139). Previously a policy with no file (or no exec) rules never created
+// that program, so the whole category was unenforced (fail open) instead of
+// taking Cedar's default (deny) -- while removing the last rule from an
+// already-attached program did deny. The no-rule default is now derived exactly
+// as it is with rules: deny unless the policy explicitly permits the root path
+// "/" (rootPathPolicy / execDefaultAllow). The file-open program also carries
+// the directory-mutation and link hooks, which are enforced in the same case.
+//
+// Bootstrapping: the workload's own start (launcher shell, leash helpers, the
+// dynamic loader and libraries, runc's /proc access in container mode) runs in
+// the governed cgroup, so a policy must permit what the workload needs to start
+// in every category, exactly as policies with rules in that category already
+// must. The built-in bootstrap policy (no policy file) permits Dir::"/" for
+// file open and exec and is unaffected.
 func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
+	rules := ConvertToFileOpenRules(policies.Open)
 	if !policies.HasOpenPolicies() {
-		// No open policies, ensure LSM is stopped
-		if m.openLsm != nil {
-			fmt.Printf("No open policies found, open LSM will continue with empty rules\n")
-			// Just reload with empty rules instead of stopping
-			return m.openLsm.LoadPolicies([]OpenPolicyRule{})
-		}
-		return nil
+		fmt.Printf("No file open policies found; file open LSM enforces the default (deny unless Dir::\"/\" is explicitly permitted)\n")
+		rules = []OpenPolicyRule{}
 	}
 
 	if m.openLsm == nil {
@@ -176,7 +187,7 @@ func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
 		m.openLsm.containerOverlay = m.containerRootfs
 
 		// Load policies and start in background
-		if err := m.openLsm.LoadPolicies(ConvertToFileOpenRules(policies.Open)); err != nil {
+		if err := m.openLsm.LoadPolicies(rules); err != nil {
 			return fmt.Errorf("failed to load open policies: %w", err)
 		}
 
@@ -186,21 +197,17 @@ func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
 				m.handleAttachFailure("file-open", err)
 			}
 		})
-	} else {
-		// Update existing policies
-		return m.openLsm.LoadPolicies(ConvertToFileOpenRules(policies.Open))
+		return nil
 	}
 
-	return nil
+	return m.openLsm.LoadPolicies(rules)
 }
 
 func (m *LSMManager) updateExecLSM(policies *PolicySet) error {
+	rules := ConvertToExecRules(policies.Exec)
 	if !policies.HasExecPolicies() {
-		if m.execLsm != nil {
-			fmt.Printf("No exec policies found, exec LSM will continue with empty rules\n")
-			return m.execLsm.LoadPolicies([]ExecPolicyRule{})
-		}
-		return nil
+		fmt.Printf("No exec policies found; exec LSM enforces the default (deny unless Dir::\"/\" is explicitly permitted)\n")
+		rules = []ExecPolicyRule{}
 	}
 
 	if m.execLsm == nil {
@@ -210,7 +217,7 @@ func (m *LSMManager) updateExecLSM(policies *PolicySet) error {
 			return fmt.Errorf("failed to create exec LSM: %w", err)
 		}
 
-		if err := m.execLsm.LoadPolicies(ConvertToExecRules(policies.Exec)); err != nil {
+		if err := m.execLsm.LoadPolicies(rules); err != nil {
 			return fmt.Errorf("failed to load exec policies: %w", err)
 		}
 
@@ -220,11 +227,10 @@ func (m *LSMManager) updateExecLSM(policies *PolicySet) error {
 				m.handleAttachFailure("exec", err)
 			}
 		})
-	} else {
-		return m.execLsm.LoadPolicies(ConvertToExecRules(policies.Exec))
+		return nil
 	}
 
-	return nil
+	return m.execLsm.LoadPolicies(rules)
 }
 
 // connectDefaultOverride decides the kernel connect LSM's default verdict
