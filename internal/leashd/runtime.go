@@ -804,22 +804,38 @@ var nftBinaryName = "nft"
 
 // applyNetworkRules attempts nftables first (v4+v6) then falls back to iptables/ip6tables.
 // leashPort and cgroupPath are used to block target container from reaching leashd control plane.
+// cgroupPath is the absolute cgroup directory; it is converted to a
+// cgroup2-root-relative path before being handed to the rule scripts.
 func applyNetworkRules(port, leashPort, cgroupPath string) error {
 	if port == "" {
 		port = "18000"
 	}
+	// The kernel cgroup matchers (nft `socket cgroupv2`, xt_cgroup `--path`)
+	// want a path relative to the cgroup2 root, not the absolute directory
+	// leashd monitors. If it cannot be expressed that way, pass no cgroup so
+	// the scripts apply the namespace-wide control-plane block instead.
+	ruleCgroup, ruleLevel := "", 0
+	if strings.TrimSpace(cgroupPath) != "" {
+		rel, level, err := cgroup2RulePath(cgroup2Root, cgroupPath)
+		if err != nil {
+			log.Printf("Warning: cannot scope control-plane isolation to cgroup (%v); blocking all local access to the control plane port", err)
+		} else {
+			ruleCgroup, ruleLevel = rel, level
+		}
+	}
 	// Try nftables first if available
 	if _, err := findNft(); err == nil {
-		if err := applyNftablesRules(port, leashPort, cgroupPath); err == nil {
+		if err := applyNftablesRules(port, leashPort, ruleCgroup, ruleLevel); err == nil {
 			return nil
 		} else {
 			log.Printf("Warning: nftables apply failed; falling back to iptables: %v", err)
 		}
 	}
 	// Fallback: iptables + ip6tables (best-effort)
-	return applyIptablesRules(port, leashPort, cgroupPath)
+	return applyIptablesRules(port, leashPort, ruleCgroup)
 }
 
+// cgroupPath must already be relative to the cgroup2 root (see cgroup2RulePath).
 func applyIptablesRules(port, leashPort, cgroupPath string) error {
 	if port == "" {
 		port = "18000"
@@ -879,7 +895,9 @@ func findIptables() (string, error) {
 }
 
 // applyNftablesRules runs the embedded nftables script to configure v4+v6.
-func applyNftablesRules(port, leashPort, cgroupPath string) error {
+// cgroupPath must be relative to the cgroup2 root and cgroupLevel its depth
+// (see cgroup2RulePath); an empty cgroupPath selects the namespace-wide block.
+func applyNftablesRules(port, leashPort, cgroupPath string, cgroupLevel int) error {
 	if port == "" {
 		port = "18000"
 	}
@@ -890,7 +908,7 @@ func applyNftablesRules(port, leashPort, cgroupPath string) error {
 	if _, err := exec.LookPath(shell); err != nil {
 		return fmt.Errorf("shell not found: %w", err)
 	}
-	cmd := exec.Command(shell, "-s", port, leashPort, cgroupPath)
+	cmd := exec.Command(shell, nftablesScriptArgs(port, leashPort, cgroupPath, cgroupLevel)...)
 	cmd.Stdin = strings.NewReader(assets.ApplyNftablesScript)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
