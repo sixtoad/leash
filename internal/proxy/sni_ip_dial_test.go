@@ -2,10 +2,13 @@ package proxy
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 
+	"github.com/strongdm/leash/internal/engine"
 	"github.com/strongdm/leash/internal/lsm"
 )
 
@@ -32,10 +35,36 @@ func connectIPRule(action int32, ip string, port uint16) lsm.ConnectPolicyRule {
 	}
 }
 
-// denyByDefault builds the real proxy-side checker with the given rules and a
-// default-deny policy.
+// denyByDefault builds the real proxy-side checker, the Cedar engine (#142),
+// from the given rules as strict Cedar under the default deny. A rule naming
+// both a host and an IP needs both (a conjunction of the two Host atoms).
 func denyByDefault(rules ...lsm.ConnectPolicyRule) PolicyChecker {
-	return lsm.NewSimplePolicyChecker(rules, false, nil)
+	var b strings.Builder
+	for _, r := range rules {
+		port := ""
+		if r.DestPort != 0 {
+			port = fmt.Sprintf(":%d", r.DestPort)
+		}
+		var atoms []string
+		if r.HostnameLen > 0 {
+			atoms = append(atoms, fmt.Sprintf("resource in Host::%q", string(r.Hostname[:r.HostnameLen])+port))
+		}
+		if r.DestIP != 0 {
+			ip := make(net.IP, 4)
+			binary.BigEndian.PutUint32(ip, r.DestIP)
+			atoms = append(atoms, fmt.Sprintf("resource in Host::%q", ip.String()+port))
+		}
+		effect := "forbid"
+		if r.Action == lsm.PolicyAllow {
+			effect = "permit"
+		}
+		fmt.Fprintf(&b, "@leash_semantics(\"cedar\")\n%s (principal, action == Action::\"NetworkConnect\", resource) when { %s };\n", effect, strings.Join(atoms, " && "))
+	}
+	e, err := engine.NewFromText("test.cedar", b.String())
+	if err != nil {
+		panic(err)
+	}
+	return e
 }
 
 func (h *httpsHarness) dialedTargets() [][2]string {

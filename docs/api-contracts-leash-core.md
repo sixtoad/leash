@@ -136,6 +136,7 @@ Single endpoint; upgrades GET → WebSocket. Implemented by `WebSocketHub` (`int
 | `policy.snapshot` | After any policy CRUD | Full `PoliciesResponse` payload |
 | `proc.exec`, `file.open`, `connect` (et al.) | Every LSM decision | `pid`, `tgid`, `comm`, `exe`/`path`/`addr`, `hostname`, `decision`, `reason`, `seq` |
 | `mcp.*` | MITM MCP observer | `server`, `tool`, `method`, decision |
+| `authz.decision` | Every plugin authz socket decision ([design/AUTHZ-SERVICE.md](design/AUTHZ-SERVICE.md)) | `plugin`, `action`, `resource`, `context_keys` (never values), `decision`, `reason`, `policies`/`rule`, `generation` |
 | `http.rewrite` | Header rewriter fired | `host`, `header` |
 
 **Client → server.** Free-form text payloads parsed by `hub.Incoming()`. Today consumed by the suggest pipeline and reserved for future real-time subscriptions. The mac-leash WebSocket client sends a separate set of envelopes — see § Mac envelopes below — but uses the same `/api` upgrade.
@@ -185,7 +186,7 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
   "contractVersion": 2,             // current CLI surface
   "minCompatibleContract": 0,       // oldest caller contract still served
   "capabilities": [                 // surface elements a provisioner can drive
-    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "allow-proxy-only"
+    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "allow-proxy-only"
   ],
   "policyLimits": {                 // enforced policy path lengths, in bytes
     "filePathBytes": 255,           // file.open rules: every byte matched; longer rules rejected at load
@@ -198,6 +199,8 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
 ```
 
 Field names are camelCase and additive-only: renaming or removing one is a contract break, adding one is not.
+
+`authz-socket` means `--inject-service` accepts `authz=<Ns>[+<Ns>...]` and `id=<id>`, and leashd serves that plugin a private Cedar authorization socket (path in the plugin's `LEASH_AUTHZ_SOCKET`) speaking protocol v1. The wire format, limits and fail-closed rules are in [design/AUTHZ-SERVICE.md](design/AUTHZ-SERVICE.md); the Go client is `github.com/strongdm/leash/pkg/authz`.
 
 Value domains a caller must accept rather than reject:
 
@@ -357,7 +360,7 @@ Every Leash-owned policy, UI, bootstrap, image, port-forward, prompt, and lifecy
 
 The capability is additive under contract version 1. A caller that requires pure stdout must require the literal `machine-output` capability rather than infer support from `contractVersion == 1`; older contract-1 builds do not carry this flag.
 
-`enforcing` reports whether **this binary carries an enforcement path**, derived from the build's `GOOS`: `true` on linux (the eBPF LSM programs plus the intercepting MITM proxy) and `true` on darwin (the darwin runtime builds and drives the same MITM proxy — `internal/darwind/runtime_darwin.go`, `NewMITMProxy` / `applyPolicyToProxy` — alongside the separately installed Endpoint Security / Network Extension components it coordinates with). Any other target reports `false`. It describes the binary, not the host's runtime capability, which is `leash doctor`'s job.
+`enforcing` reports whether **this binary carries an enforcement path**, derived from the build's `GOOS`: `true` on linux (the eBPF LSM programs plus the intercepting MITM proxy) and `true` on darwin (the darwin runtime builds and drives the same MITM proxy — `internal/darwind/runtime_darwin.go`, `NewMITMProxy` / `policy.Decisions.Publish` — alongside the separately installed Endpoint Security / Network Extension components it coordinates with). Any other target reports `false`. It describes the binary, not the host's runtime capability, which is `leash doctor`'s job.
 
 **Probing an unknown leash has a hazard.** On a build that predates this feature, `version` is not a subcommand: the argument falls through to the workload CLI, which configures telemetry and can begin runtime provisioning. `leash version --json` is a side-effect-free probe only from contract 1 onward. Establish contract 0 some other way where possible — `leash --version` has been in the argument switch of every build and only prints three lines — or probe with `LEASH_DISABLE_TELEMETRY=1` in a disposable directory.
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/strongdm/leash/internal/cedar"
 	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/proxy"
 )
@@ -31,7 +32,7 @@ func TestManagerRejectsKernelInvalidUpdateAndKeepsPrevious(t *testing.T) {
 	// any BPF work, so this runs unprivileged on any OS.
 	lsmMgr := lsm.NewLSMManager("/sys/fs/cgroup/leash-test-not-real", nil, true)
 	proxyCalls := 0
-	m := NewManager(lsmMgr, func(*lsm.PolicySet, []proxy.HeaderRewriteRule) { proxyCalls++ })
+	m := NewManager(lsmMgr, func(*cedar.Compilation) { proxyCalls++ })
 
 	bad := tooManyOpenRules(lsm.MaxPolicyRules + 1)
 	err := m.UpdateFileRules(bad, []proxy.HeaderRewriteRule{{Host: "h", Header: "X", Value: "v"}})

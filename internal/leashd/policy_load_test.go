@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
+	cedarutil "github.com/strongdm/leash/internal/cedar"
 	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/policy"
-	"github.com/strongdm/leash/internal/proxy"
 )
 
 // leashd's own startup check rejects an unknown entity (not only syntax).
@@ -50,7 +50,7 @@ func TestPolicyReloadKeepsPreviousOnBadUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	var lastProxy *lsm.PolicySet
-	mgr := policy.NewManager(nil, func(rules *lsm.PolicySet, _ []proxy.HeaderRewriteRule) { lastProxy = rules })
+	mgr := policy.NewManager(nil, func(active *cedarutil.Compilation) { lastProxy = active.Policies })
 	if err := mgr.UpdateFileRules(initial.LSMPolicies, initial.HTTPRewrites); err != nil {
 		t.Fatal(err)
 	}
@@ -62,9 +62,15 @@ func TestPolicyReloadKeepsPreviousOnBadUpdate(t *testing.T) {
 
 	openPaths := func() string {
 		fileLSM, _, _, _ := mgr.Snapshot()
+		// Distinct paths: the compiler emits one kernel rule per open mode.
 		var paths []string
+		seen := map[string]bool{}
 		for _, r := range fileLSM.Open {
-			paths = append(paths, string(r.Path[:r.PathLen]))
+			p := string(r.Path[:r.PathLen])
+			if !seen[p] {
+				seen[p] = true
+				paths = append(paths, p)
+			}
 		}
 		return strings.Join(paths, ",")
 	}
@@ -94,7 +100,7 @@ func TestPolicyReloadKeepsPreviousOnBadUpdate(t *testing.T) {
 		if got := openPaths(); got != want {
 			t.Fatalf("bad reload %q replaced the policy: open=%q", bad, got)
 		}
-		if lastProxy == nil || len(lastProxy.Open) != 1 {
+		if lastProxy == nil || len(lastProxy.Open) == 0 || string(lastProxy.Open[0].Path[:lastProxy.Open[0].PathLen]) != "/tmp/" {
 			t.Fatalf("proxy lost the previous policy after %q: %+v", bad, lastProxy)
 		}
 	}

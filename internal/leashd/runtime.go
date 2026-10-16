@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/strongdm/leash/internal/assets"
+	"github.com/strongdm/leash/internal/authz"
 	cedarutil "github.com/strongdm/leash/internal/cedar"
 	"github.com/strongdm/leash/internal/enforcement"
 	"github.com/strongdm/leash/internal/entrypoint"
@@ -184,6 +185,8 @@ type runtimeState struct {
 	mitmProxy         *proxy.MITMProxy
 	lsmManager        *lsm.LSMManager
 	policyManager     *policy.Manager
+	decisions         *policy.Decisions // the engine shared by the proxy and the authz socket
+	authzServer       *authz.Server     // plugin authz sockets (#142); nil when no plugin asked for one
 	policyWatcherStop func()
 	policyReady       atomic.Bool
 	closeOnce         sync.Once
@@ -468,12 +471,12 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 		return nil, fmt.Errorf("failed to parse Cedar policy: %w", err)
 	}
 
-	connectRules := lsm.ConvertToConnectRules(initialPolicy.LSMPolicies.Connect)
-	defaultAllow := connectDefaultAllow(initialPolicy.LSMPolicies)
-	policyChecker := lsm.NewSimplePolicyChecker(connectRules, defaultAllow, initialPolicy.LSMPolicies.MCP)
+	// One engine per policy change, shared by the proxy and the authz socket (#142).
+	decisions := &policy.Decisions{}
+	initialEngine := decisions.Publish(initialPolicy.Compilation.Engine)
 
 	// n.b. This kicks off certificate creation.
-	mitmProxy, err := proxy.NewMITMProxy(cfg.ProxyPort, headerRewriter, policyChecker, logger, cfg.MCPConfig)
+	mitmProxy, err := proxy.NewMITMProxy(cfg.ProxyPort, headerRewriter, initialEngine, logger, cfg.MCPConfig)
 	if err != nil {
 		logger.Close()
 		return nil, fmt.Errorf("failed to create MITM proxy: %w", err)
@@ -490,13 +493,14 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 		headerRewriter:    headerRewriter,
 		mitmProxy:         mitmProxy,
 		lsmManager:        lsmManager,
+		decisions:         decisions,
 		bootstrapPath:     filepath.Join(leashDir, entrypoint.BootstrapReadyFileName),
 		telemetryProvider: telemetryProvider,
 	}
 
-	policyManager := policy.NewManager(lsmManager, func(rules *lsm.PolicySet, httpRules []proxy.HeaderRewriteRule) {
-		state.headerRewriter.SetRules(httpRules)
-		applyPolicyToProxy(state.mitmProxy, rules)
+	policyManager := policy.NewManager(lsmManager, func(active *cedarutil.Compilation) {
+		state.headerRewriter.SetRules(active.HTTPRules)
+		state.decisions.Publish(active.Engine, state.mitmProxy.SetEngine)
 	})
 
 	if err := policyManager.UpdateFileRules(initialPolicy.LSMPolicies, initialPolicy.HTTPRewrites); err != nil {
@@ -505,6 +509,11 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 	}
 	headerRewriter.SetRules(initialPolicy.HTTPRewrites)
 	state.policyManager = policyManager
+
+	if err := state.startAuthz(); err != nil {
+		state.Close()
+		return nil, err
+	}
 
 	logPolicyEvent("policy.restore", map[string]any{
 		"source":        "file",
@@ -655,6 +664,45 @@ func waitForShutdown() {
 	<-lsm.ShutdownRequested()
 }
 
+// startAuthz serves the plugin authz sockets the runner described in
+// LEASH_AUTHZ_PLUGINS, answering from the same Decider the proxy uses. A
+// malformed description fails startup; a socket that cannot be bound is
+// logged and its plugin fails closed.
+// authzProcCgroup reads a peer's /proc/<pid>/cgroup for the authz workload
+// check; nil reads the real file (tests override it).
+var authzProcCgroup func(pid int) ([]byte, error)
+
+func (rt *runtimeState) startAuthz() error {
+	grants, err := authz.ParseGrants(os.Getenv(authz.EnvPlugins))
+	if err != nil {
+		return err
+	}
+	if len(grants) == 0 {
+		return nil
+	}
+	// The workload runs as the plugin's uid; without its cgroup leashd could
+	// not tell a workload peer from the plugin. Fail closed (#142).
+	if strings.TrimSpace(rt.cfg.CgroupPath) == "" {
+		return errors.New("authz: plugins with authz= need the workload cgroup (--cgroup / LEASH_CGROUP_PATH) so leashd can refuse workload peers; refusing to serve the authz sockets without one")
+	}
+	rt.authzServer = authz.New(authz.Config{
+		Grants:     grants,
+		Source:     rt.decisions.Current,
+		Logger:     rt.logger,
+		BoxCgroup:  rt.cfg.CgroupPath,
+		ProcCgroup: authzProcCgroup,
+	})
+	if err := rt.authzServer.Start(); err != nil {
+		log.Printf("authz: %v", err)
+	}
+	ids := make([]string, 0, len(grants))
+	for _, g := range grants {
+		ids = append(ids, g.ID)
+	}
+	logPolicyEvent("authz.start", map[string]any{"plugins": strings.Join(ids, ",")})
+	return nil
+}
+
 func (rt *runtimeState) Close() {
 	rt.closeOnce.Do(func() {
 		if rt.telemetryProvider != nil {
@@ -664,6 +712,9 @@ func (rt *runtimeState) Close() {
 		}
 		if rt.policyWatcherStop != nil {
 			rt.policyWatcherStop()
+		}
+		if rt.authzServer != nil {
+			_ = rt.authzServer.Close()
 		}
 		if rt.logger != nil {
 			_ = rt.logger.Close()
@@ -735,6 +786,11 @@ func applyFileReload(mgr *policy.Manager, newCfg *policy.Config) error {
 	err := mgr.UpdateFileRules(newCfg.LSMPolicies, newCfg.HTTPRewrites)
 	if err == nil {
 		return nil
+	}
+	// Refused before commit (does not compile, or the kernel would reject it):
+	// the manager never switched, so there is nothing to restore.
+	if errors.Is(err, policy.ErrCompile) || errors.Is(err, policy.ErrRejected) {
+		return err
 	}
 	if rbErr := mgr.UpdateFileRules(prevLSM, prevHTTP); rbErr != nil {
 		return fmt.Errorf("%w (restoring the previous policy also failed: %v)", err, rbErr)
@@ -829,19 +885,6 @@ func (rt *runtimeState) configureNetwork() error {
 		log.Printf("Warning: Failed to mount tracefs: %v", err)
 	}
 	return nil
-}
-
-func connectDefaultAllow(policies *lsm.PolicySet) bool {
-	if policies == nil {
-		return false
-	}
-	return policies.ConnectDefaultAllow
-}
-
-func applyPolicyToProxy(mitmproxy *proxy.MITMProxy, rules *lsm.PolicySet) {
-	connectRules := lsm.ConvertToConnectRules(rules.Connect)
-	defaultAllow := connectDefaultAllow(rules)
-	mitmproxy.SetPolicyChecker(lsm.NewSimplePolicyChecker(connectRules, defaultAllow, rules.MCP))
 }
 
 const proxyMark = "0x2000"
