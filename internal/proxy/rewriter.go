@@ -113,16 +113,24 @@ func (hr *HeaderRewriter) SetRules(rules []HeaderRewriteRule) {
 
 }
 
-// ApplyRules modifies the request headers based on the loaded rules
+// ApplyRules modifies the request headers based on the loaded rules, matching
+// on the request's own Host. The proxy request loops use ApplyRulesForHost
+// with the connection's verified host instead (issue #149); this remains for
+// callers that have already bound req.Host to the upstream they forward to.
 func (hr *HeaderRewriter) ApplyRules(req *http.Request) {
-	hr.mutex.RLock()
-	defer hr.mutex.RUnlock()
-
-	// Debug logging
 	host := req.Host
 	if host == "" && req.URL != nil {
 		host = req.URL.Host
 	}
+	hr.ApplyRulesForHost(req, host)
+}
+
+// ApplyRulesForHost applies the rules whose host matches host. host must be
+// the host the request is actually forwarded to, not a client-supplied
+// header. Matching ignores a port, case, IPv6 brackets and a trailing dot.
+func (hr *HeaderRewriter) ApplyRulesForHost(req *http.Request, host string) {
+	hr.mutex.RLock()
+	defer hr.mutex.RUnlock()
 
 	if len(hr.rules) == 0 {
 		log.Printf("HeaderRewriter: No rules to apply")
@@ -133,9 +141,13 @@ func (hr *HeaderRewriter) ApplyRules(req *http.Request) {
 	if hostWithoutPort, _, err := net.SplitHostPort(host); err == nil {
 		host = hostWithoutPort
 	}
+	host = normalizeAuthorityHost(host)
+	if host == "" {
+		return
+	}
 
 	for _, rule := range hr.rules {
-		if rule.Host == host {
+		if normalizeAuthorityHost(rule.Host) == host {
 			// always rewrite the header, even if it's empty
 			oldValuePresent := headerValuePresent(req.Header, rule.Header)
 			req.Header.Set(rule.Header, rule.Value)
