@@ -438,6 +438,22 @@ func (e *Engine) DecideOpen(path, action string) Decision {
 	return e.builtinRequest(action, res, fileParents(path, true), types.Record{})
 }
 
+// NewEntryName stands for "a new entry" of a directory: the NUL byte no
+// path and no kernel-enforced policy entity can contain.
+const NewEntryName = "\x00"
+
+// DecideMutation decides a directory mutation of an absolute path (mkdir,
+// unlink, rmdir, and each side of a rename): it needs FileOpenReadWrite on
+// the path itself and on a new entry of its directory, i.e. on writing the
+// directory's contents. There is no Cedar action of its own: the kernel's
+// mutation hooks enforce these two FileOpenReadWrite decisions (#142).
+func (e *Engine) DecideMutation(path string) Decision {
+	if d := e.DecideOpen(path, ActionFileOpenReadWrite); !d.Allow {
+		return d
+	}
+	return e.DecideOpen(path[:strings.LastIndexByte(path, '/')+1]+NewEntryName, ActionFileOpenReadWrite)
+}
+
 // DecideExec decides an exec of an absolute path.
 func (e *Engine) DecideExec(path string) Decision {
 	if e == nil {

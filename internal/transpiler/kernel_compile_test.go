@@ -98,14 +98,15 @@ func TestCompileKernelDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ir.Open) != 1 || ir.Open[0].String() != "allow file.open /" || len(ir.Exec) != 1 || !ir.ConnectDefaultAllow || !ir.ConnectDefaultExplicit {
+	if len(ir.Open) != 2 || ir.Open[0].String() != "allow file.open /" || ir.Open[1].String() != "allow file.mutate /" || len(ir.Exec) != 1 || !ir.ConnectDefaultAllow || !ir.ConnectDefaultExplicit {
 		t.Fatalf("permit-all: open=%v exec=%v connect default=%v", ir.Open, ir.Exec, ir.ConnectDefaultAllow)
 	}
 	ir, err = compileKernelText(t, ``)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ir.Open) != 0 || len(ir.Exec) != 0 || ir.ConnectDefaultAllow || !ir.ConnectDefaultExplicit {
+	// Only the mutation table's marker deny: nothing is mutable.
+	if len(ir.Open) != 1 || ir.Open[0].String() != "deny file.mutate /" || len(ir.Exec) != 0 || ir.ConnectDefaultAllow || !ir.ConnectDefaultExplicit {
 		t.Fatalf("empty policy is default deny: %+v", ir)
 	}
 	ir, err = compileKernelText(t, `

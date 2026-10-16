@@ -168,7 +168,11 @@ func CompileKernel(ps *cedarlib.PolicySet, eng *engine.Engine) (*lsm.PolicySet, 
 	if err != nil {
 		return nil, err
 	}
-	out.Open = open
+	mutation, err := compileMutationRules(points, eng)
+	if err != nil {
+		return nil, err
+	}
+	out.Open = append(open, mutation...)
 	out.Exec = compileExecRegions(points, eng)
 
 	if err := compileConnect(kps, out); err != nil {

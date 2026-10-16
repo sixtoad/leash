@@ -122,6 +122,9 @@ func directorySuggestions(ps *lsm.PolicySet, opts Options) []Suggestion {
 	}
 
 	for _, rule := range ps.Open {
+		if rule.Operation == lsm.OpMutation {
+			continue
+		}
 		addRule(rule, operationName(rule.Operation))
 	}
 	// Exec policies have exact paths; we do not currently suggest grouping them
