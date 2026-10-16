@@ -3,6 +3,8 @@ package runner
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/strongdm/leash/internal/enforcement"
 	"github.com/strongdm/leash/internal/entrypoint"
 	"github.com/strongdm/leash/internal/leashd/listen"
 	"github.com/strongdm/leash/internal/resolvercontract"
@@ -615,8 +618,10 @@ func (n nativeLauncher) hostLeashdArgv(self, netnsPath, cgroupPath string) []str
 	if !n.layer2Active() {
 		leashd = append(leashd, "--lsm-only")
 	}
-	if n.r.opts.requireLSM {
+	if n.r.cfg.requireLSM {
 		leashd = append(leashd, "--require-lsm")
+	} else {
+		leashd = append(leashd, "--allow-proxy-only")
 	}
 	leashd = append(leashd, "--cgroup", cgroupPath)
 	if cfgDir := strings.TrimSpace(n.r.cfg.cfgDir); cfgDir != "" {
@@ -697,7 +702,7 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 			if n.layer2Active() {
 				n.exportCACert(shareDir)
 			}
-			return nil
+			return n.r.reportEnforcement(ready)
 		}
 		// Fast path: if leashd already exited it will never publish the marker, so
 		// stop waiting now (fail-closed below decides the verdict).
@@ -723,15 +728,50 @@ func nativeReadyTimeout(configured time.Duration) time.Duration {
 	return configured
 }
 
-// notReady resolves an unconfirmed-enforcement situation: fail closed when the
-// operator passed --require-lsm (refuse to run the workload unenforced), else
-// preserve the historical behavior — warn and proceed (degrade to whatever
-// enforcement did attach). The leashd log has the specifics either way.
+// notReady resolves an unconfirmed-enforcement situation: fail closed by
+// default (refuse to run the workload unenforced); only with --allow-proxy-only
+// AND an active Layer 2 warn and proceed (degrade to the proxy). The leashd log
+// has the specifics either way.
 func (n nativeLauncher) notReady(reason string) error {
-	if n.r.opts.requireLSM {
-		return fmt.Errorf("%s; refusing to run the workload unenforced (--require-lsm). See %s", reason, n.leashdLogPath())
+	if detail := leashdFailureReason(n.leashdLogPath()); detail != "" {
+		reason += " (leashd: " + detail + ")"
 	}
-	n.r.logger.Printf("Warning: %s; the workload may run before Layer 1 is active. See %s", reason, n.leashdLogPath())
+	return notReadyVerdict(reason, n.r.cfg.requireLSM, n.layer2Active(), n.leashdLogPath(), n.r.logger)
+}
+
+// leashdFailureReason returns the last FATAL line from the leashd log, so a
+// refusal names the cause instead of only pointing at the log. Reads at most
+// the final 64 KiB.
+func leashdFailureReason(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	const tail = 64 << 10
+	if info, err := f.Stat(); err == nil && info.Size() > tail {
+		_, _ = f.Seek(info.Size()-tail, io.SeekStart)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return ""
+	}
+	return lastFatalLine(string(data))
+}
+
+// notReadyVerdict is notReady's pure decision. Without Layer 2 (rootless, or
+// egress setup failed -> leashd --lsm-only) there is no proxy to fall back on,
+// so --allow-proxy-only cannot apply: proceeding would run with no enforcement.
+func notReadyVerdict(reason string, requireLSM, layer2Active bool, logPath string, logger *log.Logger) error {
+	if !layer2Active {
+		return fmt.Errorf("%s; refusing to run the workload unenforced (fail-closed: %s). See %s", reason, enforcement.FailClosedRemedy(false), logPath)
+	}
+	if requireLSM {
+		return fmt.Errorf("%s; refusing to run the workload unenforced (fail-closed: %s). See %s", reason, enforcement.FailClosedRemedy(true), logPath)
+	}
+	if logger != nil {
+		logger.Printf("Warning: %s; continuing proxy-only (--allow-proxy-only): the workload may run before Layer 1 is active. See %s", reason, logPath)
+	}
 	return nil
 }
 

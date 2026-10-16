@@ -43,10 +43,28 @@ func notifyEnforcementSettled() {
 var onLSMAttached func()
 
 // requireLSM, when true, makes a failed LSM attach fatal (fail-closed) rather
-// than degrading to proxy-only. Set once at startup from the --require-lsm flag,
-// before any attach. The default (false) preserves the historical behavior:
-// degrade silently so a kernel without an active bpf LSM still runs the proxy.
+// than degrading to proxy-only. leashd sets it once at startup, before any
+// attach, from ResolveRequireLSM: fail-closed is the default and proxy-only
+// requires --allow-proxy-only / LEASH_ALLOW_PROXY_ONLY (issue #117). The
+// package-level zero value stays false so library callers and kernel tests
+// that drive LoadAndAttach directly get an error back instead of os.Exit;
+// leashd always sets it explicitly before the first attach.
 var requireLSM bool
+
+// failClosedRemedy is appended to fatal attach messages. leashd replaces it
+// with enforcement.FailClosedRemedy for the session's real state (e.g. the
+// proxy being off, where --allow-proxy-only cannot help).
+var failClosedRemedy = "pass --allow-proxy-only to continue with only the L7 proxy"
+
+// SetFailClosedRemedy sets the remediation text for fatal attach failures.
+func SetFailClosedRemedy(s string) {
+	if s != "" {
+		failClosedRemedy = s
+	}
+}
+
+// FailClosedRemedy returns the current remediation text.
+func FailClosedRemedy() string { return failClosedRemedy }
 
 // SetRequireLSM selects fail-closed (true) vs degrade-to-proxy (false) behavior
 // for LSM attach failures. Call once at startup before enforcement begins.
@@ -548,14 +566,21 @@ func LoadAndAttachBPFWithSetup(
 			return
 		}
 		settled = true
-		// Fail-closed: if this attach failed and the operator passed
-		// --require-lsm, exit BEFORE notifying the settle watcher — otherwise the
-		// host launcher would be released to run the workload with file/exec/
-		// connect enforcement silently degraded to proxy-only. Exiting here (not
-		// after notify) closes the release race.
+		// Fail-closed (the default): if this attach failed and proxy-only was
+		// not explicitly allowed, exit BEFORE notifying the settle watcher —
+		// otherwise the host launcher would be released to run the workload
+		// with file/exec/connect enforcement silently degraded to proxy-only.
+		// Exiting here (not after notify) closes the release race.
 		if retErr != nil && requireLSM {
-			fmt.Fprintf(os.Stderr, "FATAL: --require-lsm set but LSM enforcement is unavailable; refusing to run unenforced: %v\n", retErr)
+			fmt.Fprintf(os.Stderr, "FATAL: eBPF LSM enforcement is unavailable (%v); refusing to run unenforced (%s)\n", retErr, failClosedRemedy)
 			os.Exit(1)
+		}
+		// Record the degrade before reporting the attempt settled, so the
+		// enforcement-ready marker states the effective level correctly.
+		if retErr != nil {
+			markLayer1Degraded()
+		} else {
+			markLayer1Attached()
 		}
 		notifyLSMAttached()
 	}

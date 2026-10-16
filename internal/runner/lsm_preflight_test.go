@@ -3,6 +3,8 @@ package runner
 import (
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -133,8 +135,89 @@ func TestParseArgsRequireLSM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseArgs error: %v", err)
 	}
-	if off.requireLSM {
-		t.Fatal("requireLSM should default to false")
+	if off.requireLSM || off.allowProxyOnly {
+		t.Fatal("no flag should record neither explicit choice (the fail-closed default is applied in loadConfig)")
+	}
+}
+
+func TestParseArgsAllowProxyOnly(t *testing.T) {
+	t.Parallel()
+
+	opts, err := parseArgs([]string{"--allow-proxy-only", "claude"})
+	if err != nil {
+		t.Fatalf("parseArgs error: %v", err)
+	}
+	if !opts.allowProxyOnly || opts.requireLSM {
+		t.Fatalf("--allow-proxy-only should set only allowProxyOnly: %+v", opts)
+	}
+	if _, err := parseArgs([]string{"--allow-proxy-only=1"}); err == nil {
+		t.Fatal("--allow-proxy-only= should be rejected (takes no value)")
+	}
+}
+
+// Issue #117: fail closed by default; proxy-only only by explicit opt-out.
+func TestLoadConfigResolvesFailClosedDefault(t *testing.T) {
+	cases := []struct {
+		name    string
+		opts    options
+		env     map[string]string
+		want    bool
+		wantErr bool
+	}{
+		{name: "default fails closed", want: true},
+		{name: "--require-lsm is redundant", opts: options{requireLSM: true}, want: true},
+		{name: "--allow-proxy-only opts out", opts: options{allowProxyOnly: true}, want: false},
+		{name: "LEASH_ALLOW_PROXY_ONLY opts out", env: map[string]string{"LEASH_ALLOW_PROXY_ONLY": "1"}, want: false},
+		{name: "falsy LEASH_REQUIRE_LSM does not opt out", env: map[string]string{"LEASH_REQUIRE_LSM": "0"}, want: true},
+		{name: "flag beats env", opts: options{allowProxyOnly: true}, env: map[string]string{"LEASH_REQUIRE_LSM": "1"}, want: false},
+		{name: "both flags conflict", opts: options{requireLSM: true, allowProxyOnly: true}, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("LEASH_REQUIRE_LSM", "")
+			t.Setenv("LEASH_ALLOW_PROXY_ONLY", "")
+			t.Setenv("LEASH_WORK_DIR", t.TempDir())
+			t.Setenv("LEASH_HOME", t.TempDir())
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			cfg, _, err := loadConfig(t.TempDir(), tc.opts)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("want an error for conflicting flags")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if cfg.requireLSM != tc.want {
+				t.Fatalf("requireLSM = %v, want %v", cfg.requireLSM, tc.want)
+			}
+		})
+	}
+}
+
+func TestEnforcementMarkerReport(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "enforcement.ready")
+	if err := os.WriteFile(path, []byte(`{"enforcement":"proxy-only","layer1":"unavailable","layer2":"active","requireLSM":false,"allowProxyOnly":true}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, ok := readEnforcementStatus(path)
+	if !ok {
+		t.Fatal("JSON marker should decode")
+	}
+	if got, want := formatEnforcementLine(st), "leash: enforcement=proxy-only layer1=unavailable layer2=active"; got != want {
+		t.Fatalf("line = %q, want %q", got, want)
+	}
+	// An older leashd writes a bare "ready" line: no status, nothing reported.
+	if err := os.WriteFile(path, []byte("ready\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readEnforcementStatus(path); ok {
+		t.Fatal("legacy marker must not decode as a status")
 	}
 }
 

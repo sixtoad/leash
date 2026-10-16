@@ -183,10 +183,10 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
   "sourceRevision": "c686025aa1b2c3-dirty", // complete -X main.commit value for provenance checks
   "builtAt": "2026-07-21T10:11:12Z",// RFC 3339 UTC, or "unknown"
   "enforcing": true,                // does THIS BUILD carry an enforcement path
-  "contractVersion": 1,             // current CLI surface
+  "contractVersion": 2,             // current CLI surface
   "minCompatibleContract": 0,       // oldest caller contract still served
   "capabilities": [                 // surface elements a provisioner can drive
-    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket"
+    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "allow-proxy-only"
   ],
   "policyLimits": {                 // enforced policy path lengths, in bytes
     "filePathBytes": 255,           // file.open rules: every byte matched; longer rules rejected at load
@@ -213,7 +213,7 @@ Value domains a caller must accept rather than reject:
 
 **The `-dirty` marker is best-effort and not guaranteed on any given path.** Today only the Makefile `build` target appends it; `scripts/release.sh`, `scripts/install-leash.sh`, `build/publish-docker.sh` and `.goreleaser.yaml` stamp the bare hash. Its presence means the tree was modified; **its absence is not proof of a clean tree** and must not be treated as a provenance guarantee.
 
-**Compatibility rule.** The contract covers the flags a provisioner drives (`--policy`, `--inject-service`, `--runtime`, `--user`, `--require-lsm`, `--machine-output`, `--idmap-volume`) plus the shape of this document. A caller written against contract `C` proceeds iff:
+**Compatibility rule.** The contract covers the flags a provisioner drives (`--policy`, `--inject-service`, `--runtime`, `--user`, `--require-lsm`, `--allow-proxy-only`, `--machine-output`, `--idmap-volume`) plus the shape of this document. A caller written against contract `C` proceeds iff:
 
 ```
 minCompatibleContract <= C <= contractVersion
@@ -265,6 +265,19 @@ if myContract < doc.MinCompatibleContract || myContract > *doc.ContractVersion {
 Two traps that snippet avoids. Decoding straight into value types makes `null`, `{}` and any unrelated JSON object succeed with a zero range `[0,0]`, which a contract-0 caller reads as *compatible* — so require the fields that make it this document before trusting the numbers. And never compare leash against constants compiled into the caller: that compares the caller to itself and can only pass. The installed binary's stdout is the only thing that can disagree with you.
 
 `policyLimits` (with the `policy-path-limits` capability) tells a policy generator how long a resolved rule path may be — a directory's trailing `/` included — and still be enforced byte-for-byte. A longer rule (or a larger rule set) is rejected before any kernel module is updated — at startup the run fails closed, and on a live reload the previous policy stays in force. At runtime, a file whose absolute path exceeds `filePathBytes` cannot be matched byte-for-byte and is denied (file open and hard-link source alike), whatever the rules say. A policy reload is atomic across file-open and directory-mutation enforcement; a hook racing a reload is denied rather than decided on a half-loaded policy. A document without `policyLimits` comes from a build that silently skipped any file or exec rule longer than 64 bytes; a caller must treat 64 as that build's limit.
+
+**Contract 2** (issue #117) is the fail-closed-by-default posture: a build at contract `>= 2` refuses to run the workload when the eBPF LSM cannot attach unless `--allow-proxy-only` is passed, and advertises the `allow-proxy-only` capability. Nothing was removed, so `minCompatibleContract` stays `0` and callers written against contract 0 or 1 remain `compatible`; a caller that relies on the fail-closed default can require contract 2 (or test for the capability).
+
+`allow-proxy-only` means this build **fails closed by default** when the eBPF LSM (Layer 1) cannot attach or has no scopable cgroup: `leash run` refuses to start the workload instead of degrading to proxy-only. `--allow-proxy-only` (or `LEASH_ALLOW_PROXY_ONLY=1`) is the explicit opt-out. `--require-lsm` / `LEASH_REQUIRE_LSM` stay accepted (and `require-lsm` stays advertised) but are now redundant; a falsy `LEASH_REQUIRE_LSM` does **not** opt out. Flags beat the environment, and asking for both at the same level is an error. A build without `allow-proxy-only` has the old default (warn and continue proxy-only), so a caller that needs fail-closed on such a build must keep passing `--require-lsm`.
+
+**Effective enforcement level.** Once every LSM attach has settled, leashd writes the enforcement-ready marker (`enforcement.ready` in the share dir; launchers gate on its existence, unchanged) as a JSON document, and logs an `enforcement.level` event with the same fields:
+
+```jsonc
+{"enforcement": "lsm", "layer1": "active", "layer2": "active", "requireLSM": true, "allowProxyOnly": false}
+// when Layer 1 is not active, a "reason" string says why
+```
+
+`enforcement` is `lsm` (Layer 1 active: every LSM program attached, at least one did, the workload has a scopable cgroup, **and** `bpf` is listed in `/sys/kernel/security/lsm` — attach success alone is not enough, since with `CONFIG_BPF_LSM=y` but bpf inactive the programs attach and never run; an unreadable list counts as not active), `proxy-only` (Layer 1 unavailable, only reachable with `--allow-proxy-only`) or `none` (enforcement skipped). `layer1` is `active` | `unavailable`; `layer2` is `active` | `disabled` (`--lsm-only`). The client prints `leash: enforcement=<level> layer1=<state> layer2=<state>` on the diagnostic stream — always under `--machine-output` (stderr), always when the level is not `lsm`, otherwise with `--verbose`. An older leashd writes a bare `ready` line, for which nothing is printed.
 
 `container-resource-limits` means this build accepts target-container limits: `--cpus <n>` (decimal CPUs), `--memory <n[b|k|m|g]>` (hard cap, minimum `6m`; swap is pinned to the same value) and `--pids-limit <n>` (positive integer). They can also come from `LEASH_CPUS` / `LEASH_MEMORY` / `LEASH_PIDS_LIMIT` or a `[leash.resources]` table (`cpus`, `memory`, `pids_limit`) in the global config or `.leash.toml`. Precedence is per field: flag, then env, then config. An invalid value fails the run before anything is provisioned. The limits apply only to the docker/podman runtimes: the native runtime refuses them instead of ignoring them. Once the target container starts, leash reads `HostConfig` back from the engine and fails closed if a requested limit was not applied. Otherwise it writes one line to the diagnostics stream (stderr under `--machine-output`) with the fields in a fixed order and unset limits omitted, e.g. `event=runner.resource-limits status=applied cpus=1.5 nano_cpus=1500000000 memory=512m memory_bytes=536870912 pids_limit=256`.
 

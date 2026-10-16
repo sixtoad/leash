@@ -92,14 +92,17 @@ func TestNativeHostLeashdArgv(t *testing.T) {
 
 	argv := n.hostLeashdArgv("/usr/local/bin/leash", "/run/netns/leash-native-x", "/sys/fs/cgroup/scope")
 	joined := strings.Join(argv, " ")
-	// LSM-only: host netns, no nsenter, --lsm-only, and no --require-lsm by default.
-	want := "/usr/local/bin/leash --daemon --host --lsm-only --cgroup /sys/fs/cgroup/scope --proxy-port 18000"
+	// LSM-only: host netns, no nsenter, --lsm-only. A zero config (proxy-only
+	// allowed) passes the explicit opt-out so leashd's fail-closed default does
+	// not override the client's resolved decision.
+	want := "/usr/local/bin/leash --daemon --host --lsm-only --allow-proxy-only --cgroup /sys/fs/cgroup/scope --proxy-port 18000"
 	if joined != want {
 		t.Fatalf("argv = %q\nwant   %q", joined, want)
 	}
 
-	// --require-lsm on the client propagates to the daemon args (fail-closed).
-	r.opts.requireLSM = true
+	// Fail-closed (the resolved default) propagates as --require-lsm, which
+	// older leashd builds also understand.
+	r.cfg.requireLSM = true
 	joined = strings.Join(n.hostLeashdArgv("/usr/local/bin/leash", "/run/netns/leash-native-x", "/sys/fs/cgroup/scope"), " ")
 	want = "/usr/local/bin/leash --daemon --host --lsm-only --require-lsm --cgroup /sys/fs/cgroup/scope --proxy-port 18000"
 	if joined != want {
@@ -331,7 +334,7 @@ func TestNativeWaitReadyFailClosed(t *testing.T) {
 	mk := func(require bool) nativeLauncher {
 		r := &runner{}
 		r.cfg.shareDir = t.TempDir() // present but no enforcement-ready marker
-		r.opts.requireLSM = require
+		r.cfg.requireLSM = require
 		r.leashd = &injectedProc{done: exited}
 		r.logger = log.New(io.Discard, "", 0)
 		return nativeLauncher{r: r}
@@ -341,12 +344,54 @@ func TestNativeWaitReadyFailClosed(t *testing.T) {
 	if err == nil {
 		t.Fatal("WaitReady must error under --require-lsm when leashd died before ready")
 	}
-	if !strings.Contains(err.Error(), "--require-lsm") {
-		t.Fatalf("error should name --require-lsm: %v", err)
+	if !strings.Contains(err.Error(), "fail-closed") || !strings.Contains(err.Error(), "--allow-proxy-only") {
+		t.Fatalf("error should say fail-closed and name the --allow-proxy-only opt-out: %v", err)
 	}
 
-	if err := mk(false).WaitReady(context.Background()); err != nil {
-		t.Fatalf("WaitReady should warn-and-proceed (nil) without --require-lsm: %v", err)
+	// With --allow-proxy-only the verdict depends on whether Layer 2 is up in
+	// this session (root + egress); either way it must match notReadyVerdict.
+	n := mk(false)
+	err = n.WaitReady(context.Background())
+	if n.layer2Active() && err != nil {
+		t.Fatalf("WaitReady should warn-and-proceed (nil) with --allow-proxy-only and Layer 2 active: %v", err)
+	}
+	if !n.layer2Active() && err == nil {
+		t.Fatal("WaitReady must refuse with --allow-proxy-only when Layer 2 is off (nothing would enforce)")
+	}
+}
+
+// Review finding on #117: --allow-proxy-only must not release a workload when
+// the proxy is also off (rootless / egress failure -> leashd --lsm-only).
+func TestNotReadyVerdict(t *testing.T) {
+	logger := log.New(io.Discard, "", 0)
+	cases := []struct {
+		name            string
+		require, layer2 bool
+		wantErr         bool
+	}{
+		{"fail-closed, proxy up", true, true, true},
+		{"fail-closed, proxy off", true, false, true},
+		{"allow proxy-only, proxy up", false, true, false},
+		{"allow proxy-only, proxy off", false, false, true},
+	}
+	for _, tc := range cases {
+		err := notReadyVerdict("not ready", tc.require, tc.layer2, "/tmp/x.log", logger)
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("%s: err = %v, wantErr %v", tc.name, err, tc.wantErr)
+		}
+		if err != nil && !strings.Contains(err.Error(), "fail-closed") {
+			t.Fatalf("%s: error should say fail-closed: %v", tc.name, err)
+		}
+		// The remedy must reflect the session: with the proxy off,
+		// --allow-proxy-only is not offered as the way out.
+		if err != nil && !tc.layer2 {
+			if strings.Contains(err.Error(), "pass --allow-proxy-only") || !strings.Contains(err.Error(), "fix the egress setup or run as root") {
+				t.Fatalf("%s: wrong remedy for proxy-off session: %v", tc.name, err)
+			}
+		}
+		if err != nil && tc.layer2 && !strings.Contains(err.Error(), "pass --allow-proxy-only") {
+			t.Fatalf("%s: proxy-up session should offer --allow-proxy-only: %v", tc.name, err)
+		}
 	}
 }
 
@@ -357,7 +402,7 @@ func TestNativeWaitReadyWaitsForSlowAttach(t *testing.T) {
 	r := &runner{}
 	r.cfg.shareDir = t.TempDir()
 	r.cfg.bootstrapTimeout = 5 * time.Second
-	r.opts.requireLSM = true
+	r.cfg.requireLSM = true
 	r.leashd = &injectedProc{done: make(chan struct{})} // alive
 	r.logger = log.New(io.Discard, "", 0)
 	go func() {
@@ -373,12 +418,12 @@ func TestNativeWaitReadyTimesOutAtBootstrapTimeout(t *testing.T) {
 	r := &runner{}
 	r.cfg.shareDir = t.TempDir()
 	r.cfg.bootstrapTimeout = 2 * caCertWaitDelay
-	r.opts.requireLSM = true
+	r.cfg.requireLSM = true
 	r.leashd = &injectedProc{done: make(chan struct{})} // alive, never ready
 	r.logger = log.New(io.Discard, "", 0)
 	start := time.Now()
 	err := (nativeLauncher{r: r}).WaitReady(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "LEASH_BOOTSTRAP_TIMEOUT") || !strings.Contains(err.Error(), "--require-lsm") {
+	if err == nil || !strings.Contains(err.Error(), "LEASH_BOOTSTRAP_TIMEOUT") || !strings.Contains(err.Error(), "fail-closed") {
 		t.Fatalf("want a fail-closed timeout naming LEASH_BOOTSTRAP_TIMEOUT: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed < r.cfg.bootstrapTimeout {

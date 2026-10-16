@@ -123,6 +123,55 @@ Claude Code handling on top.
   read as unqualified good news. The document names the default and the human
   output warns when it is not the runtime the verdict is about.
 
+### Changed — fail closed by default when the eBPF LSM can't attach (#117)
+- **Behavior change.** When the eBPF LSM (Layer 1) cannot attach — kernel
+  without an active `bpf` LSM, rootless podman, or no scopable cgroup — leash
+  now **refuses to run the workload** instead of warning and continuing
+  proxy-only. This applies to the client preflight, native readiness, and
+  leashd (container and host mode).
+- **New opt-out: `--allow-proxy-only`** (env `LEASH_ALLOW_PROXY_ONLY=1`, also a
+  leashd flag) restores the old degrade: warn and continue with only the
+  fail-closed L7 proxy; filesystem/exec/socket policies are then not enforced.
+- **`--require-lsm` / `LEASH_REQUIRE_LSM` stay accepted** (and the
+  `require-lsm` capability stays advertised) but are now redundant. A falsy
+  `LEASH_REQUIRE_LSM` does not opt out. Flags beat env vars; asking for both
+  fail-closed and proxy-only at the same level is an error.
+- **New capability `allow-proxy-only`** in `leash version --json`; its presence
+  means this build fails closed by default.
+- **`contractVersion` is now `2`** (contract 2 = fail-closed-by-default posture
+  plus `--allow-proxy-only`). `minCompatibleContract` stays `0`: nothing was
+  removed, so callers written against contract 0 or 1 (e.g. Walk's
+  `walkLeashContract=1`) remain compatible.
+- **Effective enforcement level is machine-readable.** The enforcement-ready
+  marker (still gated on by existence) is now a JSON document
+  `{"enforcement":"lsm"|"proxy-only"|"none","layer1":…,"layer2":…,"requireLSM":…,"allowProxyOnly":…}`,
+  leashd logs an `enforcement.level` event, and the client prints
+  `leash: enforcement=<level> layer1=<state> layer2=<state>` on the diagnostic
+  stream (always under `--machine-output`, always when not `lsm`).
+- The client now always tells leashd its resolved posture
+  (`LEASH_REQUIRE_LSM=1` or `LEASH_ALLOW_PROXY_ONLY=1` in the container,
+  `--require-lsm` or `--allow-proxy-only` for native leashd), and native
+  readiness now honors `LEASH_REQUIRE_LSM` (it previously read only the flag).
+- **`--allow-proxy-only` never releases an unenforced workload.** When the L7
+  proxy is also off (native `--lsm-only`: rootless, or egress setup failed),
+  there is nothing to degrade to, so an LSM attach failure stays fatal and
+  native readiness refuses. leashd also refuses to publish the ready marker for
+  a level the posture forbids — `none`, or anything but `lsm` under
+  fail-closed, including when no LSM program attached at all.
+- **The client cross-checks leashd's reported level** against its own posture
+  and refuses to release on a mismatch, and rejects posture overrides that
+  would make the two diverge: `-e LEASH_REQUIRE_LSM` / `-e
+  LEASH_ALLOW_PROXY_ONLY` and posture flags inside `LEASH_EXTRA_ARGS`.
+- The enforcement-ready marker is written atomically (temp file + rename).
+- **Layer 1 is reported active only when the kernel confirms it.** On a kernel
+  with `CONFIG_BPF_LSM=y` but `bpf` not in `/sys/kernel/security/lsm` (Ubuntu
+  24.04's default) the LSM programs attach and are never invoked; leashd now
+  also requires `bpf` in the active list (an unreadable list counts as not
+  active), so that case fails closed by default and reports `proxy-only` with
+  a `reason` under `--allow-proxy-only`. The client's own preflight can only
+  narrow the reported level, and a native refusal now echoes leashd's FATAL
+  reason instead of only pointing at the log.
+
 ### Fixed — HTTP/2 clients bypassed header rewrite and MCP enforcement (#57)
 - **Full HTTP/2 MITM.** The proxy used to offer `h2, http/1.1` to every client
   and tunnel any h2 connection opaquely, so header-rewrite rules, MCP

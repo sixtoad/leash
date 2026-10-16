@@ -24,6 +24,7 @@ import (
 	"github.com/strongdm/leash/internal/assets"
 	"github.com/strongdm/leash/internal/authz"
 	"github.com/strongdm/leash/internal/configstore"
+	"github.com/strongdm/leash/internal/enforcement"
 	"github.com/strongdm/leash/internal/entrypoint"
 	"github.com/strongdm/leash/internal/idmap"
 	"github.com/strongdm/leash/internal/leashd/listen"
@@ -117,7 +118,8 @@ type options struct {
 	allowDisplay    bool            // keep DISPLAY/XAUTHORITY + the X11 socket (GUI apps)
 	allowDBus       bool            // keep DBUS_SESSION_BUS_ADDRESS + the keyring/D-Bus runtime dir
 	shareIPC        bool            // share the host IPC namespace (e.g. X MIT-SHM)
-	requireLSM      bool            // fail closed if the eBPF LSM can't attach (no proxy-only degrade)
+	requireLSM      bool            // --require-lsm: accepted for compatibility; fail-closed is the default
+	allowProxyOnly  bool            // --allow-proxy-only: opt out of fail-closed when the eBPF LSM can't attach
 	loginShell      bool            // --login-shell: (container) run the governed command via `<shell> -lc` (sources /etc/profile)
 	allowNamespaces bool            // skip the seccomp mount/unshare block (reopens the userns bind-mount bypass)
 	injectServices  []injectService // --inject-service: helper plugins to spawn and bind into the box
@@ -231,6 +233,10 @@ type runner struct {
 	// during Provision, so StartEnforcement/exec fall back to LSM-only (host
 	// netns) rather than a netns with no route out. Native only.
 	nativeEgressFailed bool
+	// layer1PreflightDown is the client preflight's reason the bpf LSM is not
+	// active on this host ("" when active or not determinable). It can only
+	// narrow the level leashd reports, never raise it.
+	layer1PreflightDown string
 
 	// leashd is the native leashd host-mode process (StartEnforcement), started
 	// in its own process group with a parent-death signal and a reaper. WaitReady
@@ -471,7 +477,8 @@ Flags:
   --allow-display                 (native) Let the workload reach the X11 display (keep DISPLAY; don't mask the X socket). For GUI apps.
   --allow-dbus                    (native) Let the workload reach the session D-Bus/keyring (keep DBUS_SESSION_BUS_ADDRESS; don't mask /run/user).
   --share-ipc                     (native) Share the host IPC namespace (e.g. X MIT-SHM). Default: isolated.
-  --require-lsm                   (native) Fail closed if the eBPF LSM can't attach, instead of silently degrading to proxy-only. Refuses to run the workload unenforced.
+  --allow-proxy-only              Opt out of fail-closed: if the eBPF LSM (Layer 1) can't attach, warn and continue with only the L7 proxy (Layer 2). Filesystem/exec/socket policies are then NOT enforced.
+  --require-lsm                   Accepted for compatibility; fail-closed is now the default. Mutually exclusive with --allow-proxy-only.
   --user <name>                   (native) Drop the workload to this user, overriding $SUDO_USER. Use when invoking leash as root without sudo (e.g. a scheduler) so the agent never runs as root by accident. Pass --user root to run as root deliberately.
   --allow-namespaces              (native) Let the workload create user/mount namespaces (unshare/mount) — for nested containers or sandbox tools. Reopens the userns bind-mount path-LSM bypass, so default is hardened (off).
   --inject-service <spec>         (native) Spawn a helper plugin as the invoking user, expose its socket to the box, and set an env var pointing at it. spec is comma-separated: plugin=<binary>,env=<VAR>,socket=<path>[,config=<opaque>][,authz=<Ns>[+<Ns>...][,id=<id>]]. config is optional and opaque (leash never interprets it). authz gives the plugin a private Cedar authorization socket (LEASH_AUTHZ_SOCKET) for actions in those namespaces (Action = Leash's own); id names its principal Plugin::"<id>". Fail-closed if the plugin can't start. Repeatable.
@@ -480,7 +487,6 @@ Flags:
   --container-name <name>         Force the exact agent container name (no sanitization, no collision suffix; leash container becomes <name>-leash).
   --network <name>                Attach the agent container to a docker network (e.g. a compose network). The leash container follows it automatically.
   --runtime <docker|podman>       Container runtime CLI to drive (defaults to docker).
-  --require-lsm                   Fail if the host kernel can't run the eBPF LSM layer (default: warn and continue proxy-only).
   --login-shell                   (container) Run the command via a login shell (<shell> -lc), sourcing /etc/profile. Default is a non-login shell (-c), which preserves the image's ENV PATH. Native always uses a login shell.
   --cpus <n>                      (container) CPU limit for the target container, e.g. 1.5. Also LEASH_CPUS or [leash.resources] cpus.
   --memory <n[b|k|m|g]>           (container) Hard memory limit for the target container (swap pinned to the same value), e.g. 2g. Also LEASH_MEMORY or [leash.resources] memory.
@@ -503,7 +509,8 @@ Environment variables:
   LEASH_RUNTIME                Container runtime CLI: docker (default) or podman (overridden by --runtime).
   LEASH_EXTRA_ARGS             Additional arguments passed into leash-entry.
   LEASH_CGROUP_PATH            Override cgroup path for the leash container.
-  LEASH_REQUIRE_LSM            Truthy to require the eBPF LSM layer (same as --require-lsm).
+  LEASH_ALLOW_PROXY_ONLY       Truthy to allow proxy-only enforcement when the eBPF LSM can't attach (same as --allow-proxy-only).
+  LEASH_REQUIRE_LSM            Accepted for compatibility; fail-closed is the default (a falsy value does NOT opt out).
   LEASH_LOGIN_SHELL            Truthy to run the container command via a login shell (same as --login-shell).
   LEASH_CPUS                   Target container CPU limit (same as --cpus).
   LEASH_MEMORY                 Target container memory limit (same as --memory).
@@ -697,6 +704,8 @@ func parseArgs(args []string) (options, error) {
 			opts.shareIPC = true
 		case "--require-lsm":
 			opts.requireLSM = true
+		case "--allow-proxy-only":
+			opts.allowProxyOnly = true
 		case "--login-shell":
 			opts.loginShell = true
 		case "--allow-namespaces":
@@ -854,6 +863,8 @@ func parseArgs(args []string) (options, error) {
 				return opts, fmt.Errorf("-o does not take a value")
 			case strings.HasPrefix(arg, "--require-lsm="):
 				return opts, fmt.Errorf("--require-lsm does not take a value")
+			case strings.HasPrefix(arg, "--allow-proxy-only="):
+				return opts, fmt.Errorf("--allow-proxy-only does not take a value")
 			case strings.HasPrefix(arg, "--machine-output="):
 				return opts, fmt.Errorf("--machine-output does not take a value")
 			case strings.HasPrefix(arg, "-v="):
@@ -1505,9 +1516,16 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 		cfg.runtime = defaultRuntimeName()
 	}
 
-	// Require the eBPF LSM layer (hard-stop instead of proxy-only degrade) when
-	// the flag is set or LEASH_REQUIRE_LSM is truthy.
-	cfg.requireLSM = opts.requireLSM || envTruthy("LEASH_REQUIRE_LSM")
+	// Fail closed when the eBPF LSM layer can't attach unless proxy-only is
+	// explicitly allowed (issue #117). Flags beat LEASH_* env vars.
+	requireLSM, err := enforcement.ResolveRequireLSM(opts.requireLSM, opts.allowProxyOnly, os.Getenv)
+	if err != nil {
+		return cfg, nil, err
+	}
+	cfg.requireLSM = requireLSM
+	if err := validatePostureOverrides(opts.envVars, cfg.extraArgs); err != nil {
+		return cfg, nil, err
+	}
 
 	// Container governed-command shell mode: non-login by default so the image's
 	// ENV PATH survives; --login-shell / LEASH_LOGIN_SHELL opt back in. Native
@@ -2885,10 +2903,15 @@ func (r *runner) launchLeashContainer(ctx context.Context, cgroupPath string) er
 		leashEnv = append(leashEnv, idmap.Env+"=<redacted>")
 	}
 
-	// Propagate --require-lsm so leashd fails hard (rather than degrading to
-	// proxy-only) if its eBPF LSM layer can't attach.
-	if r.cfg.requireLSM {
-		value := "LEASH_REQUIRE_LSM=1"
+	// Propagate the resolved posture explicitly either way: LEASH_REQUIRE_LSM=1
+	// keeps an older leashd image (whose default was proxy-only) fail-closed,
+	// and LEASH_ALLOW_PROXY_ONLY=1 carries the explicit opt-out to a leashd
+	// whose default is fail-closed.
+	{
+		value := enforcement.EnvRequireLSM + "=1"
+		if !r.cfg.requireLSM {
+			value = enforcement.EnvAllowProxyOnly + "=1"
+		}
 		args = append(args, "-e", value)
 		leashEnv = append(leashEnv, value)
 	}
@@ -3061,7 +3084,7 @@ func (r *runner) waitForEnforcementReady(ctx context.Context) error {
 					r.diagnosticln("Enforcement ready.")
 				}
 			}
-			return nil
+			return r.reportEnforcement(marker)
 		}
 
 		if time.Now().After(deadline) {
@@ -3070,19 +3093,18 @@ func (r *runner) waitForEnforcementReady(ctx context.Context) error {
 			return fmt.Errorf("enforcement readiness timed out after %s (target=%s, leash=%s)", r.cfg.bootstrapTimeout, targetState, leashState)
 		}
 
+		// Check the leash sidecar first: when leashd refuses (fail-closed) it
+		// exits, and the target often follows; reporting the target first would
+		// hide the leashd reason.
+		if state := r.containerSummary(ctx, r.cfg.leashContainer); isTerminalStatus(state) {
+			return r.leashContainerExitError(ctx, state)
+		}
+
 		if state := r.containerSummary(ctx, r.cfg.targetContainer); isTerminalStatus(state) {
 			if tbe := r.targetBootstrapFailure(ctx, "before enforcement was ready", nil); tbe != nil {
 				return tbe
 			}
 			return fmt.Errorf("target container terminated before enforcement was ready (state=%s). Inspect docker logs %s", state, r.cfg.targetContainer)
-		}
-
-		if state := r.containerSummary(ctx, r.cfg.leashContainer); isTerminalStatus(state) {
-			logs := r.containerLogs(ctx, r.cfg.leashContainer)
-			if logs != "" {
-				return fmt.Errorf("leash container terminated before enforcement was ready (state=%s).\nRecent docker logs (%s):\n%s", state, r.cfg.leashContainer, indentLines(logs, "  "))
-			}
-			return fmt.Errorf("leash container terminated before enforcement was ready (state=%s). Inspect docker logs %s", state, r.cfg.leashContainer)
 		}
 
 		select {
@@ -3131,6 +3153,44 @@ func (r *runner) containerLogs(ctx context.Context, name string) string {
 	return out
 }
 
+// leashContainerExitError reports a leash sidecar that stopped before the
+// enforcement-ready marker appeared: its state/exit code, leashd's last FATAL
+// reason (e.g. a fail-closed refusal) and a log excerpt bounded, sanitized and
+// credential-redacted by the same helper as the target diagnostics (#136).
+func (r *runner) leashContainerExitError(ctx context.Context, state string) error {
+	diagCtx, cancel := context.WithTimeout(cleanupContext(ctx), targetDiagTimeout)
+	defer cancel()
+	name := r.cfg.leashContainer
+	msg := fmt.Sprintf("leash container stopped before enforcement was ready (state=%s)", state)
+	if statusCategory(state) == "missing" {
+		return fmt.Errorf("%s; it was removed, so no logs are available", msg)
+	}
+	raw, err := r.rt().Output(diagCtx, "logs", "--tail", "200", name)
+	if err != nil {
+		return fmt.Errorf("%s; logs unavailable: %v", msg, err)
+	}
+	if fatal := lastFatalLine(raw); fatal != "" {
+		msg += ": " + fatal
+	}
+	if tail := sanitizeContainerLogs(raw); tail != "" {
+		return fmt.Errorf("%s.\nRecent logs (%s):\n%s", msg, name, indentLines(tail, "  "))
+	}
+	return fmt.Errorf("%s. Inspect logs of %s", msg, name)
+}
+
+// lastFatalLine returns the text after the last "FATAL:" marker in a log,
+// control-stripped and credential-redacted like the target diagnostics.
+func lastFatalLine(text string) string {
+	lines := strings.Split(text, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := sanitizeControl(lines[i])
+		if idx := strings.Index(line, "FATAL:"); idx >= 0 {
+			return redactCredentials(strings.TrimSpace(line[idx+len("FATAL:"):]))
+		}
+	}
+	return ""
+}
+
 func indentLines(text, prefix string) string {
 	if text == "" {
 		return ""
@@ -3168,6 +3228,42 @@ func statusCategory(summary string) string {
 		}
 	}
 	return summary
+}
+
+// readEnforcementStatus decodes the effective enforcement level leashd writes
+// into the enforcement-ready marker. ok is false for an older leashd whose
+// marker is the bare "ready" line.
+func readEnforcementStatus(path string) (enforcement.Status, bool) {
+	var st enforcement.Status
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return st, false
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(data), &st); err != nil || st.Enforcement == "" {
+		return enforcement.Status{}, false
+	}
+	return st, true
+}
+
+// formatEnforcementLine is the stable, machine-parseable diagnostic line that
+// states the effective enforcement level ("lsm" | "proxy-only" | "none").
+func formatEnforcementLine(st enforcement.Status) string {
+	return fmt.Sprintf("leash: enforcement=%s layer1=%s layer2=%s", st.Enforcement, st.Layer1, st.Layer2)
+}
+
+// reportEnforcement states the effective enforcement level once the workload
+// is about to be released — always in --machine-output mode (on stderr) and
+// whenever Layer 1 is not active; otherwise only with --verbose — and refuses
+// the release when leashd's level is weaker than the client's posture allows.
+func (r *runner) reportEnforcement(marker string) error {
+	st, ok := readEnforcementStatus(marker)
+	if ok && r.layer1PreflightDown != "" {
+		st = st.Narrow("client preflight: " + r.layer1PreflightDown)
+	}
+	if ok && (st.Enforcement != enforcement.LevelLSM || r.opts.machineOutput || r.verbose) {
+		r.diagnosticln(formatEnforcementLine(st))
+	}
+	return checkReleasedEnforcement(st, ok, r.cfg.requireLSM)
 }
 
 func describeBootstrapMarker(path string) string {
