@@ -33,6 +33,9 @@ type Compilation struct {
 	Rewrite *transpiler.RewriteReport
 	// Engine decides userspace requests over Strict.
 	Engine *engine.Engine
+	// Warnings are the places where the kernel enforces more strictly than
+	// Cedar decides (never more loosely).
+	Warnings []transpiler.KernelWarning
 	// Policies are the kernel tables compiled from Strict; Policies.Source
 	// is the source, which policy.Manager merges layers by.
 	Policies  *lsm.PolicySet
@@ -51,7 +54,10 @@ type ErrorDetail struct {
 	CaretEnd   int
 	Suggestion string
 	Code       string
-	Raw        error
+	// Policy is the ID of the policy a compile error names (empty for a
+	// syntax error).
+	Policy string
+	Raw    error
 }
 
 func (d *ErrorDetail) Error() string {
@@ -65,6 +71,9 @@ func (d *ErrorDetail) Error() string {
 }
 
 var parseLocationRe = regexp.MustCompile(`at\s+(.+?):(\d+):(\d+)`)
+
+// policyRefRe extracts the policy ID of a compile error: "policy <id> at ...".
+var policyRefRe = regexp.MustCompile(`^policy (.+?) at \S+:\d+:\d+`)
 
 // CompileFile reads Cedar from disk and converts it into LSM/proxy policies.
 // On parse errors, an *ErrorDetail is returned.
@@ -117,8 +126,10 @@ func formatCedarError(err error, filePath, cedar string) *ErrorDetail {
 		return nil
 	}
 	message := strings.TrimSpace(err.Error())
-	root := rootError(err)
-	if root != nil && root.Error() != "" {
+	var policyErr *PolicyError
+	isPolicyErr := errors.As(err, &policyErr)
+	if root := rootError(err); !isPolicyErr && root != nil && root.Error() != "" {
+		// A policy error keeps its whole message: it names the policy.
 		message = strings.TrimSpace(root.Error())
 	}
 	file := strings.TrimSpace(filePath)
@@ -142,8 +153,26 @@ func formatCedarError(err error, filePath, cedar string) *ErrorDetail {
 	caretStart, caretEnd := caretRange(snippet, column)
 	summary := buildSummary(message)
 	suggestion := suggestFix(message)
+	code := classifyCode(message)
+	policyID := ""
+	if isPolicyErr {
+		if m := policyRefRe.FindStringSubmatch(message); m != nil {
+			policyID = m[1]
+		}
+		switch policyErr.Kind {
+		case PolicyNotEnforceable:
+			code = "CEDAR_NOT_ENFORCEABLE"
+			summary = "policy not enforceable by the kernel: " + message
+			suggestion = "Policies on file, exec and connect actions may only test resource membership and the action (no principal, context or @expires); see docs/design/AUTHZ-SERVICE.md section 3.3."
+		default:
+			code = "CEDAR_INVALID_POLICY"
+			summary = "invalid policy: " + message
+			suggestion = "Correct the named policy; see docs/design/AUTHZ-SERVICE.md."
+		}
+	}
 
 	return &ErrorDetail{
+		Policy:     policyID,
 		Summary:    summary,
 		Message:    message,
 		File:       file,
@@ -153,7 +182,7 @@ func formatCedarError(err error, filePath, cedar string) *ErrorDetail {
 		CaretStart: caretStart,
 		CaretEnd:   caretEnd,
 		Suggestion: suggestion,
-		Code:       classifyCode(message),
+		Code:       code,
 		Raw:        err,
 	}
 }
@@ -276,5 +305,6 @@ func BuildErrorResponse(detail *ErrorDetail) map[string]any {
 		"caretEnd":   detail.CaretEnd,
 		"code":       detail.Code,
 		"suggestion": detail.Suggestion,
+		"policy":     detail.Policy,
 	}
 }

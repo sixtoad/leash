@@ -11,6 +11,27 @@ import (
 	"github.com/strongdm/leash/internal/transpiler"
 )
 
+// PolicyKind classifies a PolicyError.
+type PolicyKind string
+
+const (
+	// PolicyInvalid: the policy parses but is not a valid Leash policy (an
+	// invalid action scope or annotation, mixed namespaces).
+	PolicyInvalid PolicyKind = "invalid_policy"
+	// PolicyNotEnforceable: a policy the kernel cannot enforce exactly.
+	PolicyNotEnforceable PolicyKind = "not_enforceable"
+)
+
+// PolicyError is a policy that parses but does not compile. Its message
+// names the policy and its position ("policy <id> at <file>:<line>:<col>").
+type PolicyError struct {
+	Kind PolicyKind
+	Err  error
+}
+
+func (e *PolicyError) Error() string { return e.Err.Error() }
+func (e *PolicyError) Unwrap() error { return e.Err }
+
 // Layer is one policy layer for CompileLayers: Cedar source text, or rules
 // built in code (Source nil), which are legacy IR by definition.
 type Layer struct {
@@ -83,7 +104,7 @@ func CompileLayers(layers []Layer) (*Compilation, error) {
 	if len(legacy) > 0 {
 		rw, err := transpiler.RewriteLegacy(transpiler.RewriteOptions{Provenance: true, Name: "legacy-rewrite.cedar", OmitGlobalDefaults: len(strict) > 0}, legacy...)
 		if err != nil {
-			return nil, err
+			return nil, &PolicyError{Kind: PolicyInvalid, Err: err}
 		}
 		comp.Semantics = transpiler.SemanticsLegacy
 		comp.Rewrite = &rw.Report
@@ -100,12 +121,13 @@ func CompileLayers(layers []Layer) (*Compilation, error) {
 
 	eng, err := engine.New(merged)
 	if err != nil {
-		return nil, err
+		return nil, &PolicyError{Kind: PolicyInvalid, Err: err}
 	}
-	ir, err := transpiler.CompileKernel(merged, eng)
+	ir, warnings, err := transpiler.CompileKernelReport(merged, eng)
 	if err != nil {
-		return nil, err
+		return nil, &PolicyError{Kind: PolicyNotEnforceable, Err: err}
 	}
+	comp.Warnings = warnings
 	comp.Strict = merged
 	comp.Engine = eng
 	comp.Policies = ir
