@@ -19,6 +19,18 @@ type Config struct {
 	ProjectTargetImages   map[string]string
 	EnvVars               map[string]string
 	ProjectEnvVars        map[string]map[string]string
+	// Resources are the target-container resource limits from [leash.resources]
+	// (container runtimes only). Values are kept as written; the runner
+	// validates them.
+	Resources ResourceLimits
+}
+
+// ResourceLimits are raw, unvalidated target-container limits. An empty field
+// means "not set at this layer".
+type ResourceLimits struct {
+	CPUs      string
+	Memory    string
+	PidsLimit string
 }
 
 // DecisionScope models the precedence layer that yielded an effective choice.
@@ -126,6 +138,7 @@ func (c Config) Clone() Config {
 		out.ProjectEnvVars[projectPath] = dst
 	}
 	out.TargetImage = c.TargetImage
+	out.Resources = c.Resources
 	return out
 }
 
@@ -269,6 +282,15 @@ func Merge(base, overlay Config) Config {
 
 	if strings.TrimSpace(overlay.TargetImage) != "" {
 		out.TargetImage = overlay.TargetImage
+	}
+	if v := strings.TrimSpace(overlay.Resources.CPUs); v != "" {
+		out.Resources.CPUs = v
+	}
+	if v := strings.TrimSpace(overlay.Resources.Memory); v != "" {
+		out.Resources.Memory = v
+	}
+	if v := strings.TrimSpace(overlay.Resources.PidsLimit); v != "" {
+		out.Resources.PidsLimit = v
 	}
 
 	for cmd, value := range overlay.CommandVolumes {

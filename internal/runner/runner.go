@@ -121,6 +121,12 @@ type options struct {
 	allowNamespaces bool            // skip the seccomp mount/unshare block (reopens the userns bind-mount bypass)
 	injectServices  []injectService // --inject-service: helper plugins to spawn and bind into the box
 	dropUser        string          // --user <name>: explicit native drop-user (overrides $SUDO_USER; "root" opts in to running as root)
+
+	// Target-container resource limits (container runtimes only), raw from the
+	// flags; validated with env/config layers in loadConfig (#116).
+	cpus      string // --cpus
+	memory    string // --memory
+	pidsLimit string // --pids-limit
 }
 
 type idmapVolume struct {
@@ -180,6 +186,8 @@ type config struct {
 	// Debian/Ubuntu images resets the image's ENV PATH (#120). Container-only:
 	// the native runtime always uses a login shell (nativeWorkloadShellFlag).
 	loginShell bool
+	// resources are the validated target-container limits (#116).
+	resources resourceLimits
 }
 
 type runner struct {
@@ -462,6 +470,9 @@ Flags:
   --runtime <docker|podman>       Container runtime CLI to drive (defaults to docker).
   --require-lsm                   Fail if the host kernel can't run the eBPF LSM layer (default: warn and continue proxy-only).
   --login-shell                   (container) Run the command via a login shell (<shell> -lc), sourcing /etc/profile. Default is a non-login shell (-c), which preserves the image's ENV PATH. Native always uses a login shell.
+  --cpus <n>                      (container) CPU limit for the target container, e.g. 1.5. Also LEASH_CPUS or [leash.resources] cpus.
+  --memory <n[b|k|m|g]>           (container) Hard memory limit for the target container (swap pinned to the same value), e.g. 2g. Also LEASH_MEMORY or [leash.resources] memory.
+  --pids-limit <n>                (container) Max processes in the target container. Also LEASH_PIDS_LIMIT or [leash.resources] pids_limit.
   -V, --verbose                   Enable verbose logging (also set when -v is provided without a mount spec).
 
 Environment variables:
@@ -482,6 +493,9 @@ Environment variables:
   LEASH_CGROUP_PATH            Override cgroup path for the leash container.
   LEASH_REQUIRE_LSM            Truthy to require the eBPF LSM layer (same as --require-lsm).
   LEASH_LOGIN_SHELL            Truthy to run the container command via a login shell (same as --login-shell).
+  LEASH_CPUS                   Target container CPU limit (same as --cpus).
+  LEASH_MEMORY                 Target container memory limit (same as --memory).
+  LEASH_PIDS_LIMIT             Target container pids limit (same as --pids-limit).
   LEASH_HOME                   Base directory for persisted leash state.
 
 	Persisted mount decisions live at $XDG_CONFIG_HOME/leash/config.toml (or ~/.config/leash/config.toml). Set LEASH_HOME to override this base directory.
@@ -716,6 +730,12 @@ func parseArgs(args []string) (options, error) {
 				return opts, fmt.Errorf("container name cannot be empty")
 			}
 			i++
+		case "--cpus", "--memory", "--pids-limit":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for %s", arg)
+			}
+			setResourceFlag(&opts, arg, args[i+1])
+			i++
 		case "--network":
 			if i+1 >= len(args) {
 				return opts, fmt.Errorf("missing argument for %s", arg)
@@ -830,6 +850,12 @@ func parseArgs(args []string) (options, error) {
 					return opts, err
 				}
 				opts.idmapVolumes = append(opts.idmapVolumes, volume)
+			case strings.HasPrefix(arg, "--cpus="), strings.HasPrefix(arg, "--memory="), strings.HasPrefix(arg, "--pids-limit="):
+				name, value, _ := strings.Cut(arg, "=")
+				if strings.TrimSpace(value) == "" {
+					return opts, fmt.Errorf("missing argument for %s", name)
+				}
+				setResourceFlag(&opts, name, value)
 			case strings.HasPrefix(arg, "-e="):
 				value := strings.TrimPrefix(arg, "-e=")
 				if err := appendEnvSpec(&opts, value); err != nil {
@@ -1461,6 +1487,19 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 	// workloadUser); a native root run with neither is refused in Preflight so the
 	// workload never runs as root by accident.
 	cfg.dropUser = strings.TrimSpace(opts.dropUser)
+
+	// Target-container resource limits: flag > env > config ([leash.resources],
+	// .leash.toml over the global file). Validated here so garbage fails before
+	// anything is provisioned. The native runtime has no target container, so
+	// limits are refused there rather than silently ignored.
+	resources, err := resolveResourceLimits(opts, cfgData.Resources)
+	if err != nil {
+		return config{}, nil, err
+	}
+	if resources.any() && cfg.runtime == nativeRuntimeName {
+		return config{}, nil, errors.New("resource limits (--cpus/--memory/--pids-limit, LEASH_CPUS/LEASH_MEMORY/LEASH_PIDS_LIMIT, [leash.resources]) apply to the target container only and are not supported by the native runtime; use --runtime docker or podman, or remove the limits")
+	}
+	cfg.resources = resources
 
 	cleanupTemp = false
 	return cfg, resolvedEnv, nil
@@ -2611,6 +2650,8 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 	// bound) and set the workload env var pointing at it. The plugins were already
 	// spawned once by spawnInjectServicesContainer before the launch retry loop.
 	args = append(args, r.injectedDockerArgs...)
+	// Validated CPU/memory/pids limits for the governed workload (#116).
+	args = append(args, r.cfg.resources.dockerArgs()...)
 	for _, svc := range r.opts.injectServices {
 		targetMounts = append(targetMounts, filepath.Dir(svc.socket))
 		targetEnv = append(targetEnv, svc.env+"=unix:path="+svc.socket)
@@ -3547,4 +3588,17 @@ func isSafeShellRune(r rune) bool {
 		return true
 	}
 	return false
+}
+
+// setResourceFlag records a raw --cpus/--memory/--pids-limit value; validation
+// happens in loadConfig with the env/config layers.
+func setResourceFlag(opts *options, name, value string) {
+	switch name {
+	case "--cpus":
+		opts.cpus = value
+	case "--memory":
+		opts.memory = value
+	case "--pids-limit":
+		opts.pidsLimit = value
+	}
 }
