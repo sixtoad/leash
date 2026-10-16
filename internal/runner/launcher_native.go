@@ -679,10 +679,11 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 			}
 			return n.r.reportEnforcement(ready)
 		}
-		// Fast path: if leashd already exited it will never publish the marker, so
-		// stop waiting now (fail-closed below decides the verdict).
+		// Fast path: if leashd already exited it will never publish the marker.
+		// A dead leashd also means no proxy, so --allow-proxy-only has nothing
+		// to fall back to: always refuse (e.g. a policy that failed to load).
 		if n.leashdDied() {
-			return n.notReady("native leashd exited before enforcement was ready")
+			return n.leashdExitedError()
 		}
 		if err := ctx.Err(); err != nil {
 			return err
@@ -714,13 +715,40 @@ func (n nativeLauncher) notReady(reason string) error {
 	return notReadyVerdict(reason, n.r.cfg.requireLSM, n.layer2Active(), n.leashdLogPath(), n.r.logger)
 }
 
-// leashdFailureReason returns the last FATAL line from the leashd log, so a
-// refusal names the cause instead of only pointing at the log. Reads at most
-// the final 64 KiB.
-func leashdFailureReason(path string) string {
-	f, err := os.Open(path)
+// leashdExitedError is the refusal for a leashd that exited before publishing
+// the enforcement-ready marker. It is fail-closed regardless of
+// --allow-proxy-only: leashd is also the L7 proxy, so once it has exited
+// nothing would enforce anything. It names leashd's FATAL reason, or the log
+// tail when there is none.
+func (n nativeLauncher) leashdExitedError() error {
+	return leashdExitedVerdict(n.leashdLogPath())
+}
+
+// leashdExitedVerdict is leashdExitedError's pure form, keyed by the log path.
+func leashdExitedVerdict(logPath string) error {
+	msg := "native leashd exited before enforcement was ready"
+	if detail := leashdFailureReason(logPath); detail != "" {
+		msg += ": " + detail
+	} else if tail := leashdLogTail(logPath, leashContainerLogTailLines); tail != "" {
+		msg += ".\nRecent leashd log:\n" + indentLines(tail, "  ")
+	}
+	return fmt.Errorf("%s\nrefusing to run the workload unenforced (fail-closed: leashd is not running, so neither the eBPF LSM nor the L7 proxy would enforce; --allow-proxy-only does not apply). See %s", msg, logPath)
+}
+
+// leashdLogTail returns the last n sanitized lines of the leashd log.
+func leashdLogTail(path string, n int) string {
+	data, err := readLogTail(path)
 	if err != nil {
 		return ""
+	}
+	return boundedLogTail(data, n)
+}
+
+// readLogTail reads at most the final 64 KiB of a log file.
+func readLogTail(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
 	}
 	defer f.Close()
 	const tail = 64 << 10
@@ -729,9 +757,20 @@ func leashdFailureReason(path string) string {
 	}
 	data, err := io.ReadAll(f)
 	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// leashdFailureReason returns the last FATAL line from the leashd log, so a
+// refusal names the cause instead of only pointing at the log. Reads at most
+// the final 64 KiB.
+func leashdFailureReason(path string) string {
+	data, err := readLogTail(path)
+	if err != nil {
 		return ""
 	}
-	return lastFatalLine(string(data))
+	return lastFatalLine(data)
 }
 
 // notReadyVerdict is notReady's pure decision. Without Layer 2 (rootless, or

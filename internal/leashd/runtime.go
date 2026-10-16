@@ -108,17 +108,20 @@ func Main(args []string) error {
 	lsm.SetRequireLSM(cfg.failClosed())
 	lsm.SetFailClosedRemedy(enforcement.FailClosedRemedy(!cfg.LSMOnly))
 
+	// Clear any stale readiness markers before anything can fail: a leashd that
+	// exits during preflight (e.g. a policy that does not parse) must never
+	// leave a previous run's enforcement-ready marker for a launcher to accept.
+	leashDir := getLeashDirFromEnv()
+	if err := clearReadyMarkers(leashDir); err != nil {
+		return fmt.Errorf("prepare readiness markers: %w", err)
+	}
+
 	if err := preFlight(cfg); err != nil {
 		return err
 	}
 
-	leashDir := getLeashDirFromEnv()
 	if err := entrypoint.InflateBinaries(leashDir); err != nil {
 		return err
-	}
-
-	if err := clearReadyMarkers(leashDir); err != nil {
-		return fmt.Errorf("prepare readiness markers: %w", err)
 	}
 
 	rt, err := initRuntime(cfg, leashDir)
@@ -700,10 +703,32 @@ func (rt *runtimeState) startFrontend() error {
 	return nil
 }
 
+// applyFileReload applies a reloaded policy file, keeping the previous policy
+// when it cannot be applied. The manager already refuses a set the kernel would
+// reject before changing anything; if applying still fails (e.g. a BPF map
+// update error after some modules took the new rules), restore and re-apply the
+// previous file layer so a bad reload never leaves the workload on a partial or
+// empty policy.
+func applyFileReload(mgr *policy.Manager, newCfg *policy.Config) error {
+	if mgr == nil || newCfg == nil {
+		return fmt.Errorf("policy reload: no policy manager or config")
+	}
+	prevLSM, prevHTTP, _, _ := mgr.Snapshot()
+	err := mgr.UpdateFileRules(newCfg.LSMPolicies, newCfg.HTTPRewrites)
+	if err == nil {
+		return nil
+	}
+	if rbErr := mgr.UpdateFileRules(prevLSM, prevHTTP); rbErr != nil {
+		return fmt.Errorf("%w (restoring the previous policy also failed: %v)", err, rbErr)
+	}
+	return err
+}
+
 func (rt *runtimeState) startPolicyWatcher() error {
 	cancel, err := policy.WatchCedar(rt.cfg.PolicyPath, time.Second, func(newCfg *policy.Config) {
-		if err := rt.policyManager.UpdateFileRules(newCfg.LSMPolicies, newCfg.HTTPRewrites); err != nil {
-			logPolicyEvent("policy.update", map[string]any{"source": "file", "error": err.Error()})
+		if err := applyFileReload(rt.policyManager, newCfg); err != nil {
+			logPolicyEvent("policy.update", map[string]any{"source": "file", "error": err.Error(), "kept": "previous"})
+			log.Printf("leash: policy reload rejected, keeping the previous policy: %v", err)
 			return
 		}
 		logPolicyEvent("policy.update", map[string]any{
@@ -728,6 +753,8 @@ func (rt *runtimeState) startPolicyWatcher() error {
 			"suggestion": detail.Suggestion,
 		})
 		log.Printf("%s", formatCedarErrorForCLI(detail))
+		// WatchCedar never applies an update that fails to compile.
+		log.Printf("leash: policy reload rejected, keeping the previous policy")
 	})
 	if err != nil {
 		return fmt.Errorf("failed to watch Cedar policy file: %w", err)
@@ -963,44 +990,7 @@ func findIp6tables() (string, error) {
 }
 
 func formatCedarErrorForCLI(detail *cedarutil.ErrorDetail) string {
-	if detail == nil {
-		return "error: invalid Cedar policy"
-	}
-	var b strings.Builder
-	b.WriteString("error: invalid Cedar policy\n")
-	if detail.File != "" {
-		line := detail.Line
-		if line <= 0 {
-			line = 1
-		}
-		col := detail.Column
-		if col <= 0 {
-			col = detail.CaretStart
-		}
-		if col <= 0 {
-			col = 1
-		}
-		fmt.Fprintf(&b, "file: %s:%d:%d\n", detail.File, line, col)
-	}
-	if detail.Snippet != "" && detail.Line > 0 {
-		fmt.Fprintf(&b, "%d | %s\n", detail.Line, detail.Snippet)
-		caretPos := detail.CaretStart
-		if caretPos <= 0 {
-			caretPos = detail.Column
-		}
-		if caretPos <= 0 {
-			caretPos = 1
-		}
-		fmt.Fprintf(&b, "   | %s^", strings.Repeat(" ", caretPos-1))
-		if msg := strings.TrimSpace(detail.Message); msg != "" {
-			fmt.Fprintf(&b, " %s", msg)
-		}
-		b.WriteByte('\n')
-	}
-	if hint := strings.TrimSpace(detail.Suggestion); hint != "" {
-		fmt.Fprintf(&b, "hint: %s\n", hint)
-	}
-	return strings.TrimSpace(b.String())
+	return cedarutil.FormatForCLI(detail)
 }
 
 func splitExtraArgs(raw string) []string {

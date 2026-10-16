@@ -324,9 +324,11 @@ func TestNativeLeashdDied(t *testing.T) {
 	}
 }
 
-// WaitReady must fail closed under --require-lsm when enforcement never confirms,
-// and preserve the historical warn-and-proceed otherwise. Uses the leashd-died
-// fast path so the test doesn't sit through the full readiness timeout.
+// A leashd that exited before the enforcement-ready marker means nothing
+// enforces (leashd is also the L7 proxy), so WaitReady must refuse under every
+// posture, --allow-proxy-only included (issue #162: a policy that failed to load
+// used to warn and run the workload unenforced). Uses the leashd-died fast path
+// so the test doesn't sit through the readiness timeout.
 func TestNativeWaitReadyFailClosed(t *testing.T) {
 	exited := make(chan struct{})
 	close(exited) // simulate leashd already gone → WaitReady stops on the first poll
@@ -340,23 +342,41 @@ func TestNativeWaitReadyFailClosed(t *testing.T) {
 		return nativeLauncher{r: r}
 	}
 
-	err := mk(true).WaitReady(context.Background())
-	if err == nil {
-		t.Fatal("WaitReady must error under --require-lsm when leashd died before ready")
+	for _, require := range []bool{true, false} {
+		err := mk(require).WaitReady(context.Background())
+		if err == nil {
+			t.Fatalf("requireLSM=%t: WaitReady must refuse when leashd died before ready", require)
+		}
+		if !strings.Contains(err.Error(), "fail-closed") || !strings.Contains(err.Error(), "exited before enforcement was ready") {
+			t.Fatalf("requireLSM=%t: error should say leashd exited and fail-closed: %v", require, err)
+		}
 	}
-	if !strings.Contains(err.Error(), "fail-closed") || !strings.Contains(err.Error(), "--allow-proxy-only") {
-		t.Fatalf("error should say fail-closed and name the --allow-proxy-only opt-out: %v", err)
+}
+
+// The refusal for a dead leashd names its FATAL reason (e.g. the Cedar error),
+// or falls back to the log tail when leashd printed no FATAL line.
+func TestLeashdExitedVerdictReason(t *testing.T) {
+	dir := t.TempDir()
+	fatalLog := filepath.Join(dir, "fatal.log")
+	if err := os.WriteFile(fatalLog, []byte("leashd_mounts public=/x\n2026/10/16 error: invalid Cedar policy\nleash: FATAL: error: invalid Cedar policy; file: /p/bad.cedar:1:1; hint: Review the Cedar syntax\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := leashdExitedVerdict(fatalLog)
+	if err == nil || !strings.Contains(err.Error(), "invalid Cedar policy; file: /p/bad.cedar:1:1") {
+		t.Fatalf("want the FATAL reason in the refusal: %v", err)
 	}
 
-	// With --allow-proxy-only the verdict depends on whether Layer 2 is up in
-	// this session (root + egress); either way it must match notReadyVerdict.
-	n := mk(false)
-	err = n.WaitReady(context.Background())
-	if n.layer2Active() && err != nil {
-		t.Fatalf("WaitReady should warn-and-proceed (nil) with --allow-proxy-only and Layer 2 active: %v", err)
+	plainLog := filepath.Join(dir, "plain.log")
+	if err := os.WriteFile(plainLog, []byte("something broke\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if !n.layer2Active() && err == nil {
-		t.Fatal("WaitReady must refuse with --allow-proxy-only when Layer 2 is off (nothing would enforce)")
+	err = leashdExitedVerdict(plainLog)
+	if err == nil || !strings.Contains(err.Error(), "something broke") {
+		t.Fatalf("want the log tail when there is no FATAL line: %v", err)
+	}
+
+	if err := leashdExitedVerdict(filepath.Join(dir, "missing.log")); err == nil {
+		t.Fatal("a missing log must still refuse")
 	}
 }
 

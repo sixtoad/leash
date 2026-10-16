@@ -243,7 +243,11 @@ func (m *Manager) RemoveRule(ruleStr string) error {
 func (m *Manager) GetActiveRules() (*lsm.PolicySet, []proxy.HeaderRewriteRule) {
 	m.runtimeMutex.RLock()
 	defer m.runtimeMutex.RUnlock()
+	return m.activeRulesLocked()
+}
 
+// activeRulesLocked merges the layers; the caller holds runtimeMutex.
+func (m *Manager) activeRulesLocked() (*lsm.PolicySet, []proxy.HeaderRewriteRule) {
 	if m.runtimeOnly {
 		// In runtime-only mode, ignore file layer completely
 		rr := &lsm.PolicySet{
@@ -282,19 +286,45 @@ func (m *Manager) GetActiveRules() (*lsm.PolicySet, []proxy.HeaderRewriteRule) {
 		mergedLSM.ConnectDefaultAllow = true
 	}
 
-	mergedHTTP := append(m.fileHTTPRules, m.runtimeHTTPRules...)
+	mergedHTTP := append(append([]proxy.HeaderRewriteRule(nil), m.fileHTTPRules...), m.runtimeHTTPRules...)
 
 	return mergedLSM, mergedHTTP
 }
 
-// UpdateFileRules updates the file-based rules
+// UpdateFileRules updates the file-based rules. A set the kernel would reject
+// is refused before anything changes: the previous rules stay active in the
+// manager, the LSM and the proxy.
 func (m *Manager) UpdateFileRules(newFileRules *lsm.PolicySet, newHTTPRules []proxy.HeaderRewriteRule) error {
+	if newFileRules == nil {
+		newFileRules = &lsm.PolicySet{}
+	}
 	m.runtimeMutex.Lock()
+	prevRules, prevHTTP := m.fileRules, m.fileHTTPRules
 	m.fileRules = newFileRules
 	m.fileHTTPRules = newHTTPRules
+	if err := m.validateActiveLocked(); err != nil {
+		m.fileRules, m.fileHTTPRules = prevRules, prevHTTP
+		m.runtimeMutex.Unlock()
+		return err
+	}
 	m.runtimeMutex.Unlock()
 
 	return m.applyChanges()
+}
+
+// validateActiveLocked checks the merged rule set against the kernel's limits
+// before it is applied, so a rejected update never reaches the proxy or leaves
+// the LSM modules half-updated. Only meaningful with an LSM to enforce them.
+// The caller holds runtimeMutex.
+func (m *Manager) validateActiveLocked() error {
+	if !m.lsmManager.EnforcesKernelPolicy() {
+		return nil
+	}
+	active, _ := m.activeRulesLocked()
+	if err := lsm.ValidateKernelPolicyLimits(active); err != nil {
+		return fmt.Errorf("policy rejected, previous policy kept: %w", err)
+	}
+	return nil
 }
 
 // Helper functions
@@ -400,8 +430,14 @@ func (m *Manager) SetRuntimeRules(newLSM *lsm.PolicySet, newHTTP []proxy.HeaderR
 		ConnectDefaultExplicit: newLSM.ConnectDefaultExplicit,
 	}
 	rh := append([]proxy.HeaderRewriteRule(nil), newHTTP...)
+	prevRules, prevHTTP := m.runtimeRules, m.runtimeHTTPRules
 	m.runtimeRules = rr
 	m.runtimeHTTPRules = rh
+	if err := m.validateActiveLocked(); err != nil {
+		m.runtimeRules, m.runtimeHTTPRules = prevRules, prevHTTP
+		m.runtimeMutex.Unlock()
+		return err
+	}
 	m.runtimeMutex.Unlock()
 	return m.applyChanges()
 }
