@@ -123,6 +123,27 @@ Claude Code handling on top.
   read as unqualified good news. The document names the default and the human
   output warns when it is not the runtime the verdict is about.
 
+### Fixed — HTTP/2 clients bypassed header rewrite and MCP enforcement (#57)
+- **The MITM proxy chooses its ALPN list per connection.** It used to offer
+  `h2, http/1.1` to every client and tunnel any h2 connection opaquely, so
+  header-rewrite rules, MCP `tools/call` policy and MCP observability never saw
+  requests from h2 clients (curl, browsers, most SDKs) — only the connect
+  allow/deny applied. Now, when a request-level feature applies to the SNI host
+  (a rewrite rule for the host, any MCP policy, or MCP observability not set to
+  `off`), only `http/1.1` is offered, so the connection takes the inspected
+  HTTP/1.1 path. Hosts with no such feature keep h2 (tunneled). A client that
+  offers **only** h2 (e.g. gRPC) to a host with a rewrite rule or MCP policy is
+  refused at the handshake (`no_application_protocol`) rather than tunneled past
+  the rule; with observability alone it is still tunneled.
+- Each decision for a client that offered h2 is logged as `event=http.alpn` with
+  `alpn_offered`, `alpn_advertised`, `alpn_negotiated`, `alpn_mode`
+  (`tunnel`/`downgrade`/`refuse`) and `reasons`. Same code on Linux and macOS
+  (darwind runs this proxy behind the transparent-proxy extension).
+- With the default MCP observability (`LEASH_MCP_OBS` unset = basic), every
+  host counts as inspected, so h2 clients get HTTP/1.1 everywhere until full
+  h2 MITM lands; `LEASH_MCP_OBS=off` restores h2 for hosts without rewrite rules
+  or MCP policy.
+
 ### Fixed — remedy text that could break the host
 - **`leash doctor` could tell an operator to set `lsm=,bpf`** — a leading-comma
   kernel command line that *replaces* the host's LSM stack, silently disabling
