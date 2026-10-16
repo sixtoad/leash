@@ -2,16 +2,13 @@ package lsm
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -663,9 +660,11 @@ func LoadAndAttachBPFWithSetup(
 	}
 	defer rd.Close()
 
-	// Set up signal handling
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	// Shutdown is the process-wide sticky latch (see shutdown.go), so a signal
+	// that arrived before this loop started is not lost and the deferred link
+	// Close above runs on every shutdown.
+	InstallShutdownHandler()
+	shutdown := ShutdownRequested()
 
 	now := time.Now()
 	startTime := now.Format("15:04:05")
@@ -692,7 +691,7 @@ func LoadAndAttachBPFWithSetup(
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-shutdown:
 			// Signal received, exit gracefully
 			goto cleanup
 		case err := <-errChan:

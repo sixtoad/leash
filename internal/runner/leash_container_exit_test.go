@@ -81,14 +81,14 @@ func TestWaitForEnforcementReadyReportsLeashSidecarExit(t *testing.T) {
 	if strings.Contains(msg, "\x1b") {
 		t.Fatalf("error must be sanitized of escape sequences:\n%q", msg)
 	}
-	if n := strings.Count(msg, "noise line"); n > leashContainerLogTailLines {
+	if n := strings.Count(msg, "noise line"); n > targetLogTailLines {
 		t.Fatalf("log tail not bounded: %d noise lines", n)
 	}
 }
 
-func TestSanitizeLogLine(t *testing.T) {
-	got := sanitizeLogLine("a\x1b[1;31mred\x1b[0m\tb\rc\x07")
-	if got != "ared\tbc" {
-		t.Fatalf("sanitized = %q", got)
+func TestLastFatalLineSanitizesAndRedacts(t *testing.T) {
+	got := lastFatalLine("ok\nleash: FATAL: \x1b[31mrefused\x1b[0m token=abcdefghijklmnop\nafter\n")
+	if strings.Contains(got, "\x1b") || strings.Contains(got, "abcdefghijklmnop") || !strings.HasPrefix(got, "refused") {
+		t.Fatalf("lastFatalLine = %q", got)
 	}
 }
