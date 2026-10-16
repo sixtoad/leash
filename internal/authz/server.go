@@ -376,6 +376,11 @@ type Credentials struct {
 	PID int
 }
 
+// PeerCredentials returns a Unix socket peer's credentials (SO_PEERCRED on
+// Linux, LOCAL_PEERCRED on macOS). The enforcer daemon (internal/enforcerd)
+// authenticates its callers with the same check.
+func PeerCredentials(conn *net.UnixConn) (Credentials, error) { return peerCredentials(conn) }
+
 func readProcCgroup(pid int) ([]byte, error) {
 	return os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cgroup"))
 }

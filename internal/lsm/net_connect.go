@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"net"
 	"os"
 	"strings"
 	"sync"
@@ -219,7 +218,7 @@ func (l *ConnectLsm) LoadPolicies(policies []ConnectPolicyRule, defaultOverride 
 		if isConnectDefault(rule.DestIP, rule.DestPort, rule.Hostname[:], rule.HostnameLen) {
 			continue
 		}
-		ips, err := net.LookupIP(hostname)
+		ips, err := lookupHostIPs(hostname)
 		if err != nil {
 			failedResolves++
 			continue
@@ -531,7 +530,7 @@ func (l *ConnectLsm) resolveHostnamesFromPolicies() error {
 		}
 
 		// Resolve hostname to IP addresses
-		ips, err := net.LookupIP(hostname)
+		ips, err := lookupHostIPs(hostname)
 		if err != nil {
 			resolveErrors = append(resolveErrors, fmt.Sprintf("%s: %v", hostname, err))
 			continue
