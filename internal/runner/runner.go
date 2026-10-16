@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/strongdm/leash/internal/assets"
+	"github.com/strongdm/leash/internal/authz"
 	"github.com/strongdm/leash/internal/configstore"
 	"github.com/strongdm/leash/internal/entrypoint"
 	"github.com/strongdm/leash/internal/idmap"
@@ -145,6 +146,11 @@ type injectService struct {
 	env    string // env var set in the workload, mapped to the plugin socket
 	socket string // host socket path the plugin listens on / is exposed to the box
 	config string // opaque config payload handed to the plugin; leash never interprets it
+	// id and authz configure the plugin's authz socket (#142): authz lists the
+	// Cedar namespaces the plugin may ask about (empty = no socket); id is its
+	// principal, Plugin::"<id>" (default: the plugin's base name).
+	id    string
+	authz []string
 }
 
 type config struct {
@@ -250,6 +256,12 @@ type runner struct {
 	// loop) and appended to the target container's run args. Empty for native /
 	// when --inject-service is unused.
 	injectedDockerArgs []string
+
+	// authz socket state (#142), built once by prepareAuthz.
+	authzPrepared bool
+	authzErr      error
+	authzDir      string
+	authzGrants   []authz.PluginGrant
 
 	logger        *log.Logger
 	diagnostics   io.Writer
@@ -462,7 +474,7 @@ Flags:
   --require-lsm                   (native) Fail closed if the eBPF LSM can't attach, instead of silently degrading to proxy-only. Refuses to run the workload unenforced.
   --user <name>                   (native) Drop the workload to this user, overriding $SUDO_USER. Use when invoking leash as root without sudo (e.g. a scheduler) so the agent never runs as root by accident. Pass --user root to run as root deliberately.
   --allow-namespaces              (native) Let the workload create user/mount namespaces (unshare/mount) — for nested containers or sandbox tools. Reopens the userns bind-mount path-LSM bypass, so default is hardened (off).
-  --inject-service <spec>         (native) Spawn a helper plugin as the invoking user, expose its socket to the box, and set an env var pointing at it. spec is comma-separated: plugin=<binary>,env=<VAR>,socket=<path>[,config=<opaque>]. config is optional and opaque (leash never interprets it). Fail-closed if the plugin can't start. Repeatable.
+  --inject-service <spec>         (native) Spawn a helper plugin as the invoking user, expose its socket to the box, and set an env var pointing at it. spec is comma-separated: plugin=<binary>,env=<VAR>,socket=<path>[,config=<opaque>][,authz=<Ns>[+<Ns>...][,id=<id>]]. config is optional and opaque (leash never interprets it). authz gives the plugin a private Cedar authorization socket (LEASH_AUTHZ_SOCKET) for actions in those namespaces (Action = Leash's own); id names its principal Plugin::"<id>". Fail-closed if the plugin can't start. Repeatable.
   --image <name[:tag]>            Override the target container image (defaults to %s).
   --leash-image <name[:tag]>      Override the leash manager image (defaults to %s).
   --container-name <name>         Force the exact agent container name (no sanitization, no collision suffix; leash container becomes <name>-leash).
@@ -578,7 +590,7 @@ func parseInjectService(spec string) (injectService, error) {
 			return svc, fmt.Errorf("invalid --inject-service segment %q; want key=value", part)
 		}
 		switch k {
-		case "plugin", "env", "socket", "config":
+		case "plugin", "env", "socket", "config", "id", "authz":
 			if seen[k] {
 				return svc, fmt.Errorf("--inject-service key %q specified more than once", k)
 			}
@@ -593,8 +605,19 @@ func parseInjectService(spec string) (injectService, error) {
 			svc.socket = v
 		case "config":
 			svc.config = v
+		case "id":
+			if err := authz.ValidatePluginID(v); err != nil {
+				return svc, fmt.Errorf("--inject-service id: %w", err)
+			}
+			svc.id = v
+		case "authz":
+			ns, err := parseAuthzNamespaces(v)
+			if err != nil {
+				return svc, err
+			}
+			svc.authz = ns
 		default:
-			return svc, fmt.Errorf("unknown --inject-service key %q (want plugin, env, socket, config)", k)
+			return svc, fmt.Errorf("unknown --inject-service key %q (want plugin, env, socket, config, id, authz)", k)
 		}
 	}
 	if svc.plugin == "" {
@@ -617,6 +640,14 @@ func parseInjectService(spec string) (injectService, error) {
 	}
 	if err := validateInjectSocket(svc.socket); err != nil {
 		return svc, fmt.Errorf("--inject-service socket: %w", err)
+	}
+	if svc.id != "" && len(svc.authz) == 0 {
+		return svc, errors.New("--inject-service id= only applies with authz=<Namespace>")
+	}
+	if len(svc.authz) > 0 {
+		if err := authz.ValidatePluginID(svc.authzID()); err != nil {
+			return svc, fmt.Errorf("--inject-service: %w; set id=", err)
+		}
 	}
 	return svc, nil
 }
@@ -2817,6 +2848,18 @@ func (r *runner) launchLeashContainer(ctx context.Context, cgroupPath string) er
 		"-e", fmt.Sprintf("LEASH_PRIVATE_DIR=%s", leashPrivateMount),
 	}
 	leashMounts := []string{"/sys/fs/cgroup", "/log", "/cfg", leashPublicMount, leashPrivateMount}
+	// The authz socket dir goes to the leashd container only, never the workload.
+	if err := r.prepareAuthz(); err != nil {
+		return err
+	}
+	authzArgs, err := r.authzDockerArgs()
+	if err != nil {
+		return err
+	}
+	if len(authzArgs) > 0 {
+		args = append(args, authzArgs...)
+		leashMounts = append(leashMounts, r.authzDir)
+	}
 	leashEnv := []string{
 		fmt.Sprintf("LEASH_PROXY_PORT=%s", r.cfg.proxyPort),
 		fmt.Sprintf("LEASH_LISTEN=%s", r.cfg.listenCfg.Address()),
@@ -2826,6 +2869,9 @@ func (r *runner) launchLeashContainer(ctx context.Context, cgroupPath string) er
 		fmt.Sprintf("LEASH_BOOTSTRAP_TIMEOUT=%s", r.cfg.bootstrapTimeout.String()),
 		fmt.Sprintf("LEASH_DIR=%s", leashPublicMount),
 		fmt.Sprintf("LEASH_PRIVATE_DIR=%s", leashPrivateMount),
+	}
+	if len(authzArgs) > 0 {
+		leashEnv = append(leashEnv, authz.EnvPlugins+"=<set>")
 	}
 	if len(r.idmapSpecs) > 0 {
 		payload, err := idmap.Encode(r.idmapSpecs)

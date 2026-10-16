@@ -21,7 +21,7 @@ func testBuild() Build {
 // wantPolicyLimits pins the advertised enforced policy path limits.
 var wantPolicyLimits = &PolicyLimits{FilePathBytes: 255, ExecPathBytes: 64, FileRules: 256, ExecRules: 64}
 
-var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits"}
+var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket"}
 
 // TestEnforcingIsDerivedPerPlatform pins the criterion: `enforcing` says whether
 // *this binary* carries an enforcement path. Linux ships the eBPF LSM programs
@@ -208,7 +208,7 @@ func TestJSONWireShape(t *testing.T) {
 		"enforcing":             true,
 		"contractVersion":       float64(1), // encoding/json decodes numbers as float64
 		"minCompatibleContract": float64(0),
-		"capabilities":          []any{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits"},
+		"capabilities":          []any{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket"},
 		"policyLimits":          map[string]any{"filePathBytes": float64(255), "execPathBytes": float64(64), "fileRules": float64(256), "execRules": float64(64)},
 		"os":                    "linux",
 		"arch":                  "amd64",
