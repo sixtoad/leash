@@ -98,18 +98,39 @@ struct leash_sockaddr_in6 {
     u32 sin6_addr[4];      // Network byte order
 };
 
-// Guard the Go/BPF ABI used by policy maps and ring-buffer events.
-_Static_assert(__builtin_offsetof(struct connect_event, dest_ip) == 48, "connect_event.dest_ip ABI drift");
-_Static_assert(__builtin_offsetof(struct connect_event, dest_port) == 52, "connect_event.dest_port ABI drift");
-_Static_assert(__builtin_offsetof(struct connect_event, result) == 56, "connect_event.result ABI drift");
-_Static_assert(__builtin_offsetof(struct connect_event, dest_hostname) == 60, "connect_event.dest_hostname ABI drift");
-_Static_assert(__builtin_offsetof(struct connect_event, dest_ip6) == 188, "connect_event.dest_ip6 ABI drift");
-_Static_assert(sizeof(struct connect_event) == 208, "connect_event size ABI drift");
-_Static_assert(__builtin_offsetof(struct connect_policy_rule, family) == 8, "connect_policy_rule.family ABI drift");
-_Static_assert(__builtin_offsetof(struct connect_policy_rule, dest_ip) == 12, "connect_policy_rule.dest_ip ABI drift");
-_Static_assert(__builtin_offsetof(struct connect_policy_rule, dest_ip6) == 16, "connect_policy_rule.dest_ip6 ABI drift");
-_Static_assert(__builtin_offsetof(struct connect_policy_rule, dest_port) == 32, "connect_policy_rule.dest_port ABI drift");
+// The Go/BPF ABI of the policy map value and the ring-buffer event (#78):
+// every field at a fixed offset, every padding byte a named field, no
+// implicit padding anywhere. ConnectPolicyRuleBPF and ConnectEvent in
+// net_connect.go mirror these layouts; connect_abi_test.go checks the Go
+// side with unsafe.Offsetof/reflect, against this object's BTF, and against
+// hand-built byte fixtures. Change both sides together.
+#define CONNECT_ABI(type, field, off) \
+    _Static_assert(__builtin_offsetof(struct type, field) == (off), #type "." #field " ABI drift")
+
+CONNECT_ABI(connect_policy_rule, action, 0);
+CONNECT_ABI(connect_policy_rule, operation, 4);
+CONNECT_ABI(connect_policy_rule, family, 8);
+CONNECT_ABI(connect_policy_rule, dest_ip, 12);
+CONNECT_ABI(connect_policy_rule, dest_ip6, 16);
+CONNECT_ABI(connect_policy_rule, dest_port, 32);
+CONNECT_ABI(connect_policy_rule, _pad0, 34);
 _Static_assert(sizeof(struct connect_policy_rule) == 36, "connect_policy_rule size ABI drift");
+
+CONNECT_ABI(connect_event, pid, 0);
+CONNECT_ABI(connect_event, tgid, 4);
+CONNECT_ABI(connect_event, timestamp, 8);
+CONNECT_ABI(connect_event, cgroup_id, 16);
+CONNECT_ABI(connect_event, comm, 24);
+CONNECT_ABI(connect_event, family, 40);
+CONNECT_ABI(connect_event, protocol, 44);
+CONNECT_ABI(connect_event, dest_ip, 48);
+CONNECT_ABI(connect_event, dest_port, 52);
+CONNECT_ABI(connect_event, _pad0, 54);
+CONNECT_ABI(connect_event, result, 56);
+CONNECT_ABI(connect_event, dest_hostname, 60);
+CONNECT_ABI(connect_event, dest_ip6, 188);
+CONNECT_ABI(connect_event, _pad1, 204);
+_Static_assert(sizeof(struct connect_event) == 208, "connect_event size ABI drift");
 _Static_assert(sizeof(struct leash_sockaddr_in6) == 24, "sockaddr_in6 prefix layout");
 
 struct {
