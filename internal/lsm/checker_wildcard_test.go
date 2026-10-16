@@ -19,7 +19,7 @@ func checkerHostRule(action int32, host string) ConnectPolicyRule {
 // permit and let a wildcard forbid hit unrelated hosts. Names compare
 // case-insensitively and a trailing dot is ignored.
 func TestCheckConnectWildcardNeedsALabelBoundary(t *testing.T) {
-	pc := NewSimplePolicyChecker([]ConnectPolicyRule{checkerHostRule(PolicyAllow, "*.example.com")}, false, nil)
+	pc := newLegacyChecker([]ConnectPolicyRule{checkerHostRule(PolicyAllow, "*.example.com")}, false, nil)
 	for host, want := range map[string]bool{
 		"api.example.com":   true,
 		"a.b.example.com":   true,
@@ -38,7 +38,7 @@ func TestCheckConnectWildcardNeedsALabelBoundary(t *testing.T) {
 }
 
 func TestCheckConnectExactHostIsCaseInsensitive(t *testing.T) {
-	pc := NewSimplePolicyChecker([]ConnectPolicyRule{checkerHostRule(PolicyDeny, "API.example.com")}, true, nil)
+	pc := newLegacyChecker([]ConnectPolicyRule{checkerHostRule(PolicyDeny, "API.example.com")}, true, nil)
 	for host, want := range map[string]bool{
 		"api.example.com":  false,
 		"Api.Example.Com.": false,

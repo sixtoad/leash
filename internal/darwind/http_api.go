@@ -660,10 +660,12 @@ func (api *policyAPI) handleValidatePolicies(w http.ResponseWriter, r *http.Requ
 			}
 		}
 
-		tr := transpiler.NewCedarToLeashTranspiler()
-		ps, _, err := tr.TranspileFromString(cedar)
-		if err == nil && ps != nil {
+		if comp, err := cedarutil.CompileString("policies.cedar", cedar); err == nil && comp.Policies != nil {
+			ps := comp.Policies
 			for _, r := range ps.Open {
+				if r.Operation == lsm.OpMutation {
+					continue // the mutation table, not an open rule
+				}
 				if r.Action == lsm.PolicyAllow {
 					allowOpen++
 				} else {
@@ -784,6 +786,9 @@ func collectPolicySetHints(h *autocomplete.Hints, set *lsm.PolicySet) {
 		return
 	}
 	for _, rule := range set.Open {
+		if rule.Operation == lsm.OpMutation {
+			continue // the mutation table, not an open rule
+		}
 		path := policyRulePath(rule)
 		if path == "" {
 			continue
@@ -1036,6 +1041,10 @@ func (api *policyAPI) buildPoliciesResponse() map[string]any {
 // (e.g., running on non-Linux, missing privileges, or closed/invalid fds).
 func softLSMError(err error) bool {
 	if err == nil {
+		return false
+	}
+	// A policy that does not compile was not applied anywhere: never soft.
+	if errors.Is(err, policy.ErrCompile) {
 		return false
 	}
 	// Allow soft-fail on non-Linux hosts where LSM is unavailable.
@@ -1295,7 +1304,15 @@ func (api *policyAPI) loadCanonicalCedar() ([]byte, error) {
 }
 
 func hasAnyRules(lsmRules *lsm.PolicySet, httpRules []proxy.HeaderRewriteRule) bool {
-	return len(lsmRules.Open)+len(lsmRules.Exec)+len(lsmRules.Connect)+len(httpRules) > 0
+	// A strict policy may hold only plugin or MCP policies, or only forbids
+	// (no kernel rule at all): any policy counts (#142).
+	open := 0
+	for _, r := range lsmRules.Open {
+		if r.Operation != lsm.OpMutation { // the mutation table is always present
+			open++
+		}
+	}
+	return open+len(lsmRules.Exec)+len(lsmRules.Connect)+len(httpRules) > 0 || cedarutil.HasPolicies(lsmRules)
 }
 
 // handlePolicyLines returns a list of parsed policy lines from the operative Cedar.
@@ -1680,11 +1697,11 @@ func (api *policyAPI) addPolicyStatement(newCedar string) (map[string]any, int, 
 		updated = stmt + "\n\n" + existing
 	}
 
-	tr := transpiler.NewCedarToLeashTranspiler()
-	lsmRules, httpRules, err := tr.TranspileFromString(updated)
+	compiled, err := cedarutil.CompileString("runtime.cedar", updated)
 	if err != nil {
 		return nil, http.StatusBadRequest, err
 	}
+	lsmRules, httpRules := compiled.Policies, compiled.HTTPRules
 	if err := ensureConnectSafety(lsmRules); err != nil {
 		return nil, http.StatusBadRequest, err
 	}
@@ -1999,11 +2016,11 @@ func (api *policyAPI) deletePolicy(req deletePolicyRequest) (map[string]any, int
 	statements = append(statements[:index], statements[index+1:]...)
 	updated := strings.TrimSpace(strings.Join(statements, "\n\n"))
 
-	tr := transpiler.NewCedarToLeashTranspiler()
-	lsmRules, httpRules, err := tr.TranspileFromString(updated)
+	compiled, err := cedarutil.CompileString("runtime.cedar", updated)
 	if err != nil {
 		return nil, http.StatusBadRequest, err
 	}
+	lsmRules, httpRules := compiled.Policies, compiled.HTTPRules
 	if err := ensureConnectSafety(lsmRules); err != nil {
 		return nil, http.StatusBadRequest, err
 	}

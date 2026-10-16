@@ -129,6 +129,18 @@ type PolicySet struct {
 	// ConnectDefaultExplicit tracks whether the default posture was explicitly configured in the policy file.
 	ConnectDefaultAllow    bool
 	ConnectDefaultExplicit bool
+
+	// Source is the Cedar the rules were compiled from (nil for rules built
+	// in code, which are legacy IR by definition). policy.Manager merges
+	// layers by their sources and compiles the merged Cedar once: compiled
+	// rules of two layers are never concatenated (#142).
+	Source *PolicySource
+}
+
+// PolicySource is the Cedar text of a policy layer. It is immutable.
+type PolicySource struct {
+	Name string
+	Text string
 }
 
 // Clone returns a copy of the set whose rule slices do not alias ps. Every
@@ -145,6 +157,7 @@ func (ps *PolicySet) Clone() *PolicySet {
 		MCP:                    append([]MCPPolicyRule(nil), ps.MCP...),
 		ConnectDefaultAllow:    ps.ConnectDefaultAllow,
 		ConnectDefaultExplicit: ps.ConnectDefaultExplicit,
+		Source:                 ps.Source,
 	}
 }
 

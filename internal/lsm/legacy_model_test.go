@@ -2,7 +2,10 @@ package lsm
 
 import (
 	"bytes"
+	"fmt"
 	"net"
+	"net/url"
+	"sort"
 	"strings"
 )
 
@@ -52,6 +55,18 @@ func newLegacyModel(policies *PolicySet) *legacyModel {
 	m.mcp = normalizeMCPRules(policies.MCP)
 	return m
 }
+
+// newLegacyChecker is the legacy model of the proxy checker (connect and
+// MCP), the matcher SimplePolicyChecker implemented before #142.
+func newLegacyChecker(rules []ConnectPolicyRule, defaultAllow bool, mcp []MCPPolicyRule) *legacyModel {
+	return &legacyModel{connect: connectRulesByPrecedence(rules), connectDefault: defaultAllow, mcp: normalizeMCPRules(mcp)}
+}
+
+func (m *legacyModel) CheckConnect(hostname, ip string, port uint16) bool {
+	return m.connectAllowed(hostname, ip, port)
+}
+
+func (m *legacyModel) CheckMCPCall(server, tool string) bool { return m.mcpAllowed(server, tool) }
 
 // openAllowed: first match in precedence order (longest path, deny first at
 // equal length); a rule matches every path its bytes prefix, a directory
@@ -168,4 +183,80 @@ func (m *legacyModel) mcpAllowed(server, tool string) bool {
 		return rule.Action == PolicyAllow
 	}
 	return true
+}
+
+// The legacy proxy checker's rule normalization and precedence, kept with
+// the model (production decides with the engine, #142).
+
+// connectRulesByPrecedence returns a copy of userspace connect rules with
+// every deny before every allow, keeping the given order otherwise. The
+// Host::"*" default rule is dropped; the caller passes the default separately.
+func connectRulesByPrecedence(rules []ConnectPolicyRule) []ConnectPolicyRule {
+	out := make([]ConnectPolicyRule, 0, len(rules))
+	for _, r := range rules {
+		if !isConnectDefault(r.DestIP, r.DestPort, r.Hostname[:], r.HostnameLen) {
+			out = append(out, r)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		less, _ := denyFirst(uint32(out[i].Action), uint32(out[j].Action))
+		return less
+	})
+	return out
+}
+
+// mcpRulesByPrecedence orders MCP rules in place with every deny before every
+// allow, keeping the given order otherwise.
+func mcpRulesByPrecedence(rules []MCPPolicyRule) {
+	sort.SliceStable(rules, func(i, j int) bool {
+		less, _ := denyFirst(uint32(rules[i].Action), uint32(rules[j].Action))
+		return less
+	})
+}
+
+func normalizeMCPRules(rules []MCPPolicyRule) []MCPPolicyRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]MCPPolicyRule, 0, len(rules))
+	seen := make(map[string]struct{})
+	for _, rule := range rules {
+		server := normalizeServer(rule.Server)
+		tool := strings.ToLower(strings.TrimSpace(rule.Tool))
+		key := fmt.Sprintf("%d|%s|%s", rule.Action, server, tool)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, MCPPolicyRule{
+			Action: rule.Action,
+			Server: server,
+			Tool:   tool,
+		})
+	}
+	// CheckMCPCall takes the first match; denies first (#135).
+	mcpRulesByPrecedence(out)
+	return out
+}
+
+func normalizeServer(server string) string {
+	s := strings.TrimSpace(server)
+	if s == "" {
+		return ""
+	}
+	s = strings.ToLower(s)
+	if strings.Contains(s, "://") {
+		if u, err := url.Parse(s); err == nil {
+			if host := u.Hostname(); host != "" {
+				s = host
+			}
+		}
+	}
+	if strings.Contains(s, "/") {
+		s = strings.SplitN(s, "/", 2)[0]
+	}
+	if host, _, err := net.SplitHostPort(s); err == nil && host != "" {
+		s = host
+	}
+	return strings.TrimSpace(s)
 }

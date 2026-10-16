@@ -72,6 +72,7 @@ type runtimeState struct {
 	mitmProxy         *proxy.MITMProxy
 	lsmManager        *lsm.LSMManager
 	policyManager     *policy.Manager
+	decisions         *policy.Decisions // the engine shared by the proxy and the authz socket
 	macSync           *macsync.Manager
 	policyWatcherStop func()
 	policyReady       atomic.Bool
@@ -500,9 +501,9 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 		return nil, fmt.Errorf("failed to parse policy file: %w", err)
 	}
 
-	connectRules := lsm.ConvertToConnectRules(initialPolicy.LSMPolicies.Connect)
-	defaultAllow := connectDefaultAllow(initialPolicy.LSMPolicies)
-	policyChecker := lsm.NewSimplePolicyChecker(connectRules, defaultAllow, initialPolicy.LSMPolicies.MCP)
+	// One engine per policy change, shared by the proxy and the authz socket (#142).
+	decisions := &policy.Decisions{}
+	initialEngine := decisions.Publish(initialPolicy.Compilation.Engine)
 
 	// The MITM proxy is fed by the LeashProxy transparent-proxy system extension
 	// (PROXY-protocol ingestion), NOT by a cgroup/netfilter redirect. So on macOS it
@@ -514,7 +515,7 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 	// LEASH_MCP_SSE_EVENT_LIMIT. Previously darwin passed proxy.MCPConfig{}, whose
 	// zero-value Mode is MCPModeOff, so MCP tool-call logging never ran on macOS.
 	mcpConfig := loadMCPConfigFromEnv()
-	mitmProxy, err := proxy.NewMITMProxy(cfg.ProxyPort, headerRewriter, policyChecker, logger, mcpConfig)
+	mitmProxy, err := proxy.NewMITMProxy(cfg.ProxyPort, headerRewriter, initialEngine, logger, mcpConfig)
 	if err != nil {
 		logger.Close()
 		return nil, fmt.Errorf("failed to create MITM proxy: %w", err)
@@ -536,14 +537,13 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 		headerRewriter: headerRewriter,
 		mitmProxy:      mitmProxy,
 		lsmManager:     lsmManager,
+		decisions:      decisions,
 		macSync:        macSync,
 	}
 
-	policyManager := policy.NewManager(lsmManager, func(rules *lsm.PolicySet, httpRules []proxy.HeaderRewriteRule) {
-		state.headerRewriter.SetRules(httpRules)
-		if state.mitmProxy != nil {
-			applyPolicyToProxy(state.mitmProxy, rules)
-		}
+	policyManager := policy.NewManager(lsmManager, func(active *cedarutil.Compilation) {
+		state.headerRewriter.SetRules(active.HTTPRules)
+		state.decisions.Publish(active.Engine, state.mitmProxy.SetEngine)
 	})
 
 	if err := policyManager.UpdateFileRules(initialPolicy.LSMPolicies, initialPolicy.HTTPRewrites); err != nil {
@@ -551,9 +551,6 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 		return nil, fmt.Errorf("failed to load file policies: %w", err)
 	}
 	headerRewriter.SetRules(initialPolicy.HTTPRewrites)
-	if mitmProxy != nil {
-		applyPolicyToProxy(mitmProxy, initialPolicy.LSMPolicies)
-	}
 	state.policyManager = policyManager
 
 	state.syncMacPoliciesFrom(initialPolicy.LSMPolicies)
@@ -770,22 +767,6 @@ func (rt *runtimeState) configureNetwork() error {
 		log.Printf("Warning: Failed to mount tracefs: %v", err)
 	}
 	return nil
-}
-
-func connectDefaultAllow(policies *lsm.PolicySet) bool {
-	if policies == nil {
-		return false
-	}
-	return policies.ConnectDefaultAllow
-}
-
-func applyPolicyToProxy(mitmproxy *proxy.MITMProxy, rules *lsm.PolicySet) {
-	if mitmproxy == nil || rules == nil {
-		return
-	}
-	connectRules := lsm.ConvertToConnectRules(rules.Connect)
-	defaultAllow := connectDefaultAllow(rules)
-	mitmproxy.SetPolicyChecker(lsm.NewSimplePolicyChecker(connectRules, defaultAllow, rules.MCP))
 }
 
 func (rt *runtimeState) startClientMessageLoop() {
@@ -1490,7 +1471,19 @@ func formatCedarErrorForCLI(detail *cedarutil.ErrorDetail) string {
 		return "error: invalid Cedar policy"
 	}
 	var b strings.Builder
-	b.WriteString("error: invalid Cedar policy\n")
+	// A policy that parses but does not compile gets its own header and the
+	// policy it names; a syntax error keeps the Cedar header (#142).
+	switch detail.Code {
+	case "CEDAR_NOT_ENFORCEABLE":
+		b.WriteString("error: policy not enforceable by the kernel\n")
+	case "CEDAR_INVALID_POLICY":
+		b.WriteString("error: invalid policy\n")
+	default:
+		b.WriteString("error: invalid Cedar policy\n")
+	}
+	if detail.Policy != "" {
+		fmt.Fprintf(&b, "policy: %s\n", detail.Policy)
+	}
 	if detail.File != "" {
 		line := detail.Line
 		if line <= 0 {
@@ -1519,6 +1512,9 @@ func formatCedarErrorForCLI(detail *cedarutil.ErrorDetail) string {
 			fmt.Fprintf(&b, " %s", msg)
 		}
 		b.WriteByte('\n')
+	} else if msg := strings.TrimSpace(detail.Message); msg != "" {
+		// Always say why, even without a snippet to point at.
+		fmt.Fprintf(&b, "message: %s\n", msg)
 	}
 	if hint := strings.TrimSpace(detail.Suggestion); hint != "" {
 		fmt.Fprintf(&b, "hint: %s\n", hint)

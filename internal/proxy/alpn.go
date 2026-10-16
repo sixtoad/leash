@@ -54,7 +54,7 @@ func (p *MITMProxy) requestInspectionReasons(host string) []string {
 	if p.headerRewriter.HasRulesForHost(host) {
 		reasons = append(reasons, alpnReasonHeaderRewrite)
 	}
-	if p.policyChecker != nil && p.policyChecker.HasMCPPolicies() {
+	if pc := p.checker(); pc != nil && pc.HasMCPPolicies() {
 		reasons = append(reasons, alpnReasonMCPPolicy)
 	}
 	if p.mcpObserver != nil && p.mcpObserver.cfg.Mode != MCPModeOff {

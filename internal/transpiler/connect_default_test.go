@@ -39,7 +39,7 @@ func TestConnectDefaultRoundTripKeepsAllowlistAndDenylist(t *testing.T) {
 		if set.ConnectDefaultAllow != tc.defaultAllow {
 			t.Fatalf("%s: default allow = %v, want %v\n%s", tc.name, set.ConnectDefaultAllow, tc.defaultAllow, written)
 		}
-		pc := lsm.NewSimplePolicyChecker(lsm.ConvertToConnectRules(set.Connect), set.ConnectDefaultAllow, set.MCP)
+		pc := legacyEngine(t, written)
 		for _, host := range tc.allowed {
 			if !pc.CheckConnect(host, "", 443) {
 				t.Errorf("%s: %s denied", tc.name, host)

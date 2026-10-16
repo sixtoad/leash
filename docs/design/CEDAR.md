@@ -4,6 +4,9 @@
 > Because Leash relies on enforcement mechanisms (e.g. eBPF) which cannot evaluate Cedar policy, we translate Cedar intents into the available enforcement techniques. At policy authoring and validation time, we lint and validate the Cedar statements to ensure only those statements which are enforceable are saved and applied. The translations are simple, but may result in some intuition violations for anyone familiar with Cedar's authorization model.  
 
 
+> [!NOTE]
+> Every userspace decision (the proxy's connect check, MCP tools/call, the plugin authorization socket) is made by Cedar's own evaluator (cedar-go) over strict Cedar, and the kernel enforces tables compiled from the same policies (#142). A file without `@leash_semantics("cedar")` keeps the legacy semantics this page describes: it is rewritten at load to equivalent strict Cedar, and the daemon logs every `forbid` that gained an exception. `leash policy migrate <file>` prints the rewritten file. See `docs/design/AUTHZ-SERVICE.md`.
+
 Leash loads the initial access‑control policy from `/cfg/leash.cedar`. At startup
 the daemon validates Cedar, transpiles it to Leash IR in memory, and loads the
 resulting rules into the eBPF LSM programs and the HTTP MITM proxy.
@@ -98,8 +101,11 @@ Key elements:
 - **conditions** – optional `when { ... }` block that constrains matches. Leash
   uses it primarily for HTTP rewrite header/value matching.
 
-Statements are evaluated in the order they appear. The first matching rule
-(deciding `permit` or `forbid`) wins.
+Statement order does not matter. In a legacy file (the semantics this page
+describes) the most specific file or exec rule wins and a `forbid` wins a
+tie; connect and MCP rules are forbid-overrides-permit. In a strict file
+(`@leash_semantics("cedar")`) every action is plain Cedar: any applicable
+`forbid` denies, otherwise any applicable `permit` allows, otherwise deny.
 
 ### Supported Actions and Resources
 

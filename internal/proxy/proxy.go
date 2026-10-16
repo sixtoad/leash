@@ -18,6 +18,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/strongdm/leash/internal/engine"
 	"github.com/strongdm/leash/internal/lsm"
 )
 
@@ -45,6 +46,7 @@ type MITMProxy struct {
 	logMutex       sync.Mutex
 	sharedLogger   *lsm.SharedLogger // Shared event logger
 	policyChecker  PolicyChecker     // Connect policy enforcement
+	checkerMu      sync.RWMutex      // guards policyChecker: policy reloads swap it while requests read it
 	httpClient     *http.Client      // Custom HTTP client with marked connections
 	tlsDialer      func(addr, serverName string) (*tls.Conn, error)
 	mcpObserver    *mcpObserver
@@ -289,12 +291,30 @@ func (p *MITMProxy) SetProxyProtocolIngestion(enabled bool) {
 	p.useProxyProtocol = enabled
 }
 
+// SetEngine installs the decision engine (#142) as the proxy's policy
+// checker. It is nil-receiver safe so a runtime without a proxy can pass it
+// as a policy.Decisions consumer.
+func (p *MITMProxy) SetEngine(e *engine.Engine) {
+	if p == nil || e == nil {
+		return
+	}
+	p.SetPolicyChecker(e)
+}
+
 // SetPolicyChecker updates the policy checker used for connect enforcement.
 func (p *MITMProxy) SetPolicyChecker(pc PolicyChecker) {
+	p.checkerMu.Lock()
 	p.policyChecker = pc
+	p.checkerMu.Unlock()
 	if p.mcpObserver != nil {
 		p.mcpObserver.setForceParse(pc != nil && pc.HasMCPPolicies())
 	}
+}
+
+func (p *MITMProxy) checker() PolicyChecker {
+	p.checkerMu.RLock()
+	defer p.checkerMu.RUnlock()
+	return p.policyChecker
 }
 
 func (p *MITMProxy) handleTransparentConnection(clientConn net.Conn) {
@@ -396,11 +416,12 @@ func parseProxyProtocolV1Line(line string) (string, error) {
 
 // checkConnectPolicy validates if a connection should be allowed based on hostname/IP policy
 func (p *MITMProxy) checkConnectPolicy(hostname, destIP string, port uint16) bool {
-	if p.policyChecker == nil {
+	pc := p.checker()
+	if pc == nil {
 		return true // No policy checker, allow all
 	}
 
-	return p.policyChecker.CheckConnect(hostname, destIP, port)
+	return pc.CheckConnect(hostname, destIP, port)
 }
 
 // blockConnection sends a policy violation response and closes the connection
@@ -457,7 +478,8 @@ func (p *MITMProxy) blockConnection(clientConn net.Conn, isHTTPS bool, hostname,
 }
 
 func (p *MITMProxy) enforceMCPCall(conn net.Conn, ctx *mcpRequestContext, serverHost string, logHost string, logPort string, path string, query string, authPresent bool, scheme string) bool {
-	if p.policyChecker == nil || ctx == nil {
+	pc := p.checker()
+	if pc == nil || ctx == nil {
 		return false
 	}
 	if !strings.EqualFold(ctx.method, "tools/call") {
@@ -466,7 +488,7 @@ func (p *MITMProxy) enforceMCPCall(conn net.Conn, ctx *mcpRequestContext, server
 	if serverHost == "" {
 		serverHost = logHost
 	}
-	if !p.policyChecker.CheckMCPCall(serverHost, ctx.tool) {
+	if !pc.CheckMCPCall(serverHost, ctx.tool) {
 		status := http.StatusForbidden
 		ctx.server = serverHost
 		ctx.responseOutcome = "denied"

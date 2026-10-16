@@ -171,6 +171,7 @@ type runtimeState struct {
 	mitmProxy         *proxy.MITMProxy
 	lsmManager        *lsm.LSMManager
 	policyManager     *policy.Manager
+	decisions         *policy.Decisions // the engine shared by the proxy and the authz socket
 	policyWatcherStop func()
 	policyReady       atomic.Bool
 	closeOnce         sync.Once
@@ -442,12 +443,12 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 		return nil, fmt.Errorf("failed to parse Cedar policy: %w", err)
 	}
 
-	connectRules := lsm.ConvertToConnectRules(initialPolicy.LSMPolicies.Connect)
-	defaultAllow := connectDefaultAllow(initialPolicy.LSMPolicies)
-	policyChecker := lsm.NewSimplePolicyChecker(connectRules, defaultAllow, initialPolicy.LSMPolicies.MCP)
+	// One engine per policy change, shared by the proxy and the authz socket (#142).
+	decisions := &policy.Decisions{}
+	initialEngine := decisions.Publish(initialPolicy.Compilation.Engine)
 
 	// n.b. This kicks off certificate creation.
-	mitmProxy, err := proxy.NewMITMProxy(cfg.ProxyPort, headerRewriter, policyChecker, logger, cfg.MCPConfig)
+	mitmProxy, err := proxy.NewMITMProxy(cfg.ProxyPort, headerRewriter, initialEngine, logger, cfg.MCPConfig)
 	if err != nil {
 		logger.Close()
 		return nil, fmt.Errorf("failed to create MITM proxy: %w", err)
@@ -464,13 +465,14 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 		headerRewriter:    headerRewriter,
 		mitmProxy:         mitmProxy,
 		lsmManager:        lsmManager,
+		decisions:         decisions,
 		bootstrapPath:     filepath.Join(leashDir, entrypoint.BootstrapReadyFileName),
 		telemetryProvider: telemetryProvider,
 	}
 
-	policyManager := policy.NewManager(lsmManager, func(rules *lsm.PolicySet, httpRules []proxy.HeaderRewriteRule) {
-		state.headerRewriter.SetRules(httpRules)
-		applyPolicyToProxy(state.mitmProxy, rules)
+	policyManager := policy.NewManager(lsmManager, func(active *cedarutil.Compilation) {
+		state.headerRewriter.SetRules(active.HTTPRules)
+		state.decisions.Publish(active.Engine, state.mitmProxy.SetEngine)
 	})
 
 	if err := policyManager.UpdateFileRules(initialPolicy.LSMPolicies, initialPolicy.HTTPRewrites); err != nil {
@@ -775,19 +777,6 @@ func (rt *runtimeState) configureNetwork() error {
 	return nil
 }
 
-func connectDefaultAllow(policies *lsm.PolicySet) bool {
-	if policies == nil {
-		return false
-	}
-	return policies.ConnectDefaultAllow
-}
-
-func applyPolicyToProxy(mitmproxy *proxy.MITMProxy, rules *lsm.PolicySet) {
-	connectRules := lsm.ConvertToConnectRules(rules.Connect)
-	defaultAllow := connectDefaultAllow(rules)
-	mitmproxy.SetPolicyChecker(lsm.NewSimplePolicyChecker(connectRules, defaultAllow, rules.MCP))
-}
-
 const proxyMark = "0x2000"
 
 func clearReadyMarkers(dir string) error {
@@ -974,7 +963,19 @@ func formatCedarErrorForCLI(detail *cedarutil.ErrorDetail) string {
 		return "error: invalid Cedar policy"
 	}
 	var b strings.Builder
-	b.WriteString("error: invalid Cedar policy\n")
+	// A policy that parses but does not compile gets its own header and the
+	// policy it names; a syntax error keeps the Cedar header (#142).
+	switch detail.Code {
+	case "CEDAR_NOT_ENFORCEABLE":
+		b.WriteString("error: policy not enforceable by the kernel\n")
+	case "CEDAR_INVALID_POLICY":
+		b.WriteString("error: invalid policy\n")
+	default:
+		b.WriteString("error: invalid Cedar policy\n")
+	}
+	if detail.Policy != "" {
+		fmt.Fprintf(&b, "policy: %s\n", detail.Policy)
+	}
 	if detail.File != "" {
 		line := detail.Line
 		if line <= 0 {
@@ -1003,6 +1004,9 @@ func formatCedarErrorForCLI(detail *cedarutil.ErrorDetail) string {
 			fmt.Fprintf(&b, " %s", msg)
 		}
 		b.WriteByte('\n')
+	} else if msg := strings.TrimSpace(detail.Message); msg != "" {
+		// Always say why, even without a snippet to point at.
+		fmt.Fprintf(&b, "message: %s\n", msg)
 	}
 	if hint := strings.TrimSpace(detail.Suggestion); hint != "" {
 		fmt.Fprintf(&b, "hint: %s\n", hint)

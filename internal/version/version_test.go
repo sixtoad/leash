@@ -27,7 +27,7 @@ var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "
 // *this binary* carries an enforcement path. Linux ships the eBPF LSM programs
 // plus the MITM proxy; darwin ships and drives the same MITM proxy
 // (internal/darwind/runtime_darwin.go builds it with NewMITMProxy and pushes
-// policy into it via applyPolicyToProxy), so claiming false there would deny
+// policy into it via policy.Decisions.Publish), so claiming false there would deny
 // enforcement the binary demonstrably performs.
 func TestEnforcingIsDerivedPerPlatform(t *testing.T) {
 	t.Parallel()

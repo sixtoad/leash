@@ -23,14 +23,14 @@ func TestConnectDefaultRuleIsNotAMatchingRule(t *testing.T) {
 	denylist := []ConnectPolicyRule{allowAll, connectRuleForTest(PolicyDeny, 0, 0, "evil.test"), connectRuleForTest(PolicyDeny, ip, 22, "")}
 	for i := 0; i < precedenceShuffles; i++ {
 		// Proxy checker; the runtime passes PolicySet.ConnectDefaultAllow.
-		pc := NewSimplePolicyChecker(shuffled(rng, allowlist), false, nil)
+		pc := newLegacyChecker(shuffled(rng, allowlist), false, nil)
 		if !pc.CheckConnect("api.openai.com", "", 443) || !pc.CheckConnect("", "10.0.0.1", 443) {
 			t.Fatalf("shuffle %d: default-deny shadowed an allowlisted destination", i)
 		}
 		if pc.CheckConnect("example.com", "", 443) || pc.CheckConnect("", "10.0.0.1", 80) {
 			t.Fatalf("shuffle %d: unlisted destination allowed under default deny", i)
 		}
-		pc = NewSimplePolicyChecker(shuffled(rng, denylist), true, nil)
+		pc = newLegacyChecker(shuffled(rng, denylist), true, nil)
 		if pc.CheckConnect("evil.test", "", 443) || pc.CheckConnect("", "10.0.0.1", 22) {
 			t.Fatalf("shuffle %d: forbid lost under default allow", i)
 		}
