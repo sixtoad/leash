@@ -47,7 +47,8 @@ func MigrateText(name, text string) (out string, report RewriteReport, already b
 	if err != nil {
 		return "", rw.Report, false, err
 	}
-	if _, err := CompileKernel(rw.Policies, eng); err != nil {
+	_, warnings, err := CompileKernelReport(rw.Policies, eng)
+	if err != nil {
 		return "", rw.Report, false, err
 	}
 
@@ -55,7 +56,11 @@ func MigrateText(name, text string) (out string, report RewriteReport, already b
 	fmt.Fprintf(&b, "// Migrated from legacy Leash policy semantics by `leash policy migrate`.\n")
 	fmt.Fprintf(&b, "// Every policy below is plain Cedar (forbid overrides permit, default deny)\n")
 	fmt.Fprintf(&b, "// and decides exactly like the legacy file did.\n")
-	if lines := rw.Report.Summary(); len(lines) > 0 {
+	lines := rw.Report.Summary()
+	for _, w := range warnings {
+		lines = append(lines, "kernel stricter than Cedar: "+w.String())
+	}
+	if len(lines) > 0 {
 		b.WriteString("//\n")
 		for _, l := range lines {
 			fmt.Fprintf(&b, "// %s\n", strings.ReplaceAll(l, "\n", " "))
