@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-func TestChooseALPN(t *testing.T) {
+func TestChooseALPNDowngradeMode(t *testing.T) {
 	rewriter := NewHeaderRewriter()
 	rewriter.SetRules([]HeaderRewriteRule{{Host: "rewrite.example.com", Header: "X-A", Value: "v"}})
 
@@ -44,6 +44,7 @@ func TestChooseALPN(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			tc.proxy.h2Mode = h2ModeDowngrade
 			d := tc.proxy.chooseALPN(tc.host, tc.offered)
 			if !reflect.DeepEqual(d.nextProto, tc.wantNext) {
 				t.Errorf("nextProto = %v, want %v", d.nextProto, tc.wantNext)
@@ -192,9 +193,10 @@ func entriesWith(capture *capturingBroadcaster, substr string) []string {
 	return out
 }
 
-func TestALPNDowngradesH2ForRewriteHost(t *testing.T) {
+func TestALPNDowngradeModeH2ForRewriteHost(t *testing.T) {
 	origin := newH2TestOrigin(t, true, nil)
 	p := newTestMITM(t)
+	p.h2Mode = h2ModeDowngrade
 	logger, _, capture := newMCPTestLogger(t)
 	p.sharedLogger = logger
 	p.headerRewriter.SetSharedLogger(logger)
@@ -254,9 +256,10 @@ func TestALPNKeepsH2TunnelWithoutRequestFeatures(t *testing.T) {
 	}
 }
 
-func TestALPNDowngradeEnforcesMCPDenyForH2Client(t *testing.T) {
+func TestALPNDowngradeModeEnforcesMCPDenyForH2Client(t *testing.T) {
 	origin := newH2TestOrigin(t, true, nil)
 	p := newTestMITM(t)
+	p.h2Mode = h2ModeDowngrade
 	p.mcpObserver = newMCPObserver(MCPConfig{Mode: MCPModeBasic}, nil)
 	p.SetPolicyChecker(stubPolicyChecker{allowConnect: true, mcp: true, allowMCP: false})
 	proxyAddr := startTestMITM(t, p, origin)
@@ -276,9 +279,10 @@ func TestALPNDowngradeEnforcesMCPDenyForH2Client(t *testing.T) {
 	}
 }
 
-func TestALPNRefusesH2OnlyClientWhenRewriteApplies(t *testing.T) {
+func TestALPNDowngradeModeRefusesH2OnlyClient(t *testing.T) {
 	origin := newH2TestOrigin(t, true, nil)
 	p := newTestMITM(t)
+	p.h2Mode = h2ModeDowngrade
 	logger, _, capture := newMCPTestLogger(t)
 	p.sharedLogger = logger
 	p.headerRewriter.SetRules([]HeaderRewriteRule{{Host: "example.com", Header: "X-Injected", Value: "rewritten"}})

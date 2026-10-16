@@ -63,6 +63,9 @@ type MITMProxy struct {
 	upstreamDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 	// upstreamRootCAs verifies origin certificates; nil means the system roots.
 	upstreamRootCAs *x509.CertPool
+	// h2Mode is LEASH_PROXY_H2: "inspect" (default; "" also means inspect) MITMs
+	// h2 for inspected hosts, "downgrade" offers them only http/1.1 instead.
+	h2Mode string
 }
 
 // dialUpstream opens a TCP connection to an origin, marked on Linux so the
@@ -177,6 +180,7 @@ func NewMITMProxy(port string, headerRewriter *HeaderRewriter, policyChecker Pol
 		sharedLogger:   sharedLogger,
 		httpClient:     httpClient,
 		mcpObserver:    newMCPObserver(mcpCfg, sharedLogger),
+		h2Mode:         loadH2Mode(),
 	}
 	proxy.tlsDialer = proxy.createMarkedTLSConnection
 	proxy.SetPolicyChecker(policyChecker)
@@ -656,12 +660,11 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 	}
 
 	// The ALPN list is chosen per connection from the SNI hostname (issue #57).
-	// Hosts with a request-level feature (header rewrite, MCP policy/observability)
-	// are offered only http/1.1 so their requests go through the inspected
-	// HTTP/1.1 path below; other hosts are offered h2 + http/1.1 so clients using
-	// ALPN (e.g. the Cursor CLI, gRPC) still get h2, which is tunneled
-	// transparently after the handshake instead of being parsed as HTTP/1.1
-	// (which would fail with "malformed HTTP request/response" errors).
+	// Clients offering h2 (e.g. the Cursor CLI, gRPC, curl) get h2: for hosts
+	// with a request-level feature (header rewrite, MCP policy/observability) it
+	// is served by the h2 MITM, otherwise tunneled transparently. With
+	// LEASH_PROXY_H2=downgrade, inspected hosts are offered only http/1.1 instead
+	// so their requests go through the HTTP/1.1 path.
 	tlsConfig := &tls.Config{
 		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 			// Use the SNI (Server Name Indication) to get the correct hostname
@@ -722,14 +725,6 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 	// the SNI preserved for the upstream handshake (issue #154).
 	upstream := p.selectTLSUpstream(actualHostname, originalDest, destHost, destPort, uint16(portNum))
 
-	// Policy passed. If the client negotiated HTTP/2 via ALPN, tunnel transparently
-	// to the origin. Full h2 MITM (framing, HPACK, flow control) is complex; the
-	// tunnel preserves h2 semantics, and the connect policy above already gated it.
-	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
-		p.tunnelH2(tlsConn, upstream)
-		return
-	}
-
 	// Every request on this connection is forwarded to the upstream, which is
 	// authenticated as upstream.serverName on the upstream handshake, so that
 	// is the only host request-level decisions may be made for: the SNI name,
@@ -737,6 +732,19 @@ func (p *MITMProxy) handleTransparentHTTPS(clientConn net.Conn, originalDest str
 	authority := newConnAuthority(upstream.serverName, destPort, actualHostname)
 	// targetHost is the request authority (URL host) sent upstream.
 	targetHost := net.JoinHostPort(authority.host, destPort)
+
+	// Policy passed. If the client negotiated HTTP/2 via ALPN: hosts with a
+	// request-level feature get the h2 MITM (same per-request pipeline as the
+	// HTTP/1.1 loop below); every other host is tunneled transparently, which
+	// preserves h2 semantics — the connect policy above already gated it.
+	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
+		if alpn.mode == alpnModeInspect {
+			p.serveH2(tlsConn, upstream, authority, targetHost)
+			return
+		}
+		p.tunnelH2(tlsConn, upstream)
+		return
+	}
 
 	// Handle HTTP requests over the TLS connection
 	bufferedReader := bufio.NewReader(tlsConn)
