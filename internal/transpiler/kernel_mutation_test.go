@@ -4,6 +4,9 @@ import (
 	"strings"
 	"testing"
 
+	cedarlib "github.com/cedar-policy/cedar-go"
+
+	"github.com/strongdm/leash/internal/engine"
 	"github.com/strongdm/leash/internal/lsm"
 )
 
@@ -59,9 +62,38 @@ forbid (principal, action in Action::"FileOpen", resource == File::"/etc/hosts")
 		}
 	}
 
+	// An exact permit carved out of an excluded FilePrefix: Cedar allows
+	// mutating that one path, the table has no exact allow, so the kernel
+	// denies it and the compiler warns, naming the policy and its line.
+	ps, err := cedarlib.NewPolicySetFromBytes("strict.cedar", []byte(`@leash_semantics("cedar")
+permit (principal, action in Action::"FileOpen", resource) unless { resource in FilePrefix::"/etc/hostname" };
+@leash_semantics("cedar")
+@id("hostname-exact")
+permit (principal, action in Action::"FileOpen", resource == File::"/etc/hostname");`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eng, err := engine.New(ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !eng.DecideMutation("/etc/hostname").Allow {
+		t.Fatal("Cedar allows mutating /etc/hostname")
+	}
+	ir, warnings, err := CompileKernelReport(ps, eng)
+	if err != nil {
+		t.Fatalf("must load: %v", err)
+	}
+	if len(warnings) != 1 || warnings[0].Path != "/etc/hostname" || warnings[0].Policy != "hostname-exact at strict.cedar:3:1" {
+		t.Fatalf("warnings: %+v", warnings)
+	}
+	if got := strings.Join(mutationRules(ir), "|"); got != "allow file.mutate /|deny file.mutate /etc/hostname" {
+		t.Fatalf("mutation rules: %s", got)
+	}
+
 	// A permit nested in a forbid nested in a permit (a legacy exception):
 	// the longest-prefix table expresses it.
-	ir, err := compileKernelText(t, `@leash_semantics("cedar")
+	ir, err = compileKernelText(t, `@leash_semantics("cedar")
 permit (principal, action in Action::"FileOpen", resource in Dir::"/");
 forbid (principal, action in Action::"FileOpen", resource in Dir::"/srv/") unless { resource in Dir::"/srv/ok/" };
 permit (principal, action in Action::"FileOpen", resource in Dir::"/srv/ok/");`)

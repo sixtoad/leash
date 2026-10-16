@@ -103,13 +103,42 @@ type kernelPolicy struct {
 	effect bool // true = permit
 }
 
+// KernelWarning is a place where the kernel tables enforce more strictly
+// than Cedar decides (never more loosely), with the policy that asked for
+// what the kernel cannot grant there.
+type KernelWarning struct {
+	// Policy is the policy reference: its ID and "at file:line:col".
+	Policy  string
+	Path    string
+	Message string
+}
+
+func (w KernelWarning) String() string {
+	return fmt.Sprintf("policy %s: %s: %s", w.Policy, w.Path, w.Message)
+}
+
 // CompileKernel compiles the built-in policies of a strict policy set to
 // kernel tables. eng must be the engine built from the same set; it decides
 // the region representatives.
 func CompileKernel(ps *cedarlib.PolicySet, eng *engine.Engine) (*lsm.PolicySet, error) {
+	out, _, err := CompileKernelReport(ps, eng)
+	return out, err
+}
+
+// CompileKernelReport is CompileKernel, also returning the places where the
+// kernel is stricter than Cedar.
+func CompileKernelReport(ps *cedarlib.PolicySet, eng *engine.Engine) (*lsm.PolicySet, []KernelWarning, error) {
+	out, warnings, err := compileKernel(ps, eng)
+	if err != nil {
+		return nil, nil, err
+	}
+	return out, warnings, nil
+}
+
+func compileKernel(ps *cedarlib.PolicySet, eng *engine.Engine) (*lsm.PolicySet, []KernelWarning, error) {
 	out := &lsm.PolicySet{Open: []lsm.PolicyRule{}, Exec: []lsm.PolicyRule{}, Connect: []lsm.PolicyRule{}, MCP: []lsm.MCPPolicyRule{}}
 	if ps == nil {
-		return out, nil
+		return out, nil, nil
 	}
 	var kps []kernelPolicy
 	for _, id := range orderedIDs(ps) {
@@ -117,7 +146,7 @@ func CompileKernel(ps *cedarlib.PolicySet, eng *engine.Engine) (*lsm.PolicySet, 
 		name := policyRef(id, p)
 		sc, err := engine.ClassifyActions(p)
 		if err != nil {
-			return nil, fmt.Errorf("policy %s: %w", name, err)
+			return nil, nil, fmt.Errorf("policy %s: %w", name, err)
 		}
 		if !sc.Builtin {
 			continue
@@ -125,34 +154,34 @@ func CompileKernel(ps *cedarlib.PolicySet, eng *engine.Engine) (*lsm.PolicySet, 
 		pa := (*xast.Policy)(p.AST())
 		reach, err := reachOf(sc, pa)
 		if err != nil {
-			return nil, fmt.Errorf("policy %s: %w", name, err)
+			return nil, nil, fmt.Errorf("policy %s: %w", name, err)
 		}
 		if !reach.kernel() && !reach.mcp {
 			continue // HttpRewrite configuration
 		}
 		if _, ok := pa.Principal.(xast.ScopeTypeAll); !ok {
-			return nil, fmt.Errorf("policy %s: built-in actions are enforced for the whole workload; the principal cannot be constrained", name)
+			return nil, nil, fmt.Errorf("policy %s: built-in actions are enforced for the whole workload; the principal cannot be constrained", name)
 		}
 		if !reach.kernel() {
 			continue // MCP: userspace only
 		}
 		if _, ok := p.Annotations()[engine.AnnotationExpires]; ok {
-			return nil, fmt.Errorf("policy %s: @expires is not supported on policies the kernel enforces (file, exec, connect)", name)
+			return nil, nil, fmt.Errorf("policy %s: @expires is not supported on policies the kernel enforces (file, exec, connect)", name)
 		}
 		if err := checkKernelScope(pa.Resource); err != nil {
-			return nil, fmt.Errorf("policy %s: %w", name, err)
+			return nil, nil, fmt.Errorf("policy %s: %w", name, err)
 		}
 		for _, c := range pa.Conditions {
 			if err := kernelRefs(c.Body); err != nil {
-				return nil, fmt.Errorf("policy %s: %w", name, err)
+				return nil, nil, fmt.Errorf("policy %s: %w", name, err)
 			}
 			if err := checkKernelExpr(c.Body); err != nil {
-				return nil, fmt.Errorf("policy %s: %w", name, err)
+				return nil, nil, fmt.Errorf("policy %s: %w", name, err)
 			}
 		}
 		if reach.exec {
 			if err := checkExecPathLengths(pa); err != nil {
-				return nil, fmt.Errorf("policy %s: %w", name, err)
+				return nil, nil, fmt.Errorf("policy %s: %w", name, err)
 			}
 		}
 		kps = append(kps, kernelPolicy{name: name, reach: reach, ast: pa, effect: pa.Effect == xast.EffectPermit})
@@ -161,33 +190,35 @@ func CompileKernel(ps *cedarlib.PolicySet, eng *engine.Engine) (*lsm.PolicySet, 
 	var points []pathPoint
 	for _, kp := range kps {
 		if kp.reach.ro || kp.reach.rw || kp.reach.exec {
-			points = append(points, collectPathPoints(kp.ast)...)
+			for _, p := range collectPathPoints(kp.ast) {
+				p.policy = kp.name
+				points = append(points, p)
+			}
 		}
 	}
 	open, err := compileOpenRegions(points, eng)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	mutation, err := compileMutationRules(points, eng)
-	if err != nil {
-		return nil, err
-	}
+	mutation, warnings := compileMutationRules(points, eng)
 	out.Open = append(open, mutation...)
 	out.Exec = compileExecRegions(points, eng)
 
 	if err := compileConnect(kps, out); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return out, nil
+	return out, warnings, nil
 }
 
-// policyRef names a policy in an error: its display ID and, unless it came
-// from a legacy rewrite (whose @leash_source already is a file:line), its
-// position, in the "at file:line:col" form Cedar errors use.
+// policyRef names a policy in an error or warning: its display ID and its
+// position in the "at file:line:col" form Cedar errors use. A policy from a
+// legacy rewrite is placed at its legacy source (@leash_source).
 func policyRef(id cedarlib.PolicyID, p *cedarlib.Policy) string {
 	name := engine.DisplayID(id, p)
-	pos := p.Position()
-	if _, ok := p.Annotations()[engine.AnnotationSource]; !ok && pos.Line > 0 {
+	if src, ok := p.Annotations()[engine.AnnotationSource]; ok && strings.TrimSpace(string(src)) != "" {
+		return fmt.Sprintf("%s at %s:1", name, string(src))
+	}
+	if pos := p.Position(); pos.Line > 0 {
 		return fmt.Sprintf("%s at %s:%d:%d", name, pos.Filename, pos.Line, pos.Column)
 	}
 	return name
@@ -514,8 +545,9 @@ func checkExecPathLengths(pa *xast.Policy) error {
 // pathPoint is a file entity named by a kernel policy: bytes is the path (a
 // Dir with its trailing slash).
 type pathPoint struct {
-	bytes string
-	kind  pointKind
+	bytes  string
+	kind   pointKind
+	policy string // the policy that names it (for warnings)
 }
 
 type pointKind uint8

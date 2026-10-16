@@ -1471,7 +1471,19 @@ func formatCedarErrorForCLI(detail *cedarutil.ErrorDetail) string {
 		return "error: invalid Cedar policy"
 	}
 	var b strings.Builder
-	b.WriteString("error: invalid Cedar policy\n")
+	// A policy that parses but does not compile gets its own header and the
+	// policy it names; a syntax error keeps the Cedar header (#142).
+	switch detail.Code {
+	case "CEDAR_NOT_ENFORCEABLE":
+		b.WriteString("error: policy not enforceable by the kernel\n")
+	case "CEDAR_INVALID_POLICY":
+		b.WriteString("error: invalid policy\n")
+	default:
+		b.WriteString("error: invalid Cedar policy\n")
+	}
+	if detail.Policy != "" {
+		fmt.Fprintf(&b, "policy: %s\n", detail.Policy)
+	}
 	if detail.File != "" {
 		line := detail.Line
 		if line <= 0 {
@@ -1500,6 +1512,9 @@ func formatCedarErrorForCLI(detail *cedarutil.ErrorDetail) string {
 			fmt.Fprintf(&b, " %s", msg)
 		}
 		b.WriteByte('\n')
+	} else if msg := strings.TrimSpace(detail.Message); msg != "" {
+		// Always say why, even without a snippet to point at.
+		fmt.Fprintf(&b, "message: %s\n", msg)
 	}
 	if hint := strings.TrimSpace(detail.Suggestion); hint != "" {
 		fmt.Fprintf(&b, "hint: %s\n", hint)

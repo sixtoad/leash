@@ -23,8 +23,11 @@ import (
 // each), one representative each, top down: a region whose decision
 // differs from the one its nearest enclosing rule gives gets a rule at its
 // point, and a single (an exact File, a directory itself) gets an exact deny
-// where the table would allow it. The table has no exact allow: a single
-// the table would deny but Cedar allows fails the compilation.
+// where the table would allow it. The table has no exact allow: where Cedar
+// allows a mutation of one single path that the table denies around it
+// (e.g. permit == File::"/etc/hostname" carved out of an excluded
+// FilePrefix::"/etc/hostname"), the kernel denies it, and the compiler
+// returns a warning naming the policy and the path.
 //
 // One documented over-denial: below a FilePrefix that does not end in "/"
 // (the strict form of a legacy File rule, e.g. FilePrefix::"/dev/null"),
@@ -38,7 +41,8 @@ type mutationKey struct {
 	allow bool
 }
 
-func compileMutationRules(points []pathPoint, eng *engine.Engine) ([]lsm.PolicyRule, error) {
+func compileMutationRules(points []pathPoint, eng *engine.Engine) ([]lsm.PolicyRule, []KernelWarning) {
+	var warnings []KernelWarning
 	rs := newRegionSet(points, true)
 	var loose []string
 	for _, p := range points {
@@ -132,7 +136,11 @@ func compileMutationRules(points []pathPoint, eng *engine.Engine) ([]lsm.PolicyR
 			exact[s] = true
 			exactOrder = append(exactOrder, s)
 		case want && !got && !inZone(s):
-			return nil, errKernel("directory mutations (mkdir, unlink, rmdir, rename) would be allowed at exactly %s and denied around it: the kernel's mutation table has no exact allow", s)
+			// Over-deny: the kernel is stricter here, never looser.
+			for _, policy := range singlePolicies(points, s) {
+				warnings = append(warnings, KernelWarning{Policy: policy, Path: s,
+					Message: "directory mutations (mkdir, unlink, rmdir, rename) of this path are allowed by Cedar but denied by the kernel: its mutation table has no exact allow"})
+			}
 		}
 	}
 
@@ -147,7 +155,26 @@ func compileMutationRules(points []pathPoint, eng *engine.Engine) ([]lsm.PolicyR
 		// Nothing is mutable; one deny marks the table as compiled.
 		out = append(out, newMutationRule(false, "/", 0))
 	}
-	return out, nil
+	return out, warnings
+}
+
+// singlePolicies returns the policies naming the single s: an exact File s,
+// or the directory Dir::"s/".
+func singlePolicies(points []pathPoint, s string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range points {
+		if (p.kind == pointExact && p.bytes == s) || (p.kind == pointDir && p.bytes == s+"/") {
+			if p.policy != "" && !seen[p.policy] {
+				seen[p.policy] = true
+				out = append(out, p.policy)
+			}
+		}
+	}
+	if len(out) == 0 {
+		out = []string{"(unknown)"}
+	}
+	return out
 }
 
 func newMutationRule(allow bool, path string, kind int32) lsm.PolicyRule {

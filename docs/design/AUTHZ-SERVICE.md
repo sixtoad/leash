@@ -214,10 +214,16 @@ forbidden file cannot be unlinked even in a writable directory.
   region whose decision differs from the one its nearest enclosing rule
   gives gets a rule at its point; a single (an exact `File`, a directory
   itself) gets an exact deny where the table would allow it.
-- **Rejected:** the table has no exact allow, so a mutation Cedar allows at
-  one path that the table can only deny (a directory itself inside a
-  byte-prefix forbid that covers its name, e.g. `forbid FilePrefix::"/a/b"`
-  with `permit Dir::"/a/bc/"`) fails the load with the path named.
+- **Over-denial with a warning:** the table has no exact allow. Where Cedar
+  allows mutating one single path that the table denies around it (an exact
+  permit carved out of an excluded prefix, e.g. `permit ... resource ==
+  File::"/etc/hostname"` next to `unless { resource in
+  FilePrefix::"/etc/hostname" }`), the kernel denies mutations of that path
+  (opens of it are still allowed), and the load logs a warning naming the
+  policy, its line and the path (`transpiler.KernelWarning`; the linter
+  reports it as `kernel_stricter`). Nothing in the mutation table is ever
+  rejected: denying is always possible, and the kernel is only ever
+  stricter than Cedar here, never looser.
 - **Over-denial (documented):** below a `FilePrefix` that does not end in
   `/` (the strict form of a legacy `File` rule, e.g. `FilePrefix::"/dev/null"`),
   paths with a `/` after the prefix but not right after it (`/dev/nullx/y`)
@@ -257,9 +263,9 @@ to longest-prefix matching.
 | Nesting | `TestLegacyRewriteNestingProperty`: alternating forbid/permit chains up to depth 6, shuffled, every open mode and exec | 2000 chains, 360,000 decisions, equal |
 | Layers | `TestLegacyRewriteAcrossLayers`: file + runtime layer rewritten together vs the legacy Manager merge | 1000 pairs, 150,000 decisions, equal |
 | Raw IR layers | `TestLegacyRewriteOfRawIRLayers` | 500 layers, 75,000 decisions, equal |
-| Kernel == Cedar (files, exec) | `TestKernelCompileMatchesCedarForStrictPolicies`: random strict subset policies (exact `File` via `==` and `in`, `FilePrefix`, `Dir`; boolean combinations, actions, `unless`, `is`) through CompileKernel and the real loaders (`OpenLsm`/`ExecLsm`/`ConnectLsm.LoadPolicies`) and the BPF lookup models (the exec model reads the NUL-terminated path), with the mutation table (mkdir/unlink/rmdir/rename, longest-prefix model of the changed `check_mutation_policy`) and the hard-link guard | 2998 sets (2 rejected: an exact mutation allow), 959,360 decisions, equal |
+| Kernel == Cedar (files, exec) | `TestKernelCompileMatchesCedarForStrictPolicies`: random strict subset policies (exact `File` via `==` and `in`, `FilePrefix`, `Dir`; boolean combinations, actions, `unless`, `is`) through CompileKernel and the real loaders (`OpenLsm`/`ExecLsm`/`ConnectLsm.LoadPolicies`) and the BPF lookup models (the exec model reads the NUL-terminated path), with the mutation table (mkdir/unlink/rmdir/rename, longest-prefix model of the changed `check_mutation_policy`) and the hard-link guard | 3000 sets (none rejected), 960,000 decisions; equal, except mutations denied at warned exact paths and below loose `FilePrefix`es (never the reverse) |
 | Kernel == Cedar (connect, IP) | `TestKernelCompileMatchesCedarForConnect` (also checks mutations and links) | 3000 sets, 720,000 decisions, equal |
-| End to end | `TestKernelCompileOfRewrittenLegacyPolicies`: legacy → rewrite → kernel tables (open, exec, connect, mutation, link) vs cedar.Authorize; a rewritten file may only fail on the exact-mutation-allow shape above | 1989 files (11 rejected on that shape), 636,480 decisions, equal |
+| End to end | `TestKernelCompileOfRewrittenLegacyPolicies`: legacy → rewrite → kernel tables (open, exec, connect, mutation, link) vs cedar.Authorize; every rewritten legacy file must compile | 2000 files (13 with a warned exact-path over-denial), 640,000 decisions; equal, except the documented mutation over-denials |
 | Legacy model == kernel | `TestLegacyModel*MatchesKernel*` pin the oracle to the loaders | 5000 sets each |
 | Plugin decisions | `TestPluginDecisionsAreCedarAuthorize`, namespace rule, `@expires`, routing | |
 
@@ -371,9 +377,10 @@ load.
 - **#27**: macOS needs a Swift change.
 - **#28**: only reachable from IR built in code, not from Cedar.
 - **#29**: the mutation table has no exact allow; a mutation Cedar allows at
-  one path that a byte-prefix forbid denies around it fails the load (§3.3).
-  Below a loose `FilePrefix` the kernel may deny mutations Cedar allows
-  (documented over-denial).
+  one single path that the table denies around it is denied by the kernel,
+  with a load-time warning naming the policy and path (§3.3). Below a loose
+  `FilePrefix` the kernel may deny mutations Cedar allows (documented
+  over-denial). The kernel is never looser than Cedar.
 - **Exec argument denies** (line format): no Cedar form; such layers fail.
 
 ## 5. Migration

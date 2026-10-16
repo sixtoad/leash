@@ -182,6 +182,7 @@ type Manager struct {
 	runtimeOnly      bool // when true, active rules are runtime-only (ignore file layer)
 	active           *cedar.Compilation
 	lastRewrite      string
+	lastWarnings     string
 	runtimeMutex     sync.RWMutex
 
 	// applyMutex orders changes: compile, commit and apply happen as one
@@ -316,8 +317,19 @@ func (m *Manager) apply(active *cedar.Compilation) error {
 	return lsmErr
 }
 
-// logRewrite logs what the legacy rewrite changed, once per distinct rewrite.
+// logRewrite logs what the legacy rewrite changed and where the kernel is
+// stricter than Cedar, once per distinct result.
 func (m *Manager) logRewrite(active *cedar.Compilation) {
+	var warnings []string
+	for _, w := range active.Warnings {
+		warnings = append(warnings, w.String())
+	}
+	if key := strings.Join(warnings, "\n"); key != m.lastWarnings {
+		m.lastWarnings = key
+		for _, w := range warnings {
+			log.Printf("policy: warning: kernel stricter than Cedar: %s", w)
+		}
+	}
 	if active.Rewrite == nil {
 		m.lastRewrite = ""
 		return
