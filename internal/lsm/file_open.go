@@ -183,8 +183,11 @@ func validateOpenPolicyRules(policies []OpenPolicyRule) error {
 		if rule.Action != PolicyDeny && rule.Action != PolicyAllow {
 			return fmt.Errorf("invalid file open policy rule %d action: %d", i, rule.Action)
 		}
-		if rule.Operation > OpOpenRW {
+		if rule.Operation > OpOpenRW && rule.Operation != OpMutation {
 			return fmt.Errorf("invalid file open policy rule %d operation: %d", i, rule.Operation)
+		}
+		if rule.Operation == OpMutation && (rule.IsDirectory == 1 || (rule.IsDirectory == ExactPath && rule.Action != PolicyDeny)) {
+			return fmt.Errorf("invalid file mutation rule %d: a prefix, or an exact deny", i)
 		}
 		if rule.IsDirectory == 1 && rule.Path[rule.PathLen-1] != '/' {
 			return fmt.Errorf("invalid file open policy rule %d: directory path must end with '/'", i)
@@ -307,7 +310,7 @@ func rootPathPolicy(rules []OpenPolicyRule) bool {
 	for _, rule := range rules {
 		pathStr := string(bytes.TrimRight(rule.Path[:rule.PathLen], "\x00"))
 		// An exact rule on "/" covers only the root directory itself.
-		if pathStr == "/" && rule.Action == PolicyAllow && rule.IsDirectory != ExactPath {
+		if pathStr == "/" && rule.Action == PolicyAllow && rule.IsDirectory != ExactPath && rule.Operation <= OpOpenRW {
 			return true
 		}
 	}
@@ -677,6 +680,32 @@ func commitPolicyIndexes(mutationStore mutationIndexStore, openStore openIndexSt
 
 func compileMutationIndex(rules []OpenPolicyRule) compiledMutationIndex {
 	index := compiledMutationIndex{denies: make(map[mutationPrefixRuleKey]uint8), allows: make(map[mutationPrefixRuleKey]uint8), selfDenies: make(map[mutationExactRuleKey]uint8)}
+	// Compiled mutation rules are the whole table (#142).
+	compiled := false
+	for _, rule := range rules {
+		if rule.Operation != OpMutation || rule.PathLen == 0 || rule.PathLen > MaxPolicyPathLength {
+			continue
+		}
+		compiled = true
+		if rule.IsDirectory == ExactPath {
+			self := mutationExactRuleKey{PathLen: rule.PathLen}
+			copy(self.Path[:], rule.Path[:rule.PathLen])
+			index.selfDenies[self] = 1
+			continue
+		}
+		// The value is the prefix's specificity: check_mutation_policy
+		// lets the longer of the matching allow and deny win (tie: deny).
+		prefix := mutationPrefixRuleKey{PrefixLen: mutationIndexDomainBits + rule.PathLen*8}
+		copy(prefix.Path[:], rule.Path[:rule.PathLen])
+		if rule.Action == PolicyDeny {
+			index.denies[prefix] = uint8(rule.PathLen)
+		} else {
+			index.allows[prefix] = uint8(rule.PathLen)
+		}
+	}
+	if compiled {
+		return index
+	}
 	for _, rule := range rules {
 		if rule.PathLen == 0 || rule.PathLen > MaxPolicyPathLength {
 			continue

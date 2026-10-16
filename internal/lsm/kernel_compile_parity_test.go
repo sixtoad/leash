@@ -3,6 +3,7 @@ package lsm_test
 import (
 	"fmt"
 	"math/rand"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -139,6 +140,20 @@ func checkKernelParity(t *testing.T, rng *rand.Rand, text string, eng *engine.En
 			}
 		}
 		n++
+		if got, want := k.Link(path), eng.DecideOpen(path, engine.ActionFileOpenReadOnly).Allow; got != want {
+			t.Fatalf("link source %q: kernel=%v cedar=%v\npolicy:\n%s\nrules: %v", path, got, want, text, ruleStrings(ir.Open))
+		}
+		// mkdir/unlink/rmdir/rename: the mutation table vs the two Cedar
+		// decisions it stands for. Below a loose FilePrefix the kernel may be
+		// stricter (documented), never looser.
+		for _, m := range []string{path, path + "/n", path + "n"} {
+			n++
+			got, want := k.Mutation(m), eng.DecideMutation(m).Allow
+			if got != want && !(want && !got && belowLooseFilePrefix(text, m)) {
+				t.Fatalf("mutation %q: kernel=%v cedar=%v\npolicy:\n%s\nrules: %v", m, got, want, text, ruleStrings(ir.Open))
+			}
+		}
+		n++
 		if got, want := k.Exec(path), eng.DecideExec(path).Allow; got != want {
 			t.Fatalf("exec %q: kernel=%v cedar=%v\npolicy:\n%s\nrules: %v", path, got, want, text, ruleStrings(ir.Exec))
 		}
@@ -150,6 +165,21 @@ func checkKernelParity(t *testing.T, rng *rand.Rand, text string, eng *engine.En
 		}
 	}
 	return n
+}
+
+var filePrefixLiteral = regexp.MustCompile(`FilePrefix::"([^"]*)"`)
+
+// belowLooseFilePrefix reports whether path has a "/" after a FilePrefix of
+// the policy that does not end in "/": the documented zone where the
+// kernel's mutation table may deny what Cedar allows.
+func belowLooseFilePrefix(text, path string) bool {
+	for _, m := range filePrefixLiteral.FindAllStringSubmatch(text, -1) {
+		x := m[1]
+		if !strings.HasSuffix(x, "/") && strings.HasPrefix(path, x) && strings.Contains(path[len(x):], "/") {
+			return true
+		}
+	}
+	return false
 }
 
 func ruleStrings(rules []lsm.PolicyRule) []string {
@@ -235,7 +265,7 @@ func TestKernelCompileMatchesCedarForConnect(t *testing.T) {
 // -> RewriteLegacy -> CompileKernel -> kernel loaders == cedar.Authorize.
 func TestKernelCompileOfRewrittenLegacyPolicies(t *testing.T) {
 	rng := rand.New(rand.NewSource(1432))
-	sets, decisions := 0, 0
+	sets, decisions, rejected := 0, 0, 0
 	for i := 0; i < 2000; i++ {
 		var lines []string
 		for n := rng.Intn(8) + 1; n > 0; n-- {
@@ -256,10 +286,21 @@ func TestKernelCompileOfRewrittenLegacyPolicies(t *testing.T) {
 		}
 		ir, err := transpiler.CompileKernel(rw.Policies, eng)
 		if err != nil {
-			t.Fatalf("a rewritten legacy policy must compile for the kernel: %v\nlegacy:\n%s\nstrict:\n%s", err, text, rw.Text)
+			// The only rewritten-legacy shape the kernel cannot enforce: a
+			// mutation Cedar allows at one path (a directory itself) that a
+			// byte-prefix forbid denies around it: the table has no exact
+			// allow.
+			if !strings.Contains(err.Error(), "directory mutations") {
+				t.Fatalf("a rewritten legacy policy must compile for the kernel: %v\nlegacy:\n%s\nstrict:\n%s", err, text, rw.Text)
+			}
+			if rejected == 0 {
+				t.Logf("example rejection: %v\nlegacy:\n%s", err, text)
+			}
+			rejected++
+			continue
 		}
 		sets++
 		decisions += checkKernelParity(t, rng, rw.Text, eng, ir, 40)
 	}
-	t.Logf("%d rewritten legacy sets, %d decisions: kernel == cedar.Authorize", sets, decisions)
+	t.Logf("%d rewritten legacy sets (%d rejected: a mutation allowed at one path the table can only deny), %d decisions: kernel == cedar.Authorize", sets, rejected, decisions)
 }

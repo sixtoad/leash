@@ -101,7 +101,8 @@ func TestManagerRewritesLegacyLayersTogether(t *testing.T) {
 		k[r.String()] = true
 	}
 	// (The forbid is the default deny: pruned.)
-	if !k["allow file.open /work/ok/"] || len(rules.Open) != 1 {
+	// The mutation table comes with them: create and remove below /work/ok/.
+	if !k["allow file.open /work/ok/"] || !k["allow file.mutate /work/ok/"] || len(rules.Open) != 2 {
 		t.Fatalf("kernel rules: %v", rules.Open)
 	}
 }

@@ -26,6 +26,7 @@ func (l LegacyModelForTest) MCP(server, tool string) bool { return l.m.mcpAllowe
 type KernelForTest struct {
 	openIndex      compiledOpenIndex
 	openDefault    bool
+	mutation       compiledMutationIndex
 	exec           []ExecPolicyRule
 	execDefault    bool
 	connect        []ConnectPolicyRuleBPF
@@ -43,6 +44,7 @@ func NewKernelForTest(ps *PolicySet) (*KernelForTest, error) {
 		return nil, err
 	}
 	k.openIndex, k.openDefault = compileOpenIndex(o.policyRules), o.defaultPolicyResult
+	k.mutation = compileMutationIndex(o.policyRules)
 	e := &ExecLsm{}
 	if err := e.LoadPolicies(ConvertToExecRules(ps.Exec)); err != nil {
 		return nil, err
@@ -72,6 +74,16 @@ func NewKernelForTest(ps *PolicySet) (*KernelForTest, error) {
 func (k *KernelForTest) Open(path string, op uint32) bool {
 	return indexedOpenDecision(k.openIndex, k.openDefault, path, op) == PolicyAllow
 }
+
+// Mutation models check_mutation_policy (mkdir, unlink, rmdir, each side of
+// rename) over the compiled mutation index; see mutationDecision.
+func (k *KernelForTest) Mutation(path string) bool {
+	return mutationDecision(k.mutation, path)
+}
+
+// Link models the hard-link guard: the source must be readable (a read-only
+// open through the same index).
+func (k *KernelForTest) Link(source string) bool { return k.Open(source, OpOpenRO) }
 
 func (k *KernelForTest) Exec(path string) bool {
 	return execDecision(k.exec, k.execDefault, path, nil) == PolicyAllow

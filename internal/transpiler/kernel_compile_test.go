@@ -50,6 +50,37 @@ func TestCompileKernelRejectsWhatTheKernelCannotEnforce(t *testing.T) {
 	}
 }
 
+// Exec rules must fit the kernel exec matcher: 64 bytes for a prefix, 63 for
+// an exact path (plus its NUL). The error names the policy and its line.
+func TestCompileKernelChecksExecPathLengths(t *testing.T) {
+	p63 := "/" + strings.Repeat("a", 62)
+	p64 := "/" + strings.Repeat("a", 63)
+	p65 := "/" + strings.Repeat("a", 64)
+	ok := []string{
+		`permit (principal, action == Action::"ProcessExec", resource == File::"` + p63 + `");`,
+		`permit (principal, action == Action::"ProcessExec", resource in FilePrefix::"` + p64 + `");`,
+		`permit (principal, action == Action::"ProcessExec", resource in Dir::"` + p63 + `/");`,
+		// Only exec is limited: a long exact path for file opens is fine.
+		`permit (principal, action in Action::"FileOpen", resource == File::"` + p65 + `");`,
+	}
+	for _, text := range ok {
+		if _, err := compileKernelText(t, "@leash_semantics(\"cedar\")\n"+text); err != nil {
+			t.Errorf("%s: %v", text, err)
+		}
+	}
+	bad := []string{
+		`permit (principal, action == Action::"ProcessExec", resource == File::"` + p64 + `");`,
+		`permit (principal, action == Action::"ProcessExec", resource in FilePrefix::"` + p65 + `");`,
+		`forbid (principal, action, resource) when { resource in Dir::"` + p64 + `/" };`,
+	}
+	for _, text := range bad {
+		_, err := compileKernelText(t, "@leash_semantics(\"cedar\")\n"+text)
+		if err == nil || !strings.Contains(err.Error(), "kernel exec matcher") || !strings.Contains(err.Error(), "strict.cedar:1:1") {
+			t.Errorf("%s\n  got %v", text, err)
+		}
+	}
+}
+
 func TestCompileKernelAcceptsUserspaceOnlyPolicies(t *testing.T) {
 	for _, text := range []string{
 		`permit (principal, action == Action::"McpCall", resource) when { context.server == "mcp.example.com" };`,
@@ -67,14 +98,15 @@ func TestCompileKernelDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ir.Open) != 1 || ir.Open[0].String() != "allow file.open /" || len(ir.Exec) != 1 || !ir.ConnectDefaultAllow || !ir.ConnectDefaultExplicit {
+	if len(ir.Open) != 2 || ir.Open[0].String() != "allow file.open /" || ir.Open[1].String() != "allow file.mutate /" || len(ir.Exec) != 1 || !ir.ConnectDefaultAllow || !ir.ConnectDefaultExplicit {
 		t.Fatalf("permit-all: open=%v exec=%v connect default=%v", ir.Open, ir.Exec, ir.ConnectDefaultAllow)
 	}
 	ir, err = compileKernelText(t, ``)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ir.Open) != 0 || len(ir.Exec) != 0 || ir.ConnectDefaultAllow || !ir.ConnectDefaultExplicit {
+	// Only the mutation table's marker deny: nothing is mutable.
+	if len(ir.Open) != 1 || ir.Open[0].String() != "deny file.mutate /" || len(ir.Exec) != 0 || ir.ConnectDefaultAllow || !ir.ConnectDefaultExplicit {
 		t.Fatalf("empty policy is default deny: %+v", ir)
 	}
 	ir, err = compileKernelText(t, `

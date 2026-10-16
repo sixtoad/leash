@@ -34,8 +34,14 @@ forbid (
 	if cfg.LSMPolicies == nil {
 		t.Fatal("expected LSMPolicies to be populated")
 	}
-	if len(cfg.LSMPolicies.Open) != 1 {
-		t.Fatalf("expected one open rule, got %d", len(cfg.LSMPolicies.Open))
+	open := 0
+	for _, r := range cfg.LSMPolicies.Open {
+		if r.Operation != lsm.OpMutation {
+			open++
+		}
+	}
+	if open != 1 {
+		t.Fatalf("expected one open rule, got %d", open)
 	}
 	// The forbid is the default deny already: the kernel tables compiled from
 	// the strict policy need no exec rule for it (#142).

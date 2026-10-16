@@ -50,6 +50,9 @@ func ConvertPolicyToMacRules(policy *lsm.PolicySet) ([]messages.MacPolicyRule, [
 	}
 
 	for _, rule := range policy.Open {
+		if rule.Operation == lsm.OpMutation {
+			continue // the Linux directory-mutation table; ES derives creates from the open rules
+		}
 		action := actionString(rule.Action)
 		if action == "" {
 			continue
