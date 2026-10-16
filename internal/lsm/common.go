@@ -318,6 +318,13 @@ func parsePolicyLine(line string, lineNum int) (PolicyRule, error) {
 
 		copy(rule.Path[:], resolved)
 		rule.PathLen = int32(len(resolved))
+		// A trailing '/' marks a directory rule, exactly as the Cedar
+		// transpiler marks Dir:: resources ("/x/" with IsDirectory=1). The
+		// flag drives the directory-self match (the rule also covers "/x"
+		// itself) and, for file.open:rw, the in-directory mutation grant.
+		if strings.HasSuffix(resolved, "/") {
+			rule.IsDirectory = 1
+		}
 	}
 
 	// Handle arguments (only for exec operations)
