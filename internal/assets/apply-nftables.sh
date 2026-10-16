@@ -11,7 +11,12 @@
 
 MITM_PORT=${1:-18000}
 LEASH_PORT=${2:-}
+# TARGET_CGROUP is relative to the cgroup2 root (e.g. system.slice/foo.service),
+# which is what nft's `socket cgroupv2` match resolves against. TARGET_CGROUP_LEVEL
+# is its depth below the root; nft compares the socket's ancestor at that level,
+# so it must equal the number of path components or the rule never matches.
 TARGET_CGROUP=${3:-}
+TARGET_CGROUP_LEVEL=${4:-}
 PROXY_MARK=${PROXY_MARK:-0x2000}
 NFT=${NFT:-nft}
 
@@ -85,12 +90,20 @@ ensure_rule inet leash out_route "leash:drop-quic" udp dport 443 drop
 # Uses inet family to cover both IPv4 and IPv6.
 # SECURITY: This is a REQUIRED security control - failure is fatal.
 # Requires --cgroupns=host on the container to see host cgroup paths.
+# The cgroup path must reach nft wrapped in double quotes (nft's own string
+# syntax), hence the literal \" around it below.
 if [ -n "$TARGET_CGROUP" ] && [ -n "$LEASH_PORT" ]; then
+    # Tolerate an absolute-style leading slash and derive the level when the
+    # caller did not supply one.
+    TARGET_CGROUP=${TARGET_CGROUP#/}
+    if [ -z "$TARGET_CGROUP_LEVEL" ]; then
+        TARGET_CGROUP_LEVEL=$(printf '%s\n' "$TARGET_CGROUP" | awk -F/ '{print NF}')
+    fi
     ensure_chain inet leash out_filter { type filter hook output priority 0\; }
     # Check if rule already exists
     if nft_cmd list chain inet leash out_filter 2>/dev/null | grep -F "leash:block-control-plane" >/dev/null; then
         : # Rule already exists, nothing to do
-    elif nft_cmd add rule inet leash out_filter socket cgroupv2 level 1 "$TARGET_CGROUP" tcp dport $LEASH_PORT reject with tcp reset comment "leash:block-control-plane" 2>&1; then
+    elif nft_cmd add rule inet leash out_filter socket cgroupv2 level "$TARGET_CGROUP_LEVEL" "\"$TARGET_CGROUP\"" tcp dport "$LEASH_PORT" reject with tcp reset comment '"leash:block-control-plane"' 2>&1; then
         echo "leash: blocked target cgroup $TARGET_CGROUP from reaching control plane port $LEASH_PORT (nftables)"
     else
         # Fallback: some kernels (notably LinuxKit on Docker Desktop) lack nft_socket cgroupv2 support.

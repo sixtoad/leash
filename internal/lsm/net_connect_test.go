@@ -70,6 +70,11 @@ func TestConnectBPFHooksCanonicalizeSockaddrFields(t *testing.T) {
 			if !strings.Contains(body, "dest_port = bpf_ntohs(") {
 				t.Fatal("port sockaddr field is not converted from network byte order")
 			}
+			// Both hooks receive a kernel copy of the sockaddr; a user read
+			// fails at runtime and the hook falls through to allow.
+			if strings.Contains(body, "bpf_probe_read_user") {
+				t.Fatal("sockaddr is read with bpf_probe_read_user; it is a kernel pointer at this hook")
+			}
 		})
 	}
 }
@@ -199,6 +204,63 @@ func TestConnectEventFormatsCanonicalTCPAndUDPAddresses(t *testing.T) {
 			}
 			if strings.Contains(string(entry), "1.1.168.192") {
 				t.Fatalf("event log contains byte-reversed address: %q", entry)
+			}
+		})
+	}
+}
+
+// The kernel emits struct connect_event with C alignment: result at 56 and
+// dest_hostname at 60. handleEvent decodes with binary.Read, which inserts no
+// padding, so the Go struct must carry it explicitly or a denied event's
+// result bytes leak into the hostname (logged as hostname="\xEF\xBF\xBD").
+func TestConnectEventDecodesKernelLayout(t *testing.T) {
+	var event ConnectEvent
+	if got := unsafe.Offsetof(event.Result); got != 56 {
+		t.Fatalf("ConnectEvent.Result offset = %d, want 56", got)
+	}
+	if got := unsafe.Offsetof(event.DestHostname); got != 60 {
+		t.Fatalf("ConnectEvent.DestHostname offset = %d, want 60", got)
+	}
+
+	for _, tt := range []struct {
+		name, hostname, want, reject string
+	}{
+		{name: "no-dns-entry", want: `addr="192.168.1.1:443" decision=denied`, reject: "hostname="},
+		{name: "dns-entry", hostname: "resolver.test", want: `hostname="resolver.test" decision=denied`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Build the record byte-for-byte as the BPF program lays it out.
+			raw := make([]byte, 192)
+			binary.LittleEndian.PutUint32(raw[0:], 42)
+			copy(raw[24:40], "agent")
+			binary.LittleEndian.PutUint32(raw[40:], 2)
+			binary.LittleEndian.PutUint32(raw[44:], 6)
+			binary.LittleEndian.PutUint32(raw[48:], asymmetricIPv4)
+			binary.LittleEndian.PutUint16(raw[52:], 443)
+			binary.LittleEndian.PutUint32(raw[56:], uint32(0xfffffff3)) // -EACCES
+			copy(raw[60:], tt.hostname)
+
+			logPath := filepath.Join(t.TempDir(), "events.log")
+			logger, err := NewSharedLogger(logPath)
+			if err != nil {
+				t.Fatalf("new logger: %v", err)
+			}
+			t.Cleanup(func() { _ = logger.Close() })
+			loader, err := NewConnectLsm("/test", logger)
+			if err != nil {
+				t.Fatalf("new connect LSM: %v", err)
+			}
+			loader.handleEvent(raw)
+
+			entry, err := os.ReadFile(logPath)
+			if err != nil {
+				t.Fatalf("read event log: %v", err)
+			}
+			if !strings.Contains(string(entry), tt.want) {
+				t.Fatalf("event log %q does not contain %q", entry, tt.want)
+			}
+			if tt.reject != "" && strings.Contains(string(entry), tt.reject) {
+				t.Fatalf("event log %q unexpectedly contains %q", entry, tt.reject)
 			}
 		})
 	}

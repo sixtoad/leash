@@ -173,8 +173,8 @@ func TestTargetWorkloadExecArgsPreserveIdentity(t *testing.T) {
 				cfg:                 config{callerDir: "/workspace", targetContainer: "target"},
 				targetContainerUser: tt.user,
 			}
-			got := r.targetWorkloadExecArgs("-it", "sh", "-lc", "exec id")
-			want := []string{"exec", "-it", "--user", tt.want, "-w", "/workspace", "target", "sh", "-lc", "exec id"}
+			got := r.targetWorkloadExecArgs("-it", "sh", "-c", "exec id")
+			want := []string{"exec", "-it", "--user", tt.want, "-w", "/workspace", "target", "sh", "-c", "exec id"}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("targetWorkloadExecArgs() = %v, want %v", got, want)
 			}
@@ -303,13 +303,13 @@ func TestContainerLauncherWorkloadPathsUseCapturedIdentity(t *testing.T) {
 	}
 
 	_ = l.execCommandWithStdinKind(context.Background(), "bash", "id", false, false)
-	wantNonInteractive := []string{"exec", "-i", "--user", "agent:workers", "-w", "/workspace", "target", "bash", "-lc", "exec id"}
+	wantNonInteractive := []string{"exec", "-i", "--user", "agent:workers", "-w", "/workspace", "target", "bash", "-c", "exec id"}
 	if !reflect.DeepEqual(rt.commands[1], wantNonInteractive) {
 		t.Fatalf("non-interactive argv = %v, want %v", rt.commands[1], wantNonInteractive)
 	}
 
 	_ = l.ExecCommand(context.Background(), "bash", "id", true)
-	wantInteractive := []string{"exec", "-it", "--user", "agent:workers", "-w", "/workspace", "target", "bash", "-lc", "exec id"}
+	wantInteractive := []string{"exec", "-it", "--user", "agent:workers", "-w", "/workspace", "target", "bash", "-c", "exec id"}
 	if !reflect.DeepEqual(rt.commands[2], wantInteractive) {
 		t.Fatalf("interactive argv = %v, want %v", rt.commands[2], wantInteractive)
 	}
@@ -362,7 +362,7 @@ func TestContainerLauncherExecCommandSelectsInputFlag(t *testing.T) {
 			if tt.wantFlag != "" {
 				want = append(want, tt.wantFlag)
 			}
-			want = append(want, "--user", "agent", "-w", "/workspace", "target", "sh", "-lc", "exec cat")
+			want = append(want, "--user", "agent", "-w", "/workspace", "target", "sh", "-c", "exec cat")
 			if !reflect.DeepEqual(rt.commands[0], want) {
 				t.Fatalf("ExecCommand argv = %v, want %v", rt.commands[0], want)
 			}
@@ -603,7 +603,7 @@ func TestManualAttachCommandQuotesImageUser(t *testing.T) {
 		targetContainerUser: "agent;touch/tmp/pwn",
 	}
 	got := r.manualAttachCommand("sh", "printf '%s' ok")
-	want := `docker exec -it --user 'agent;touch/tmp/pwn' -w '/work tree' target sh -lc 'exec printf '"'"'%s'"'"' ok'`
+	want := `docker exec -it --user 'agent;touch/tmp/pwn' -w '/work tree' target sh -c 'exec printf '"'"'%s'"'"' ok'`
 	if got != want {
 		t.Fatalf("manual attach command = %q, want %q", got, want)
 	}

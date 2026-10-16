@@ -20,6 +20,7 @@ package lsm
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -159,6 +160,7 @@ func (l longPathTrees) prepare(t *testing.T) {
 	t.Cleanup(func() {
 		_ = syscall.Unmount(l.mountM, syscall.MNT_DETACH)
 		_ = syscall.Unmount(longPathRoot, syscall.MNT_DETACH)
+		_ = os.Remove(longPathRoot) // the empty mount point on the root fs
 	})
 	for _, dir := range []string{longPathRoot + "/s", longPathRoot + "/e", filepath.Dir(l.blockedA), l.sealedA, l.sealedA + "x",
 		l.dirB, l.siblingB, filepath.Dir(l.file200), filepath.Dir(l.file255), filepath.Dir(l.deepM)} {
@@ -286,13 +288,66 @@ func (l longPathTrees) verifyReload(t *testing.T, openLsm *OpenLsm, cgroupFD int
 	if err := openLsm.LoadPolicies(ConvertToFileOpenRules(set.Open)); err != nil {
 		t.Fatalf("live reload: %v", err)
 	}
+	// The mount-root link cases must target "/" itself (the prefix-stripping
+	// edge case), so the aliases cannot live in a temp dir: name them per run
+	// and remove them so a rerun on the same host starts clean (#144).
+	passwdAlias := fmt.Sprintf("/leash-passwd-alias-%d", os.Getpid())
+	debianAlias := fmt.Sprintf("/leash-debian-alias-%d", os.Getpid())
+	for _, alias := range []string{passwdAlias, debianAlias} {
+		_ = os.Remove(alias)
+		t.Cleanup(func() { _ = os.Remove(alias) })
+	}
 	runBoxCases(t, cgroupFD, []boxCase{
 		{"reload: read short file outside forbidden mount (root allow)", boxRead, []string{l.okA}, true, ""},
 		{"reload: read short file under forbidden 146-byte mount", boxRead, []string{l.shallowM}, false, ""},
 		{"reload: read >255-byte path under forbidden mount (no basename fallback)", boxRead, []string{l.deepM}, false, ""},
 		{"reload: read /etc/passwd under read-only forbid", boxRead, []string{"/etc/passwd"}, false, ""},
-		{"reload: hard-link read-only-forbidden file into / (mount root)", boxLink, []string{"/etc/passwd", "/passwd-alias"}, false, eperm},
-		{"reload: hard-link readable file into / (mount root)", boxLink, []string{"/etc/debian_version", "/debian-alias"}, true, ""},
+		{"reload: hard-link read-only-forbidden file into / (mount root)", boxLink, []string{"/etc/passwd", passwdAlias}, false, eperm},
+		{"reload: hard-link readable file into / (mount root)", boxLink, []string{"/etc/debian_version", debianAlias}, true, ""},
+	})
+}
+
+// loopbackTargets are two 127.0.0.1 ports with live TCP listeners, so a
+// connect that the hook fails to deny succeeds instead of being refused.
+// Only the allowed port has a connect rule; the policy default is deny.
+type loopbackTargets struct {
+	allowedPort, deniedPort int
+}
+
+func newLoopbackTargets(t *testing.T) loopbackTargets {
+	t.Helper()
+	listen := func() int {
+		ln, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen on loopback: %v", err)
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+		return ln.Addr().(*net.TCPAddr).Port
+	}
+	return loopbackTargets{allowedPort: listen(), deniedPort: listen()}
+}
+
+func (l loopbackTargets) allowedAddr() string { return fmt.Sprintf("127.0.0.1:%d", l.allowedPort) }
+func (l loopbackTargets) deniedAddr() string  { return fmt.Sprintf("127.0.0.1:%d", l.deniedPort) }
+
+func (l loopbackTargets) policy() []string {
+	return []string{"allow net.send " + l.allowedAddr()}
+}
+
+func (l loopbackTargets) verify(t *testing.T, cgroupFD int) {
+	t.Helper()
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Fatalf("connect cases need bash for /dev/tcp and /dev/udp: %v", err)
+	}
+	// bash's /dev/tcp and /dev/udp redirections call connect(2); for UDP that
+	// is a connected socket, the path glibc's resolver uses for DNS.
+	const connect = `exec bash -c 'exec 3<>"/dev/$1/127.0.0.1/$2"' bash "$@"`
+	allowed, denied := fmt.Sprint(l.allowedPort), fmt.Sprint(l.deniedPort)
+	runBoxCases(t, cgroupFD, []boxCase{
+		{"tcp connect to permitted loopback port", connect, []string{"tcp", allowed}, true, ""},
+		{"tcp connect to unpermitted loopback port (live listener)", connect, []string{"tcp", denied}, false, ""},
+		{"connected-udp connect to permitted loopback port", connect, []string{"udp", allowed}, true, ""},
+		{"connected-udp connect to unpermitted loopback port", connect, []string{"udp", denied}, false, ""},
 	})
 }
 
@@ -379,7 +434,8 @@ func TestKernelLoadAllModulesWithExecRule(t *testing.T) {
 
 	longPaths := newLongPathTrees()
 	longPaths.prepare(t)
-	policies := kernelLoadPolicySet(t, longPaths.policy()...)
+	loopback := newLoopbackTargets(t)
+	policies := kernelLoadPolicySet(t, append(longPaths.policy(), loopback.policy()...)...)
 	eventLog := filepath.Join(t.TempDir(), "events.log")
 	logger, err := NewSharedLogger(eventLog)
 	if err != nil {
@@ -483,6 +539,10 @@ collect:
 		t.Fatalf("exec /usr/bin/false under an exec deny: want EACCES, got %v", err)
 	}
 
+	// The attached connect hook must enforce TCP and connected-UDP connect(2)
+	// on literal addresses, not only unconnected sendto.
+	loopback.verify(t, int(cgroupDir.Fd()))
+
 	// Long policy paths must be enforced byte-for-byte by the attached
 	// file-open and directory-mutation hooks (issues #108/#109).
 	longPaths.verify(t, int(cgroupDir.Fd()))
@@ -495,6 +555,10 @@ collect:
 		`event=file.open:rw .*path="` + regexp.QuoteMeta(longPaths.sibling255) + `" decision=denied`,
 		`event=file.open:rw .*path="` + regexp.QuoteMeta(longPaths.blockedA) + `" decision=denied`,
 		`event=file.unlink .*path="` + regexp.QuoteMeta(longPaths.dirB+"victim.txt") + `" decision=allowed`,
+		// No DNS-cache entry for loopback: the record must carry no hostname field.
+		`event=net.send .*protocol=tcp addr="` + regexp.QuoteMeta(loopback.allowedAddr()) + `" decision=allowed`,
+		`event=net.send .*protocol=tcp addr="` + regexp.QuoteMeta(loopback.deniedAddr()) + `" decision=denied`,
+		`event=net.send .*protocol=udp addr="` + regexp.QuoteMeta(loopback.deniedAddr()) + `" decision=denied`,
 	}
 	var events []byte
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(250 * time.Millisecond) {
@@ -515,7 +579,10 @@ collect:
 		}
 	}
 	for _, line := range strings.Split(string(events), "\n") {
-		if strings.Contains(line, longPathRoot+"/") && !strings.Contains(line, "proc.exec") {
+		if strings.Contains(line, "event=net.send") && strings.Contains(line, "hostname=") {
+			t.Errorf("FAIL audit: net.send record without a DNS entry carries a hostname: %s", line)
+		}
+		if strings.Contains(line, "event=net.send") || (strings.Contains(line, longPathRoot+"/") && !strings.Contains(line, "proc.exec")) {
 			t.Logf("audit: %s", line)
 		}
 	}
