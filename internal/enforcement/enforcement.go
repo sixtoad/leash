@@ -100,7 +100,17 @@ type Status struct {
 	AllowProxyOnly bool   `json:"allowProxyOnly"`
 	// Reason says why Layer 1 is not active (empty when it is).
 	Reason string `json:"reason,omitempty"`
+	// Layer1Via names who holds the eBPF LSM programs when it is not leashd
+	// itself: "enforcer-daemon" for a rootless run whose programs the
+	// leash enforcer daemon attached (docs/ROOTLESS.md). Empty otherwise.
+	// The level is "lsm" either way: the same programs, compiled from the
+	// same policy.
+	Layer1Via string `json:"layer1Via,omitempty"`
 }
+
+// Layer1ViaEnforcerDaemon is Status.Layer1Via for a rootless run enforced by
+// the leash enforcer daemon.
+const Layer1ViaEnforcerDaemon = "enforcer-daemon"
 
 // LSMListState is what the kernel's active-LSM list says about "bpf". Attach
 // success alone proves nothing: with CONFIG_BPF_LSM=y but bpf absent from the

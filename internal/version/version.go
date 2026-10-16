@@ -126,6 +126,13 @@ const (
 	// default when the eBPF LSM can't attach (issue #117): without the flag a
 	// run refuses to start proxy-only. `--require-lsm` stays accepted.
 	CapabilityAllowProxyOnly = "allow-proxy-only"
+	// CapabilityRootlessDaemon means a rootless podman run gets the eBPF LSM
+	// through the leash enforcer daemon (`leash daemon install|status|
+	// uninstall`, docs/ROOTLESS.md) and reports enforcement=lsm with
+	// layer1Via=enforcer-daemon in the enforcement-ready marker; without a
+	// usable daemon such a run is refused before anything starts unless
+	// --allow-proxy-only is passed.
+	CapabilityRootlessDaemon = "rootless-daemon"
 )
 
 // Enforced policy path limits, in bytes of the resolved path (a directory
@@ -168,6 +175,7 @@ var capabilities = []string{
 	CapabilityContainerResourceLimits,
 	CapabilityAuthzSocket,
 	CapabilityAllowProxyOnly,
+	CapabilityRootlessDaemon,
 }
 
 // Capabilities returns the surface names this build advertises. The slice is a

@@ -25,6 +25,7 @@ import (
 	"github.com/strongdm/leash/internal/authz"
 	"github.com/strongdm/leash/internal/configstore"
 	"github.com/strongdm/leash/internal/enforcement"
+	"github.com/strongdm/leash/internal/enforcerd"
 	"github.com/strongdm/leash/internal/entrypoint"
 	"github.com/strongdm/leash/internal/idmap"
 	"github.com/strongdm/leash/internal/leashd/listen"
@@ -237,6 +238,13 @@ type runner struct {
 	// active on this host ("" when active or not determinable). It can only
 	// narrow the level leashd reports, never raise it.
 	layer1PreflightDown string
+
+	// enforcerSocket is the leash enforcer daemon's socket (host path) when a
+	// rootless podman run is enforced through it; "" otherwise.
+	enforcerSocket string
+	// workloadFinished is set once the workload exited, so the daemon
+	// enforcement watch does not report the normal teardown as a loss.
+	workloadFinished workloadFinishedFlag
 
 	// leashd is the native leashd host-mode process (StartEnforcement), started
 	// in its own process group with a parent-death signal and a reaper. WaitReady
@@ -461,6 +469,7 @@ entrypoint is left running.
 
 Subcommands:
   version [--json]                Print build metadata. --json adds the contract range provisioners check before driving leash.
+  daemon install|status|uninstall The leash enforcer daemon: eBPF LSM enforcement for rootless podman (sudo for install/uninstall; see docs/ROOTLESS.md).
   doctor [--json]                 Report whether this machine can enforce, per runtime. Exits 0 only when a runtime enforces both layers; 3 when one runs proxy-only; 1 when none runs.
 
 Flags:
@@ -1711,6 +1720,9 @@ func (r *runner) startContainers(ctx context.Context) error {
 		return err
 	}
 	if err := r.preflightHostKernel(); err != nil {
+		return err
+	}
+	if err := r.preflightRootless(ctx); err != nil {
 		return err
 	}
 
@@ -3005,6 +3017,13 @@ func (r *runner) launchLeashContainer(ctx context.Context, cgroupPath string) er
 		leashEnv = append(leashEnv, env)
 	}
 
+	// Rootless podman: Layer 1 through the enforcer daemon.
+	if daemonArgs := r.enforcerDaemonArgs(); len(daemonArgs) > 0 {
+		args = append(args, daemonArgs...)
+		leashMounts = append(leashMounts, enforcerSocketDirInContainer)
+		leashEnv = append(leashEnv, enforcerd.EnvSocket+"=<set>")
+	}
+
 	args = append(args, r.cfg.leashImage, "--cgroup", cgroupPath)
 	r.logContainerConfig("leash", leashMounts, leashEnv)
 	return r.launchContainer(ctx, r.cfg.leashContainer, args...)
@@ -3141,7 +3160,11 @@ func (r *runner) waitForEnforcementReady(ctx context.Context) error {
 					r.diagnosticln("Enforcement ready.")
 				}
 			}
-			return r.reportEnforcement(marker)
+			if err := r.reportEnforcement(marker); err != nil {
+				return err
+			}
+			r.watchDaemonEnforcement(ctx)
+			return nil
 		}
 
 		if time.Now().After(deadline) {
@@ -3305,7 +3328,7 @@ func readEnforcementStatus(path string) (enforcement.Status, bool) {
 // formatEnforcementLine is the stable, machine-parseable diagnostic line that
 // states the effective enforcement level ("lsm" | "proxy-only" | "none").
 func formatEnforcementLine(st enforcement.Status) string {
-	return fmt.Sprintf("leash: enforcement=%s layer1=%s layer2=%s", st.Enforcement, st.Layer1, st.Layer2)
+	return fmt.Sprintf("leash: enforcement=%s layer1=%s layer2=%s", st.Enforcement, st.Layer1, st.Layer2) + enforcementVia(st)
 }
 
 // reportEnforcement states the effective enforcement level once the workload
@@ -3490,6 +3513,7 @@ func cleanupContext(ctx context.Context) context.Context {
 // finishLifecycle centralizes teardown so callers only pass the command result and any error;
 // it stops containers unless keepContainers is set and preserves the command's exit semantics.
 func (r *runner) finishLifecycle(ctx context.Context, exitCode int, runErr error) error {
+	r.workloadFinished.Store(true)
 	if r.keepContainers {
 		// Kept containers outlive leash, but the injected helpers are leash's
 		// children and would only be orphaned when it exits (#128). The same
