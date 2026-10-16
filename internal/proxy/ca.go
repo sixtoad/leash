@@ -313,6 +313,13 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		os.Remove(tmpName)
 		return err
 	}
+	// Persist the rename itself so a consumer on another mount (the target
+	// container reads ca-cert.pem over a bind mount) never sees the old or a
+	// missing entry after a crash. Best effort: some shares reject dir fsync.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 	return nil
 }
 

@@ -23,12 +23,25 @@ const (
 	selfCgroupPath = "/proc/self/cgroup"
 	bootstrapPath  = shareRoot + "/" + entrypoint.BootstrapReadyFileName
 	caCertPath     = shareRoot + "/ca-cert.pem"
+
+	// Bounded retry while the shared CA is present but not yet valid
+	// (~10s total with these values).
+	caReadAttempts     = 8
+	caReadInitialDelay = 250 * time.Millisecond
+	caReadMaxDelay     = 2 * time.Second
 )
 
 func main() {
 	if len(os.Args) == 3 && os.Args[1] == "--resolve-identity" {
 		if err := printResolvedIdentity(os.Args[2]); err != nil {
 			os.Stderr.WriteString("leash-error: resolve identity: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) == 3 && os.Args[1] == installCAFlag {
+		if err := runInstallCASubcommand(os.Args[2], os.Stdin); err != nil {
+			os.Stderr.WriteString("leash-error: install CA certificate: " + err.Error() + "\n")
 			os.Exit(1)
 		}
 		return
@@ -85,39 +98,44 @@ func main() {
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	// TODO: install cert as call to self with sudo
-	// TODO: support more than alpine
-
-	// Copy CA cert to system certificates directory
+	// Read and validate the CA in Go. Never copy it with cp: on Docker
+	// Desktop's VMM/virtiofs share the file reports st_blocks == 0 and
+	// SEEK_DATA == EOF, so coreutils' sparse-aware copy writes a same-sized
+	// run of NUL bytes that update-ca-certificates silently skips (#169).
 	os.Stderr.WriteString("leash-entry: installing CA certificate\n")
-	var copyCmd *exec.Cmd
-	if os.Geteuid() == 0 {
-		copyCmd = exec.Command("cp", caCertFile, filepath.Join(certBasePath, "leash-ca.crt"))
-	} else {
-		copyCmd = exec.Command("sudo", "cp", caCertFile, filepath.Join(certBasePath, "leash-ca.crt"))
+	caData, caCert, err := readValidCACert(caCertFile, caReadAttempts, caReadInitialDelay, caReadMaxDelay, time.Sleep)
+	if err != nil {
+		os.Stderr.WriteString("leash-error: " + caCertFile + " is not a valid PEM CA certificate: " + err.Error() + "\n")
+		os.Exit(1)
 	}
-	copyCmd.Stdout = os.Stdout
-	copyCmd.Stderr = os.Stderr
-	if err := copyCmd.Run(); err != nil {
-		os.Stderr.WriteString(err.Error() + "\n")
-		os.Stderr.WriteString("leash-error: failed to copy CA certificate\n")
+	anchorPath := filepath.Join(certBasePath, leashCAFileName)
+	asRoot := os.Geteuid() == 0
+	if asRoot {
+		err = installCAAnchor(anchorPath, caData)
+	} else {
+		err = installCAViaSudo(anchorPath, caData)
+	}
+	if err != nil {
+		os.Stderr.WriteString("leash-error: failed to install CA certificate to " + anchorPath + ": " + err.Error() + "\n")
 		os.Exit(1)
 	}
 
-	// Run update-ca-certificates
 	os.Stderr.WriteString("leash-entry: updating CA certificates\n")
-	var updateCmd *exec.Cmd
-	if os.Geteuid() == 0 {
-		updateCmd = exec.Command(updateCommand)
-	} else {
-		updateCmd = exec.Command("sudo", updateCommand)
-	}
-	updateCmd.Stdout = os.Stdout
-	updateCmd.Stderr = os.Stderr
-	if err := updateCmd.Run(); err != nil {
+	if err := runTrustUpdate(updateCommand, asRoot); err != nil {
 		os.Stderr.WriteString(err.Error() + "\n")
 		os.Stderr.WriteString("leash-error: failed to update CA certificates\n")
 		os.Exit(1)
+	}
+
+	// Only signal bootstrap once the regenerated bundle really trusts the CA;
+	// a silent skip here would leave every TLS client in the container broken.
+	checked, err := verifyTrustBundle(defaultCABundlePaths, caCert)
+	if err != nil {
+		os.Stderr.WriteString("leash-error: " + err.Error() + "\n")
+		os.Exit(1)
+	}
+	if len(checked) == 0 {
+		os.Stderr.WriteString("leash-entry: WARNING: no known CA bundle found; verified only " + anchorPath + "\n")
 	}
 
 	if err := writeBootstrapMarker(); err != nil {
@@ -240,29 +258,8 @@ func writeMarkerAtomic(path string, data []byte) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil && !os.IsExist(err) {
 		return fmt.Errorf("ensure bootstrap dir: %w", err)
 	}
-
-	tmpName := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
-	tmp, err := os.OpenFile(tmpName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return fmt.Errorf("create temp marker: %w", err)
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
+	if err := writeFileAtomic(path, data, 0o644); err != nil {
 		return fmt.Errorf("write marker: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpName)
-		return fmt.Errorf("sync marker: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("close marker: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		os.Remove(tmpName)
-		return fmt.Errorf("commit marker: %w", err)
 	}
 	return nil
 }
