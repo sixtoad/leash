@@ -526,6 +526,20 @@ func (t *CedarToLeashTranspiler) buildConnectRule(rule lsm.PolicyRule, resource 
 	}
 }
 
+// HTTPRewrites returns the header rewrites configured by a policy set's
+// HttpRewrite permits. Rewrites are configuration, not authorization: they
+// read the same in legacy and strict files.
+func (t *CedarToLeashTranspiler) HTTPRewrites(policySet *CedarPolicySet) []proxy.HeaderRewriteRule {
+	out := []proxy.HeaderRewriteRule{}
+	if policySet == nil {
+		return out
+	}
+	for _, policy := range policySet.Policies {
+		out = append(out, t.extractHTTPRewrites(policy)...)
+	}
+	return out
+}
+
 // extractHTTPRewrites builds HTTP rewrite rules from Cedar when action is http.rewrite or Http::ApplyRewrite
 func (t *CedarToLeashTranspiler) extractHTTPRewrites(policy CedarPolicy) []proxy.HeaderRewriteRule {
 	// Only on permit
@@ -702,7 +716,26 @@ func (p *CedarParser) ParseFromNamedString(name, content string) (*CedarPolicySe
 func (p *CedarParser) extractPoliciesFromNativeSet(nativePolicySet *cedarlib.PolicySet) ([]CedarPolicy, error) {
 	policies := make([]CedarPolicy, 0)
 
-	for policyID, nativePolicy := range nativePolicySet.Map() {
+	// PolicySet.Map is a Go map; iterate in source order (then ID) so the
+	// transpiled rule order is the same on every run (#135).
+	policyMap := nativePolicySet.Map()
+	ids := make([]cedarlib.PolicyID, 0, len(policyMap))
+	for policyID := range policyMap {
+		ids = append(ids, policyID)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		a, b := policyMap[ids[i]].Position(), policyMap[ids[j]].Position()
+		if a.Filename != b.Filename {
+			return a.Filename < b.Filename
+		}
+		if a.Offset != b.Offset {
+			return a.Offset < b.Offset
+		}
+		return ids[i] < ids[j]
+	})
+
+	for _, policyID := range ids {
+		nativePolicy := policyMap[policyID]
 		policy, err := p.extractPolicyFromAST(string(policyID), nativePolicy)
 		if err != nil {
 			return nil, fmt.Errorf("failed to extract policy %s: %w", policyID, err)

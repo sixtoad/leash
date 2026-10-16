@@ -162,3 +162,28 @@ func (hr *HeaderRewriter) ApplyRulesForHost(req *http.Request, host string) {
 		}
 	}
 }
+
+// HasRulesForHost reports whether any rewrite rule targets host. It uses the
+// same matching as ApplyRulesForHost (port stripped, normalizeAuthorityHost on
+// both sides) so the proxy can decide, per TLS connection, whether requests
+// to host must be inspected.
+func (hr *HeaderRewriter) HasRulesForHost(host string) bool {
+	if hr == nil {
+		return false
+	}
+	if hostWithoutPort, _, err := net.SplitHostPort(host); err == nil {
+		host = hostWithoutPort
+	}
+	host = normalizeAuthorityHost(host)
+	if host == "" {
+		return false
+	}
+	hr.mutex.RLock()
+	defer hr.mutex.RUnlock()
+	for _, rule := range hr.rules {
+		if normalizeAuthorityHost(rule.Host) == host {
+			return true
+		}
+	}
+	return false
+}

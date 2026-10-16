@@ -214,3 +214,45 @@ func sanitizeAuthorityLog(s string) string {
 	}
 	return b.String()
 }
+
+// tlsUpstream is where the requests of an intercepted TLS connection are
+// sent: the address the proxy dials and the server name it presents (and
+// verifies the origin certificate against) on the upstream handshake.
+type tlsUpstream struct {
+	// addr is the host:port that is dialed.
+	addr string
+	// serverName is the SNI / certificate verification name for the upstream
+	// handshake; request-level decisions are made for this host.
+	serverName string
+	// byName is true when addr names serverName, i.e. the connect policy
+	// permitted the SNI hostname itself.
+	byName bool
+}
+
+// selectTLSUpstream picks the upstream for a TLS connection whose connect
+// policy check (SNI hostname together with the original destination IP) has
+// already passed. The dialed destination must be one the policy actually
+// permitted (issue #154):
+//
+//   - no hostname SNI (none, or an IP literal): dial the original
+//     destination, as before;
+//   - the SNI hostname is permitted on its own (checked without the
+//     destination IP, so IP-bound rules cannot contribute): dial the name, as
+//     before;
+//   - otherwise the permit came from a rule bound to the original destination
+//     IP: dial that IP and keep the SNI for the upstream handshake, so the
+//     origin must still present a valid certificate for the name. The SNI
+//     name is never resolved and dialed, so an IP-only permit cannot be used
+//     to reach whatever host a client-chosen SNI names.
+func (p *MITMProxy) selectTLSUpstream(sni, originalDest, destHost, destPort string, port uint16) tlsUpstream {
+	ipHost := strings.Trim(destHost, "[]")
+	trimmed := strings.Trim(strings.TrimSpace(sni), "[]")
+	if trimmed == "" || net.ParseIP(trimmed) != nil {
+		return tlsUpstream{addr: originalDest, serverName: ipHost}
+	}
+	if p.checkConnectPolicy(sni, "", port) {
+		return tlsUpstream{addr: net.JoinHostPort(sni, destPort), serverName: sni, byName: true}
+	}
+	log.Printf("proxy: SNI %q permitted only via destination %s; dialing the destination with SNI preserved", sanitizeAuthorityLog(sni), originalDest)
+	return tlsUpstream{addr: originalDest, serverName: sni}
+}

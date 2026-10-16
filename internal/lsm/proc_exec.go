@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -104,6 +103,10 @@ func validateExecPolicyRules(policies []ExecPolicyRule) error {
 		if policies[i].PathLen <= 0 || policies[i].PathLen > MaxExecPolicyPathLength {
 			return fmt.Errorf("invalid exec policy rule %d path length: %d (must be 1-%d)", i, policies[i].PathLen, MaxExecPolicyPathLength)
 		}
+		// A NUL may only end the path (an exact-path rule, see ExactPath).
+		if n := bytes.IndexByte(policies[i].Path[:policies[i].PathLen], 0); n >= 0 && n != int(policies[i].PathLen)-1 {
+			return fmt.Errorf("invalid exec policy rule %d path: a NUL byte may only end it", i)
+		}
 	}
 	return nil
 }
@@ -113,13 +116,12 @@ func (l *ExecLsm) LoadPolicies(policies []ExecPolicyRule) error {
 	if err := validateExecPolicyRules(policies); err != nil {
 		return err
 	}
-	l.policyRules = policies
+	l.policyRules = append([]ExecPolicyRule(nil), policies...)
 	l.numPolicyRules = len(policies)
 
-	// Sort policy rules by path length (longest first) for specificity
-	sort.Slice(l.policyRules, func(i, j int) bool {
-		return l.policyRules[i].PathLen > l.policyRules[j].PathLen
-	})
+	// Longest path first; at equal length deny before allow (#135). The BPF
+	// scan takes the first match, so this order is the precedence.
+	sortExecRulesByPrecedence(l.policyRules)
 
 	// Check if root path "/" is allowed to set default policy result
 	l.checkRootPathPolicy()
@@ -153,7 +155,8 @@ func (l *ExecLsm) checkRootPathPolicy() {
 // deny (Cedar's default). Pure, so the decision is unit tested without a kernel.
 func execDefaultAllow(rules []ExecPolicyRule) bool {
 	for _, rule := range rules {
-		pathStr := string(bytes.TrimRight(rule.Path[:rule.PathLen], "\x00"))
+		// Untrimmed: an exact rule on "/" ends in a NUL and covers only "/".
+		pathStr := string(rule.Path[:rule.PathLen])
 		if pathStr == "/" && rule.Action == PolicyAllow {
 			return true
 		}
