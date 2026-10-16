@@ -87,6 +87,9 @@ func CompileString(name, cedar string) (*Compilation, error) {
 	if err != nil {
 		return nil, formatCedarError(err, name, cedar)
 	}
+	if detail := unknownEntityError(name, cedar); detail != nil {
+		return nil, detail
+	}
 	return &Compilation{
 		Cedar:     cedar,
 		Policies:  policies,

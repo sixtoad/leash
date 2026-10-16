@@ -49,8 +49,7 @@ func TestInjectServiceContainer(t *testing.T) {
 
 	shareDir := t.TempDir()
 	policyPath := filepath.Join(t.TempDir(), "policy.cedar")
-	mustWrite(t, policyPath, []byte(`permit (principal, action == Action::"ProcessLaunch", resource)
-when { resource in [ Process::"/bin/sh" ] };`))
+	mustWrite(t, policyPath, []byte(`permit (principal, action == Action::"ProcessExec", resource in Dir::"/");`))
 
 	cmd := exec.Command("timeout", "135", bin, "--inject-service", spec, "--", "sleep", "40")
 	cmd.Env = append(os.Environ(),
