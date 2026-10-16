@@ -180,6 +180,7 @@ mode when the modes differ.
   against the NUL-terminated resolved path, so the NUL matches only where
   the path ends, and the rule (one byte longer) outranks every prefix. No BPF
   change; the 64-byte exec rule limit leaves 63 bytes for an exact path.
+  Both limits are checked at compile time, naming the policy and its line.
 - An exact allow on `/` covers only the root directory; it does not turn
   the kernel default to allow.
 

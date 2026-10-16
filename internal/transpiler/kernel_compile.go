@@ -150,6 +150,11 @@ func CompileKernel(ps *cedarlib.PolicySet, eng *engine.Engine) (*lsm.PolicySet, 
 				return nil, fmt.Errorf("policy %s: %w", name, err)
 			}
 		}
+		if reach.exec {
+			if err := checkExecPathLengths(pa); err != nil {
+				return nil, fmt.Errorf("policy %s: %w", name, err)
+			}
+		}
 		kps = append(kps, kernelPolicy{name: name, reach: reach, ast: pa, effect: pa.Effect == xast.EffectPermit})
 	}
 
@@ -482,6 +487,24 @@ func parseHostID(id string) (hostForm, error) {
 		f.name = host
 	}
 	return f, nil
+}
+
+// checkExecPathLengths rejects the file entities of a policy that can apply
+// to ProcessExec when the kernel's exec matcher could not hold their rule:
+// rules are at most lsm.MaxExecPolicyPathLength bytes, and an exact path
+// takes one more byte for its terminating NUL. Failing here names the
+// policy, instead of the Linux exec loader rejecting the whole load later.
+func checkExecPathLengths(pa *xast.Policy) error {
+	for _, p := range collectPathPoints(pa) {
+		limit, what := lsm.MaxExecPolicyPathLength, "a prefix"
+		if p.kind == pointExact {
+			limit, what = lsm.MaxExecPolicyPathLength-1, "an exact path"
+		}
+		if len(p.bytes) > limit {
+			return errKernel("exec rule %q is %d bytes; the kernel exec matcher holds %s of at most %d bytes", p.bytes, len(p.bytes), what, limit)
+		}
+	}
+	return nil
 }
 
 // pathPoint is a file entity named by a kernel policy: bytes is the path (a
