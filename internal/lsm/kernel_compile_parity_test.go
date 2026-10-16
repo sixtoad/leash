@@ -278,11 +278,7 @@ func TestKernelCompileOfRewrittenLegacyPolicies(t *testing.T) {
 	rng := rand.New(rand.NewSource(1432))
 	sets, decisions, warnedSets := 0, 0, 0
 	for i := 0; i < 2000; i++ {
-		var lines []string
-		for n := rng.Intn(8) + 1; n > 0; n-- {
-			lines = append(lines, randomLegacyPolicy(rng))
-		}
-		text := strings.Join(lines, "\n")
+		text := randomAcceptedLegacyFile(t, rng, "leash.cedar", rng.Intn(8)+1)
 		parsed, err := transpiler.NewCedarParser().ParseFromNamedString("leash.cedar", text)
 		if err != nil {
 			t.Fatal(err)

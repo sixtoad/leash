@@ -97,7 +97,7 @@ func TestRewriteLegacyDeviations(t *testing.T) {
 	rw := rewriteText(t, `
 permit (principal, action == Action::"FileOpenReadOnly", resource) when { resource in [Dir::"/"] };
 permit (principal == User::"alice", action == Action::"ProcessExec", resource) when { resource in [Dir::"/bin/"] && context.tty == true };
-forbid (principal, action == Action::"ProcessExec", resource) unless { resource in [File::"/bin/rm"] };
+forbid (principal, action == Action::"ProcessExec", resource in File::"/bin/rm") unless { resource in [File::"/bin/rmdir"] };
 permit (principal, action == Action::"NetworkConnect", resource == Host::"*");
 forbid (principal, action == Action::"McpCall", resource) when { resource in [MCP::Server::"mcp.evil.com"] };
 permit (principal, action == Action::"McpCall", resource == MCP::Tool::"search");
@@ -128,7 +128,7 @@ permit (principal, action, resource);
 		t.Error("legacy default allow from a read-only \"/\" must carry to writes")
 	}
 	if e.DecideExec("/bin/rm").Allow || e.DecideExec("/bin/rmdir").Allow {
-		t.Error("legacy read `unless { resource in [File::\"/bin/rm\"] }` as when: a byte-prefix forbid")
+		t.Error("legacy read `unless { resource in [File::\"/bin/rmdir\"] }` as when (stricter for a forbid): a byte-prefix forbid")
 	}
 	if !e.DecideMCP("other", "x").Allow || e.DecideMCP("mcp.evil.com", "x").Allow {
 		t.Error("MCP default allow with server forbid")

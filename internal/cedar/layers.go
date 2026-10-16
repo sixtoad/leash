@@ -1,6 +1,7 @@
 package cedar
 
 import (
+	"errors"
 	"fmt"
 
 	cedarlib "github.com/cedar-policy/cedar-go"
@@ -20,7 +21,21 @@ const (
 	PolicyInvalid PolicyKind = "invalid_policy"
 	// PolicyNotEnforceable: a policy the kernel cannot enforce exactly.
 	PolicyNotEnforceable PolicyKind = "not_enforceable"
+	// PolicyUnenforceableCondition: a policy whose condition or principal
+	// constraint no adapter it applies to can enforce, so enforcing it
+	// would allow more than it says (#164).
+	PolicyUnenforceableCondition PolicyKind = "unenforceable_condition"
 )
+
+// policyErrorKind is kind, or PolicyUnenforceableCondition when err is a
+// transpiler.UnenforceableError.
+func policyErrorKind(kind PolicyKind, err error) PolicyKind {
+	var ue *transpiler.UnenforceableError
+	if errors.As(err, &ue) {
+		return PolicyUnenforceableCondition
+	}
+	return kind
+}
 
 // PolicyError is a policy that parses but does not compile. Its message
 // names the policy and its position ("policy <id> at <file>:<line>:<col>").
@@ -104,7 +119,7 @@ func CompileLayers(layers []Layer) (*Compilation, error) {
 	if len(legacy) > 0 {
 		rw, err := transpiler.RewriteLegacy(transpiler.RewriteOptions{Provenance: true, Name: "legacy-rewrite.cedar", OmitGlobalDefaults: len(strict) > 0}, legacy...)
 		if err != nil {
-			return nil, &PolicyError{Kind: PolicyInvalid, Err: err}
+			return nil, &PolicyError{Kind: policyErrorKind(PolicyInvalid, err), Err: err}
 		}
 		comp.Semantics = transpiler.SemanticsLegacy
 		comp.Rewrite = &rw.Report
@@ -125,7 +140,7 @@ func CompileLayers(layers []Layer) (*Compilation, error) {
 	}
 	ir, warnings, err := transpiler.CompileKernelReport(merged, eng)
 	if err != nil {
-		return nil, &PolicyError{Kind: PolicyNotEnforceable, Err: err}
+		return nil, &PolicyError{Kind: policyErrorKind(PolicyNotEnforceable, err), Err: err}
 	}
 	comp.Warnings = warnings
 	comp.Strict = merged

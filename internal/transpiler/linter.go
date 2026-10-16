@@ -1,6 +1,7 @@
 package transpiler
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -53,9 +54,13 @@ func LintFromString(cedar string) (*LintReport, error) {
 	// The load rewrites a legacy file to strict Cedar and compiles it for
 	// the kernel (#142); report what would fail there.
 	rw, err := RewriteLegacy(RewriteOptions{}, LegacyLayer{Name: "policies", Policies: ps})
-	if err != nil {
+	var ue *UnenforceableError
+	switch {
+	case errors.As(err, &ue):
+		issues = append(issues, ue.Issues()...)
+	case err != nil:
 		issues = append(issues, LintIssue{Severity: LintError, Code: "invalid_policy", Message: err.Error()})
-	} else {
+	default:
 		issues = append(issues, lintStrict(rw.Policies)...)
 	}
 	return &LintReport{Issues: issues}, nil
@@ -69,6 +74,10 @@ func lintStrict(ps *cedarlib.PolicySet) []LintIssue {
 		return []LintIssue{{Severity: LintError, Code: "invalid_policy", Message: err.Error()}}
 	}
 	_, warnings, err := CompileKernelReport(ps, eng)
+	var ue *UnenforceableError
+	if errors.As(err, &ue) {
+		return ue.Issues()
+	}
 	if err != nil {
 		return []LintIssue{{Severity: LintError, Code: "not_enforceable", Message: err.Error(), Suggestion: "Policies on file, exec and connect actions may only test resource membership (`resource in ...`) and the action; see docs/design/AUTHZ-SERVICE.md."}}
 	}

@@ -46,7 +46,11 @@ import (
 //     `resource in [...]` and context.hostname, `unless` read as `when`,
 //     policies that lowered to no rule) is reproduced, not reinterpreted:
 //     the rewritten policy carries exactly the rules legacy enforced, and
-//     the report lists every dropped construct.
+//     the report lists every dropped construct. Except where that would
+//     allow more than the policy says (#164, unenforceable.go): a permit
+//     with such a constraint that grants any file, exec or connect rule,
+//     and a forbid that would be enforced on fewer requests than written,
+//     fail the rewrite with an UnenforceableError.
 //   - Plugin-action policies already had Cedar semantics and are kept as
 //     written.
 //
@@ -127,13 +131,18 @@ type legacyUnit struct {
 func RewriteLegacy(opts RewriteOptions, layers ...LegacyLayer) (*Rewrite, error) {
 	rw := &Rewrite{}
 	var units []*legacyUnit
+	var unenforceable []UnenforceableFinding
 	for _, layer := range layers {
 		switch {
 		case layer.Policies != nil:
 			for _, p := range layer.Policies.Policies {
-				u, err := lowerLegacyPolicy(layer.Name, p, &rw.Report)
+				u, finding, err := lowerLegacyPolicy(layer.Name, p, &rw.Report)
 				if err != nil {
 					return nil, err
+				}
+				if finding != nil {
+					unenforceable = append(unenforceable, *finding)
+					continue
 				}
 				if u != nil {
 					units = append(units, u)
@@ -146,6 +155,11 @@ func RewriteLegacy(opts RewriteOptions, layers ...LegacyLayer) (*Rewrite, error)
 			}
 			units = append(units, u)
 		}
+	}
+	if len(unenforceable) > 0 {
+		// #164: enforcing these as legacy semantics did would allow more
+		// than the policies say. Fail the load, naming every one.
+		return nil, &UnenforceableError{Findings: unenforceable}
 	}
 	text, err := emitStrict(units, opts, &rw.Report)
 	if err != nil {
@@ -188,10 +202,13 @@ func keptAnnotations(p *xast.Policy) []xast.AnnotationType {
 	return out
 }
 
-func lowerLegacyPolicy(layer string, p CedarPolicy, report *RewriteReport) (*legacyUnit, error) {
+// lowerLegacyPolicy lowers one legacy policy. A policy legacy semantics
+// cannot enforce as written without allowing more than it says returns a
+// finding instead (#164).
+func lowerLegacyPolicy(layer string, p CedarPolicy, report *RewriteReport) (*legacyUnit, *UnenforceableFinding, error) {
 	native := p.NativePolicy
 	if native == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	pa := (*xast.Policy)(native.AST())
 	u := &legacyUnit{source: policySource(layer, native), annots: keptAnnotations(pa)}
@@ -201,18 +218,20 @@ func lowerLegacyPolicy(layer string, p CedarPolicy, report *RewriteReport) (*leg
 
 	sc, err := engine.ClassifyActions(native)
 	if err != nil {
-		return nil, fmt.Errorf("policy %s at %s:1: %w", engine.DisplayID(cedarlib.PolicyID(p.ID), native), u.source, err)
+		return nil, nil, fmt.Errorf("policy %s at %s:1: %w", engine.DisplayID(cedarlib.PolicyID(p.ID), native), u.source, err)
 	}
 	if len(sc.Namespaces) > 0 {
-		// Plugin actions always had Cedar semantics (#142).
+		// Plugin actions always had Cedar semantics (#142): kept as
+		// written, conditions included; cedar.Authorize evaluates them
+		// with the context the plugin sends.
 		u.verbat = pa
-		return u, nil
+		return u, nil, nil
 	}
 
 	tr := NewCedarToLeashTranspiler()
 	ir, _, err := tr.TranspilePolicySet(&CedarPolicySet{Policies: []CedarPolicy{p}})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	u.open, u.exec, u.connect, u.mcp = ir.Open, ir.Exec, ir.Connect, ir.MCP
 	dropNeverMatching(u, report)
@@ -234,8 +253,19 @@ func lowerLegacyPolicy(layer string, p CedarPolicy, report *RewriteReport) (*leg
 	}
 
 	isMCP := hasMCPCallAction(p)
+	if why := legacyUnenforceable(p, pa, u, isMCP); why != "" {
+		effect := "permit"
+		if p.Effect != Permit {
+			effect = "forbid"
+		}
+		return nil, &UnenforceableFinding{ID: engine.DisplayID(cedarlib.PolicyID(p.ID), native), Policy: legacyFindingRef(layer, p.ID, native), Effect: effect, Reason: why}, nil
+	}
+	stricter := ""
+	if p.Effect != Permit {
+		stricter = "; the forbid applies without it (stricter)"
+	}
 	if !(p.Principal.IsAny && len(p.Principal.InSet) == 0 && p.Principal.Type == "" && p.Principal.ID == "") && !hasRewrite {
-		note("principal constraint ignored: legacy semantics apply built-in policies to every principal")
+		note("principal constraint ignored: legacy semantics apply built-in policies to every principal%s", stricter)
 	}
 	ignored, unlessIn := false, false
 	for _, c := range p.Conditions {
@@ -254,10 +284,10 @@ func lowerLegacyPolicy(layer string, p CedarPolicy, report *RewriteReport) (*leg
 		ignored = true
 	}
 	if unlessIn {
-		note("`unless { resource in [...] }` was read as `when`: the listed resources are the policy's resources")
+		note("`unless { resource in [...] }` was read as `when`: the listed resources are the policy's resources%s", stricter)
 	}
 	if ignored && !(hasRewrite && len(u.open)+len(u.exec)+len(u.connect)+len(u.mcp) == 0) {
-		note("conditions other than `resource in [...]` and context.hostname were ignored by legacy semantics and are dropped")
+		note("conditions other than `resource in [...]` and context.hostname were ignored by legacy semantics and are dropped%s", stricter)
 	}
 	if len(u.open)+len(u.exec)+len(u.connect)+len(u.mcp) == 0 && u.rewrite == nil {
 		switch {
@@ -266,9 +296,9 @@ func lowerLegacyPolicy(layer string, p CedarPolicy, report *RewriteReport) (*leg
 		default:
 			note("policy had no effect under legacy semantics (no supported action and resource); dropped")
 		}
-		return nil, nil
+		return nil, nil, nil
 	}
-	return u, nil
+	return u, nil, nil
 }
 
 func lowerLegacyIR(name string, ir *lsm.PolicySet) (*legacyUnit, error) {

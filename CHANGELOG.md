@@ -123,6 +123,40 @@ Claude Code handling on top.
   read as unqualified good news. The document names the default and the human
   output warns when it is not the runtime the verdict is about.
 
+### Changed — permits with conditions Leash cannot enforce no longer load (#164)
+- **Behavior change for legacy policy files.** Legacy semantics ignored
+  principal constraints and every condition other than a whole
+  `resource in [...]` or `context.hostname ==`/`like` clause, and read
+  `unless` as `when`. A permit carrying such a constraint was enforced
+  without it, so it allowed more than written (for example
+  `permit (...) when { context.tty == true }` granted unconditionally, and
+  `permit (... resource in Dir::"/a/") unless { resource in Dir::"/a/secret/" }`
+  granted `/a/secret/`). The load (leashd, the policy API, the runner's
+  preflight, reloads) now fails instead, naming the policy, its line and the
+  construct (`CEDAR_UNENFORCEABLE_CONDITION`); a reload leaves the previous
+  policy active. A permit that grants no file, exec or connect rule (MCP
+  permits, which were no-ops) is unaffected.
+- **Forbids** without their unenforceable constraint are enforced more
+  broadly, as before (stricter); the rewrite report now says so. A forbid
+  that legacy semantics would have enforced on *fewer* requests than written
+  is rejected too: one whose resources appear only in the ignored condition
+  or in an `unless` (`forbid (principal, action, resource) unless { resource
+  in [File::"/bin/rm"] }` forbade only `/bin/rm`), or an MCP forbid naming
+  servers or tools inside such a condition.
+- **Strict files:** an `McpCall` policy (userspace only) may test only
+  `context.server`, the only context the MCP adapters supply; one reading
+  other context keys, the principal, or entity attributes or tags could never
+  apply as written and is rejected. Kernel-enforced actions already had to
+  stay in the kernel subset. Plugin-action policies keep every condition:
+  the authz socket evaluates them with the context the plugin sends.
+- `leash policy migrate` refuses such a file with the same error, and
+  `LintFromString` (policy API, Control UI) reports each one as
+  `unenforceable_condition`. Fix: drop the constraint to grant
+  unconditionally, narrow the resources, express an exception as a forbid,
+  or mark the file strict (`@leash_semantics("cedar")`), where `unless {
+  resource in [...] }` is enforced as written. Design:
+  [`docs/design/AUTHZ-SERVICE.md`](docs/design/AUTHZ-SERVICE.md) §4.3.
+
 ### Changed — fail closed by default when the eBPF LSM can't attach (#117)
 - **Behavior change.** When the eBPF LSM (Layer 1) cannot attach — kernel
   without an active `bpf` LSM, rootless podman, or no scopable cgroup — leash
