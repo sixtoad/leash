@@ -67,7 +67,7 @@ type PolicyRule struct {
 	Operation   int32 // 0 = open, 1 = open:ro, 2 = open:rw, 3 = exec, 4 = connect
 	PathLen     int32
 	Path        [256]byte
-	IsDirectory int32 // 1 if path ends with /
+	IsDirectory int32 // 1 if path ends with / (prefix plus directory self); ExactPath for an exact-path file-open rule
 
 	// Argument matching (only used for exec operations)
 	ArgCount    int32       // Number of args to match (0 = match any)
@@ -90,6 +90,14 @@ type MCPPolicyRule struct {
 	Server string // empty matches any server
 	Tool   string // empty matches any tool
 }
+
+// ExactPath in PolicyRule.IsDirectory marks a file-open rule that matches
+// exactly its path, nothing below it (#142): it compiles to an entry of the
+// kernel's exact map, with a specificity above any prefix of that path.
+// An exact exec rule instead ends its path with a NUL byte: the exec matcher
+// compares rule bytes against the NUL-terminated resolved path, so the NUL
+// only matches where the path ends.
+const ExactPath = 2
 
 const (
 	PolicyDeny  = 0
@@ -114,6 +122,23 @@ type PolicySet struct {
 	// ConnectDefaultExplicit tracks whether the default posture was explicitly configured in the policy file.
 	ConnectDefaultAllow    bool
 	ConnectDefaultExplicit bool
+}
+
+// Clone returns a copy of the set whose rule slices do not alias ps. Every
+// layer that copies a PolicySet uses it, so a new rule kind cannot be dropped
+// by a copy that forgot it.
+func (ps *PolicySet) Clone() *PolicySet {
+	if ps == nil {
+		return &PolicySet{}
+	}
+	return &PolicySet{
+		Open:                   append([]PolicyRule(nil), ps.Open...),
+		Exec:                   append([]PolicyRule(nil), ps.Exec...),
+		Connect:                append([]PolicyRule(nil), ps.Connect...),
+		MCP:                    append([]MCPPolicyRule(nil), ps.MCP...),
+		ConnectDefaultAllow:    ps.ConnectDefaultAllow,
+		ConnectDefaultExplicit: ps.ConnectDefaultExplicit,
+	}
 }
 
 // String returns the canonical string representation of a PolicyRule

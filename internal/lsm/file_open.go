@@ -186,8 +186,11 @@ func validateOpenPolicyRules(policies []OpenPolicyRule) error {
 		if rule.Operation > OpOpenRW {
 			return fmt.Errorf("invalid file open policy rule %d operation: %d", i, rule.Operation)
 		}
-		if rule.IsDirectory != 0 && rule.Path[rule.PathLen-1] != '/' {
+		if rule.IsDirectory == 1 && rule.Path[rule.PathLen-1] != '/' {
 			return fmt.Errorf("invalid file open policy rule %d: directory path must end with '/'", i)
+		}
+		if rule.IsDirectory > ExactPath {
+			return fmt.Errorf("invalid file open policy rule %d: kind %d", i, rule.IsDirectory)
 		}
 	}
 	return nil
@@ -303,7 +306,8 @@ func (l *OpenLsm) attachCopyUpExitTracepoint(coll *ebpf.Collection) error {
 func rootPathPolicy(rules []OpenPolicyRule) bool {
 	for _, rule := range rules {
 		pathStr := string(bytes.TrimRight(rule.Path[:rule.PathLen], "\x00"))
-		if pathStr == "/" && rule.Action == PolicyAllow {
+		// An exact rule on "/" covers only the root directory itself.
+		if pathStr == "/" && rule.Action == PolicyAllow && rule.IsDirectory != ExactPath {
 			return true
 		}
 	}
@@ -343,6 +347,18 @@ func compileOpenIndex(rules []OpenPolicyRule) compiledOpenIndex {
 			if operation > OpOpenRW {
 				continue
 			}
+			if rule.IsDirectory == ExactPath {
+				// Exact path only: above every prefix of the path (at most
+				// PathLen), level with a directory-self entry.
+				exactKey := openExactRuleKey{Operation: operation, PathLen: rule.PathLen}
+				copy(exactKey.Path[:], rule.Path[:rule.PathLen])
+				exactValue := value
+				exactValue.Specificity = rule.PathLen + 1
+				if existing, exists := index.exact[exactKey]; !exists || overridesOpenIndexRule(exactValue, existing) {
+					index.exact[exactKey] = exactValue
+				}
+				continue
+			}
 			prefixKey := openPrefixRuleKey{
 				PrefixLen: openIndexDomainBits + rule.PathLen*8,
 				Domain:    uint8(operation),
@@ -352,7 +368,7 @@ func compileOpenIndex(rules []OpenPolicyRule) compiledOpenIndex {
 				index.prefix[prefixKey] = value
 			}
 
-			if rule.IsDirectory != 0 && rule.PathLen > 1 && rule.Path[rule.PathLen-1] == '/' {
+			if rule.IsDirectory == 1 && rule.PathLen > 1 && rule.Path[rule.PathLen-1] == '/' {
 				selfKey := openExactRuleKey{
 					Operation: operation,
 					PathLen:   rule.PathLen - 1,
@@ -666,8 +682,17 @@ func compileMutationIndex(rules []OpenPolicyRule) compiledMutationIndex {
 			continue
 		}
 		genericDeny := rule.Operation == OpOpen && rule.Action == PolicyDeny
-		rwDirectory := rule.IsDirectory != 0 && rule.Operation == OpOpenRW
+		rwDirectory := rule.IsDirectory == 1 && rule.Operation == OpOpenRW
 		if !genericDeny && !rwDirectory {
+			continue
+		}
+		if rule.IsDirectory == ExactPath {
+			// An exact deny covers mutations of that path only.
+			if genericDeny {
+				self := mutationExactRuleKey{PathLen: rule.PathLen}
+				copy(self.Path[:], rule.Path[:rule.PathLen])
+				index.selfDenies[self] = 1
+			}
 			continue
 		}
 		prefix := mutationPrefixRuleKey{PrefixLen: mutationIndexDomainBits + rule.PathLen*8}
@@ -678,7 +703,7 @@ func compileMutationIndex(rules []OpenPolicyRule) compiledMutationIndex {
 		if rwDirectory && rule.Action == PolicyAllow {
 			index.allows[prefix] = 1
 		}
-		if genericDeny && rule.IsDirectory != 0 && rule.PathLen > 1 && rule.Path[rule.PathLen-1] == '/' {
+		if genericDeny && rule.IsDirectory == 1 && rule.PathLen > 1 && rule.Path[rule.PathLen-1] == '/' {
 			self := mutationExactRuleKey{PathLen: rule.PathLen - 1}
 			copy(self.Path[:], rule.Path[:rule.PathLen-1])
 			index.selfDenies[self] = 1

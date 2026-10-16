@@ -103,6 +103,10 @@ func validateExecPolicyRules(policies []ExecPolicyRule) error {
 		if policies[i].PathLen <= 0 || policies[i].PathLen > MaxExecPolicyPathLength {
 			return fmt.Errorf("invalid exec policy rule %d path length: %d (must be 1-%d)", i, policies[i].PathLen, MaxExecPolicyPathLength)
 		}
+		// A NUL may only end the path (an exact-path rule, see ExactPath).
+		if n := bytes.IndexByte(policies[i].Path[:policies[i].PathLen], 0); n >= 0 && n != int(policies[i].PathLen)-1 {
+			return fmt.Errorf("invalid exec policy rule %d path: a NUL byte may only end it", i)
+		}
 	}
 	return nil
 }
@@ -147,7 +151,8 @@ func (l *ExecLsm) checkRootPathPolicy() {
 
 	// Check if any rule explicitly allows root path "/"
 	for _, rule := range l.policyRules {
-		pathStr := string(bytes.TrimRight(rule.Path[:rule.PathLen], "\x00"))
+		// Untrimmed: an exact rule on "/" ends in a NUL and covers only "/".
+		pathStr := string(rule.Path[:rule.PathLen])
 		if pathStr == "/" && rule.Action == PolicyAllow {
 			l.defaultPolicyResult = true
 			break

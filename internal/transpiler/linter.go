@@ -6,6 +6,9 @@ import (
 	"strconv"
 	"strings"
 
+	cedarlib "github.com/cedar-policy/cedar-go"
+
+	"github.com/strongdm/leash/internal/engine"
 	"github.com/strongdm/leash/internal/lsm"
 )
 
@@ -39,14 +42,49 @@ func LintFromString(cedar string) (*LintReport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse Cedar: %w", err)
 	}
+	sem, err := DetectSemantics(ps.NativePolicySet)
+	if err != nil {
+		return &LintReport{Issues: []LintIssue{{Severity: LintError, Code: "invalid_semantics_marker", Message: err.Error()}}}, nil
+	}
+	if sem == SemanticsCedar {
+		return &LintReport{Issues: lintStrict(ps.NativePolicySet)}, nil
+	}
 	issues := lintPolicySet(ps)
+	// The load rewrites a legacy file to strict Cedar and compiles it for
+	// the kernel (#142); report what would fail there.
+	rw, err := RewriteLegacy(RewriteOptions{}, LegacyLayer{Name: "policies", Policies: ps})
+	if err != nil {
+		issues = append(issues, LintIssue{Severity: LintError, Code: "invalid_policy", Message: err.Error()})
+	} else {
+		issues = append(issues, lintStrict(rw.Policies)...)
+	}
 	return &LintReport{Issues: issues}, nil
+}
+
+// lintStrict reports what fails the load of a strict-Cedar set: an invalid
+// action scope or annotation, or a construct the kernel cannot enforce.
+func lintStrict(ps *cedarlib.PolicySet) []LintIssue {
+	eng, err := engine.New(ps)
+	if err != nil {
+		return []LintIssue{{Severity: LintError, Code: "invalid_policy", Message: err.Error()}}
+	}
+	if _, err := CompileKernel(ps, eng); err != nil {
+		return []LintIssue{{Severity: LintError, Code: "not_enforceable", Message: err.Error(), Suggestion: "Policies on file, exec and connect actions may only test resource membership (`resource in ...`) and the action; see docs/design/AUTHZ-SERVICE.md."}}
+	}
+	return nil
 }
 
 func lintPolicySet(ps *CedarPolicySet) []LintIssue {
 	var issues []LintIssue
 
 	for _, p := range ps.Policies {
+		// Plugin-action policies have Cedar semantics; they are checked with
+		// the strict set (lintStrict).
+		if p.NativePolicy != nil {
+			if sc, err := engine.ClassifyActions(p.NativePolicy); err == nil && len(sc.Namespaces) > 0 {
+				continue
+			}
+		}
 		// 1) Principal scoping is not enforced in IR (warning to avoid hard blocks)
 		if !p.Principal.IsAny || len(p.Principal.InSet) > 0 || p.Principal.Type != "" || p.Principal.ID != "" {
 			issues = append(issues, LintIssue{

@@ -111,6 +111,14 @@ Statements are evaluated in the order they appear. The first matching rule
 | `Action::"HttpRewrite"`          | `Host::"example.com"`                               | Requires `context.header` and `context.value`. |
 | `Action::"McpCall"`              | `MCP::Server::"host"`, `MCP::Tool::"tool-name"`     | V1: `forbid` enforced; `permit` informational only. |
 
+### Plugin Actions
+
+Actions outside the root `Action::` namespace (for example `Secret::Action::"Read"`) belong to injected plugins, which ask Leash for decisions over the authorization socket. They are evaluated by cedar-go itself, with Cedar semantics (forbid overrides permit, default deny) and the full Cedar language, against only the policies whose action scope names their namespace: a policy with an unconstrained `action` never decides a plugin action. `@id` names a policy in decisions; `@expires("<RFC 3339>")` makes it stop applying at that instant. See `docs/design/AUTHZ-SERVICE.md`.
+
+### Strict Cedar Semantics and `leash policy migrate`
+
+A file whose policies carry `@leash_semantics("cedar")` is read as plain Cedar over Leash's entity hierarchy (see `docs/design/AUTHZ-SERVICE.md` §3): `File::"/p"` is exactly one path, `Dir::"/d/"` a tree (and the directory itself for opens), `FilePrefix::"/q"` every path those bytes prefix. `leash policy migrate <file> [--write]` rewrites a file in the semantics described on this page into that form, with the same decisions: a `forbid` that a more specific `permit` used to override gains an `unless { resource in ... }` exception, a `File::` rule (a byte prefix on this page) becomes `FilePrefix::`, and the MCP and connect defaults become explicit policies.
+
 ### Action→IR Mapping
 
 Leash IR and logs use stable operation strings. Actions map as follows:

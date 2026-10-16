@@ -526,6 +526,20 @@ func (t *CedarToLeashTranspiler) buildConnectRule(rule lsm.PolicyRule, resource 
 	}
 }
 
+// HTTPRewrites returns the header rewrites configured by a policy set's
+// HttpRewrite permits. Rewrites are configuration, not authorization: they
+// read the same in legacy and strict files.
+func (t *CedarToLeashTranspiler) HTTPRewrites(policySet *CedarPolicySet) []proxy.HeaderRewriteRule {
+	out := []proxy.HeaderRewriteRule{}
+	if policySet == nil {
+		return out
+	}
+	for _, policy := range policySet.Policies {
+		out = append(out, t.extractHTTPRewrites(policy)...)
+	}
+	return out
+}
+
 // extractHTTPRewrites builds HTTP rewrite rules from Cedar when action is http.rewrite or Http::ApplyRewrite
 func (t *CedarToLeashTranspiler) extractHTTPRewrites(policy CedarPolicy) []proxy.HeaderRewriteRule {
 	// Only on permit

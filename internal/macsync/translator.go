@@ -40,7 +40,7 @@ func ConvertPolicyToMacRules(policy *lsm.PolicySet) ([]messages.MacPolicyRule, [
 			Kind:   "processExec",
 			Action: action,
 		}
-		if rule.IsDirectory != 0 {
+		if rule.IsDirectory == 1 {
 			macRule.ExecutablePath = "*"
 			macRule.Directory = path
 		} else {
@@ -67,7 +67,7 @@ func ConvertPolicyToMacRules(policy *lsm.PolicySet) ([]messages.MacPolicyRule, [
 			ExecutablePath: "*",
 			CoversCreates:  coversCreates,
 		}
-		if rule.IsDirectory != 0 {
+		if rule.IsDirectory == 1 {
 			macRule.Directory = path
 		} else {
 			macRule.FilePath = path
