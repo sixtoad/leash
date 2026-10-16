@@ -13,14 +13,12 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/strongdm/leash/internal/assets"
@@ -105,6 +103,13 @@ func Main(args []string) error {
 	// Select fail-closed vs degrade-to-proxy for LSM attach failures before any
 	// attach happens.
 	lsm.SetRequireLSM(cfg.RequireLSM)
+
+	// Observe SIGINT/SIGTERM through one sticky process-wide latch from the
+	// start: the LSM attach goroutines (spawned by the initial policy load in
+	// initRuntime) and every later wait share it, so a stop request at any phase
+	// shuts leashd down instead of being swallowed by whichever listener
+	// happened to be registered (#143).
+	lsm.InstallShutdownHandler()
 
 	if err := preFlight(cfg); err != nil {
 		return err
@@ -494,11 +499,19 @@ func (rt *runtimeState) Run() error {
 	}
 
 	if err := rt.waitForBootstrap(); err != nil {
+		if errors.Is(err, errShutdownBeforeBootstrap) {
+			logPolicyEvent("bootstrap.abort", map[string]any{"reason": "shutdown requested"})
+			return nil
+		}
 		return err
 	}
 
 	return rt.activate()
 }
+
+// errShutdownBeforeBootstrap reports that SIGINT/SIGTERM arrived while leashd
+// was still waiting for the bootstrap marker.
+var errShutdownBeforeBootstrap = errors.New("shutdown requested before bootstrap")
 
 func (rt *runtimeState) activate() error {
 	if skipEnforcement() {
@@ -575,7 +588,13 @@ func (rt *runtimeState) waitForBootstrap() error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("bootstrap marker %s not observed within %s", path, rt.cfg.BootstrapTimeout)
 		}
-		time.Sleep(250 * time.Millisecond)
+		select {
+		case <-lsm.ShutdownRequested():
+			// The launcher is tearing down before bootstrap: exit now instead of
+			// waiting out the bootstrap timeout (#143).
+			return errShutdownBeforeBootstrap
+		case <-time.After(250 * time.Millisecond):
+		}
 	}
 }
 
@@ -600,9 +619,8 @@ func readBootstrapMetadata(path string) (map[string]any, error) {
 }
 
 func waitForShutdown() {
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	<-sigChan
+	lsm.InstallShutdownHandler()
+	<-lsm.ShutdownRequested()
 }
 
 func (rt *runtimeState) Close() {
