@@ -17,3 +17,13 @@ func TestBootstrapUsesPublicCert(t *testing.T) {
 		t.Fatalf("CA certificate path %q must remain under %s", caCertPath, shareRoot)
 	}
 }
+
+func TestNonRootBootstrapErrorNamesTheCause(t *testing.T) {
+	t.Parallel()
+	msg := nonRootBootstrapError(1001)
+	for _, want := range []string{"leash-error:", "uid 1001", "container root", "--user 0", "containers.conf"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("message %q lacks %q", msg, want)
+		}
+	}
+}

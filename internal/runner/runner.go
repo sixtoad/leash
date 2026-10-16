@@ -2256,6 +2256,39 @@ func (r *runner) targetWorkloadUser() string {
 	return r.targetContainerUser
 }
 
+// sidecarUsernsArgs makes the podman leash container share the target's user
+// namespace when the target has one of its own (#121); see
+// launchLeashContainer. Podman reports the mode in HostConfig.UsernsMode: ""
+// (or "host") when the container runs in the engine's own user namespace —
+// rootful, or rootless podman's default — where the sidecar already is and
+// cannot setns into it again (EINVAL); "private" for keep-id, auto, nomap and
+// explicit mappings, which the sidecar must join.
+func (r *runner) sidecarUsernsArgs(ctx context.Context) []string {
+	if r.rt().Name() != "podman" {
+		return nil
+	}
+	out, err := r.rt().Output(ctx, "inspect", "--format", "{{.HostConfig.UsernsMode}}", r.cfg.targetContainer)
+	if err != nil {
+		r.debugf("inspect target user namespace mode: %v; leaving the sidecar in the engine's user namespace", err)
+		return nil
+	}
+	if !targetHasOwnUserns(out) {
+		return nil
+	}
+	r.debugf("target %s runs in its own user namespace (%s, e.g. containers.conf userns=keep-id); the leash container joins it", r.cfg.targetContainer, strings.TrimSpace(out))
+	return []string{"--userns", "container:" + r.cfg.targetContainer}
+}
+
+// targetHasOwnUserns interprets podman's HostConfig.UsernsMode.
+func targetHasOwnUserns(mode string) bool {
+	switch strings.TrimSpace(mode) {
+	case "", "host", "<no value>":
+		return false
+	default:
+		return true
+	}
+}
+
 func (r *runner) targetWorkloadIsRoot() bool {
 	user := r.targetWorkloadUser()
 	if idx := strings.IndexByte(user, ':'); idx >= 0 {
@@ -2863,6 +2896,18 @@ func (r *runner) launchLeashContainer(ctx context.Context, cgroupPath string) er
 		"--cap-add", "NET_ADMIN",
 		"--cgroupns=host", // Use host cgroup namespace for iptables cgroup matching
 		"--network", fmt.Sprintf("container:%s", r.cfg.targetContainer),
+	}
+	// Podman: join the target's user namespace too (#121). The leash
+	// container manages the target's network namespace (netfilter rules), which
+	// needs CAP_NET_ADMIN in the user namespace that owns it. With an ambient
+	// `userns = "keep-id"` (containers.conf, a common rootless setting) the
+	// target gets its own user namespace and a sidecar left in the default one
+	// cannot even mount sysfs in the shared netns ("crun: mount sysfs to sys:
+	// Operation not permitted"). Joining the target's namespace needs no change
+	// to the target, so keep-id stays the user's choice. Docker has no
+	// per-container user namespaces to join.
+	args = append(args, r.sidecarUsernsArgs(ctx)...)
+	args = append(args,
 		"-v", "/sys/fs/cgroup:/sys/fs/cgroup:ro",
 		"-v", r.internalBindMountSpec(r.cfg.logDir, "/log", ""),
 		"-v", r.internalBindMountSpec(r.cfg.cfgDir, "/cfg", ""),
@@ -2876,7 +2921,7 @@ func (r *runner) launchLeashContainer(ctx context.Context, cgroupPath string) er
 		"-e", fmt.Sprintf("LEASH_BOOTSTRAP_TIMEOUT=%s", r.cfg.bootstrapTimeout.String()),
 		"-e", fmt.Sprintf("LEASH_DIR=%s", leashPublicMount),
 		"-e", fmt.Sprintf("LEASH_PRIVATE_DIR=%s", leashPrivateMount),
-	}
+	)
 	leashMounts := []string{"/sys/fs/cgroup", "/log", "/cfg", leashPublicMount, leashPrivateMount}
 	// The authz socket dir goes to the leashd container only, never the workload.
 	if err := r.prepareAuthz(); err != nil {

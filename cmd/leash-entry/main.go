@@ -57,7 +57,7 @@ func main() {
 	if os.Geteuid() != 0 {
 		// Check if sudo is available
 		if _, err := exec.LookPath("sudo"); err != nil {
-			os.Stderr.WriteString("leash-error: must run as root or have sudo available\n")
+			os.Stderr.WriteString(nonRootBootstrapError(os.Geteuid()) + "\n")
 			os.Exit(1)
 		}
 	}
@@ -150,6 +150,17 @@ func main() {
 		os.Stderr.WriteString("leash-error: failed to exec: " + err.Error() + "\n")
 		os.Exit(1)
 	}
+}
+
+// nonRootBootstrapError explains a bootstrap that is not running as container
+// root (#121). Leash always starts the target with --user 0 so the CA can be
+// installed into the image's trust store before the workload runs as the image
+// user; reaching this means something overrode that.
+func nonRootBootstrapError(euid int) string {
+	return fmt.Sprintf("leash-error: leash-entry is running as uid %d, not as container root, and sudo is not available: "+
+		"the bootstrap (installing the leash CA into the image trust store) needs container root. "+
+		"Leash starts the target with --user 0; check for a runtime setting that overrides it "+
+		"(for example a containers.conf [containers] user/userns entry, or a wrapper passing --user)", euid)
 }
 
 func printResolvedIdentity(raw string) error {
