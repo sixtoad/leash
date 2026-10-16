@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -64,6 +65,14 @@ func TestMCPObserverCapturesJSONRPCAndSSE(t *testing.T) {
 			SniffLimit:    32 * 1024,
 			SSEEventLimit: 10,
 		}, logger),
+		// Host: mcp.test must resolve to the original destination (the local
+		// test server) for the plain-HTTP authority check (issue #149).
+		lookupIP: func(_ context.Context, host string) ([]net.IP, error) {
+			if host == "mcp.test" {
+				return []net.IP{net.ParseIP("127.0.0.1")}, nil
+			}
+			return nil, fmt.Errorf("unexpected lookup %q", host)
+		},
 	}
 	proxy.SetPolicyChecker(stubPolicyChecker{allowConnect: true})
 

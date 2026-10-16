@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -116,9 +117,16 @@ type options struct {
 	allowDBus       bool            // keep DBUS_SESSION_BUS_ADDRESS + the keyring/D-Bus runtime dir
 	shareIPC        bool            // share the host IPC namespace (e.g. X MIT-SHM)
 	requireLSM      bool            // fail closed if the eBPF LSM can't attach (no proxy-only degrade)
+	loginShell      bool            // --login-shell: (container) run the governed command via `<shell> -lc` (sources /etc/profile)
 	allowNamespaces bool            // skip the seccomp mount/unshare block (reopens the userns bind-mount bypass)
 	injectServices  []injectService // --inject-service: helper plugins to spawn and bind into the box
 	dropUser        string          // --user <name>: explicit native drop-user (overrides $SUDO_USER; "root" opts in to running as root)
+
+	// Target-container resource limits (container runtimes only), raw from the
+	// flags; validated with env/config layers in loadConfig (#116).
+	cpus      string // --cpus
+	memory    string // --memory
+	pidsLimit string // --pids-limit
 }
 
 type idmapVolume struct {
@@ -173,6 +181,13 @@ type config struct {
 	runtime             string
 	requireLSM          bool
 	dropUser            string
+	// loginShell runs the container governed command through a login shell
+	// (`-lc`). Off by default: a login shell sources /etc/profile, which on
+	// Debian/Ubuntu images resets the image's ENV PATH (#120). Container-only:
+	// the native runtime always uses a login shell (nativeWorkloadShellFlag).
+	loginShell bool
+	// resources are the validated target-container limits (#116).
+	resources resourceLimits
 }
 
 type runner struct {
@@ -211,18 +226,21 @@ type runner struct {
 	// netns) rather than a netns with no route out. Native only.
 	nativeEgressFailed bool
 
-	// leashdExited is closed when the native leashd process exits (StartEnforcement
-	// starts a reaper). WaitReady selects on it to fail fast — instead of waiting
-	// out the full readiness timeout — when leashd died before enforcement went
-	// live (e.g. an LSM attach abort under --require-lsm). Nil until enforcement
-	// starts / on non-native backends.
-	leashdExited chan struct{}
+	// leashd is the native leashd host-mode process (StartEnforcement), started
+	// in its own process group with a parent-death signal and a reaper. WaitReady
+	// checks leashd.exited() to fail fast — instead of waiting out the full
+	// readiness timeout — when leashd died before enforcement went live (e.g. an
+	// LSM attach abort under --require-lsm), and every teardown path stops it via
+	// stopLeashd (#143). Nil until enforcement starts / on non-native backends.
+	leashd   *injectedProc
+	leashdMu sync.Mutex // guards leashd
 
 	// injectedPlugins are the --inject-service helper subprocesses (native), run as
 	// the invoking user. injectedEnv are the "VAR=value" pairs that point the
 	// workload at each plugin's socket. injectedCleanup are host paths (sockets) to
 	// remove on teardown. All empty when --inject-service is unused.
-	injectedPlugins []*exec.Cmd
+	injectedPlugins []*injectedProc
+	injectMu        sync.Mutex // guards injectedPlugins
 	injectedEnv     []string
 	injectedCleanup []string
 
@@ -348,6 +366,16 @@ func execute(cmdName string, args []string) error {
 		return err
 	}
 
+	// Backstop: no --inject-service helper may outlive the run, whatever path
+	// returns from here (keepContainers, early errors, ...). Idempotent with the
+	// launchers' Remove.
+	defer r.teardownInjectedPlugins()
+	// Same backstop for native leashd (#143). It used to rely on
+	// exec.CommandContext killing it when the run context was cancelled, but
+	// that kill runs on a goroutine that races os.Exit, so leashd (and its
+	// attached eBPF LSM) could outlive leash. stopLeashd is synchronous.
+	defer r.stopLeashd()
+
 	defer func() {
 		if !r.cfg.workDirIsTemp || r.cfg.workDir == "" || r.keepContainers {
 			return
@@ -382,6 +410,11 @@ func execute(cmdName string, args []string) error {
 				cancel()
 				continue
 			}
+			// Forced exit skips every deferred teardown: kill the injected
+			// helpers and native leashd first so they are not orphaned
+			// (#128, #143).
+			r.killInjectedPluginsNow()
+			r.killLeashdNow()
 			os.Exit(1)
 		}
 	}()
@@ -436,6 +469,10 @@ Flags:
   --network <name>                Attach the agent container to a docker network (e.g. a compose network). The leash container follows it automatically.
   --runtime <docker|podman>       Container runtime CLI to drive (defaults to docker).
   --require-lsm                   Fail if the host kernel can't run the eBPF LSM layer (default: warn and continue proxy-only).
+  --login-shell                   (container) Run the command via a login shell (<shell> -lc), sourcing /etc/profile. Default is a non-login shell (-c), which preserves the image's ENV PATH. Native always uses a login shell.
+  --cpus <n>                      (container) CPU limit for the target container, e.g. 1.5. Also LEASH_CPUS or [leash.resources] cpus.
+  --memory <n[b|k|m|g]>           (container) Hard memory limit for the target container (swap pinned to the same value), e.g. 2g. Also LEASH_MEMORY or [leash.resources] memory.
+  --pids-limit <n>                (container) Max processes in the target container. Also LEASH_PIDS_LIMIT or [leash.resources] pids_limit.
   -V, --verbose                   Enable verbose logging (also set when -v is provided without a mount spec).
 
 Environment variables:
@@ -455,6 +492,10 @@ Environment variables:
   LEASH_EXTRA_ARGS             Additional arguments passed into leash-entry.
   LEASH_CGROUP_PATH            Override cgroup path for the leash container.
   LEASH_REQUIRE_LSM            Truthy to require the eBPF LSM layer (same as --require-lsm).
+  LEASH_LOGIN_SHELL            Truthy to run the container command via a login shell (same as --login-shell).
+  LEASH_CPUS                   Target container CPU limit (same as --cpus).
+  LEASH_MEMORY                 Target container memory limit (same as --memory).
+  LEASH_PIDS_LIMIT             Target container pids limit (same as --pids-limit).
   LEASH_HOME                   Base directory for persisted leash state.
 
 	Persisted mount decisions live at $XDG_CONFIG_HOME/leash/config.toml (or ~/.config/leash/config.toml). Set LEASH_HOME to override this base directory.
@@ -625,6 +666,8 @@ func parseArgs(args []string) (options, error) {
 			opts.shareIPC = true
 		case "--require-lsm":
 			opts.requireLSM = true
+		case "--login-shell":
+			opts.loginShell = true
 		case "--allow-namespaces":
 			opts.allowNamespaces = true
 		case "--inject-service":
@@ -686,6 +729,12 @@ func parseArgs(args []string) (options, error) {
 			if opts.containerName == "" {
 				return opts, fmt.Errorf("container name cannot be empty")
 			}
+			i++
+		case "--cpus", "--memory", "--pids-limit":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for %s", arg)
+			}
+			setResourceFlag(&opts, arg, args[i+1])
 			i++
 		case "--network":
 			if i+1 >= len(args) {
@@ -801,6 +850,12 @@ func parseArgs(args []string) (options, error) {
 					return opts, err
 				}
 				opts.idmapVolumes = append(opts.idmapVolumes, volume)
+			case strings.HasPrefix(arg, "--cpus="), strings.HasPrefix(arg, "--memory="), strings.HasPrefix(arg, "--pids-limit="):
+				name, value, _ := strings.Cut(arg, "=")
+				if strings.TrimSpace(value) == "" {
+					return opts, fmt.Errorf("missing argument for %s", name)
+				}
+				setResourceFlag(&opts, name, value)
 			case strings.HasPrefix(arg, "-e="):
 				value := strings.TrimPrefix(arg, "-e=")
 				if err := appendEnvSpec(&opts, value); err != nil {
@@ -1423,10 +1478,28 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 	// the flag is set or LEASH_REQUIRE_LSM is truthy.
 	cfg.requireLSM = opts.requireLSM || envTruthy("LEASH_REQUIRE_LSM")
 
+	// Container governed-command shell mode: non-login by default so the image's
+	// ENV PATH survives; --login-shell / LEASH_LOGIN_SHELL opt back in. Native
+	// ignores this and always uses a login shell.
+	cfg.loginShell = opts.loginShell || envTruthy("LEASH_LOGIN_SHELL")
+
 	// Explicit native drop-user. Falls back to $SUDO_USER at spawn time (see
 	// workloadUser); a native root run with neither is refused in Preflight so the
 	// workload never runs as root by accident.
 	cfg.dropUser = strings.TrimSpace(opts.dropUser)
+
+	// Target-container resource limits: flag > env > config ([leash.resources],
+	// .leash.toml over the global file). Validated here so garbage fails before
+	// anything is provisioned. The native runtime has no target container, so
+	// limits are refused there rather than silently ignored.
+	resources, err := resolveResourceLimits(opts, cfgData.Resources)
+	if err != nil {
+		return config{}, nil, err
+	}
+	if resources.any() && cfg.runtime == nativeRuntimeName {
+		return config{}, nil, errors.New("resource limits (--cpus/--memory/--pids-limit, LEASH_CPUS/LEASH_MEMORY/LEASH_PIDS_LIMIT, [leash.resources]) apply to the target container only and are not supported by the native runtime; use --runtime docker or podman, or remove the limits")
+	}
+	cfg.resources = resources
 
 	cleanupTemp = false
 	return cfg, resolvedEnv, nil
@@ -2577,6 +2650,8 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 	// bound) and set the workload env var pointing at it. The plugins were already
 	// spawned once by spawnInjectServicesContainer before the launch retry loop.
 	args = append(args, r.injectedDockerArgs...)
+	// Validated CPU/memory/pids limits for the governed workload (#116).
+	args = append(args, r.cfg.resources.dockerArgs()...)
 	for _, svc := range r.opts.injectServices {
 		targetMounts = append(targetMounts, filepath.Dir(svc.socket))
 		targetEnv = append(targetEnv, svc.env+"=unix:path="+svc.socket)
@@ -2950,9 +3025,8 @@ func (r *runner) waitForEnforcementReady(ctx context.Context) error {
 		}
 
 		if state := r.containerSummary(ctx, r.cfg.targetContainer); isTerminalStatus(state) {
-			logs := r.containerLogs(ctx, r.cfg.targetContainer)
-			if logs != "" {
-				return fmt.Errorf("target container terminated before enforcement was ready (state=%s).\nRecent docker logs (%s):\n%s", state, r.cfg.targetContainer, indentLines(logs, "  "))
+			if tbe := r.targetBootstrapFailure(ctx, "before enforcement was ready", nil); tbe != nil {
+				return tbe
 			}
 			return fmt.Errorf("target container terminated before enforcement was ready (state=%s). Inspect docker logs %s", state, r.cfg.targetContainer)
 		}
@@ -2999,11 +3073,12 @@ func (r *runner) containerSummary(ctx context.Context, name string) string {
 }
 
 func (r *runner) containerLogs(ctx context.Context, name string) string {
-	out, err := r.rt().Output(ctx, "logs", "--tail", "200", name)
+	out, err := r.rt().Output(ctx, "logs", "--tail", strconv.Itoa(targetLogTailLines), name)
 	if err != nil {
 		return fmt.Sprintf("unavailable: %v", err)
 	}
-	out = strings.TrimSpace(out)
+	// Bounded and credential-redacted, like the target excerpt (#81).
+	out = sanitizeContainerLogs(out)
 	if out == "" {
 		return "(no output)"
 	}
@@ -3140,6 +3215,17 @@ func (r *runner) execInteractive(ctx context.Context, shellBin, cmd string) (int
 	return 0, err
 }
 
+// workloadShellFlag is the shell flag the container governed command runs
+// under: "-c" (non-login) by default so the target image's ENV PATH is not reset
+// by /etc/profile; "-lc" when the run opted in to a login shell (#120). The
+// native runtime does not use it (see nativeWorkloadShellFlag).
+func (r *runner) workloadShellFlag() string {
+	if r.cfg.loginShell {
+		return "-lc"
+	}
+	return "-c"
+}
+
 // targetWorkloadExecArgs is the single construction point for every
 // workload-facing container exec. Keeping the image identity as its own argv
 // value prevents shell interpretation and keeps shell probing, prechecks, and
@@ -3172,7 +3258,7 @@ func (r *runner) targetWorkloadExecArgsWithEnv(ioFlag string, env []string, comm
 }
 
 func (r *runner) manualAttachCommand(shellBin, cmd string) string {
-	args := append([]string{r.rt().Name()}, r.targetWorkloadExecArgs("-it", shellBin, "-lc", "exec "+cmd)...)
+	args := append([]string{r.rt().Name()}, r.targetWorkloadExecArgs("-it", shellBin, r.workloadShellFlag(), "exec "+cmd)...)
 	return shellJoin(args)
 }
 
@@ -3206,6 +3292,12 @@ func cleanupContext(ctx context.Context) context.Context {
 // it stops containers unless keepContainers is set and preserves the command's exit semantics.
 func (r *runner) finishLifecycle(ctx context.Context, exitCode int, runErr error) error {
 	if r.keepContainers {
+		// Kept containers outlive leash, but the injected helpers are leash's
+		// children and would only be orphaned when it exits (#128). The same
+		// holds for native leashd: as leash's child it must not keep its eBPF
+		// LSM attached after leash exits (#143).
+		r.teardownInjectedPlugins()
+		r.stopLeashd()
 		if runErr != nil {
 			return runErr
 		}
@@ -3496,4 +3588,17 @@ func isSafeShellRune(r rune) bool {
 		return true
 	}
 	return false
+}
+
+// setResourceFlag records a raw --cpus/--memory/--pids-limit value; validation
+// happens in loadConfig with the env/config layers.
+func setResourceFlag(opts *options, name, value string) {
+	switch name {
+	case "--cpus":
+		opts.cpus = value
+	case "--memory":
+		opts.memory = value
+	case "--pids-limit":
+		opts.pidsLimit = value
+	}
 }

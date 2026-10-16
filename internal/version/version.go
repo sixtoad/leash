@@ -103,6 +103,13 @@ const (
 	// enforcement matches over every byte. Longer rules are rejected when the
 	// policy loads (fail closed); none is silently skipped.
 	CapabilityPolicyPathLimits = "policy-path-limits"
+	// CapabilityContainerResourceLimits is the `--cpus`, `--memory` and
+	// `--pids-limit` target-container limits (also LEASH_CPUS / LEASH_MEMORY /
+	// LEASH_PIDS_LIMIT and [leash.resources]). Container runtimes only: the
+	// native runtime refuses them. Once the target starts, the applied limits are
+	// read back from the engine (fail closed on mismatch) and reported on stderr
+	// as an `event=runner.resource-limits status=applied ...` line.
+	CapabilityContainerResourceLimits = "container-resource-limits"
 )
 
 // Enforced policy path limits, in bytes of the resolved path (a directory
@@ -142,6 +149,7 @@ var capabilities = []string{
 	CapabilityResolverContractJSON,
 	CapabilityIDMapVolume,
 	CapabilityPolicyPathLimits,
+	CapabilityContainerResourceLimits,
 }
 
 // Capabilities returns the surface names this build advertises. The slice is a

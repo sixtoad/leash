@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/strongdm/leash/internal/entrypoint"
@@ -167,7 +168,13 @@ func (n nativeLauncher) StartEnforcement(ctx context.Context, cgroupPath string)
 			blocker, strings.Join(argv, " "))
 	}
 
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	// Deliberately NOT exec.CommandContext: its context-driven SIGKILL runs on a
+	// goroutine that races leash's own os.Exit, so a cancelled run could exit
+	// before leashd was killed, leaving it running with the eBPF LSM attached
+	// (#143). The runner owns leashd's lifetime instead: startLeashd puts it in
+	// its own process group with a parent-death signal and a reaper, and every
+	// teardown path stops it via stopLeashd.
+	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = append(os.Environ(), n.leashdEnv()...)
 	// Native runs leashd in the same TTY as the (interactive) workload, so its
 	// ongoing proxy/LSM logs would corrupt the agent's TUI. Send them to a file
@@ -181,24 +188,12 @@ func (n nativeLauncher) StartEnforcement(ctx context.Context, cgroupPath string)
 	} else {
 		n.r.debugf("native: leashd log file %s: %v (discarding leashd output)", n.leashdLogPath(), err)
 	}
-	if err := cmd.Start(); err != nil {
-		if logf != nil {
-			logf.Close()
-		}
+	// The reaper also lets WaitReady fail fast if leashd dies before enforcement
+	// is ready (e.g. leashd os.Exit(1)s on an LSM attach abort under
+	// --require-lsm) instead of blocking for the whole readiness timeout.
+	if err := n.r.startLeashd(cmd, logf); err != nil {
 		return err
 	}
-	// Reap leashd and signal its exit so WaitReady can fail fast if it dies before
-	// enforcement is ready (e.g. leashd os.Exit(1)s on an LSM attach abort under
-	// --require-lsm) instead of blocking for the whole readiness timeout.
-	exited := make(chan struct{})
-	n.r.leashdExited = exited
-	go func() {
-		_ = cmd.Wait()
-		if logf != nil {
-			logf.Close()
-		}
-		close(exited)
-	}()
 	if err := n.injectServices(ctx); err != nil {
 		return err
 	}
@@ -351,17 +346,27 @@ func (r *runner) spawnInjectService(ctx context.Context, svc injectService) erro
 		cmdEnv = append(os.Environ(), r.invokingUserEnv()...)
 		cmdEnv = append(cmdEnv, injectEnv...)
 	}
-	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	// Deliberately NOT exec.CommandContext: cancelling ctx (e.g. on SIGINT/SIGTERM)
+	// would SIGKILL only the direct child (often `runuser`), orphaning the plugin
+	// beneath it. The runner owns the helper's lifetime; teardownInjectedPlugins
+	// stops it on every teardown path (#128).
+	cmd := exec.Command(argv[0], argv[1:]...)
 	if cmdEnv != nil {
 		cmd.Env = cmdEnv
 	}
-	if logf, err := os.Create(r.injectLogPath(svc)); err == nil {
+	logf, err := os.Create(r.injectLogPath(svc))
+	if err == nil {
 		cmd.Stdout, cmd.Stderr = logf, logf
+	} else {
+		logf = nil
 	}
-	if err := cmd.Start(); err != nil {
+	proc, err := startInjectedProc(svc.plugin, cmd, logf)
+	if err != nil {
 		return fmt.Errorf("native: start inject-service plugin %q: %w", svc.plugin, err)
 	}
-	r.injectedPlugins = append(r.injectedPlugins, cmd)
+	r.injectMu.Lock()
+	r.injectedPlugins = append(r.injectedPlugins, proc)
+	r.injectMu.Unlock()
 	r.injectedCleanup = append(r.injectedCleanup, svc.socket)
 	if configFile != "" {
 		r.injectedCleanup = append(r.injectedCleanup, configFile)
@@ -374,6 +379,9 @@ func (r *runner) spawnInjectService(ctx context.Context, svc injectService) erro
 		}
 		if _, err := os.Stat(svc.socket); err == nil {
 			return nil
+		}
+		if proc.exited() {
+			return fmt.Errorf("native: inject-service plugin %q exited before creating socket %s (see %s)", svc.plugin, svc.socket, r.injectLogPath(svc))
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -406,32 +414,35 @@ func (r *runner) spawnInjectServicesContainer(ctx context.Context) error {
 }
 
 // teardownInjectedPlugins stops every injected plugin and removes its socket/config
-// files. Shared by the native and container launchers' Remove. Each plugin is
-// signalled (SIGINT) for a clean teardown, then force-killed after a grace period
-// so teardown can't hang.
+// files. Called from both launchers' Remove and, as a backstop, when Run returns
+// (covering keepContainers and any early-return path), so it is idempotent. Each
+// helper's process group gets SIGTERM, then SIGKILL after injectStopGrace, and the
+// direct child is reaped, so no helper outlives the run (#128).
 func (r *runner) teardownInjectedPlugins() {
-	for _, cmd := range r.injectedPlugins {
-		if cmd == nil || cmd.Process == nil {
-			continue
-		}
-		// Signal (not kill) so the plugin can tear down cleanly, but don't wait
-		// forever: give it a grace period, then force-kill so teardown can't hang.
-		_ = cmd.Process.Signal(os.Interrupt)
-		done := make(chan struct{})
-		go func(c *exec.Cmd) {
-			_ = c.Wait()
-			close(done)
-		}(cmd)
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
+	r.injectMu.Lock()
+	procs := append([]*injectedProc(nil), r.injectedPlugins...)
+	r.injectMu.Unlock()
+	for _, p := range procs {
+		if !p.stop(injectStopGrace, injectKillWait) {
+			r.debugf("inject-service plugin %q (pid %d) did not exit after SIGKILL", p.name, p.cmd.Process.Pid)
 		}
 	}
 	// Remove every injected socket / config file regardless of wait outcome.
 	for _, sock := range r.injectedCleanup {
 		_ = os.Remove(sock)
+	}
+}
+
+// killInjectedPluginsNow SIGKILLs every helper's process group without waiting.
+// Used on the forced-exit path (a second interrupt calls os.Exit, skipping the
+// orderly teardown); safe to call concurrently with teardownInjectedPlugins.
+func (r *runner) killInjectedPluginsNow() {
+	r.injectMu.Lock()
+	defer r.injectMu.Unlock()
+	for _, p := range r.injectedPlugins {
+		if !p.exited() {
+			p.signalGroup(syscall.SIGKILL)
+		}
 	}
 }
 
@@ -542,16 +553,10 @@ func (r *runner) writeInjectConfig(svc injectService) (string, error) {
 
 // leashdDied reports whether the reaped leashd process has already exited.
 func (n nativeLauncher) leashdDied() bool {
-	ch := n.r.leashdExited
-	if ch == nil {
-		return false
-	}
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
+	n.r.leashdMu.Lock()
+	p := n.r.leashd
+	n.r.leashdMu.Unlock()
+	return p != nil && p.exited()
 }
 
 // leashdLogPath is where native tees leashd's stdout/stderr, off the workload's
@@ -739,6 +744,9 @@ func (n nativeLauncher) exportCACert(shareDir string) {
 // partial egress setup still cleans up.
 func (n nativeLauncher) Remove(ctx context.Context) error {
 	n.r.teardownInjectedPlugins()
+	// Stop leashd (detaching its eBPF LSM) before deleting the netns it runs
+	// in (#143).
+	n.r.stopLeashd()
 	if nativeLayer2Enabled && !n.useUserManager() {
 		n.teardownEgress(ctx)
 		_, _ = hostOutput(ctx, "ip", "netns", "del", n.netnsName())
@@ -1060,7 +1068,7 @@ func (n nativeLauncher) workloadCommand(ctx context.Context, cgroupPath, workdir
 	if err != nil {
 		self = ""
 	}
-	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, n.r.workloadUser(), caCert, self, h)
+	inner := nativeWorkloadScript(cgroupPath, workdir, shellBin, nativeWorkloadShellFlag, cmd, n.r.workloadUser(), caCert, self, h)
 	if n.layer2Active() {
 		argv := n.layer2Wrap(inner) // nsenter --net + private mount ns (resolv bind)
 		return exec.CommandContext(ctx, argv[0], argv[1:]...)
@@ -1183,7 +1191,14 @@ func hasEnvKey(env []string, key string) bool {
 	return false
 }
 
-func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, self string, h hardenOpts) string {
+// nativeWorkloadShellFlag keeps the native workload on a login shell. Native
+// leash usually runs under sudo, so its own PATH is root's secure_path; the
+// login shell is what rebuilds the dropped user's PATH (~/.local/bin, nvm, ...)
+// for the agent. The non-login default from #120 is container-only, where the
+// image's ENV PATH is already applied by the runtime's exec.
+const nativeWorkloadShellFlag = "-lc"
+
+func nativeWorkloadScript(cgroupPath, workdir, shellBin, shellFlag, cmd, dropUser, caCert, self string, h hardenOpts) string {
 	procs := quoteShellArg(filepath.Join(cgroupPath, "cgroup.procs"))
 	innerCmd := "exec " + cmd
 	if caCert != "" {
@@ -1199,7 +1214,10 @@ func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, 
 			" REQUESTS_CA_BUNDLE=" + q +
 			" GIT_SSL_CAINFO=" + q + "; " + innerCmd
 	}
-	shellRun := fmt.Sprintf("%s -lc %s", quoteShellArg(shellBin), quoteShellArg(innerCmd))
+	if shellFlag == "" {
+		shellFlag = nativeWorkloadShellFlag
+	}
+	shellRun := fmt.Sprintf("%s %s %s", quoteShellArg(shellBin), shellFlag, quoteShellArg(innerCmd))
 
 	// Scrub the session env vars that leak the keyring/GUI location — unless the
 	// matching allow flag keeps them.
@@ -1281,8 +1299,9 @@ func nativeWorkloadScript(cgroupPath, workdir, shellBin, cmd, dropUser, caCert, 
 
 // hostOutput runs a host command (systemd-run/systemctl/ip), capturing combined
 // output. Native uses host tooling directly, independent of the container
-// Runtime command wrappers.
-func hostOutput(ctx context.Context, name string, args ...string) (string, error) {
+// Runtime command wrappers. A variable so teardown tests can exercise the
+// native Remove without touching the host's netns/iptables/systemd state.
+var hostOutput = func(ctx context.Context, name string, args ...string) (string, error) {
 	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
 	return string(out), err
 }

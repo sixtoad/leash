@@ -96,6 +96,7 @@ type ConnectEvent struct {
 	Protocol     uint32    // IPPROTO_TCP, IPPROTO_UDP
 	DestIP       uint32    // Canonical IPv4 value a<<24|b<<16|c<<8|d
 	DestPort     uint16    // Host-order destination port
+	_            [2]byte   // C alignment padding; binary.Read adds none implicitly
 	Result       int32     // Result of the connect operation (0 = allowed, -EACCES = denied)
 	DestHostname [128]byte // Resolved hostname if available
 }

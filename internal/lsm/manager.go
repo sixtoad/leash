@@ -5,9 +5,8 @@ package lsm
 import (
 	"fmt"
 	"os"
-	"os/signal"
 	"sync"
-	"syscall"
+	"time"
 )
 
 // LSMManager manages multiple LSM programs and handles policy reloading
@@ -35,7 +34,17 @@ type LSMManager struct {
 	attachWG        sync.WaitGroup
 	trackOnce       sync.Once
 	settleWatchOnce sync.Once
+
+	// runWG tracks the attach goroutines for their whole lifetime (attach plus
+	// event loop). Each closes its BPF links when it returns, so LoadAndStart
+	// waits on it at shutdown to detach the programs before leashd exits.
+	runWG sync.WaitGroup
 }
+
+// lsmDetachWait bounds how long LoadAndStart waits at shutdown for the attach
+// goroutines to close their links. The kernel also detaches them when leashd's
+// FDs close on exit, so this only orders the detach; it can never hang shutdown.
+var lsmDetachWait = 3 * time.Second
 
 // SetContainerRootfs enables container layered-root compatibility. Native
 // sessions intentionally leave it disabled and retain actual-user-home policy.
@@ -90,19 +99,44 @@ func (m *LSMManager) StartSettleWatch() {
 }
 
 func (m *LSMManager) LoadAndStart() error {
-	// Set up signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	// The shared sticky latch (shutdown.go) rather than a private
+	// signal.Notify: a signal already consumed by an attach goroutine's event
+	// loop would otherwise leave this wait blocked forever (#143).
+	InstallShutdownHandler()
 
 	fmt.Printf("LSM Manager started. Press Ctrl-C to stop.\n")
 
-	// Wait for shutdown signal
-	select {
-	case <-sigChan:
-		fmt.Printf("Received shutdown signal\n")
-	}
-
+	<-ShutdownRequested()
+	fmt.Printf("Received shutdown signal\n")
+	m.waitDetached(lsmDetachWait)
 	return nil
+}
+
+// goAttach runs one LSM program's attach + event loop in the background,
+// tracked by runWG so shutdown can wait for its links to close.
+func (m *LSMManager) goAttach(fn func()) {
+	m.runWG.Add(1)
+	go func() {
+		defer m.runWG.Done()
+		fn()
+	}()
+}
+
+// waitDetached waits (bounded) for every attach goroutine to return, i.e. for
+// every BPF link to be closed. It reports whether they all returned in time.
+func (m *LSMManager) waitDetached(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		m.runWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		fmt.Fprintf(os.Stderr, "leash: LSM programs did not detach within %s; exiting anyway (the kernel detaches them when leashd exits)\n", timeout)
+		return false
+	}
 }
 
 // ValidateKernelPolicyLimits checks a policy set against the limits the
@@ -147,11 +181,11 @@ func (m *LSMManager) updateOpenLSM(policies *PolicySet) error {
 		}
 
 		m.trackAttach()
-		go func() {
+		m.goAttach(func() {
 			if err := m.openLsm.LoadAndAttach(loadLsmOpen); err != nil {
 				m.handleAttachFailure("file-open", err)
 			}
-		}()
+		})
 	} else {
 		// Update existing policies
 		return m.openLsm.LoadPolicies(ConvertToFileOpenRules(policies.Open))
@@ -181,11 +215,11 @@ func (m *LSMManager) updateExecLSM(policies *PolicySet) error {
 		}
 
 		m.trackAttach()
-		go func() {
+		m.goAttach(func() {
 			if err := m.execLsm.LoadAndAttach(loadLsmExec); err != nil {
 				m.handleAttachFailure("exec", err)
 			}
-		}()
+		})
 	} else {
 		return m.execLsm.LoadPolicies(ConvertToExecRules(policies.Exec))
 	}
@@ -220,11 +254,11 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 		}
 
 		m.trackAttach()
-		go func() {
+		m.goAttach(func() {
 			if err := m.connectLsm.LoadAndAttach(loadLsmConnect); err != nil {
 				m.handleAttachFailure("connect", err)
 			}
-		}()
+		})
 	} else {
 		return m.connectLsm.LoadPolicies(ConvertToConnectRules(policies.Connect), defaultOverride)
 	}
