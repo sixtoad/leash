@@ -335,69 +335,73 @@ func (l *ConnectLsm) LoadAndAttach(loader func() (*ebpf.CollectionSpec, error)) 
 	return LoadAndAttachBPFWithSetup(l, loader, config, customSetup)
 }
 
+// connectMapPutter is the one map operation loadPolicyIntoBPF needs; an
+// *ebpf.Map satisfies it, and tests substitute an in-memory model.
+type connectMapPutter interface {
+	Put(key, value interface{}) error
+}
+
 func (l *ConnectLsm) loadPolicyIntoBPF(coll *ebpf.Collection) error {
-	// Always load the default policy result into BPF map
+	return l.writePolicyMaps(func(name string) connectMapPutter {
+		if m := coll.Maps[name]; m != nil {
+			return m
+		}
+		return nil
+	})
+}
+
+// writePolicyMaps pushes the current policy into the connect maps. The rule
+// count is ALWAYS written — including zero — so a reload that drops to no
+// connect rules (or whose hostnames all fail to resolve) retires the
+// previously loaded kernel rules instead of leaving them live (#118 review).
+// Rules are written before the count so a growing set never exposes
+// unwritten slots; entries beyond the count are ignored by the program.
+func (l *ConnectLsm) writePolicyMaps(lookup func(string) connectMapPutter) error {
+	get := func(name string) (connectMapPutter, error) {
+		m := lookup(name)
+		if m == nil {
+			return nil, fmt.Errorf("BPF map %s not found", name)
+		}
+		return m, nil
+	}
+
 	key := uint32(0)
 	defaultResult := uint32(0) // Default to deny
 	if l.defaultPolicyResult {
 		defaultResult = uint32(1) // Allow
 	}
-	if err := coll.Maps["connect_default_policy"].Put(&key, &defaultResult); err != nil {
+	defMap, err := get("connect_default_policy")
+	if err != nil {
+		return err
+	}
+	if err := defMap.Put(&key, &defaultResult); err != nil {
 		return fmt.Errorf("failed to update connect_default_policy map: %w", err)
 	}
 
-	if l.numPolicyRules == 0 {
-		fmt.Printf("No connect policy rules to load, using default policy result: %v\n", l.defaultPolicyResult)
-		return nil
+	numMap, err := get("connect_num_rules")
+	if err != nil {
+		return err
 	}
 
-	// Load the number of rules
+	if l.numPolicyRules > 0 {
+		rulesMap, err := get("connect_policy_rules")
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Loading %d connect policy rules into BPF maps...\n", l.numPolicyRules)
+		for i := 0; i < l.numPolicyRules; i++ {
+			if err := rulesMap.Put(uint32(i), &l.policyRules[i]); err != nil {
+				return fmt.Errorf("failed to update connect_policy_rules map for rule %d: %w", i, err)
+			}
+		}
+	} else {
+		fmt.Printf("No connect policy rules to load, using default policy result: %v\n", l.defaultPolicyResult)
+	}
+
 	numRules := int32(l.numPolicyRules)
-	if err := coll.Maps["connect_num_rules"].Put(&key, &numRules); err != nil {
+	if err := numMap.Put(&key, &numRules); err != nil {
 		return fmt.Errorf("failed to update connect_num_rules map: %w", err)
 	}
-
-	fmt.Printf("Loading %d connect policy rules into BPF maps...\n", l.numPolicyRules)
-
-	// Load each policy rule
-	for i := 0; i < l.numPolicyRules; i++ {
-		if err := coll.Maps["connect_policy_rules"].Put(uint32(i), &l.policyRules[i]); err != nil {
-			return fmt.Errorf("failed to update connect_policy_rules map for rule %d: %w", i, err)
-		}
-
-		// actionStr := "deny"
-		// if l.policyRules[i].Action == PolicyAllow {
-		// 	actionStr = "allow"
-		// }
-
-		// var targetStr string
-		// if l.policyRules[i].DestIP != 0 {
-		// 	// IP-based rule
-		// 	ip := make(net.IP, 4)
-		// 	binary.BigEndian.PutUint32(ip, l.policyRules[i].DestIP)
-		// 	targetStr = ip.String()
-		// } else if l.policyRules[i].HostnameLen > 0 {
-		// 	// Hostname-based rule
-		// 	hostname := string(bytes.TrimRight(l.policyRules[i].Hostname[:], "\x00"))
-		// 	targetStr = hostname
-		// } else {
-		// 	targetStr = "*" // Any destination
-		// }
-
-		// portStr := ""
-		// if l.policyRules[i].DestPort != 0 {
-		// 	portStr = fmt.Sprintf(":%d", l.policyRules[i].DestPort)
-		// }
-
-		// wildcardStr := ""
-		// if l.policyRules[i].IsWildcard == 1 {
-		// 	wildcardStr = " (wildcard)"
-		// }
-
-		// fmt.Printf("Loaded connect rule %d: %s connect %s%s%s\n", i, actionStr, targetStr, portStr, wildcardStr)
-	}
-
-	// fmt.Printf("Successfully loaded all connect policy rules into BPF\n")
 	return nil
 }
 

@@ -156,10 +156,19 @@ Claude Code handling on top.
   this also denies DNS and loopback from the target unless the resolver /
   address is permitted. Policies that relied on the old implicit allow must add
   explicit `NetworkConnect` permits.
+- **Connect policy reloads that drop to zero kernel rules now take effect.**
+  The rule count was only written when there were rules, so removing the last
+  connect rule (or a reload whose hostnames all failed to resolve) left the
+  previously loaded kernel rules live — the kernel kept allowing an IP the
+  proxy already denied. The count is now always written.
+- **Known limitation: IPv6 egress is not enforced by the connect LSM.** Both
+  hooks (`socket_connect`, `socket_sendmsg`) allow every non-`AF_INET` socket,
+  so IPv6 connections from the target are not denied by the kernel layer,
+  with or without connect rules.
 - **Behavior change — file opens and execs are denied when a policy has no
   file / exec rules.** The kernel file-open LSM (which also carries the
   directory-mutation and link hooks) and the exec LSM are now always created
-  and attached, like the connect LSM above (#139). Previously a policy with no
+  and attached, like the connect LSM (#118; this is #139). Previously a policy with no
   `FileOpen*` rules (or no `ProcessExec` rules) never attached that program, so
   the whole category was unenforced, while removing the last rule from an
   already-attached program denied it. The kernel default is now Cedar's:

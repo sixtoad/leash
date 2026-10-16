@@ -131,3 +131,102 @@ func TestUpdateConnectLSMCreatesWithoutConnectRules(t *testing.T) {
 	}
 	m.attachWG.Wait()
 }
+
+// fakeConnectMaps models the three connect policy maps and the kernel's
+// check_connect_policy lookup (lsm_connect.bpf.c) over them.
+type fakeConnectMaps struct {
+	defaultPolicy uint32
+	numRules      int32
+	numSet        bool
+	rules         map[uint32]ConnectPolicyRuleBPF
+}
+
+type fakeMap struct {
+	put func(key, value interface{}) error
+}
+
+func (f fakeMap) Put(key, value interface{}) error { return f.put(key, value) }
+
+func (f *fakeConnectMaps) lookup(name string) connectMapPutter {
+	switch name {
+	case "connect_default_policy":
+		return fakeMap{func(_, v interface{}) error { f.defaultPolicy = *v.(*uint32); return nil }}
+	case "connect_num_rules":
+		return fakeMap{func(_, v interface{}) error { f.numRules = *v.(*int32); f.numSet = true; return nil }}
+	case "connect_policy_rules":
+		return fakeMap{func(k, v interface{}) error { f.rules[k.(uint32)] = *v.(*ConnectPolicyRuleBPF); return nil }}
+	}
+	return nil
+}
+
+// allows mirrors check_connect_policy: no count entry => deny; count <= 0 =>
+// default; first matching rule wins; else default.
+func (f *fakeConnectMaps) allows(ip uint32, port uint16) bool {
+	if !f.numSet {
+		return false
+	}
+	if f.numRules <= 0 {
+		return f.defaultPolicy == 1
+	}
+	for i := uint32(0); i < uint32(f.numRules); i++ {
+		r, ok := f.rules[i]
+		if !ok {
+			continue
+		}
+		if r.DestIP != 0 && r.DestIP != ip {
+			continue
+		}
+		if r.DestPort != 0 && r.DestPort != port {
+			continue
+		}
+		return r.Action == PolicyAllow
+	}
+	return f.defaultPolicy == 1
+}
+
+// Review finding on #118: a reload that drops to zero connect rules must
+// retire the previously loaded kernel rules; before the fix num_rules was
+// never rewritten and 1.1.1.1 stayed allowed in the kernel.
+func TestConnectReloadToZeroRulesRetiresKernelRules(t *testing.T) {
+	l, err := NewConnectLsm("/sys/fs/cgroup/leash-test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maps := &fakeConnectMaps{rules: map[uint32]ConnectPolicyRuleBPF{}}
+	oneOneOneOne := uint32(1<<24 | 1<<16 | 1<<8 | 1)
+
+	withRule := &PolicySet{Connect: []PolicyRule{mustConnectRule(t, "allow net.send 1.1.1.1")}}
+	if err := l.LoadPolicies(ConvertToConnectRules(withRule.Connect), connectDefaultOverride(withRule)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.writePolicyMaps(maps.lookup); err != nil {
+		t.Fatal(err)
+	}
+	if !maps.allows(oneOneOneOne, 53) {
+		t.Fatal("setup: 1.1.1.1 should be allowed while the rule is loaded")
+	}
+
+	empty := &PolicySet{}
+	if err := l.LoadPolicies(ConvertToConnectRules(empty.Connect), connectDefaultOverride(empty)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.writePolicyMaps(maps.lookup); err != nil {
+		t.Fatal(err)
+	}
+	if maps.numRules != 0 {
+		t.Fatalf("connect_num_rules = %d after reload to zero rules, want 0", maps.numRules)
+	}
+	if maps.allows(oneOneOneOne, 53) {
+		t.Fatal("1.1.1.1 still allowed by the kernel after the rule was removed")
+	}
+}
+
+func TestConnectWritePolicyMapsMissingMap(t *testing.T) {
+	l, err := NewConnectLsm("/sys/fs/cgroup/leash-test", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.writePolicyMaps(func(string) connectMapPutter { return nil }); err == nil {
+		t.Fatal("missing maps must be an error, not a silent no-op")
+	}
+}
