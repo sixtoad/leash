@@ -55,6 +55,7 @@ struct connect_event {
     u32 protocol;          // IPPROTO_TCP, IPPROTO_UDP
     u32 dest_ip;           // Canonical IPv4 value (a<<24 | b<<16 | c<<8 | d)
     u16 dest_port;         // Host-order destination port
+    u16 _pad0;             // Explicit padding; Go decodes with binary.Read (no implicit padding)
     s32 result;            // Result of the connect operation (0 = allowed, -EACCES = denied)
     char dest_hostname[MAX_HOSTNAME_LEN]; // Resolved hostname if available
 };
@@ -74,6 +75,8 @@ struct connect_policy_rule {
 // ring-buffer events. The remaining legacy fields are outside this contract.
 _Static_assert(__builtin_offsetof(struct connect_event, dest_ip) == 48, "connect_event.dest_ip ABI drift");
 _Static_assert(__builtin_offsetof(struct connect_event, dest_port) == 52, "connect_event.dest_port ABI drift");
+_Static_assert(__builtin_offsetof(struct connect_event, result) == 56, "connect_event.result ABI drift");
+_Static_assert(__builtin_offsetof(struct connect_event, dest_hostname) == 60, "connect_event.dest_hostname ABI drift");
 _Static_assert(__builtin_offsetof(struct connect_policy_rule, dest_ip) == 8, "connect_policy_rule.dest_ip ABI drift");
 _Static_assert(__builtin_offsetof(struct connect_policy_rule, dest_port) == 12, "connect_policy_rule.dest_port ABI drift");
 
@@ -293,6 +296,10 @@ static __always_inline int process_network_event(struct socket *sock, u32 dest_i
         return policy_result ? 0 : -13; // -EACCES = 13
     }
     
+    // Ring buffer memory is not zeroed: clear padding and the unused
+    // hostname tail so no stale bytes reach userspace.
+    __builtin_memset(event, 0, sizeof(*event));
+
     // Get process information
     u64 pid_tgid = bpf_get_current_pid_tgid();
     event->pid = pid_tgid >> 32;
@@ -336,24 +343,26 @@ int BPF_PROG(lsm_connect, struct socket *sock, struct sockaddr *address, int add
     u32 dest_ip = 0;
     u16 dest_port = 0;
     
-    // Only handle IPv4 for now (address is a USER pointer in this LSM hook)
+    // Only handle IPv4 for now. security_socket_connect() runs after
+    // move_addr_to_kernel(), so address is a KERNEL pointer: a user read
+    // fails and the hook would fall through to allow.
     u16 family = 0;
-    if (bpf_probe_read_user(&family, sizeof(family), &address->sa_family) != 0) {
+    if (bpf_probe_read_kernel(&family, sizeof(family), &address->sa_family) != 0) {
         return 0;
     }
     if (family != AF_INET) {
         return 0; // Allow non-IPv4 connections
     }
     
-    // Extract destination IP and port from sockaddr_in via user read
-    struct sockaddr_in uaddr = {};
-    if (bpf_probe_read_user(&uaddr, sizeof(uaddr), address) != 0) {
+    // Extract destination IP and port from the kernel copy of sockaddr_in
+    struct sockaddr_in kaddr = {};
+    if (bpf_probe_read_kernel(&kaddr, sizeof(kaddr), address) != 0) {
         return 0;
     }
     // sockaddr_in stores both fields in network byte order. Convert once at
     // ingress so policy maps, DNS keys, and events all use canonical values.
-    dest_ip = bpf_ntohl(uaddr.sin_addr.s_addr);
-    dest_port = bpf_ntohs(uaddr.sin_port);
+    dest_ip = bpf_ntohl(kaddr.sin_addr.s_addr);
+    dest_port = bpf_ntohs(kaddr.sin_port);
     
     return process_network_event(sock, dest_ip, dest_port, family);
 }
@@ -379,9 +388,10 @@ int BPF_PROG(lsm_sendmsg, struct socket *sock, void *msg, int size)
         return 0;
     }
     
-    // Check if message has destination address
+    // No destination address: send()/write() on a connected socket. Its peer
+    // was checked by lsm_connect when connect(2) set it, so allow here.
     if (!msg_name) {
-        return 0; // No destination address, likely a connected socket
+        return 0;
     }
     
     // Read the address family from msg_name (kernel pointer, not user)
