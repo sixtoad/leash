@@ -19,7 +19,7 @@ import (
 
 var (
 	eqPathPool = []string{"/", "/a", "/a/", "/ab", "/a/b", "/a/b/", "/a/bc", "/a/b/c", "/a/b/c/", "/a/b/c/d", "/a/b/c/d/", "/x", "/x/", "/x/y/", "/etc/", "/etc/passwd", "/bin/rm", "/bin/rmdir", "/bin/", "relative"}
-	eqHostPool = []string{`Host::"a.example.com"`, `Host::"*.example.com"`, `Host::"example.com"`, `Host::"*"`, `Host::"10.0.0.1"`, `Host::"10.0.0.2"`, `Host::"10.0.0.1:22"`, `Host::"*.com"`, `Host::"b.a.example.com:443"`, `Host::"*:443"`, `Host::"A.Example.com"`, `Net::DnsZone::"example.com"`, `Net::Hostname::"x.example.com"`, `Host::"0.0.0.0:22"`, `Host::"*.example.com:443"`, `Host::"example.com."`, `Host::"*."`, `Host::"a b.example.com"`, `Host::"x.example.com:0"`}
+	eqHostPool = []string{`Host::"a.example.com"`, `Host::"*.example.com"`, `Host::"example.com"`, `Host::"*"`, `Host::"10.0.0.1"`, `Host::"10.0.0.2"`, `Host::"10.0.0.1:22"`, `Host::"*.com"`, `Host::"b.a.example.com:443"`, `Host::"*:443"`, `Host::"A.Example.com"`, `Net::DnsZone::"example.com"`, `Net::Hostname::"x.example.com"`, `Host::"0.0.0.0:22"`, `Host::"*.example.com:443"`, `Host::"example.com."`, `Host::"*."`, `Host::"a b.example.com"`, `Host::"x.example.com:0"`, `Host::"2001:db8::1"`, `Host::"[2001:db8::1]:443"`, `Host::"[2001:db8::2]:22"`, `Host::"2001:DB8:0::2"`}
 	eqServers  = []string{"mcp.example.com", "other.example.com", "mcp.example.com:8443"}
 	eqTools    = []string{"search", "Execute-Shell", "delete"}
 )
@@ -155,7 +155,7 @@ func checkEquivalent(t *testing.T, rng *rand.Rand, legacyIR *lsm.PolicySet, eng 
 			}
 		case 2:
 			host := pick(rng, []string{"", "a.example.com", "b.a.example.com", "example.com", "evilexample.com", "x.example.com", "A.EXAMPLE.COM", "a.example.com.", "other.org", "mcp.example.com"})
-			ip := pick(rng, []string{"", "10.0.0.1", "10.0.0.2", "10.0.0.3"})
+			ip := pick(rng, []string{"", "10.0.0.1", "10.0.0.2", "10.0.0.3", "::ffff:10.0.0.1", "2001:db8::1", "2001:db8::2", "2001:db8::3"})
 			if host == "" && ip == "" {
 				ip = "10.0.0.1"
 			}

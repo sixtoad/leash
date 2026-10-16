@@ -863,19 +863,11 @@ func policyRuleHost(rule lsm.PolicyRule) string {
 		}
 		return host
 	}
-	if rule.DestIP == 0 {
+	ip := lsm.ConnectRuleAddr(rule.DestIP, rule.DestIP6)
+	if ip == "" {
 		return ""
 	}
-	ip := fmt.Sprintf("%d.%d.%d.%d",
-		(rule.DestIP>>24)&0xFF,
-		(rule.DestIP>>16)&0xFF,
-		(rule.DestIP>>8)&0xFF,
-		rule.DestIP&0xFF,
-	)
-	if rule.DestPort > 0 {
-		return fmt.Sprintf("%s:%d", ip, rule.DestPort)
-	}
-	return ip
+	return lsm.JoinConnectTarget(ip, rule.DestPort)
 }
 
 func normalizeAndDedupe(values []string, limit int) []string {
@@ -1128,8 +1120,8 @@ func policyRuleToView(rule lsm.PolicyRule) policyRuleView {
 			view.Hostname = host
 			view.Target = host
 		}
-		if rule.DestIP != 0 {
-			view.IP = formatIPv4(rule.DestIP)
+		if ip := lsm.ConnectRuleAddr(rule.DestIP, rule.DestIP6); ip != "" {
+			view.IP = ip
 			if view.Target == "" {
 				view.Target = view.IP
 			}
@@ -1137,7 +1129,7 @@ func policyRuleToView(rule lsm.PolicyRule) policyRuleView {
 		if rule.DestPort != 0 {
 			view.Port = rule.DestPort
 			if view.Target != "" {
-				view.Target = fmt.Sprintf("%s:%d", view.Target, rule.DestPort)
+				view.Target = lsm.JoinConnectTarget(view.Target, rule.DestPort)
 			} else {
 				view.Target = fmt.Sprintf(":%d", rule.DestPort)
 			}
@@ -1176,14 +1168,6 @@ func operationString(op int32) string {
 	default:
 		return "unknown"
 	}
-}
-
-func formatIPv4(addr uint32) string {
-	b0 := byte((addr >> 24) & 0xff)
-	b1 := byte((addr >> 16) & 0xff)
-	b2 := byte((addr >> 8) & 0xff)
-	b3 := byte(addr & 0xff)
-	return fmt.Sprintf("%d.%d.%d.%d", b0, b1, b2, b3)
 }
 
 // extractCedar reads the body as raw Cedar or JSON { "cedar": string }.

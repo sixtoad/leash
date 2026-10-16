@@ -168,7 +168,8 @@ func checkKernelParity(t *testing.T, rng *rand.Rand, text string, eng *engine.En
 		if got, want := k.Exec(path), eng.DecideExec(path).Allow; got != want {
 			t.Fatalf("exec %q: kernel=%v cedar=%v\npolicy:\n%s\nrules: %v", path, got, want, text, ruleStrings(ir.Exec))
 		}
-		ip := pick(rng, []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"})
+		// IPv4, IPv4-mapped IPv6 (decided by the IPv4 rules) and IPv6.
+		ip := pick(rng, []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "::ffff:10.0.0.1", "::ffff:10.0.0.2", "2001:db8::1", "2001:db8::2", "2001:db8::3"})
 		port := pick(rng, []uint16{22, 80, 443})
 		n++
 		if got, want := k.Connect(ip, port), eng.DecideConnect("", ip, port).Allow; got != want {
@@ -227,7 +228,8 @@ func TestKernelCompileMatchesCedarForStrictPolicies(t *testing.T) {
 	t.Logf("%d random strict policy sets (%d rejected as not kernel-enforceable), %d decisions: kernel == cedar.Authorize", sets, rejected, decisions)
 }
 
-var kpHosts = []string{`Host::"10.0.0.1"`, `Host::"10.0.0.2"`, `Host::"10.0.0.1:22"`, `Host::"10.0.0.2:443"`, `Host::"*:443"`, `Host::"*"`, `Host::"api.example.com"`, `Host::"*.example.com"`}
+var kpHosts = []string{`Host::"10.0.0.1"`, `Host::"10.0.0.2"`, `Host::"10.0.0.1:22"`, `Host::"10.0.0.2:443"`, `Host::"*:443"`, `Host::"*"`, `Host::"api.example.com"`, `Host::"*.example.com"`,
+	`Host::"2001:db8::1"`, `Host::"2001:db8::2"`, `Host::"[2001:db8::1]:22"`, `Host::"[2001:db8::2]:443"`}
 
 func randomStrictConnectPolicy(rng *rand.Rand) string {
 	effect := pick(rng, []string{"permit", "forbid"})
@@ -269,7 +271,7 @@ func TestKernelCompileMatchesCedarForConnect(t *testing.T) {
 		sets++
 		decisions += checkKernelParity(t, rng, text, eng, ir, warned, 30)
 	}
-	t.Logf("%d random strict connect sets, %d decisions: kernel == cedar.Authorize (IP rules; hostnames reach the kernel via DNS)", sets, decisions)
+	t.Logf("%d random strict connect sets, %d decisions: kernel == cedar.Authorize (IPv4, IPv4-mapped and IPv6 rules; hostnames reach the kernel via DNS)", sets, decisions)
 }
 
 // TestKernelCompileOfRewrittenLegacyPolicies closes the chain: legacy policy

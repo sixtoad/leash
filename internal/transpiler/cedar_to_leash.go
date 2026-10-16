@@ -490,7 +490,15 @@ func (t *CedarToLeashTranspiler) buildConnectRule(rule lsm.PolicyRule, resource 
 		hostname := resource.Value
 		var port uint16 = 0
 
-		if strings.Contains(hostname, ":") {
+		switch {
+		case strings.HasPrefix(hostname, "[") || strings.Count(hostname, ":") > 1:
+			// IPv6: [addr]:port, [addr] or a bare address
+			h, p, err := lsm.SplitConnectTarget(hostname)
+			if err != nil {
+				return rule, err
+			}
+			hostname, port = h, p
+		case strings.Contains(hostname, ":"):
 			parts := strings.SplitN(hostname, ":", 2)
 			hostname = parts[0]
 			if p, err := strconv.ParseUint(parts[1], 10, 16); err == nil {
@@ -503,12 +511,12 @@ func (t *CedarToLeashTranspiler) buildConnectRule(rule lsm.PolicyRule, resource 
 		}
 
 		if net.ParseIP(hostname) != nil {
-			ip := net.ParseIP(hostname)
-			ipv4 := ip.To4()
-			if ipv4 == nil {
-				return rule, fmt.Errorf("IPv6 not supported: %s", hostname)
+			v4, v6, err := lsm.ParseConnectIP(hostname)
+			if err != nil {
+				return rule, fmt.Errorf("%s: %w", hostname, err)
 			}
-			rule.DestIP = uint32(ipv4[0])<<24 | uint32(ipv4[1])<<16 | uint32(ipv4[2])<<8 | uint32(ipv4[3])
+			rule.DestIP = v4
+			rule.DestIP6 = v6
 			rule.DestPort = port
 		} else {
 			if strings.HasPrefix(hostname, "*.") {

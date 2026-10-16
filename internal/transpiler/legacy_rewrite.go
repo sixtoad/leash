@@ -3,7 +3,6 @@ package transpiler
 import (
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	cedarlib "github.com/cedar-policy/cedar-go"
@@ -471,8 +470,8 @@ func connectAtomID(r lsm.PolicyRule) string {
 		if host == "*" && r.DestPort == 0 {
 			return ""
 		}
-	case r.DestIP != 0:
-		host = fmt.Sprintf("%d.%d.%d.%d", (r.DestIP>>24)&0xFF, (r.DestIP>>16)&0xFF, (r.DestIP>>8)&0xFF, r.DestIP&0xFF)
+	case r.DestIP != 0 || r.DestIP6 != [16]byte{}:
+		host = lsm.ConnectRuleAddr(r.DestIP, r.DestIP6)
 	default:
 		// No IP and no hostname: any destination (Host::"0.0.0.0" lowers
 		// to this), optionally on one port.
@@ -482,7 +481,7 @@ func connectAtomID(r lsm.PolicyRule) string {
 		host = "*"
 	}
 	if r.DestPort != 0 {
-		host += ":" + strconv.Itoa(int(r.DestPort))
+		host = engine.HostWithPort(host, r.DestPort)
 	}
 	return host
 }

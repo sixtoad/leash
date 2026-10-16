@@ -35,6 +35,8 @@ Cedar resource entities are mapped to Leash resource types:
 | `Dir::"<path>"` | Directory path ending with `/` | Directory and subdirectories |
 | `Host::"<hostname>"` | Hostname or IP | Network host |
 | `Host::"<hostname>:<port>"` | Hostname with port | Network host and port |
+| `Host::"2001:db8::1"` | IPv6 address (RFC 5952 form) | Network host |
+| `Host::"[2001:db8::1]:443"` | IPv6 address with port | Network host and port |
 | `MCP::Server::"<hostname>"` | MCP server host | MCP server endpoint |
 | `MCP::Tool::"<tool-name>"` | MCP tool name | Specific MCP tool |
 
@@ -124,7 +126,19 @@ allow net.send *.example.com
 ## Limitations
 
 - Context-based conditions (e.g., `context.hostname like "*.example.com"`) are partially supported
-- IPv6 addresses are not yet supported
+- IP addresses must be canonical: dotted IPv4, RFC 5952 IPv6 (lowercase,
+  zeros compressed), bracketed only before a port. An IPv4-mapped address
+  (`::ffff:a.b.c.d`) is written as the IPv4 address it carries: the kernel
+  decides a mapped destination with the IPv4 rules. `::` and `0.0.0.0` are
+  not destinations; `Host::"*"` is any host, IPv4 and IPv6.
+- Hostname rules reach the kernel as the name's A and AAAA records, resolved
+  at load time.
+- Address families: the kernel connect/sendmsg hooks enforce `AF_INET` and
+  `AF_INET6`; `AF_UNIX` and `AF_NETLINK` sockets are local IPC and are not
+  checked; every other socket family (packet, vsock, ...) gets the connect
+  default, because no rule can name it. Packet and raw sockets also need
+  `CAP_NET_RAW`, which the native workload does not hold; a container
+  workload holds whatever the container runtime grants (#182).
 - Complex Cedar expressions may not be fully supported
 - HTTP header rewrite rules are supported via `Action::"HttpRewrite"` with `context.header/value`
 - **MCP policies (V1 limitations)**:

@@ -18,7 +18,7 @@ Cross-cutting model reference for everything persisted, exchanged, or pushed int
 | `Action::"FileOpenReadOnly"` | same | `file.open:ro` |
 | `Action::"FileOpenReadWrite"` | same | `file.open:rw` |
 | `Action::"ProcessExec"` | `Dir::"/path/"`, `File::"/path"` | `proc.exec` |
-| `Action::"NetworkConnect"` | `Host::"name"`, `Host::"*.example.com"`, `Host::"ip:port"` | `net.send` |
+| `Action::"NetworkConnect"` | `Host::"name"`, `Host::"*.example.com"`, `Host::"ip:port"`, `Host::"2001:db8::1"`, `Host::"[2001:db8::1]:443"` | `net.send` |
 | `Action::"HttpRewrite"` | `Host::"host"` (with `context.header` + `context.value`) | `http.rewrite` |
 | `Action::"McpCall"` | `MCP::Server::"host"`, `MCP::Tool::"tool"` | `mcp.*` |
 
