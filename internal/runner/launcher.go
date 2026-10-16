@@ -177,7 +177,8 @@ type launcher interface {
 	// DetectShell returns the shell to run the workload with (container: probed
 	// inside the container; native: the host shell).
 	DetectShell(ctx context.Context) (string, error)
-	// ExecCommand builds the command that runs `shellBin -lc "exec cmd"` inside
+	// ExecCommand builds the command that runs `shellBin -c "exec cmd"` (or -lc
+	// under --login-shell) inside
 	// the enforced box. The runner runs it and handles the exit code, so the exec
 	// UX stays backend-agnostic. interactive requests a TTY.
 	ExecCommand(ctx context.Context, shellBin, cmd string, interactive bool) *exec.Cmd
@@ -322,7 +323,22 @@ func (c containerLauncher) Provision(ctx context.Context, stopSignal string) (st
 }
 
 func (c containerLauncher) StartEnforcement(ctx context.Context, cgroupPath string) error {
-	return c.r.launchLeashContainer(ctx, cgroupPath)
+	// The sidecar joins the target's network namespace, so a target that died in
+	// its bootstrap entrypoint makes the runtime reject the sidecar with "cannot
+	// join network namespace of a non running container", hiding the real error.
+	// Check before launching, and again if the launch fails (the target may die
+	// in between), surfacing the target's exit code and log tail as the primary
+	// error while it still exists (#81).
+	if tbe := c.r.targetBootstrapFailure(ctx, "during bootstrap, before the leash sidecar could start", nil); tbe != nil {
+		return tbe
+	}
+	if err := c.r.launchLeashContainer(ctx, cgroupPath); err != nil {
+		if tbe := c.r.targetBootstrapFailure(ctx, "during bootstrap, before the leash sidecar could start", fmt.Errorf("leash sidecar launch failed: %w", err)); tbe != nil {
+			return tbe
+		}
+		return err
+	}
+	return nil
 }
 
 func (c containerLauncher) WaitReady(ctx context.Context) error {
@@ -537,7 +553,7 @@ func (c containerLauncher) execCommandWithStdinKind(ctx context.Context, shellBi
 		// group with SIGTTIN. Pipes and redirected files retain -i below.
 		flag = ""
 	}
-	return c.r.rt().Cmd(ctx, c.r.targetWorkloadExecArgs(flag, shellBin, "-lc", "exec "+cmd)...)
+	return c.r.rt().Cmd(ctx, c.r.targetWorkloadExecArgs(flag, shellBin, c.r.workloadShellFlag(), "exec "+cmd)...)
 }
 
 func (c containerLauncher) Precheck(ctx context.Context, shellBin, cmd string) error {
