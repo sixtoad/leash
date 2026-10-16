@@ -109,6 +109,15 @@ const (
 	OpOpenRW  = 2 // open:rw (any write mode)
 	OpExec    = 3 // exec
 	OpConnect = 4 // connect
+	// OpMutation rules (in PolicySet.Open) are the directory-mutation table
+	// (mkdir, unlink, rmdir, rename source and destination), compiled by
+	// transpiler.CompileKernel from the Cedar decisions (#142): an allow
+	// prefix, a deny prefix, or (IsDirectory == ExactPath) an exact deny.
+	// The kernel denies a mutation under any deny prefix or exact deny, else
+	// allows it under any allow prefix, else denies. When a set has no
+	// OpMutation rule (rules built in code), the table is derived from the
+	// open rules as before.
+	OpMutation = 5
 )
 
 // PolicySet holds separated policy rules by operation type
@@ -173,6 +182,8 @@ func (pr *PolicyRule) String() string {
 		operation = "proc.exec"
 	case OpConnect:
 		operation = "net.send"
+	case OpMutation:
+		operation = "file.mutate"
 	}
 
 	var target string

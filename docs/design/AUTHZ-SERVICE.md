@@ -180,8 +180,44 @@ mode when the modes differ.
   against the NUL-terminated resolved path, so the NUL matches only where
   the path ends, and the rule (one byte longer) outranks every prefix. No BPF
   change; the 64-byte exec rule limit leaves 63 bytes for an exact path.
+  Both limits are checked at compile time, naming the policy and its line.
 - An exact allow on `/` covers only the root directory; it does not turn
   the kernel default to allow.
+
+**Directory mutations.** mkdir, unlink, rmdir and both sides of rename are
+checked by the kernel against the path they create or remove, through a
+table of their own that is deny first: a mutation is denied under any deny
+prefix or exact deny, else allowed under any allow prefix, else denied. They
+have no Cedar action. A mutation of path t is allowed iff Cedar allows
+`FileOpenReadWrite` on t **and** on a new entry of t's directory (writing the
+directory's contents), `engine.DecideMutation`. So a granted tree
+`Dir::"/work/"` lets the workload create and remove entries below `/work`,
+but not remove or rename `/work` itself unless `/` is writable too.
+
+- The compiler builds this table from those decisions, as `lsm.OpMutation`
+  rules carried with the open rules: the single source of truth. It is never
+  inferred from the open rules (inferring it is what broke mutations in the
+  first rework: the region compiler folds read-only and read-write into one
+  generic rule, and the old inference only took read-write directory
+  allows). The loader derives the table from the open rules only for rule
+  sets built in code, which carry no `OpMutation` rule.
+- Same regions, one representative each, top down: a region whose decision
+  differs from what the table already gives it gets an allow or a deny
+  prefix; a single gets an exact deny where the table would allow it.
+- **Rejected:** a mutation allow under a deny prefix that a broader allow
+  needed, i.e. a permit nested in a forbid nested in a permit (for
+  mutations). A deny-first table cannot express it, and the load fails
+  naming both paths. Changing the BPF check to longest-prefix would lift
+  this; that is a follow-up, not done here. A permit nested in a forbid
+  under the default deny (the usual `unless` exception) compiles.
+- **Over-denial (documented):** below a `FilePrefix` that does not end in
+  `/` (the strict form of a legacy `File` rule, e.g. `FilePrefix::"/dev/null"`),
+  paths with a `/` after the prefix (`/dev/null/x`, `/dev/nullx/y`) may be
+  denied where Cedar allows them. The prefix names a file, so such paths
+  only exist under an equally named directory. The kernel is stricter
+  there, never looser.
+- The hard-link guard needs the source to be readable: a read-only open
+  through the open index.
 
 **Connect: symbolic.** For `NetworkConnect` each policy must reduce to a
 constant or a disjunction of single `Host` atoms (no conjunction or negation
@@ -213,9 +249,9 @@ to longest-prefix matching.
 | Nesting | `TestLegacyRewriteNestingProperty`: alternating forbid/permit chains up to depth 6, shuffled, every open mode and exec | 2000 chains, 360,000 decisions, equal |
 | Layers | `TestLegacyRewriteAcrossLayers`: file + runtime layer rewritten together vs the legacy Manager merge | 1000 pairs, 150,000 decisions, equal |
 | Raw IR layers | `TestLegacyRewriteOfRawIRLayers` | 500 layers, 75,000 decisions, equal |
-| Kernel == Cedar (files, exec) | `TestKernelCompileMatchesCedarForStrictPolicies`: random strict subset policies (exact `File` via `==` and `in`, `FilePrefix`, `Dir`; boolean combinations, actions, `unless`, `is`) through CompileKernel and the real loaders (`OpenLsm`/`ExecLsm`/`ConnectLsm.LoadPolicies`) and the BPF lookup models (the exec model reads the NUL-terminated path) | 3000 sets (none rejected), 480,000 decisions, equal |
-| Kernel == Cedar (connect, IP) | `TestKernelCompileMatchesCedarForConnect` | 3000 sets, 360,000 decisions, equal |
-| End to end | `TestKernelCompileOfRewrittenLegacyPolicies`: legacy → rewrite → kernel tables vs cedar.Authorize; every rewritten legacy file must compile | 2000 files, 320,000 decisions, equal |
+| Kernel == Cedar (files, exec) | `TestKernelCompileMatchesCedarForStrictPolicies`: random strict subset policies (exact `File` via `==` and `in`, `FilePrefix`, `Dir`; boolean combinations, actions, `unless`, `is`) through CompileKernel and the real loaders (`OpenLsm`/`ExecLsm`/`ConnectLsm.LoadPolicies`) and the BPF lookup models (the exec model reads the NUL-terminated path), with the mutation table (mkdir/unlink/rmdir/rename) and the hard-link guard | 2994 sets (6 rejected: a mutation permit nested in a forbid nested in a permit), 958,080 decisions, equal |
+| Kernel == Cedar (connect, IP) | `TestKernelCompileMatchesCedarForConnect` (also checks mutations and links) | 3000 sets, 720,000 decisions, equal |
+| End to end | `TestKernelCompileOfRewrittenLegacyPolicies`: legacy → rewrite → kernel tables (open, exec, connect, mutation, link) vs cedar.Authorize; a rewritten file may only fail on the mutation shape above | 1932 files (68 rejected on that shape), 618,240 decisions, equal |
 | Legacy model == kernel | `TestLegacyModel*MatchesKernel*` pin the oracle to the loaders | 5000 sets each |
 | Plugin decisions | `TestPluginDecisionsAreCedarAuthorize`, namespace rule, `@expires`, routing | |
 
@@ -318,6 +354,7 @@ load.
 | 26 | Kernel matches connects by IP, the proxy by name | unchanged | inherent |
 | 27 | macOS ES rule order (file before directory, deny first) | not equivalent for exceptions | pre-existing; follow-up |
 | 28 | Layer merge: a raw-IR runtime layer with an *explicit* default allow overrode a file `forbid Host::"*"` | union: a forbid default wins | Cedar layers cannot express an explicit allow default; only IR built in code could |
+| 29 | Directory mutations were allowed only by read-write directory allow rules (generic `FileOpen` allows did not count), denied by any covering generic forbid, deny first | Cedar: `FileOpenReadWrite` on the path and on a new entry of its directory, compiled into the mutation table | a permit nested in a forbid nested in a permit fails the load (deny-first table); generic `FileOpen` permits now allow mutations |
 
 ### 4.4 What cannot be made equivalent
 
@@ -325,6 +362,10 @@ load.
 - **#26**: the kernel cannot match names; documented.
 - **#27**: macOS needs a Swift change.
 - **#28**: only reachable from IR built in code, not from Cedar.
+- **#29**: a mutation permit nested in a forbid nested in a permit cannot be
+  enforced by the deny-first mutation table; such a file fails the load (it
+  loaded on #138, where mutations below the nested permit were silently
+  denied).
 - **Exec argument denies** (line format): no Cedar form; such layers fail.
 
 ## 5. Migration
@@ -448,7 +489,8 @@ server and the client.
 - `reason` is one of `matched_permit`, `matched_forbid`, `default_allow`
   (reserved: strict Cedar has no default allow), `default_deny`,
   `unsupported_action`, `invalid_request`, `no_policy`,
-  `namespace_not_granted`, `rate_limited`, `unsupported_version`. The list is
+  `namespace_not_granted`, `rate_limited`, `unsupported_version`,
+  `peer_rejected` (audit only: the connection is refused). The list is
   append-only. `approval_required` is reserved (§8).
 - `policies` holds the deciding policy IDs (`@id`, else the legacy source
   `<file>:<line>` of a rewritten policy, else the Cedar ID), for plugin and

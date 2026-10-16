@@ -2,6 +2,35 @@ package lsm
 
 import "testing"
 
+// Compiled mutation rules are the whole mutation table: the open rules are
+// not consulted when one is present (#142).
+func TestCompiledMutationRulesAreTheWholeTable(t *testing.T) {
+	mut := func(action uint32, kind uint32, path string) OpenPolicyRule {
+		r := OpenPolicyRule{Action: action, Operation: OpMutation, PathLen: uint32(len(path)), IsDirectory: kind}
+		copy(r.Path[:], path)
+		return r
+	}
+	rules := []OpenPolicyRule{
+		openDirectoryRuleForPath(PolicyAllow, OpOpenRW, "/ignored/"),
+		mut(PolicyAllow, 0, "/"),
+		mut(PolicyDeny, 0, "/etc/"),
+		mut(PolicyDeny, ExactPath, "/etc"),
+	}
+	if err := validateOpenPolicyRules(rules); err != nil {
+		t.Fatal(err)
+	}
+	idx := compileMutationIndex(rules)
+	if len(idx.allows) != 1 || len(idx.denies) != 1 || len(idx.selfDenies) != 1 {
+		t.Fatalf("mutation index: %+v", idx)
+	}
+	if rootPathPolicy(rules[1:]) {
+		t.Fatal("a mutation allow on / must not set the open default")
+	}
+	if err := validateOpenPolicyRules([]OpenPolicyRule{mut(PolicyAllow, ExactPath, "/x")}); err == nil {
+		t.Fatal("the mutation table has no exact allow")
+	}
+}
+
 func exactRule(action uint32, op uint32, path string) OpenPolicyRule {
 	r := OpenPolicyRule{Action: action, Operation: op, PathLen: uint32(len(path)), IsDirectory: ExactPath}
 	copy(r.Path[:], path)
