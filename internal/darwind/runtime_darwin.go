@@ -126,6 +126,9 @@ func runExec(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := refuseUnsupportedDarwinFlags(passthrough); err != nil {
+		return err
+	}
 
 	if _, err := os.Stat(cliPath); err != nil {
 		if isExecHelpRequest(passthrough) {
@@ -133,6 +136,13 @@ func runExec(args []string) error {
 			return nil
 		}
 		return fmt.Errorf("leashcli not found at %q: %w", cliPath, err)
+	}
+
+	// The daemon refuses to start without the extensions too, but it runs
+	// detached with its output in the log file; check here so the refusal and
+	// its remedy reach the terminal instead of a readiness timeout.
+	if err := preflightDarwinEnforcement(); err != nil {
+		return err
 	}
 
 	handle, err := acquireExecServer()
@@ -325,6 +335,11 @@ func preFlight(cfg *runtimeConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("runtime configuration required")
 	}
+	// Native macOS enforcement is the ES/NE system extensions and nothing else.
+	// Refuse to start without them, before touching any directory, key or log.
+	if err := preflightDarwinEnforcement(); err != nil {
+		return err
+	}
 	policyPath := strings.TrimSpace(cfg.PolicyPath)
 	if policyPath == "" {
 		return fmt.Errorf("policy file path required")
@@ -452,14 +467,6 @@ func preFlight(cfg *runtimeConfig) error {
 		}
 	} else if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("inspect CA key at %q: %w", keyPath, err)
-	}
-
-	// Native macOS enforcement relies on the ES/NE system extensions (no Layer-2
-	// proxy fallback). Surface it up front if they aren't active instead of
-	// running silently unprotected. Warns by default; LEASH_REQUIRE_ENFORCEMENT
-	// makes it fatal.
-	if err := preflightDarwinEnforcement(); err != nil {
-		return err
 	}
 
 	return nil

@@ -3,8 +3,8 @@
 // `systemextensionsctl list` prints.
 //
 // It lives outside internal/darwind because two callers now need the same
-// answer and must not drift: the `--darwin` runtime's own preflight (warn or
-// refuse to start unenforced) and `leash doctor` (report the same fact as a
+// answer and must not drift: the `--darwin` runtime's own preflight (it
+// refuses to start unenforced) and `leash doctor` (report the same fact as a
 // machine-readable verdict). A doctor that parsed the table its own way would
 // eventually disagree with the runtime about whether the machine enforces,
 // which is exactly the false assurance doctor exists to prevent.
@@ -119,17 +119,38 @@ func InterpretEntry(line string) (isActive, isInstalledButDisabled bool, state s
 	return isActive, isInstalledButDisabled, state, true
 }
 
-// Parse scans `systemextensionsctl list` output for the row(s) matching id
-// (case-insensitive) and returns the best state found.
+// RowBundleID extracts the bundle identifier from a `systemextensionsctl list`
+// data row. Rows are tab-separated and the bundleID column carries a trailing
+// version, e.g. "com.strongdm.leash.LeashES (1.0/1)"; this returns just the id.
+// It returns "" for header and other non-data rows (fewer than 4 columns).
+func RowBundleID(line string) string {
+	cols := strings.Split(line, "\t")
+	if len(cols) < 4 {
+		return ""
+	}
+	field := strings.TrimSpace(cols[3])
+	if i := strings.Index(field, " ("); i >= 0 {
+		field = field[:i]
+	}
+	return strings.TrimSpace(field)
+}
+
+// Parse scans `systemextensionsctl list` output for the row(s) whose bundle-id
+// column is exactly id (case-insensitive) and returns the best state found.
+//
+// The match is on the bundle-id column, never a substring of the line: a
+// sibling identifier that merely starts with id ("<id>Helper") must not make
+// the extension look active, because the runtime refuses to start unenforced
+// on exactly this answer.
 //
 // A missing row is StateMissing, never StateUnknown: the command answered, and
 // what it said was "there is no such extension". StateUnknown is reserved for
 // callers that could not run the command at all.
 func Parse(output, id string) State {
-	idLower := strings.ToLower(strings.TrimSpace(id))
+	want := strings.TrimSpace(id)
 	disabled := false
 	for _, raw := range strings.Split(output, "\n") {
-		if !strings.Contains(strings.ToLower(raw), idLower) {
+		if !strings.EqualFold(RowBundleID(raw), want) {
 			continue
 		}
 		active, isDisabled, _, ok := InterpretEntry(raw)

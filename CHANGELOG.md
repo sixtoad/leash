@@ -8,6 +8,20 @@ Claude Code handling on top.
 
 ## [Unreleased]
 
+### Changed — native macOS refuses to start without its extensions
+- `leash --darwin exec` and the darwin daemon now **refuse to start** unless
+  both the Endpoint Security and the Network Filter system extensions are
+  activated. The previous default warned and ran the workload unenforced;
+  `LEASH_REQUIRE_ENFORCEMENT` is removed because refusing is now the only
+  behaviour. The check runs in the terminal first, so the refusal and the
+  activation steps are printed instead of a daemon readiness timeout, and it
+  runs before the daemon touches any directory, key or log.
+- `systemextensionsctl list` rows are matched on the bundle-id column exactly
+  (leash doctor included), so a sibling extension whose id starts with leash's
+  cannot make leash look enforced.
+- `--inject-service` (and its `authz=` socket) is refused in native macOS mode
+  with an explanation: darwind serves no plugin authorization socket.
+
 ### Added — build & compatibility document
 - **`leash version --json`** (also `--output json`): the build metadata as a
   machine-readable document — `version`, `commit`, `builtAt`, `enforcing`,
