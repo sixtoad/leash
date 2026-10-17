@@ -268,6 +268,27 @@ func connectDefaultOverride(policies *PolicySet) *bool {
 	return nil
 }
 
+// proxyRestricts reports whether the policy restricts traffic that only the
+// L7 proxy enforces: an MCP forbid (PolicySet.ProxyRestricted from the
+// kernel compiler, or a deny rule in an MCP rule list built in code). A
+// packet socket builds its own TCP stream past the proxy's redirect, so such
+// a policy keeps packet, raw and SCTP sockets denied
+// (ConnectLsm.unaddressedAllowed, #188).
+func proxyRestricts(policies *PolicySet) bool {
+	if policies == nil {
+		return false
+	}
+	if policies.ProxyRestricted {
+		return true
+	}
+	for _, r := range policies.MCP {
+		if r.Action != PolicyAllow {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 	defaultOverride := connectDefaultOverride(policies)
 	rules := ConvertToConnectRules(policies.Connect)
@@ -282,6 +303,7 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 		if err != nil {
 			return fmt.Errorf("failed to create connect LSM: %w", err)
 		}
+		m.connectLsm.proxyRestricted = proxyRestricts(policies)
 
 		if err := m.connectLsm.LoadPolicies(rules, defaultOverride); err != nil {
 			return fmt.Errorf("failed to load connect policies: %w", err)
@@ -296,6 +318,7 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 		return nil
 	}
 
+	m.connectLsm.proxyRestricted = proxyRestricts(policies)
 	return m.connectLsm.LoadPolicies(rules, defaultOverride)
 }
 

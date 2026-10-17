@@ -380,3 +380,14 @@ Persistence is similarly performed through `/api/policies/persist` or via the
 - Directory resources must end with `/` to indicate recursive coverage.
 - Hostname wildcards support leading `*.` only (e.g., `*.example.com`).
 - IPv6 and CIDR resources are unsupported and will trigger lints.
+- Packet sockets (`AF_PACKET`, `AF_XDP`), raw IP sockets (`SOCK_RAW`) and
+  SCTP sockets cannot be governed by `Host` rules: a bound packet or raw
+  socket sends with no destination address, and SCTP adds peers past the
+  connect hook. The kernel refuses to create them (`EPERM`) unless the policy
+  restricts no destination at all (connect default allow, no `forbid` on
+  `NetworkConnect`, no `forbid` on `McpCall`). There is no action to permit
+  them otherwise. iputils `ping` uses an ICMP datagram socket where
+  `net.ipv4.ping_group_range` admits the workload's group (Docker containers
+  do); it is decided by the connect rules with port 0, so `Host::"1.1.1.1"`
+  permits pinging it and `Host::"1.1.1.1:443"` does not. BusyBox `ping`
+  needs a raw socket. See `docs/design/SECURITY-MODEL.md`.

@@ -31,6 +31,7 @@ type KernelForTest struct {
 	execDefault    bool
 	connect        []ConnectPolicyRuleBPF
 	connectDefault bool
+	unaddressed    bool
 }
 
 // NewKernelForTest loads ps the way LSMManager does (OpenLsm, ExecLsm and
@@ -68,6 +69,10 @@ func NewKernelForTest(ps *PolicySet) (*KernelForTest, error) {
 		return nil, err
 	}
 	k.connect, k.connectDefault = c.policyRules, c.defaultPolicyResult
+	// lsm_socket_create's verdict comes from the WHOLE connect rule list
+	// (hostname rules included, as LoadPolicies sees it in production) and
+	// the MCP forbids, the way updateConnectLSM computes it.
+	k.unaddressed = unaddressedSocketsAllowed(ConvertToConnectRules(ps.Connect), c.defaultPolicyResult, proxyRestricts(ps))
 	return k, nil
 }
 
@@ -94,6 +99,10 @@ func (k *KernelForTest) Exec(path string) bool {
 func (k *KernelForTest) Connect(ip string, port uint16) bool {
 	return connectBPFDecisionDest(k.connect, k.connectDefault, connectDestOf(net.ParseIP(ip), port)) == PolicyAllow
 }
+
+// UnaddressedSockets models lsm_socket_create (#188): whether the workload
+// may create a packet, raw IP, XDP or SCTP socket.
+func (k *KernelForTest) UnaddressedSockets() bool { return k.unaddressed }
 
 // OpenDecisionForTest runs rules through the same pipeline LoadPolicies uses
 // (conversion, precedence sort, root default, full-byte index

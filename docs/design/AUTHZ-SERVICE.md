@@ -251,6 +251,36 @@ is always written as explicit, so the loader's own guesses (an address-less
 allow rule or `allow *` turning the default to allow) never apply.
 `Host::"*:443"` compiles to an address-less rule on port 443.
 
+**Sockets no address rule can see (#188).** A packet socket (`AF_PACKET`,
+`AF_XDP`) bound with `bind()` and a raw IP socket (`SOCK_RAW`, e.g. with
+`IP_HDRINCL`) send with `send()` and no destination address, so no
+`NetworkConnect` request exists for them. SCTP (`IPPROTO_SCTP`, and
+`SOCK_SEQPACKET` on an IP family, which is SCTP even with protocol 0) adds
+peers past `socket_connect`: `sctp_connectx()` passes only
+`security_sctp_bind_connect`, the `SCTP_DSTADDRV4`/`V6` address list of a
+`sendmsg()` passes no LSM hook at all, and a peer advertises further
+addresses in INIT-ACK and ASCONF. A per-address `lsm/sctp_bind_connect`
+program would therefore still miss destinations, so these sockets are
+decided once, at creation (`lsm_socket_create` on `socket_create`, in the
+connect object): **denied with `EPERM`** (the error a missing `CAP_NET_RAW`
+gives) **unless the policy restricts no destination**: the compiled connect default
+is allow, there is no deny connect rule of any kind (address, port, hostname
+or `*.zone`), and no `McpCall` forbid can apply (`PolicySet.ProxyRestricted`,
+set by the compiler for a forbid that reaches `McpCall` with a resource
+scope that can be an MCP entity; a packet socket can also bypass the
+proxy). There is no Cedar action for them: a `permit` could only be all or
+nothing, and the one policy shape under which they cannot reach anything
+the policy forbids is already expressible. `TestKernelCompileUnaddressedSockets`
+pins the verdict per policy shape, and `checkKernelParity` asserts on every
+random set that the kernel allows them only where `cedar.Authorize` allows
+every probed connection (hosts, IPv4, v4-mapped and IPv6 addresses, ports).
+ICMP datagram sockets (`SOCK_DGRAM`, `IPPROTO_ICMP`/`ICMPV6`, which iputils
+`ping` opens first) are ordinary addressed sockets: `sendto()` is decided by
+the connect rules, with port 0 (`Host::"10.0.0.1"` permits ping to it,
+`Host::"10.0.0.1:443"` does not). A container run that may continue
+proxy-only also starts the target with `--cap-drop NET_RAW`
+(SECURITY-MODEL.md).
+
 **Inherent divergence (documented, unchanged):** the kernel matches connects
 by IP. Hostname rules are resolved to IPs when the policy loads and wildcards
 are not loaded at all; the proxy (the engine) matches the name. A forbidden
@@ -273,6 +303,7 @@ to longest-prefix matching.
 | Raw IR layers | `TestLegacyRewriteOfRawIRLayers` | 500 layers, 75,000 decisions, equal |
 | Kernel == Cedar (files, exec) | `TestKernelCompileMatchesCedarForStrictPolicies`: random strict subset policies (exact `File` via `==` and `in`, `FilePrefix`, `Dir`; boolean combinations, actions, `unless`, `is`) through CompileKernel and the real loaders (`OpenLsm`/`ExecLsm`/`ConnectLsm.LoadPolicies`) and the BPF lookup models (the exec model reads the NUL-terminated path), with the mutation table (mkdir/unlink/rmdir/rename, longest-prefix model of the changed `check_mutation_policy`) and the hard-link guard | 3000 sets (none rejected), 960,000 decisions; equal, except mutations denied at warned exact paths and below loose `FilePrefix`es (never the reverse) |
 | Kernel == Cedar (connect, IP) | `TestKernelCompileMatchesCedarForConnect` (also checks mutations and links) | 3000 sets, 720,000 decisions, equal |
+| Packet/raw/SCTP sockets (#188) | `TestKernelCompileUnaddressedSockets` (verdict per policy shape); every `checkKernelParity` set: an allowed verdict implies `cedar.Authorize` allows every probed connection | never looser than Cedar |
 | End to end | `TestKernelCompileOfRewrittenLegacyPolicies`: legacy → rewrite → kernel tables (open, exec, connect, mutation, link) vs cedar.Authorize; every rewritten legacy file must compile | 2000 files (13 with a warned exact-path over-denial), 640,000 decisions; equal, except the documented mutation over-denials |
 | Legacy model == kernel | `TestLegacyModel*MatchesKernel*` pin the oracle to the loaders | 5000 sets each |
 | Plugin decisions | `TestPluginDecisionsAreCedarAuthorize`, namespace rule, `@expires`, routing | |
@@ -389,6 +420,7 @@ that constrains the principal of a built-in policy fails the load.
 | 27 | macOS ES rule order (file before directory, deny first) | not equivalent for exceptions | pre-existing; follow-up |
 | 28 | Layer merge: a raw-IR runtime layer with an *explicit* default allow overrode a file `forbid Host::"*"` | union: a forbid default wins | Cedar layers cannot express an explicit allow default; only IR built in code could |
 | 29 | Directory mutations were allowed only by read-write directory allow rules (generic `FileOpen` allows did not count), denied by any covering generic forbid, deny first | Cedar: `FileOpenReadWrite` on the path and on a new entry of its directory, compiled into the mutation table | the table is now longest-prefix (one BPF function); generic `FileOpen` permits now allow mutations; a permit nested in a forbid now allows mutations below it |
+| 30 | Packet, raw IP and SCTP sockets got the connect default per address-bearing call; a bound packet or raw socket and SCTP `connectx` passed unchecked (#188) | no Cedar form: denied at `socket_create` unless the policy restricts no destination (§3.3) | the kernel is stricter: allowed only where Cedar allows every connection |
 
 ### 4.4 What cannot be made equivalent
 
@@ -396,6 +428,8 @@ that constrains the principal of a built-in policy fails the load.
 - **#26**: the kernel cannot match names; documented.
 - **#27**: macOS needs a Swift change.
 - **#28**: only reachable from IR built in code, not from Cedar.
+- **#30**: packet, raw and SCTP sockets have no destination to decide; the
+  kernel allows them only where Cedar allows every connection.
 - **#29**: the mutation table has no exact allow; a mutation Cedar allows at
   one single path that the table denies around it is denied by the kernel,
   with a load-time warning naming the policy and path (§3.3). Below a loose
