@@ -460,12 +460,22 @@ func execute(cmdName string, args []string) error {
 // holder unit, temp work dir) — or, for container backends, both containers
 // and the temp work dir — is removed here, within forcedExitBudget (#158).
 func (r *runner) forcedExitCleanup() {
+	_ = r.boundedForcedExitCleanup()
+}
+
+// boundedForcedExitCleanup runs the forced-exit teardown for at most
+// forcedExitBudget. On overrun it returns with the teardown still running; its
+// context is canceled by then, so it winds down promptly, and the returned
+// channel is closed once it has returned. The forced exit does not wait for
+// that (os.Exit follows), but tests do, so no teardown outlives its test.
+func (r *runner) boundedForcedExitCleanup() <-chan struct{} {
+	done := make(chan struct{})
 	if r.keepContainers {
-		return
+		close(done)
+		return done
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), forcedExitBudget)
 	defer cancel()
-	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		if r.usingNativeRuntime() {
@@ -478,6 +488,7 @@ func (r *runner) forcedExitCleanup() {
 	case <-done:
 	case <-ctx.Done():
 	}
+	return done
 }
 
 // forceRemoveContainers is the container backend's forced-exit teardown: a
