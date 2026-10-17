@@ -2,6 +2,7 @@ package lsm
 
 import (
 	"math/rand"
+	"net"
 	"reflect"
 	"strings"
 	"testing"
@@ -224,13 +225,41 @@ func connectRuleForTest(action int32, ip uint32, port uint16, host string) Conne
 	return r
 }
 
-// connectBPFDecision models check_connect_policy's first-match scan.
-func connectBPFDecision(rules []ConnectPolicyRuleBPF, defaultAllow bool, ip uint32, port uint16) uint32 {
+// connectDestForTest is struct connect_dest: a destination classified by
+// read_inet_dest.
+type connectDestForTest struct {
+	family uint32
+	ip     uint32
+	ip6    [16]byte
+	port   uint16
+}
+
+// connectDestOf models read_inet_dest: an IPv4 or IPv4-mapped IPv6 address
+// is AF_INET with its canonical value, any other IPv6 address AF_INET6.
+func connectDestOf(ip net.IP, port uint16) connectDestForTest {
+	if v4, ok := canonicalIPv4(ip); ok {
+		return connectDestForTest{family: afInet, ip: v4, port: port}
+	}
+	d := connectDestForTest{family: afInet6, port: port}
+	copy(d.ip6[:], ip.To16())
+	return d
+}
+
+// connectBPFDecisionDest models check_connect_policy's first-match scan.
+func connectBPFDecisionDest(rules []ConnectPolicyRuleBPF, defaultAllow bool, d connectDestForTest) uint32 {
 	for _, r := range rules {
-		if r.DestIP != 0 && r.DestIP != ip {
-			continue
+		if r.Family != 0 {
+			if r.Family != d.family {
+				continue
+			}
+			if d.family == afInet && r.DestIP != d.ip {
+				continue
+			}
+			if d.family == afInet6 && r.DestIP6 != d.ip6 {
+				continue
+			}
 		}
-		if r.DestPort != 0 && r.DestPort != port {
+		if r.DestPort != 0 && r.DestPort != d.port {
 			continue
 		}
 		return r.Action
@@ -239,6 +268,11 @@ func connectBPFDecision(rules []ConnectPolicyRuleBPF, defaultAllow bool, ip uint
 		return PolicyAllow
 	}
 	return PolicyDeny
+}
+
+// connectBPFDecision is connectBPFDecisionDest for an IPv4 destination.
+func connectBPFDecision(rules []ConnectPolicyRuleBPF, defaultAllow bool, ip uint32, port uint16) uint32 {
+	return connectBPFDecisionDest(rules, defaultAllow, connectDestForTest{family: afInet, ip: ip, port: port})
 }
 
 func TestConnectKernelPrecedenceIsOrderIndependentAndDenyWins(t *testing.T) {

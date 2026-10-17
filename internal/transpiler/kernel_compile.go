@@ -34,7 +34,8 @@ import (
 //     no context, no principal, no attributes;
 //   - File (exact), FilePrefix and Dir IDs absolute and at most 255 bytes
 //     (`==` only on File), Host IDs lowercase in one of the forms name,
-//     *.zone, *, IPv4, each optionally with :port.
+//     *.zone, *, IPv4, each optionally with :port, or an IPv6 address in
+//     RFC 5952 form, bare or as [IPv6]:port.
 //
 // Files and execs compile by regions: every FilePrefix/Dir entity named by
 // a kernel policy is a prefix point, every exact File (and, for opens, a
@@ -163,7 +164,12 @@ func compileKernel(ps *cedarlib.PolicySet, eng *engine.Engine) (*lsm.PolicySet, 
 			return nil, nil, fmt.Errorf("policy %s: built-in actions are enforced for the whole workload; the principal cannot be constrained", name)
 		}
 		if !reach.kernel() {
-			continue // MCP: userspace only
+			// MCP: userspace only, but the MCP adapters supply only
+			// context.server (#164).
+			if why := mcpUnenforceable(pa); why != "" {
+				return nil, nil, &UnenforceableError{Findings: []UnenforceableFinding{{ID: engine.DisplayID(id, p), Policy: name, Effect: effectName(pa), Reason: why}}}
+			}
+			continue
 		}
 		if _, ok := p.Annotations()[engine.AnnotationExpires]; ok {
 			return nil, nil, fmt.Errorf("policy %s: @expires is not supported on policies the kernel enforces (file, exec, connect)", name)
@@ -480,17 +486,46 @@ type hostForm struct {
 	any      bool
 }
 
-// parseHostID parses a Host entity ID in the forms the hierarchy defines.
+// parseHostID parses a Host entity ID in the forms the hierarchy defines:
+// name, *.zone, *, IPv4 or a bare IPv6 address, each but the IPv6 address
+// optionally with :port, and [IPv6]:port.
 func parseHostID(id string) (hostForm, error) {
 	var f hostForm
 	host := id
-	if i := strings.LastIndex(id, ":"); i >= 0 {
-		p, err := strconv.ParseUint(id[i+1:], 10, 16)
+	parsePort := func(s string) error {
+		p, err := strconv.ParseUint(s, 10, 16)
 		if err != nil || p == 0 {
-			return f, fmt.Errorf("port %q must be 1-65535", id[i+1:])
+			return fmt.Errorf("port %q must be 1-65535", s)
 		}
 		f.port = uint16(p)
-		host = id[:i]
+		return nil
+	}
+	switch {
+	case strings.HasPrefix(id, "["):
+		end := strings.Index(id, "]")
+		if end < 0 || !strings.HasPrefix(id[end+1:], ":") {
+			return f, fmt.Errorf("brackets are only for an IPv6 address with a port ([2001:db8::1]:443); write a bare IPv6 address without them")
+		}
+		host = id[1:end]
+		if !strings.Contains(host, ":") || net.ParseIP(host) == nil {
+			return f, fmt.Errorf("brackets enclose only an IPv6 address")
+		}
+		if err := parsePort(id[end+2:]); err != nil {
+			return f, err
+		}
+	case strings.Count(id, ":") > 1:
+		// A bare IPv6 address: its colons are not a port separator (the
+		// engine names an IPv6 host on a port [addr]:port).
+		if net.ParseIP(id) == nil {
+			return f, fmt.Errorf("write an IPv6 address with a port as [address]:port")
+		}
+	default:
+		if i := strings.LastIndex(id, ":"); i >= 0 {
+			if err := parsePort(id[i+1:]); err != nil {
+				return f, err
+			}
+			host = id[:i]
+		}
 	}
 	switch {
 	case host == "":
@@ -499,9 +534,14 @@ func parseHostID(id string) (hostForm, error) {
 		f.any = true
 		f.name = host
 	case net.ParseIP(host) != nil:
-		v4 := engine.CanonicalIPv4(host)
-		if v4 == "" || v4 != host {
-			return f, fmt.Errorf("only canonical dotted IPv4 addresses are supported")
+		canonical := engine.CanonicalIP(host)
+		if canonical != host {
+			return f, fmt.Errorf("IP addresses must be written in canonical form (%s): dotted IPv4 (also for an IPv4-mapped address), RFC 5952 IPv6", canonical)
+		}
+		if net.ParseIP(host).IsUnspecified() {
+			// The kernel rule ABI reads an all-zero address as "any
+			// destination"; the engine matches only that literal address.
+			return f, fmt.Errorf("the unspecified address %s is not a destination; use Host::\"*\" for any host", host)
 		}
 		f.ip = host
 	default:

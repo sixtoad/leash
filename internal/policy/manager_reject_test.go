@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -52,6 +53,30 @@ func TestManagerRejectsKernelInvalidUpdateAndKeepsPrevious(t *testing.T) {
 	}
 	if _, _, rt, _ := m.Snapshot(); len(rt.Open) != 0 {
 		t.Fatalf("runtime layer changed by a refused update: open=%d", len(rt.Open))
+	}
+}
+
+// #164: a file layer with a permit whose condition cannot be enforced is
+// refused as a whole; the previous policy stays active.
+func TestManagerRejectsUnenforceablePermitAndKeepsPrevious(t *testing.T) {
+	proxyCalls := 0
+	m := NewManager(lsm.NewLSMManager("", nil, false), func(*cedar.Compilation) { proxyCalls++ })
+	good := &lsm.PolicySet{Source: &lsm.PolicySource{Name: "leash.cedar", Text: `permit (principal, action == Action::"ProcessExec", resource in Dir::"/usr/bin/");`}}
+	if err := m.UpdateFileRules(good, nil); err != nil {
+		t.Fatal(err)
+	}
+	calls := proxyCalls
+	bad := &lsm.PolicySet{Source: &lsm.PolicySource{Name: "leash.cedar", Text: `permit (principal, action == Action::"ProcessExec", resource in Dir::"/usr/bin/");
+permit (principal, action == Action::"ProcessExec", resource in Dir::"/opt/") when { context.tty == true };`}}
+	err := m.UpdateFileRules(bad, nil)
+	if !errors.Is(err, ErrCompile) || !strings.Contains(err.Error(), "leash.cedar:2:1") {
+		t.Fatalf("want the update refused naming the policy, got %v", err)
+	}
+	if proxyCalls != calls {
+		t.Fatal("the proxy must not receive a refused policy")
+	}
+	if m.Active().Engine.DecideExec("/opt/x").Allow || !m.Active().Engine.DecideExec("/usr/bin/ls").Allow {
+		t.Fatal("the previous policy must stay active")
 	}
 }
 

@@ -351,13 +351,22 @@ func (t *CedarToLeashTranspiler) parseResource(resourceStr string) *Resource {
 	}
 	// Normalize escaped quotes produced by cedar AST serialization
 	clean := strings.ReplaceAll(resourceStr, `\"`, `"`)
-	parts := strings.Split(clean, "::")
-	if len(parts) < 2 {
-		return nil
+	// The entity ID is the quoted string after the last `::"`: an ID may
+	// itself contain "::" (an IPv6 address), and parseEntityString renders a
+	// nested type as MCP::"Server::"id".
+	head, valuePart := clean, ""
+	if i := strings.LastIndex(clean, `::"`); i >= 0 {
+		head, valuePart = clean[:i], clean[i+2:]
+	} else {
+		parts := strings.Split(clean, "::")
+		if len(parts) < 2 {
+			return nil
+		}
+		head, valuePart = strings.Join(parts[:len(parts)-1], "::"), strings.TrimSpace(parts[len(parts)-1])
 	}
-	valuePart := strings.TrimSpace(parts[len(parts)-1])
-	typeParts := make([]string, len(parts)-1)
-	for i, part := range parts[:len(parts)-1] {
+	parts := strings.Split(head, "::")
+	typeParts := make([]string, len(parts))
+	for i, part := range parts {
 		typeParts[i] = strings.Trim(strings.TrimSpace(part), `"`)
 	}
 	rawType := strings.TrimSpace(strings.Join(typeParts, "::"))
@@ -490,7 +499,15 @@ func (t *CedarToLeashTranspiler) buildConnectRule(rule lsm.PolicyRule, resource 
 		hostname := resource.Value
 		var port uint16 = 0
 
-		if strings.Contains(hostname, ":") {
+		switch {
+		case strings.HasPrefix(hostname, "[") || strings.Count(hostname, ":") > 1:
+			// IPv6: [addr]:port, [addr] or a bare address
+			h, p, err := lsm.SplitConnectTarget(hostname)
+			if err != nil {
+				return rule, err
+			}
+			hostname, port = h, p
+		case strings.Contains(hostname, ":"):
 			parts := strings.SplitN(hostname, ":", 2)
 			hostname = parts[0]
 			if p, err := strconv.ParseUint(parts[1], 10, 16); err == nil {
@@ -503,12 +520,12 @@ func (t *CedarToLeashTranspiler) buildConnectRule(rule lsm.PolicyRule, resource 
 		}
 
 		if net.ParseIP(hostname) != nil {
-			ip := net.ParseIP(hostname)
-			ipv4 := ip.To4()
-			if ipv4 == nil {
-				return rule, fmt.Errorf("IPv6 not supported: %s", hostname)
+			v4, v6, err := lsm.ParseConnectIP(hostname)
+			if err != nil {
+				return rule, fmt.Errorf("%s: %w", hostname, err)
 			}
-			rule.DestIP = uint32(ipv4[0])<<24 | uint32(ipv4[1])<<16 | uint32(ipv4[2])<<8 | uint32(ipv4[3])
+			rule.DestIP = v4
+			rule.DestIP6 = v6
 			rule.DestPort = port
 		} else {
 			if strings.HasPrefix(hostname, "*.") {

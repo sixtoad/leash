@@ -137,13 +137,21 @@ func legacyExecRootPathPolicy(rules []ExecPolicyRule) bool {
 // connect default.
 func (m *legacyModel) connectAllowed(hostname, ip string, port uint16) bool {
 	var ipNum uint32
+	var ip6 [16]byte
 	if addr := net.ParseIP(ip); addr != nil {
-		ipNum, _ = canonicalIPv4(addr)
+		var ok bool
+		if ipNum, ok = canonicalIPv4(addr); !ok {
+			copy(ip6[:], addr.To16())
+		}
 	}
 	host := strings.ToLower(strings.TrimSuffix(hostname, "."))
 	for i := range m.connect {
 		rule := &m.connect[i]
-		if rule.DestIP != 0 && rule.DestIP != ipNum {
+		if rule.DestIP6 != ([16]byte{}) {
+			if rule.DestIP6 != ip6 {
+				continue
+			}
+		} else if rule.DestIP != 0 && rule.DestIP != ipNum {
 			continue
 		}
 		if rule.DestPort != 0 && rule.DestPort != port {

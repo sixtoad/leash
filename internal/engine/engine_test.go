@@ -298,3 +298,47 @@ func TestFileParents(t *testing.T) {
 		}
 	}
 }
+
+// IPv6 destinations (#182): RFC 5952 Host IDs, bracketed before a port; an
+// IPv4-mapped address is the IPv4 host it carries; wildcards cover IPv6.
+func TestConnectHierarchyIPv6(t *testing.T) {
+	e := mustEngine(t, `
+permit (principal, action == Action::"NetworkConnect", resource in Host::"2001:db8::1");
+permit (principal, action == Action::"NetworkConnect", resource in Host::"[2001:db8::2]:443");
+permit (principal, action == Action::"NetworkConnect", resource in Host::"10.0.0.1:22");
+permit (principal, action == Action::"NetworkConnect", resource in Host::"*:8443");
+forbid (principal, action == Action::"NetworkConnect", resource in Host::"2001:db8::bad");
+`)
+	cases := []struct {
+		host, ip string
+		port     uint16
+		want     bool
+	}{
+		{"", "2001:db8::1", 443, true},
+		{"", "2001:DB8:0:0::1", 80, true}, // canonicalized
+		{"", "[2001:db8::1]", 0, true},    // bracketed literal
+		{"2001:db8::1", "", 22, true},     // an IP literal host is the address
+		{"[2001:db8::1]", "", 22, true},
+		{"", "2001:db8::2", 443, true},
+		{"", "2001:db8::2", 80, false}, // port-scoped
+		{"", "2001:db8::3", 443, false},
+		{"", "::ffff:10.0.0.1", 22, true}, // IPv4-mapped is the IPv4 host
+		{"", "::ffff:10.0.0.1", 23, false},
+		{"", "2001:db8::9", 8443, true}, // *:port covers IPv6
+		{"", "2001:db8::bad", 8443, false},
+		{"api.example.com", "2001:db8::1", 443, true}, // the address decides for a named IPv6 destination
+	}
+	for _, tc := range cases {
+		if got := e.DecideConnect(tc.host, tc.ip, tc.port); got.Allow != tc.want {
+			t.Errorf("connect %q %q %d: got %+v, want allow=%v", tc.host, tc.ip, tc.port, got, tc.want)
+		}
+	}
+	for in, want := range map[string]string{"2001:DB8::0:1": "2001:db8::1", "::ffff:10.0.0.1": "10.0.0.1", "[::1]": "::1", "10.0.0.1": "10.0.0.1", "x.com": ""} {
+		if got := CanonicalIP(in); got != want {
+			t.Errorf("CanonicalIP(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := HostWithPort("2001:db8::1", 443); got != "[2001:db8::1]:443" {
+		t.Errorf("HostWithPort = %q", got)
+	}
+}

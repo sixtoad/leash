@@ -3,6 +3,7 @@ package lsm
 import (
 	"bytes"
 	"encoding/binary"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,11 +16,20 @@ const asymmetricIPv4 = uint32(0xc0a80101) // 192.168.1.1
 
 func TestConnectAddressAndPortABIOffsets(t *testing.T) {
 	var policy ConnectPolicyRuleBPF
-	if got := unsafe.Offsetof(policy.DestIP); got != 8 {
-		t.Fatalf("ConnectPolicyRuleBPF.DestIP offset = %d, want 8", got)
+	if got := unsafe.Offsetof(policy.Family); got != 8 {
+		t.Fatalf("ConnectPolicyRuleBPF.Family offset = %d, want 8", got)
 	}
-	if got := unsafe.Offsetof(policy.DestPort); got != 12 {
-		t.Fatalf("ConnectPolicyRuleBPF.DestPort offset = %d, want 12", got)
+	if got := unsafe.Offsetof(policy.DestIP); got != 12 {
+		t.Fatalf("ConnectPolicyRuleBPF.DestIP offset = %d, want 12", got)
+	}
+	if got := unsafe.Offsetof(policy.DestIP6); got != 16 {
+		t.Fatalf("ConnectPolicyRuleBPF.DestIP6 offset = %d, want 16", got)
+	}
+	if got := unsafe.Offsetof(policy.DestPort); got != 32 {
+		t.Fatalf("ConnectPolicyRuleBPF.DestPort offset = %d, want 32", got)
+	}
+	if got := unsafe.Sizeof(policy); got != 36 {
+		t.Fatalf("ConnectPolicyRuleBPF size = %d, want 36", got)
 	}
 
 	var event ConnectEvent
@@ -29,15 +39,24 @@ func TestConnectAddressAndPortABIOffsets(t *testing.T) {
 	if got := unsafe.Offsetof(event.DestPort); got != 52 {
 		t.Fatalf("ConnectEvent.DestPort offset = %d, want 52", got)
 	}
+	if got := unsafe.Offsetof(event.DestIP6); got != 188 {
+		t.Fatalf("ConnectEvent.DestIP6 offset = %d, want 188", got)
+	}
+	if got := unsafe.Sizeof(event); got != 208 {
+		t.Fatalf("ConnectEvent size = %d, want 208", got)
+	}
 }
 
 func TestConnectPolicyMapAddressAndPortNativeValues(t *testing.T) {
-	policy := ConnectPolicyRuleBPF{DestIP: asymmetricIPv4, DestPort: 443}
+	policy := ConnectPolicyRuleBPF{Family: afInet, DestIP: asymmetricIPv4, DestPort: 443}
 	raw := unsafe.Slice((*byte)(unsafe.Pointer(&policy)), int(unsafe.Sizeof(policy)))
-	if got := binary.NativeEndian.Uint32(raw[8:12]); got != asymmetricIPv4 {
+	if got := binary.NativeEndian.Uint32(raw[8:12]); got != afInet {
+		t.Fatalf("serialized policy family = %d, want %d", got, afInet)
+	}
+	if got := binary.NativeEndian.Uint32(raw[12:16]); got != asymmetricIPv4 {
 		t.Fatalf("serialized policy IP = %#08x, want %#08x", got, asymmetricIPv4)
 	}
-	if got := binary.NativeEndian.Uint16(raw[12:14]); got != 443 {
+	if got := binary.NativeEndian.Uint16(raw[32:34]); got != 443 {
 		t.Fatalf("serialized policy port = %d, want 443", got)
 	}
 }
@@ -64,18 +83,30 @@ func TestConnectBPFHooksCanonicalizeSockaddrFields(t *testing.T) {
 	}
 	for name, body := range hooks {
 		t.Run(name, func(t *testing.T) {
-			if !strings.Contains(body, "dest_ip = bpf_ntohl(") {
-				t.Fatal("IPv4 sockaddr field is not converted from network byte order")
-			}
-			if !strings.Contains(body, "dest_port = bpf_ntohs(") {
-				t.Fatal("port sockaddr field is not converted from network byte order")
+			// Both hooks decide through the shared classifier, which reads
+			// IPv4 and IPv6 sockaddrs.
+			if !strings.Contains(body, "decide_destination(sock, ") {
+				t.Fatal("hook does not decide through decide_destination")
 			}
 			// Both hooks receive a kernel copy of the sockaddr; a user read
-			// fails at runtime and the hook falls through to allow.
+			// fails at runtime.
 			if strings.Contains(body, "bpf_probe_read_user") {
 				t.Fatal("sockaddr is read with bpf_probe_read_user; it is a kernel pointer at this hook")
 			}
 		})
+	}
+	for _, want := range []string{
+		"d->ip = bpf_ntohl(a4.sin_addr.s_addr)", // IPv4 address, canonical
+		"d->port = bpf_ntohs(a4.sin_port)",      // IPv4 port, host order
+		"d->port = bpf_ntohs(a6.sin6_port)",     // IPv6 port, host order
+		"d->ip = bpf_ntohl(a6.sin6_addr[3])",    // IPv4-mapped IPv6 -> IPv4 path
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("read_inet_dest is missing %q", want)
+		}
+	}
+	if strings.Contains(text, "bpf_probe_read_user") {
+		t.Error("the connect program reads a user pointer; every sockaddr at these hooks is a kernel copy")
 	}
 }
 
@@ -161,12 +192,15 @@ func TestConnectEventUpdatesDNSCacheWithCanonicalIPv4Key(t *testing.T) {
 func TestConnectEventFormatsCanonicalTCPAndUDPAddresses(t *testing.T) {
 	tests := []struct {
 		name     string
+		family   uint32
 		protocol uint32
 		port     uint16
 		want     string
 	}{
 		{name: "tcp", protocol: 6, port: 443, want: `protocol=tcp addr="192.168.1.1:443"`},
 		{name: "udp-dns", protocol: 17, port: 53, want: `protocol=udp addr="192.168.1.1:53"`},
+		{name: "tcp6", family: afInet6, protocol: 6, port: 443, want: `protocol=tcp addr="[2001:db8::1]:443"`},
+		{name: "udp6-any-port", family: afInet6, protocol: 17, want: `protocol=udp addr="2001:db8::1"`},
 	}
 
 	for _, tt := range tests {
@@ -185,10 +219,14 @@ func TestConnectEventFormatsCanonicalTCPAndUDPAddresses(t *testing.T) {
 			event := ConnectEvent{
 				PID:      42,
 				CgroupID: 99,
-				Family:   2,
+				Family:   afInet,
 				Protocol: tt.protocol,
 				DestIP:   asymmetricIPv4,
 				DestPort: tt.port,
+			}
+			if tt.family == afInet6 {
+				event.Family, event.DestIP = afInet6, 0
+				copy(event.DestIP6[:], net.ParseIP("2001:db8::1").To16())
 			}
 			copy(event.Comm[:], "agent")
 
@@ -230,14 +268,14 @@ func TestConnectEventDecodesKernelLayout(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			// Build the record byte-for-byte as the BPF program lays it out.
-			raw := make([]byte, 192)
-			binary.LittleEndian.PutUint32(raw[0:], 42)
+			raw := make([]byte, 208)
+			binary.NativeEndian.PutUint32(raw[0:], 42)
 			copy(raw[24:40], "agent")
-			binary.LittleEndian.PutUint32(raw[40:], 2)
-			binary.LittleEndian.PutUint32(raw[44:], 6)
-			binary.LittleEndian.PutUint32(raw[48:], asymmetricIPv4)
-			binary.LittleEndian.PutUint16(raw[52:], 443)
-			binary.LittleEndian.PutUint32(raw[56:], uint32(0xfffffff3)) // -EACCES
+			binary.NativeEndian.PutUint32(raw[40:], 2)
+			binary.NativeEndian.PutUint32(raw[44:], 6)
+			binary.NativeEndian.PutUint32(raw[48:], asymmetricIPv4)
+			binary.NativeEndian.PutUint16(raw[52:], 443)
+			binary.NativeEndian.PutUint32(raw[56:], uint32(0xfffffff3)) // -EACCES
 			copy(raw[60:], tt.hostname)
 
 			logPath := filepath.Join(t.TempDir(), "events.log")

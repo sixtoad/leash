@@ -37,7 +37,9 @@ forbid (principal, action in Action::"FileOpen", resource == File::"/etc/leash-d
 @leash_semantics("cedar")
 permit (principal, action == Action::"ProcessExec", resource) when { resource in Dir::"/" } unless { resource in FilePrefix::"/usr/bin/nc" };
 @leash_semantics("cedar")
-permit (principal, action == Action::"NetworkConnect", resource) when { resource in [Host::"example.com", Host::"*:53"] };
+permit (principal, action == Action::"NetworkConnect", resource) when { resource in [Host::"example.com", Host::"*:53", Host::"[fd00:6::1]:8443"] };
+@leash_semantics("cedar")
+forbid (principal, action == Action::"NetworkConnect", resource in Host::"fd00:6::2");
 @leash_semantics("cedar")
 permit (principal, action == Action::"McpCall", resource);`,
 		"empty-strict": `@leash_semantics("cedar")

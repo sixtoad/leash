@@ -107,7 +107,10 @@ struct linux_binprm {
 };
 
 // Network structures for socket_connect LSM hook
+#define AF_UNSPEC 0
+#define AF_UNIX 1
 #define AF_INET 2
+#define AF_NETLINK 16
 #define AF_INET6 10
 #define IPPROTO_TCP 6
 #define IPPROTO_UDP 17
@@ -128,8 +131,14 @@ struct sockaddr_in {
     char sin_zero[8];
 };
 
+struct sock_common {
+    unsigned short skc_family;
+    // Other fields omitted for simplicity
+};
+
 struct sock {
-    int sk_protocol;
+    struct sock_common __sk_common;
+    __u16 sk_protocol;
     // Other fields omitted for simplicity
 };
 

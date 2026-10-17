@@ -41,6 +41,14 @@ func TestCompileKernelRejectsWhatTheKernelCannotEnforce(t *testing.T) {
 		`forbid (principal, action == Action::"NetworkConnect", resource in Host::"*.a.com") unless { resource in Host::"b.a.com" };`: "unless",
 		`permit (principal, action, resource) when { resource.owner == "x" };`:                                                        "attributes",
 		`permit (principal, action == Action::"FileOpenReadOnly", resource in File::"relative");`:                                     "absolute",
+		`permit (principal, action == Action::"NetworkConnect", resource in Host::"2001:DB8::1");`:                                    "canonical form (2001:db8::1)",
+		`permit (principal, action == Action::"NetworkConnect", resource in Host::"::ffff:10.0.0.1");`:                                "canonical form (10.0.0.1)",
+		`permit (principal, action == Action::"NetworkConnect", resource in Host::"[2001:db8::1]");`:                                  "brackets are only for an IPv6 address with a port",
+		`permit (principal, action == Action::"NetworkConnect", resource in Host::"[10.0.0.1]:443");`:                                 "brackets enclose only an IPv6 address",
+		`permit (principal, action == Action::"NetworkConnect", resource in Host::"[2001:db8::1]:0");`:                                "port",
+		`permit (principal, action == Action::"NetworkConnect", resource in Host::"::");`:                                             "unspecified address",
+		`permit (principal, action == Action::"NetworkConnect", resource in Host::"0.0.0.0");`:                                        "unspecified address",
+		`permit (principal, action == Action::"NetworkConnect", resource in Host::"a:b:c");`:                                          "[address]:port",
 	}
 	for text, want := range cases {
 		_, err := compileKernelText(t, text)
@@ -118,5 +126,27 @@ permit (principal, action == Action::"NetworkConnect", resource in Host::"10.0.0
 	}
 	if ir.ConnectDefaultAllow || len(ir.Connect) != 1 || !lsm.IsConnectDefaultRule(ir.Connect[0]) {
 		t.Fatalf("a forbid of every connection beats every permit: %v", ir.Connect)
+	}
+}
+
+// IPv6 literals (#182) compile to IPv6 kernel rules.
+func TestCompileKernelIPv6Hosts(t *testing.T) {
+	ir, err := compileKernelText(t, `
+permit (principal, action == Action::"NetworkConnect", resource in Host::"[2001:db8::1]:443");
+forbid (principal, action == Action::"NetworkConnect", resource in Host::"2001:db8::2");`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, r := range ir.Connect {
+		got[r.String()] = true
+	}
+	for _, want := range []string{"allow net.send [2001:db8::1]:443", "deny net.send 2001:db8::2"} {
+		if !got[want] {
+			t.Errorf("missing kernel rule %q in %v", want, got)
+		}
+	}
+	if ir.ConnectDefaultAllow {
+		t.Error("IPv6 rules must not change the default deny")
 	}
 }
