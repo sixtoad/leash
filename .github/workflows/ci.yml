@@ -255,6 +255,33 @@ jobs:
             | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E '(error|warning: unre|\*\* BUILD)' || true
           grep -q '\*\* BUILD SUCCEEDED \*\*' "$RUNNER_TEMP/xcodebuild.log"
 
+  test-web:
+    name: test-web
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6.1.0
+
+      # Pinned as tests.yml did; an unpinned pnpm >= 10 build is #174.
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.18.0 --activate
+          node --version
+          pnpm --version
+
+      - name: Install
+        working-directory: controlui/web
+        run: pnpm install --frozen-lockfile
+
+      - name: vitest
+        working-directory: controlui/web
+        run: pnpm test
+
+      - name: next build
+        working-directory: controlui/web
+        run: pnpm run build
+
   # TODO(e2e-docker): the e2e suite (./test_e2e.sh, LEASH_E2E=1) needs the leash
   # manager image built from Dockerfile.leash (which also needs the Control UI
   # build, #174) plus the LEASH_E2E_* target images. Wire it up once the UI build
