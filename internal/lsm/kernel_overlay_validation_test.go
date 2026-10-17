@@ -38,6 +38,8 @@ type overlayRootCases struct {
 	renameOKTo      string
 	uringPermitted  string // overlay file in the permitted rw dir, opened first
 	uringHelper     string // copy of this test binary where the box may exec it
+	linkSource      string // readable lower-layer image file
+	linkTarget      string // in the permitted rw dir
 }
 
 func newOverlayRootCases() overlayRootCases {
@@ -54,6 +56,8 @@ func newOverlayRootCases() overlayRootCases {
 		renameOKTo:      "/tmp/leash-ovl-to",
 		uringPermitted:  "/tmp/leash-ovl-uring-ok",
 		uringHelper:     "/usr/local/bin/leash-ovl-uring-helper",
+		linkSource:      "/etc/issue",
+		linkTarget:      "/tmp/leash-ovl-issue-link",
 	}
 }
 
@@ -74,12 +78,12 @@ func (o overlayRootCases) prepare(t *testing.T) {
 	if fs.Type != overlayfsSuperMagic {
 		t.Fatalf("container rootfs is not overlayfs (magic %#x); run via scripts/verify-lsm-kernel-load.sh with an overlay storage driver", fs.Type)
 	}
-	for _, file := range []string{o.defaultDenyFile, o.forbiddenWrite, o.readForbidden, o.permittedLower, o.renameSource} {
+	for _, file := range []string{o.defaultDenyFile, o.forbiddenWrite, o.readForbidden, o.permittedLower, o.renameSource, o.linkSource} {
 		if _, err := os.Stat(file); err != nil {
 			t.Fatalf("image file %s: %v", file, err)
 		}
 	}
-	for _, path := range []string{o.renameTarget, o.renameOKTo, o.defaultDenyDir + "/leash-ovl-new", o.permittedDir + "/leash-ovl-new"} {
+	for _, path := range []string{o.renameTarget, o.renameOKTo, o.linkTarget, o.linkTarget + "-denied", o.defaultDenyDir + "/leash-ovl-new", o.permittedDir + "/leash-ovl-new"} {
 		_ = os.Remove(path)
 	}
 	for _, file := range []string{o.renameOKFrom, o.uringPermitted} {
@@ -111,6 +115,10 @@ func (o overlayRootCases) verify(t *testing.T, cgroupFD int) {
 		{"overlay: O_CREAT in permitted image dir", boxWrite, []string{o.permittedDir + "/leash-ovl-new"}, true, ""},
 		{"overlay: rename default-deny image file into permitted rw dir", `mv "$1" "$2"`, []string{o.renameSource, o.renameTarget}, false, ""},
 		{"overlay: rename inside permitted rw dir", `mv "$1" "$2"`, []string{o.renameOKFrom, o.renameOKTo}, true, ""},
+		// The link copies the lower-layer source up; its backing opens ride the
+		// correlation the allowed link installs (#29).
+		{"overlay: hard-link readable lower-layer image file into permitted rw dir", boxLink, []string{o.linkSource, o.linkTarget}, true, ""},
+		{"overlay: hard-link default-deny image file into permitted rw dir", boxLink, []string{o.defaultDenyFile, o.linkTarget + "-denied"}, false, eperm},
 	})
 	o.verifyURing(t, cgroupFD)
 	if _, err := os.Stat(o.renameTarget); err == nil {

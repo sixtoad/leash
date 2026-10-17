@@ -106,6 +106,11 @@ const (
 	mutationOpUnlink              uint32 = 4
 	mutationOpRmdir               uint32 = 5
 	mutationOpRename              uint32 = 6
+	mutationOpLink                uint32 = 7 // hard-link destination (new name)
+	mutationOpLinkSource          uint32 = 8 // hard-link source (existing file)
+	linkTailCallMapName                  = "link_tail_calls"
+	linkTailCallProgramName              = "lsm_link_policy"
+	linkGuardProgramName                 = "lsm_link"
 	// Note: Policy constants are now defined in common.go
 
 	// duplicateSuppressionWindow limits how long we treat identical payloads as retries.
@@ -233,27 +238,44 @@ func (l *OpenLsm) LoadPolicies(policies []OpenPolicyRule) error {
 }
 
 func (l *OpenLsm) LoadAndAttach(loader func() (*ebpf.CollectionSpec, error)) error {
+	return LoadAndAttachBPFWithSetup(l, loader, l.bpfConfig(), populateOpenTailCall)
+}
+
+func (l *OpenLsm) bpfConfig() BPFConfig {
 	config := BPFConfig{
 		ProgramNames: l.requiredProgramNames(),
 		// lsm_link (hard-link guard, audit #3) is best-effort: it needs
 		// CONFIG_SECURITY_PATH and rides the same policy maps, but must never
 		// degrade file-open enforcement if it can't attach on some kernel.
-		OptionalProgramNames: []string{"lsm_link"},
-		EventMapName:         "events",
-		AllowedCgroupsMap:    "allowed_cgroups",
-		TargetCgroupMap:      "target_cgroup",
-		StartMessage:         "Successfully started monitoring file opens",
-		ShutdownMessage:      "Shutting down open LSM tracker",
+		OptionalProgramNames: []string{linkGuardProgramName},
+		// Its decision stage is tail-called, never attached, and is stripped
+		// with it if either fails verification.
+		OptionalStageNames: []string{linkTailCallProgramName},
+		EventMapName:       "events",
+		AllowedCgroupsMap:  "allowed_cgroups",
+		TargetCgroupMap:    "target_cgroup",
+		StartMessage:       "Successfully started monitoring file opens",
+		ShutdownMessage:    "Shutting down open LSM tracker",
 	}
 	if l.containerOverlay {
 		config.AfterRequiredAttach = l.attachCopyUpExitTracepoint
 	}
-	return LoadAndAttachBPFWithSetup(l, loader, config, populateOpenTailCall)
+	return config
 }
 
 func populateOpenTailCall(coll *ebpf.Collection) error {
 	if coll == nil {
 		return fmt.Errorf("file-open tail-call collection is nil")
+	}
+	if err := populateLinkTailCall(coll); err != nil {
+		// lsm_link denies on an unpopulated slot, so it must not attach
+		// without its decision stage. The guard is best-effort; file-open
+		// enforcement is unaffected.
+		fmt.Fprintf(os.Stderr, "leash: optional LSM hook %q disabled: %v\n", linkGuardProgramName, err)
+		if guard := coll.Programs[linkGuardProgramName]; guard != nil {
+			guard.Close()
+			delete(coll.Programs, linkGuardProgramName)
+		}
 	}
 	tailCalls := coll.Maps[openTailCallMapName]
 	if tailCalls == nil {
@@ -278,6 +300,26 @@ func populateOpenTailCall(coll *ebpf.Collection) error {
 		if err := tailCalls.Put(stage.slot, programFD); err != nil {
 			return fmt.Errorf("populate file-open tail-call slot %d: %w", stage.slot, err)
 		}
+	}
+	return nil
+}
+
+// populateLinkTailCall installs the hard-link decision stage (#29). It is a
+// no-op when the optional guard was stripped from the collection.
+func populateLinkTailCall(coll *ebpf.Collection) error {
+	if coll.Programs[linkGuardProgramName] == nil {
+		return nil
+	}
+	stage := coll.Programs[linkTailCallProgramName]
+	if stage == nil {
+		return fmt.Errorf("decision stage %q not loaded", linkTailCallProgramName)
+	}
+	tailCalls := coll.Maps[linkTailCallMapName]
+	if tailCalls == nil {
+		return fmt.Errorf("tail-call map %q not found", linkTailCallMapName)
+	}
+	if err := tailCalls.Put(uint32(0), uint32(stage.FD())); err != nil {
+		return fmt.Errorf("populate %q slot 0: %w", linkTailCallMapName, err)
 	}
 	return nil
 }
@@ -995,6 +1037,10 @@ func (l *OpenLsm) handleEvent(data []byte) {
 		eventName = "file.rmdir"
 	case mutationOpRename:
 		eventName = "file.rename"
+	case mutationOpLink:
+		eventName = "file.link"
+	case mutationOpLinkSource:
+		eventName = "file.link:source"
 	}
 
 	// Format in logfmt (key=value pairs) - matching C version format exactly

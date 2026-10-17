@@ -367,10 +367,12 @@ func TestDirectoryMutationDenialNamesOperationAndPath(t *testing.T) {
 	l := &OpenLsm{logger: logger}
 
 	for op, want := range map[uint32]string{
-		mutationOpMkdir:  "file.mkdir",
-		mutationOpUnlink: "file.unlink",
-		mutationOpRmdir:  "file.rmdir",
-		mutationOpRename: "file.rename",
+		mutationOpMkdir:      "file.mkdir",
+		mutationOpUnlink:     "file.unlink",
+		mutationOpRmdir:      "file.rmdir",
+		mutationOpRename:     "file.rename",
+		mutationOpLink:       "file.link",
+		mutationOpLinkSource: "file.link:source",
 	} {
 		event := OpenEvent{PID: 42, TGID: 42, Operation: op, Result: -13}
 		copy(event.Comm[:], "fixture\x00")
@@ -396,11 +398,26 @@ func TestHardlinkComponentReadIsVerifierBoundedAndFailsClosed(t *testing.T) {
 	}
 	text := string(source)
 	for _, guard := range []string{
-		"len == 0 || len >= HL_MAX_COMP",
-		"bpf_probe_read_kernel_str(comp, sizeof(comp), name)",
-		"read < 0 || read <= (long)len",
+		// Bounded only by the 255-byte contract (#29), never by a smaller
+		// component or depth limit that would leave a path unresolved.
+		"#define HL_MAX_DEPTH (MAX_PATH_LEN / 2)",
+		"if (len >= MAX_PATH_LEN || off - (int)len - 1 < 1) {\n            return -1;",
+		"__u32 dst = (__u32)(off - (int)len) & (MAX_PATH_LEN - 1);",
+		"__u32 size = len & (MAX_PATH_LEN - 1);",
+		"bpf_probe_read_kernel(buf + dst, size, name) < 0",
+		"char raw[MAX_PATH_LEN * 2];",
+		"if (!reached) {\n        return -1;",
 		"hl_build_within(old_dentry, mnt_root, s->raw)",
-		"if (sstart == -2) {\n        return -13;",
+		// Unreadable and over-long sources both deny; nothing fails open.
+		"if (sstart < 0 || sstart >= MAX_PATH_LEN) {\n        return -1;",
+		"return -1; // unresolved (e.g. beyond 255 bytes): deny, as file_open does",
+		// The decision is tail-called; an unpopulated slot denies.
+		"bpf_tail_call(ctx, &link_tail_calls, 0);\n    return -1;",
+		"int BPF_PROG(lsm_link_policy, struct dentry *old_dentry, const struct path *new_dir, struct dentry *new_dentry)",
+		"int readable = check_open_indexed_policy(s->path, OP_OPEN_RO);",
+		"emit_mutation_decision(s->path, OP_LINK_SOURCE, 0);",
+		"int ret = check_directory_mutation(new_dir, new_dentry, OP_LINK, true);",
+		"if (mark_allowed_overlay_mutation(new_dir) != 0) {\n        return emit_current_mutation(OP_LINK, 0);",
 	} {
 		if !strings.Contains(text, guard) {
 			t.Fatalf("hard-link component read is missing %q", guard)

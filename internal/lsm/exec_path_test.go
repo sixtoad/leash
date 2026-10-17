@@ -50,8 +50,8 @@ func TestPathComparisonLoopsKeepVerifierVisibleBounds(t *testing.T) {
 			"barrier_var(max_len);\n\n    #pragma clang loop unroll(disable)\n    for (int i = 0; i < 64; i++) {",
 		},
 		"bpf/lsm_open.bpf.c": {
-			"if (len == 0 || len >= HL_MAX_COMP) {\n            return -2;\n        }",
-			"barrier_var(len);\n        if (off - (int)len - 1 < 1) {",
+			"if (len == 0) {\n            return -2;\n        }",
+			"if (len >= MAX_PATH_LEN || off - (int)len - 1 < 1) {\n            return -1;\n        }",
 		},
 	} {
 		source, err := os.ReadFile(file)
