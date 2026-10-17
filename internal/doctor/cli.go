@@ -2,10 +2,14 @@ package doctor
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"strings"
+
+	"github.com/strongdm/leash/internal/runner"
 )
 
 // Exit codes. 0 is the only code that means "this machine can enforce", so
@@ -48,9 +52,13 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	// accepted on every platform so a script does not have to branch on GOOS;
 	// off macOS they simply have nothing to configure.
 	leashCLI := fs.String("leash-cli-path", "", "macOS: `path` to the companion leashcli binary (default "+DefaultLeashCLIPath+")")
+	// Native boxes (holder unit, netns, work dir) left behind by a leash that
+	// was SIGKILLed are reported on stderr; --reap removes them (#158). Only
+	// boxes whose owning leash is provably gone are listed or touched.
+	reap := fs.Bool("reap", false, "remove native boxes (systemd unit, netns, temp dirs) left by leash runs whose process is gone")
 	daemonAddr := fs.String("darwin-daemon", "", "macOS: `address` of the running \"leash --darwin\" daemon (default $LEASH_LISTEN, else "+DefaultDarwinDaemonAddr+")")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "usage: leash doctor [--json] [--quick] [--leash-cli-path PATH] [--darwin-daemon ADDR]\n\nChecks whether this machine can enforce, per runtime.\n\nflags:\n")
+		fmt.Fprintf(stderr, "usage: leash doctor [--json] [--quick] [--reap] [--leash-cli-path PATH] [--darwin-daemon ADDR]\n\nChecks whether this machine can enforce, per runtime.\n\nflags:\n")
 		fs.PrintDefaults()
 		fmt.Fprintf(stderr, "\n%s", usageExitNotes)
 	}
@@ -71,6 +79,8 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		fs.Usage()
 		return exitUsage
 	}
+
+	reportStaleNativeBoxes(stderr, *reap)
 
 	report := Evaluate(ProbeWithOptions(ProbeOptions{
 		Quick:            *quick,
@@ -99,4 +109,25 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return exitInternal
 	}
 	return report.ExitCode()
+}
+
+// Seams for tests: the stale-box lookups touch /run and systemd.
+var (
+	staleNativeBoxes = runner.StaleNativeBoxes
+	reapNativeBoxes  = func() []string { return runner.ReapStaleNativeBoxes(context.Background()) }
+)
+
+// reportStaleNativeBoxes notes (or, with reap, removes) native boxes left by
+// dead leash runs. It writes to stderr only, so the JSON report on stdout and
+// the exit code are unchanged.
+func reportStaleNativeBoxes(stderr io.Writer, reap bool) {
+	if reap {
+		if names := reapNativeBoxes(); len(names) > 0 {
+			fmt.Fprintf(stderr, "leash doctor: reaped %d stale native box(es) from dead runs: %s\n", len(names), strings.Join(names, ", "))
+		}
+		return
+	}
+	if names := staleNativeBoxes(); len(names) > 0 {
+		fmt.Fprintf(stderr, "leash doctor: %d stale native box(es) left by dead runs: %s (remove with `leash doctor --reap`; the next native run also reaps them)\n", len(names), strings.Join(names, ", "))
+	}
 }

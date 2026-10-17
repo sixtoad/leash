@@ -441,6 +441,7 @@ func execute(cmdName string, args []string) error {
 			// (#128, #143).
 			r.killInjectedPluginsNow()
 			r.killLeashdNow()
+			r.forcedExitCleanup()
 			os.Exit(1)
 		}
 	}()
@@ -453,6 +454,53 @@ func execute(cmdName string, args []string) error {
 	}
 	return nil
 }
+
+// forcedExitCleanup is the bounded, best-effort teardown on a forced exit:
+// os.Exit skips every deferred cleanup, so the native box (netns, egress,
+// holder unit, temp work dir) — or, for container backends, both containers
+// and the temp work dir — is removed here, within forcedExitBudget (#158).
+func (r *runner) forcedExitCleanup() {
+	if r.keepContainers {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), forcedExitBudget)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if r.usingNativeRuntime() {
+			nativeLauncher{r: r}.forceRemove(ctx)
+			return
+		}
+		r.forceRemoveContainers(ctx)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
+// forceRemoveContainers is the container backend's forced-exit teardown: a
+// second interrupt can land while the orderly teardown has removed the leash
+// sidecar but not yet the target, which would leave the workload's container
+// running with nothing enforcing it. Remove both, then the temp work dir.
+func (r *runner) forceRemoveContainers(ctx context.Context) {
+	names := []string{}
+	for _, n := range []string{r.cfg.targetContainer, r.cfg.leashContainer} {
+		if strings.TrimSpace(n) != "" {
+			names = append(names, n)
+		}
+	}
+	if len(names) > 0 {
+		_ = r.rt().Run(ctx, append([]string{"rm", "-f"}, names...)...)
+	}
+	if ctx.Err() == nil && r.cfg.workDirIsTemp && safeReapPath(r.cfg.workDir) {
+		_ = os.RemoveAll(r.cfg.workDir)
+	}
+}
+
+// forcedExitBudget bounds forcedExitCleanup so a forced exit stays prompt.
+var forcedExitBudget = 5 * time.Second
 
 func terminationSignals() []os.Signal {
 	return []os.Signal{os.Interrupt, syscall.SIGTERM}

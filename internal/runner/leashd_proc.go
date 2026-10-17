@@ -62,3 +62,17 @@ func (r *runner) killLeashdNow() {
 		p.signalGroup(syscall.SIGKILL)
 	}
 }
+
+// waitLeashdExit waits up to d for leashd's reaper to observe its exit.
+func (r *runner) waitLeashdExit(d time.Duration) {
+	r.leashdMu.Lock()
+	p := r.leashd
+	r.leashdMu.Unlock()
+	if p == nil {
+		return
+	}
+	select {
+	case <-p.done:
+	case <-time.After(d):
+	}
+}
