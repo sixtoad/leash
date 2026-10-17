@@ -77,14 +77,17 @@ type longPathTrees struct {
 	file255, sibling255    string // 255-byte exact rw file permit + same-length sibling
 	mountM                 string // 146-byte mount point of a second tmpfs (generic permit)
 	deepM, shallowM        string // a >255-byte file and a short file inside mountM
+	// Hard-link reconstruction beyond the old 4-deep/40-byte bounds (#29).
+	linkDeepSecret string // forbidden, 7 deep; its last 4 components alias a path under parentA
+	linkDeepOK     string // readable, 8 deep under parentA
+	linkLongName   string // readable, 60-byte final component under parentA
+	linkTmp        string // readable temp file inside rw+ro dirB (atomic temp -> final)
 }
 
 func newLongPathTrees() longPathTrees {
 	tail := func(prefix string, n int, fill byte) string {
 		return prefix + strings.Repeat(string(fill), n-len(prefix))
 	}
-	// Tree A and mount M keep every component under the hard-link guard's
-	// 40-byte and 4-deep reconstruction bounds (#29) so link cases exercise policy.
 	component := (longPathSegment + longPathSegment)[:37]
 	treeA := longPathRoot + "/a/" + component + "/" + component + "/"
 	dirC := longPathRoot + "/c/" + strings.Repeat(longPathSegment, 9) + "/"
@@ -111,6 +114,12 @@ func newLongPathTrees() longPathTrees {
 		mountM:     mountM,
 		deepM:      mountM + "/" + component39 + "/" + component39 + "/" + component39 + "/" + component39,
 		shallowM:   mountM + "/ok.txt",
+		// The old walk stopped after 4 components, so this source resolved
+		// to /lp/a/k/k/secret, under parentA's permit: a forbidden alias.
+		linkDeepSecret: longPathRoot + "/x/y/a/k/k/secret",
+		linkDeepOK:     longPathRoot + "/a/d1/d2/d3/d4/d5/d6/ok.txt",
+		linkLongName:   longPathRoot + "/a/" + strings.Repeat("n", 60),
+		linkTmp:        longPathRoot + "/b/" + strings.Repeat(longPathSegment, 4) + "dir/tmp.1234",
 	}
 }
 
@@ -130,6 +139,10 @@ func (l longPathTrees) policy() []string {
 		"allow file.open:rw " + l.file200,
 		"allow file.open:rw " + l.file255,
 		"allow file.open " + l.mountM + "/",
+		// Hard-link destinations need writable-directory authority (#29).
+		"allow file.open:rw " + l.mountM + "/",
+		"allow file.open:ro " + l.dirB,
+		"deny file.open " + l.linkDeepSecret,
 	}
 }
 
@@ -138,6 +151,7 @@ func (l longPathTrees) policy() []string {
 func (l longPathTrees) reloadPolicy() []string {
 	return []string{
 		"allow file.open /",
+		"allow file.open:rw /", // the mount-root link cases create names in "/"
 		"deny file.open " + l.mountM + "/",
 		"deny file.open:ro /etc/passwd",
 	}
@@ -163,13 +177,15 @@ func (l longPathTrees) prepare(t *testing.T) {
 		_ = os.Remove(longPathRoot) // the empty mount point on the root fs
 	})
 	for _, dir := range []string{longPathRoot + "/s", longPathRoot + "/e", filepath.Dir(l.blockedA), l.sealedA, l.sealedA + "x",
-		l.dirB, l.siblingB, filepath.Dir(l.file200), filepath.Dir(l.file255), filepath.Dir(l.deepM)} {
+		l.dirB, l.siblingB, filepath.Dir(l.file200), filepath.Dir(l.file255), filepath.Dir(l.deepM),
+		filepath.Dir(l.linkDeepSecret), filepath.Dir(l.linkDeepOK)} {
 		if err := os.MkdirAll(dir, 0o777); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for _, file := range []string{l.blockedA, l.roSecretA, l.forbid64, l.forbid65, l.forbid255,
-		l.dirB + "victim.txt", l.siblingB + "victim.txt", l.dirB + "from.txt", l.deepM, l.shallowM} {
+		l.dirB + "victim.txt", l.siblingB + "victim.txt", l.dirB + "from.txt", l.deepM, l.shallowM,
+		l.linkDeepSecret, l.linkDeepOK, l.linkLongName, l.linkTmp} {
 		if err := os.WriteFile(file, []byte("x"), 0o666); err != nil {
 			t.Fatal(err)
 		}
@@ -248,7 +264,16 @@ func (l longPathTrees) verify(t *testing.T, cgroupFD int) {
 		{"list same-prefix sibling of forbidden directory", `ls "$1"`, []string{l.sealedA + "x"}, true, ""},
 		{"hard-link 93-byte forbidden source into permitted dir", boxLink, []string{l.blockedA, l.parentA + "alias"}, false, eperm},
 		{"hard-link 95-byte read-only-forbidden source", boxLink, []string{l.roSecretA, l.parentA + "ro-alias"}, false, eperm},
-		{"hard-link permitted long source into permitted dir", boxLink, []string{l.okA, l.parentA + "ok-alias"}, true, ""},
+		{"hard-link permitted long source into permitted rw dir", boxLink, []string{l.okA, l.dirB + "ok-alias"}, true, ""},
+		// #29: reconstruction is bounded only by the 255-byte contract. The
+		// destination has short components so only the source walk is tested.
+		{"hard-link forbidden 7-deep source (old 4-deep walk aliased a permit)", boxLink, []string{l.linkDeepSecret, longPathRoot + "/s/deep-secret-alias"}, false, eperm},
+		{"hard-link readable 8-deep source", boxLink, []string{l.linkDeepOK, longPathRoot + "/s/deep-ok-alias"}, true, ""},
+		{"hard-link readable source with a 60-byte component", boxLink, []string{l.linkLongName, longPathRoot + "/s/long-name-alias"}, true, ""},
+		// #29: the new name needs writable-directory authority.
+		{"hard-link readable source into undeclared same-prefix sibling", boxLink, []string{l.okA, l.siblingB + "alias"}, false, ""},
+		{"hard-link readable source into generic-only (not rw) dir", boxLink, []string{l.okA, l.parentA + "generic-alias"}, false, ""},
+		{"hard-link atomic temp -> final inside one rw workspace", boxLink, []string{l.linkTmp, l.dirB + "final.txt"}, true, ""},
 		{"write 64-byte exact file permit", boxWrite, []string{l.permit64}, true, ""},
 		{"write 64-byte same-length sibling", boxWrite, []string{l.permit64[:63] + "x"}, false, ""},
 		{"write 65-byte exact file permit", boxWrite, []string{l.permit65}, true, ""},
@@ -572,6 +597,10 @@ collect:
 	// The audit trail must carry the complete long paths with the operation
 	// and decision on the same record.
 	required := []string{
+		`event=file.link:source .*path="` + regexp.QuoteMeta(longPaths.linkDeepSecret) + `" decision=denied`,
+		`event=file.link .*path="` + regexp.QuoteMeta(longPaths.siblingB+"alias") + `" decision=denied`,
+		`event=file.link .*path="` + regexp.QuoteMeta(longPaths.dirB+"final.txt") + `" decision=allowed`,
+		`event=file.link:source .*path="` + regexp.QuoteMeta(longPaths.linkTmp) + `" decision=allowed`,
 		`event=file.open:rw .*path="` + regexp.QuoteMeta(longPaths.file255) + `" decision=allowed`,
 		`event=file.open:rw .*path="` + regexp.QuoteMeta(longPaths.sibling255) + `" decision=denied`,
 		`event=file.open:rw .*path="` + regexp.QuoteMeta(longPaths.blockedA) + `" decision=denied`,
