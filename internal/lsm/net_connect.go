@@ -432,9 +432,10 @@ func (l *ConnectLsm) handleEvent(data []byte) {
 		return
 	}
 
+	// Ring-buffer records are in the kernel's (host) byte order.
 	var event ConnectEvent
 	reader := bytes.NewReader(data)
-	if err := binary.Read(reader, binary.LittleEndian, &event); err != nil {
+	if err := binary.Read(reader, binary.NativeEndian, &event); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to parse connect event: %v\n", err)
 		return
 	}

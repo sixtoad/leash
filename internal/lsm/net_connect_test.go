@@ -269,13 +269,13 @@ func TestConnectEventDecodesKernelLayout(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Build the record byte-for-byte as the BPF program lays it out.
 			raw := make([]byte, 208)
-			binary.LittleEndian.PutUint32(raw[0:], 42)
+			binary.NativeEndian.PutUint32(raw[0:], 42)
 			copy(raw[24:40], "agent")
-			binary.LittleEndian.PutUint32(raw[40:], 2)
-			binary.LittleEndian.PutUint32(raw[44:], 6)
-			binary.LittleEndian.PutUint32(raw[48:], asymmetricIPv4)
-			binary.LittleEndian.PutUint16(raw[52:], 443)
-			binary.LittleEndian.PutUint32(raw[56:], uint32(0xfffffff3)) // -EACCES
+			binary.NativeEndian.PutUint32(raw[40:], 2)
+			binary.NativeEndian.PutUint32(raw[44:], 6)
+			binary.NativeEndian.PutUint32(raw[48:], asymmetricIPv4)
+			binary.NativeEndian.PutUint16(raw[52:], 443)
+			binary.NativeEndian.PutUint32(raw[56:], uint32(0xfffffff3)) // -EACCES
 			copy(raw[60:], tt.hostname)
 
 			logPath := filepath.Join(t.TempDir(), "events.log")
