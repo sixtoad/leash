@@ -472,56 +472,6 @@ func (m *Manager) StorePolicyEvent(event *messages.MacPolicyEventPayload) {
 	log.Printf("macsync: stored policy event %s kind=%s process=%s", event.ID, event.Kind, event.ProcessPath)
 }
 
-// ProcessPolicyDecision converts a decision into a rule and stores it.
-func (m *Manager) ProcessPolicyDecision(decision *messages.MacPolicyDecisionPayload) error {
-	if decision == nil {
-		return fmt.Errorf("decision payload required")
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	event, exists := m.policyEvents[decision.EventID]
-	if !exists {
-		return fmt.Errorf("event %s not found", decision.EventID)
-	}
-
-	// Only create persistent rules for "always" and "directory" scopes
-	if decision.Scope.Type != "always" && decision.Scope.Type != "directory" {
-		// For "once" scope, just allow/deny without creating a rule
-		delete(m.policyEvents, decision.EventID)
-		return nil
-	}
-
-	// Create a rule from the decision
-	rule := messages.MacPolicyRule{
-		ID:             fmt.Sprintf("%s-%s", event.ID[:8], decision.Action),
-		Kind:           event.Kind,
-		Action:         decision.Action,
-		ExecutablePath: event.ProcessPath,
-	}
-
-	if event.FileOperation == "create" || event.FileOperation == "write" {
-		rule.CoversCreates = true
-	}
-
-	if decision.Scope.Type == "directory" && decision.Scope.Path != "" {
-		rule.Directory = decision.Scope.Path
-	} else if event.CurrentWorkingDirectory != "" {
-		rule.Directory = event.CurrentWorkingDirectory
-	}
-
-	if event.FilePath != "" {
-		rule.FilePath = event.FilePath
-	}
-
-	m.policyRules[rule.ID] = rule
-	delete(m.policyEvents, decision.EventID)
-
-	log.Printf("macsync: created policy rule %s: %s %s → %s", rule.ID, rule.Action, rule.ExecutablePath, rule.Kind)
-	return nil
-}
-
 // MARK: - Policy Rules
 
 // GetPolicyRules returns all current policy rules.
