@@ -144,7 +144,7 @@ func TestOpenIndexedPolicyLinearizesOnFullActivationToken(t *testing.T) {
 	if hookStart < 0 {
 		t.Fatal("could not find indexed file-open policy hook")
 	}
-	hookEnd := strings.Index(body[hookStart:], "\nSEC(\"lsm/file_open\")")
+	hookEnd := strings.Index(body[hookStart:], "\nSEC(\"")
 	if hookEnd < 0 {
 		t.Fatal("could not isolate indexed file-open policy hook")
 	}
