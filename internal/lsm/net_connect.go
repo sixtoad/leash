@@ -238,7 +238,7 @@ func (l *ConnectLsm) LoadPolicies(policies []ConnectPolicyRule, defaultOverride 
 		if isConnectDefault(rule.DestIP, rule.DestPort, rule.Hostname[:], rule.HostnameLen) {
 			continue
 		}
-		ips, err := lookupConnectHost(hostname)
+		ips, err := lookupHostIPs(hostname)
 		if err != nil {
 			failedResolves++
 			continue

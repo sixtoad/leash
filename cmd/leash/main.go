@@ -13,6 +13,7 @@ import (
 
 	"github.com/strongdm/leash/internal/darwind"
 	"github.com/strongdm/leash/internal/doctor"
+	"github.com/strongdm/leash/internal/enforcerd"
 	"github.com/strongdm/leash/internal/hardening"
 	"github.com/strongdm/leash/internal/idmap"
 	"github.com/strongdm/leash/internal/leashd"
@@ -90,6 +91,8 @@ func main() {
 			return
 		case "policy": // `policy migrate [--write] <file>`: legacy policy file -> strict Cedar (#142).
 			os.Exit(policycli.Main(args[2:], os.Stdout, os.Stderr))
+		case "daemon": // `daemon install|uninstall|status|run`: the rootless enforcer daemon.
+			os.Exit(enforcerd.Main(args[2:], version, os.Stdout, os.Stderr))
 		case "doctor": // node readiness self-check; exit 0 enforces, 3 runs proxy-only, 1 cannot run at all.
 			os.Exit(doctor.Main(args[2:], os.Stdout, os.Stderr))
 		case "--harden-exec": // internal: seccomp-harden this process, then exec the workload.
