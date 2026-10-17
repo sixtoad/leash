@@ -204,7 +204,19 @@ jobs:
       - name: go build
         run: go build ./...
 
+      # releasecontract runs the release shell scripts, which need GNU
+      # timeout(1); macOS ships none.
+      - name: GNU coreutils
+        run: |
+          brew list coreutils >/dev/null 2>&1 || brew install coreutils
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      # The default TMPDIR (/var/folders/...) is a symlink into /private, and
+      # releasecontract compares script-printed physical paths against
+      # t.TempDir(); RUNNER_TEMP has no symlink in its path.
       - name: go test
+        env:
+          TMPDIR: ${{ runner.temp }}
         run: go test -count=1 ./...
 
   mac-leash:
