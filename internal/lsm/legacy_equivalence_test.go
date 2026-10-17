@@ -1,8 +1,11 @@
 package lsm_test
 
 import (
+	"errors"
 	"fmt"
 	"math/rand"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -40,22 +43,36 @@ func randomFileEntity(rng *rand.Rand) string {
 	return fmt.Sprintf("File::%q", p)
 }
 
-func resourceClause(rng *rand.Rand, entities []string) (head string, conds []string) {
+func resourceClause(rng *rand.Rand, entities []string) (head string, conds []string, unless bool) {
 	switch {
 	case len(entities) == 1 && rng.Intn(3) == 0:
-		return "resource == " + entities[0], nil
+		return "resource == " + entities[0], nil, false
 	case rng.Intn(6) == 0:
 		// Legacy reads `unless { resource in [...] }` as `when`.
-		return "resource", []string{"unless { resource in [" + strings.Join(entities, ", ") + "] }"}
+		return "resource", []string{"unless { resource in [" + strings.Join(entities, ", ") + "] }"}, true
 	}
-	return "resource", []string{"when { resource in [" + strings.Join(entities, ", ") + "] }"}
+	return "resource", []string{"when { resource in [" + strings.Join(entities, ", ") + "] }"}, false
 }
 
 func randomLegacyPolicy(rng *rand.Rand) string {
+	text, _ := randomLegacyPolicyFlagged(rng)
+	return text
+}
+
+// randomLegacyPolicyFlagged also reports whether the policy carries a
+// constraint legacy semantics cannot enforce in a way at least as strict as
+// written (#164): a file/exec/connect permit with a principal constraint, an
+// `unless` or an ignored condition, or a forbid whose only resources are in
+// an `unless` (read as `when`, the opposite of what is written). The load
+// rejects such a policy, except a permit that grants no rule at all (only
+// never-matching entities).
+func randomLegacyPolicyFlagged(rng *rand.Rand) (string, bool) {
 	effect := pick(rng, []string{"permit", "forbid"})
 	principal := "principal"
+	constrained := false
 	if rng.Intn(8) == 0 {
 		principal = `principal == User::"alice"`
+		constrained = true
 	}
 	var action string
 	var entities []string
@@ -98,13 +115,87 @@ func randomLegacyPolicy(rng *rand.Rand) string {
 		if rng.Intn(3) > 0 {
 			conds = append(conds, fmt.Sprintf("when { resource in [MCP::Server::%q] }", pick(rng, eqServers)))
 		}
-		return fmt.Sprintf("%s (%s, %s, %s) %s;", effect, principal, action, head, strings.Join(conds, " "))
+		// MCP permits had no effect and MCP forbids only get stricter.
+		return fmt.Sprintf("%s (%s, %s, %s) %s;", effect, principal, action, head, strings.Join(conds, " ")), false
 	}
-	head, conds := resourceClause(rng, entities)
+	head, conds, unless := resourceClause(rng, entities)
+	ignored := false
 	if rng.Intn(10) == 0 {
 		conds = append(conds, "when { context.ignored == 1 }")
+		ignored = true
 	}
-	return fmt.Sprintf("%s (%s, %s, %s) %s;", effect, principal, action, head, strings.Join(conds, " "))
+	flagged := unless
+	if effect == "permit" {
+		flagged = constrained || unless || ignored
+	}
+	return fmt.Sprintf("%s (%s, %s, %s) %s;", effect, principal, action, head, strings.Join(conds, " ")), flagged
+}
+
+// eqRejected counts the generated policies the rewrite rejected (#164).
+var eqRejected int
+
+var findingLineRe = regexp.MustCompile(` at [^ ]+:(\d+):\d+: `)
+
+// randomAcceptedLegacyFile generates a random legacy file of n policies,
+// one per line, checks that the rewrite rejects exactly the flagged
+// policies that grant or forbid anything (#164), and returns the file
+// without them.
+func randomAcceptedLegacyFile(t *testing.T, rng *rand.Rand, name string, n int) string {
+	t.Helper()
+	var lines, accepted []string
+	flagged := map[int]bool{}
+	for i := 0; i < n; i++ {
+		line, f := randomLegacyPolicyFlagged(rng)
+		lines = append(lines, line)
+		if f {
+			flagged[i+1] = true
+		} else {
+			accepted = append(accepted, line)
+		}
+	}
+	text := strings.Join(lines, "\n")
+	parsed, err := transpiler.NewCedarParser().ParseFromNamedString(name, text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = transpiler.RewriteLegacy(transpiler.RewriteOptions{}, transpiler.LegacyLayer{Name: name, Policies: parsed})
+	rejected := map[int]bool{}
+	var ue *transpiler.UnenforceableError
+	switch {
+	case errors.As(err, &ue):
+		for _, f := range ue.Findings {
+			m := findingLineRe.FindStringSubmatch(" at " + strings.SplitN(f.Policy, " at ", 2)[1] + ": ")
+			if m == nil {
+				t.Fatalf("finding without a line: %q", f.Policy)
+			}
+			line, _ := strconv.Atoi(m[1])
+			if !flagged[line] {
+				t.Fatalf("rejected a policy that is enforceable as written (line %d): %s\n%s", line, f, text)
+			}
+			rejected[line] = true
+			eqRejected++
+		}
+	case err != nil:
+		t.Fatalf("rewrite: %v\n%s", err, text)
+	}
+	for line := range flagged {
+		if rejected[line] {
+			continue
+		}
+		// Not rejected: it must have no effect at all.
+		one, err := transpiler.NewCedarParser().ParseFromNamedString(name, lines[line-1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		rw, err := transpiler.RewriteLegacy(transpiler.RewriteOptions{OmitGlobalDefaults: true}, transpiler.LegacyLayer{Name: name, Policies: one})
+		if err != nil {
+			t.Fatalf("line %d: rejected alone but not in the file: %v", line, err)
+		}
+		if strings.TrimSpace(rw.Text) != "" {
+			t.Fatalf("flagged policy accepted although it has an effect (line %d):\n%s\nrewrite:\n%s", line, lines[line-1], rw.Text)
+		}
+	}
+	return strings.Join(accepted, "\n")
 }
 
 // randomProbePath returns an absolute path: requests always are (the engine
@@ -197,11 +288,7 @@ func TestLegacyRewriteIsEquivalentToLegacySemantics(t *testing.T) {
 	var c eqCounter
 	tr := transpiler.NewCedarToLeashTranspiler()
 	for i := 0; i < sets; i++ {
-		var lines []string
-		for n := rng.Intn(8) + 1; n > 0; n-- {
-			lines = append(lines, randomLegacyPolicy(rng))
-		}
-		text := strings.Join(lines, "\n")
+		text := randomAcceptedLegacyFile(t, rng, "leash.cedar", rng.Intn(8)+1)
 		legacyIR, _, err := tr.TranspileFromString(text)
 		if err != nil {
 			t.Fatalf("legacy transpile: %v\n%s", err, text)
@@ -214,7 +301,7 @@ func TestLegacyRewriteIsEquivalentToLegacySemantics(t *testing.T) {
 		c.policies++
 		checkEquivalent(t, rng, legacyIR, eng, text, rw.Text, probes, &c)
 	}
-	t.Logf("%d random legacy policy sets, %d decisions: legacy == strict Cedar", c.policies, c.decisions)
+	t.Logf("%d random legacy policy sets, %d decisions: legacy == strict Cedar (%d unenforceable policies rejected so far, #164)", c.policies, c.decisions, eqRejected)
 }
 
 // TestLegacyRewriteNestingProperty: random nested chains of alternating
@@ -313,11 +400,7 @@ func TestLegacyRewriteAcrossLayers(t *testing.T) {
 		var irs [2]*lsm.PolicySet
 		var layers []transpiler.LegacyLayer
 		for l := 0; l < 2; l++ {
-			var lines []string
-			for n := rng.Intn(5) + 1; n > 0; n-- {
-				lines = append(lines, randomLegacyPolicy(rng))
-			}
-			texts[l] = strings.Join(lines, "\n")
+			texts[l] = randomAcceptedLegacyFile(t, rng, fmt.Sprintf("layer%d.cedar", l), rng.Intn(5)+1)
 			ir, _, err := tr.TranspileFromString(texts[l])
 			if err != nil {
 				t.Fatal(err)

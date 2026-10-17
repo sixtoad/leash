@@ -163,7 +163,12 @@ func compileKernel(ps *cedarlib.PolicySet, eng *engine.Engine) (*lsm.PolicySet, 
 			return nil, nil, fmt.Errorf("policy %s: built-in actions are enforced for the whole workload; the principal cannot be constrained", name)
 		}
 		if !reach.kernel() {
-			continue // MCP: userspace only
+			// MCP: userspace only, but the MCP adapters supply only
+			// context.server (#164).
+			if why := mcpUnenforceable(pa); why != "" {
+				return nil, nil, &UnenforceableError{Findings: []UnenforceableFinding{{ID: engine.DisplayID(id, p), Policy: name, Effect: effectName(pa), Reason: why}}}
+			}
+			continue
 		}
 		if _, ok := p.Annotations()[engine.AnnotationExpires]; ok {
 			return nil, nil, fmt.Errorf("policy %s: @expires is not supported on policies the kernel enforces (file, exec, connect)", name)

@@ -165,6 +165,44 @@ func TestServerDecidesThroughTheDecisionCore(t *testing.T) {
 	}
 }
 
+// #164 rejects permits whose condition no adapter can enforce. Plugin
+// policies are evaluated with the context the plugin sends, so their
+// conditions keep loading and deciding, in strict files as in legacy ones
+// (testPolicy above is legacy). A built-in McpCall query may test
+// context.server, which the socket passes on.
+func TestServerPluginConditionsSurviveTheUnenforceableCheck(t *testing.T) {
+	ts := startServer(t, PluginGrant{ID: "secretbroker", Namespaces: []string{"Secret", "Action"}}, nil)
+	c := wire.New(ts.socket)
+	defer c.Close()
+	ctx := context.Background()
+	publish(t, ts.decisions, `@leash_semantics("cedar")
+@id("agent-scoped")
+permit (principal == Plugin::"secretbroker", action == Secret::Action::"Read", resource is Secret::Item)
+when { context has agent && context.agent == "antigravity" && context.attempt < 3 };
+@leash_semantics("cedar")
+permit (principal, action == Action::"McpCall", resource) when { context.server == "mcp.example.com" };`)
+	for _, tc := range []struct {
+		name  string
+		req   wire.Request
+		allow bool
+	}{
+		{"context holds", wire.Request{Action: wire.UID("Secret::Action", "Read"), Resource: wire.UID("Secret::Item", "aws"),
+			Context: map[string]any{"agent": "antigravity", "attempt": 1}}, true},
+		{"context fails", wire.Request{Action: wire.UID("Secret::Action", "Read"), Resource: wire.UID("Secret::Item", "aws"),
+			Context: map[string]any{"agent": "antigravity", "attempt": 5}}, false},
+		{"no context", read("aws"), false},
+		{"mcp server holds", wire.Request{Action: wire.UID("Action", "McpCall"), Resource: wire.UID("MCP::Tool", "search"),
+			Context: map[string]any{"server": "mcp.example.com"}}, true},
+		{"mcp server fails", wire.Request{Action: wire.UID("Action", "McpCall"), Resource: wire.UID("MCP::Tool", "search"),
+			Context: map[string]any{"server": "other.example.com"}}, false},
+	} {
+		d := c.Check(ctx, tc.req)
+		if d.Err != nil || d.Allowed() != tc.allow {
+			t.Errorf("%s: allow=%v reason=%s err=%v, want allow=%v", tc.name, d.Allowed(), d.Reason, d.Err, tc.allow)
+		}
+	}
+}
+
 func TestServerBuiltinQueriesMatchTheProxy(t *testing.T) {
 	ts := startServer(t, PluginGrant{ID: "mcp-gate", Namespaces: []string{"Action"}}, nil)
 	publish(t, ts.decisions, testPolicy)
