@@ -236,9 +236,17 @@ func TestNativeForcedExitCleanupIsBounded(t *testing.T) {
 
 	r := nativeTestRunner(t)
 	start := time.Now()
-	r.forcedExitCleanup()
+	done := r.boundedForcedExitCleanup()
 	if d := time.Since(start); d > 2*time.Second {
 		t.Fatalf("forced-exit cleanup took %s; must be bounded by its budget", d)
+	}
+	// The abandoned teardown's context is canceled once the budget runs out,
+	// so the wedged host tool returns and it winds down; join it so it cannot
+	// outlive this test's stubs (in production os.Exit follows instead).
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("forced-exit teardown did not wind down after its budget expired")
 	}
 }
 
