@@ -163,6 +163,11 @@ func compileKernel(ps *cedarlib.PolicySet, eng *engine.Engine) (*lsm.PolicySet, 
 		if _, ok := pa.Principal.(xast.ScopeTypeAll); !ok {
 			return nil, nil, fmt.Errorf("policy %s: built-in actions are enforced for the whole workload; the principal cannot be constrained", name)
 		}
+		if reach.mcp && pa.Effect == xast.EffectForbid && resourceMayBeMCP(pa.Resource) {
+			// Only the proxy enforces it; a packet socket bypasses the
+			// proxy, so the kernel keeps such sockets denied (#188).
+			out.ProxyRestricted = true
+		}
 		if !reach.kernel() {
 			// MCP: userspace only, but the MCP adapters supply only
 			// context.server (#164).
@@ -250,6 +255,26 @@ func orderedIDs(ps *cedarlib.PolicySet) []cedarlib.PolicyID {
 
 func errKernel(format string, args ...any) error {
 	return fmt.Errorf("not enforceable by the kernel: "+format, args...)
+}
+
+// resourceMayBeMCP reports whether a policy's resource scope can match an
+// McpCall request (an MCP::Tool resource). Conditions are not inspected: a
+// forbid that may apply counts.
+func resourceMayBeMCP(scope xast.IsResourceScopeNode) bool {
+	isMCP := func(t types.EntityType) bool {
+		return string(t) == engine.TypeMCPTool || string(t) == engine.TypeMCPServer
+	}
+	switch s := scope.(type) {
+	case xast.ScopeTypeIs:
+		return isMCP(s.Type)
+	case xast.ScopeTypeEq:
+		return isMCP(s.Entity.Type)
+	case xast.ScopeTypeIn:
+		return isMCP(s.Entity.Type)
+	case xast.ScopeTypeIsIn:
+		return isMCP(s.Type)
+	}
+	return true
 }
 
 func checkKernelScope(scope xast.IsResourceScopeNode) error {

@@ -51,7 +51,7 @@ var connectEventABI = []abiField{
 	{"protocol", 44, 4},
 	{"dest_ip", 48, 4},
 	{"dest_port", 52, 2},
-	{"_pad0", 54, 2},
+	{"sock_type", 54, 2},
 	{"result", 56, 4},
 	{"dest_hostname", 60, 128},
 	{"dest_ip6", 188, 16},
@@ -364,5 +364,42 @@ func TestConnectEventIPv6Fixture(t *testing.T) {
 	l.handleEvent(raw[:connectEventSize-1])
 	if after, _ := os.ReadFile(logPath); len(after) != len(entry) {
 		t.Errorf("a truncated record was logged: %q", after[len(entry):])
+	}
+}
+
+// A socket_create record (#188) built byte by byte: sock_type (offset 54)
+// carries 0x100 | the socket type, and the log names a net.socket decision,
+// not a destination.
+func TestConnectEventSocketCreateFixture(t *testing.T) {
+	raw := make([]byte, connectEventSize)
+	binary.NativeEndian.PutUint32(raw[0:], 7)
+	copy(raw[24:40], "scapy")
+	binary.NativeEndian.PutUint32(raw[40:], 17) // AF_PACKET
+	binary.NativeEndian.PutUint32(raw[44:], 0x0300)
+	binary.NativeEndian.PutUint16(raw[54:], 0x100|3)            // SOCK_RAW
+	binary.NativeEndian.PutUint32(raw[56:], uint32(0xffffffff)) // -EPERM
+
+	logPath := filepath.Join(t.TempDir(), "events.log")
+	logger, err := NewSharedLogger(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+	l, err := NewConnectLsm("/test", logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l.handleEvent(raw)
+	entry, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`event=net.socket`, `exe="scapy"`, `family=packet`, `type=raw`, `protocol=768`, `decision=denied`} {
+		if !strings.Contains(string(entry), want) {
+			t.Errorf("event log %q lacks %s", entry, want)
+		}
+	}
+	if strings.Contains(string(entry), "net.send") {
+		t.Errorf("a socket_create record was logged as a send: %q", entry)
 	}
 }

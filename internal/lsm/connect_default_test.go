@@ -190,6 +190,7 @@ func TestUpdateConnectLSMCreatesWithoutConnectRules(t *testing.T) {
 // check_connect_policy lookup (lsm_connect.bpf.c) over them.
 type fakeConnectMaps struct {
 	defaultPolicy uint32
+	unaddressed   uint32
 	numRules      int32
 	numSet        bool
 	rules         map[uint32]ConnectPolicyRuleBPF
@@ -205,6 +206,8 @@ func (f *fakeConnectMaps) lookup(name string) connectMapPutter {
 	switch name {
 	case "connect_default_policy":
 		return fakeMap{func(_, v interface{}) error { f.defaultPolicy = *v.(*uint32); return nil }}
+	case "connect_unaddressed_policy":
+		return fakeMap{func(_, v interface{}) error { f.unaddressed = *v.(*uint32); return nil }}
 	case "connect_num_rules":
 		return fakeMap{func(_, v interface{}) error { f.numRules = *v.(*int32); f.numSet = true; return nil }}
 	case "connect_policy_rules":

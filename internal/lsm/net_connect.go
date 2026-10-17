@@ -112,7 +112,7 @@ type ConnectEvent struct {
 	Protocol     uint32    // offset 44: IPPROTO_TCP, IPPROTO_UDP
 	DestIP       uint32    // offset 48: canonical IPv4 value a<<24|b<<16|c<<8|d (AF_INET)
 	DestPort     uint16    // offset 52: host-order destination port
-	_            [2]byte   // offset 54: explicit padding
+	SockType     uint16    // offset 54: 0 for connect/sendmsg; lsm_socket_create: 0x100 | socket type
 	Result       int32     // offset 56: 0 = allowed, -EACCES = denied
 	DestHostname [128]byte // offset 60: resolved hostname if available
 	DestIP6      [16]byte  // offset 188: IPv6 address, network byte order (AF_INET6)
@@ -151,6 +151,14 @@ type ConnectLsm struct {
 	numPolicyRules      int
 	defaultPolicyResult bool       // Default policy result: false=deny, true=allow
 	logMutex            sync.Mutex // Protect concurrent writes to stdout and log file
+
+	// unaddressedAllowed is lsm_socket_create's verdict for packet, raw IP,
+	// XDP and SCTP sockets (#188); see unaddressedSocketsAllowed.
+	unaddressedAllowed bool
+	// proxyRestricted is set by the manager when the policy restricts
+	// traffic the L7 proxy enforces (an MCP forbid). A packet socket
+	// bypasses the proxy too, so it keeps unaddressed sockets denied.
+	proxyRestricted bool
 
 	// DNS cache for hostname resolution
 	dnsCache    map[uint32]string // IP -> hostname mapping
@@ -283,6 +291,8 @@ func (l *ConnectLsm) LoadPolicies(policies []ConnectPolicyRule, defaultOverride 
 		}
 	}
 
+	l.unaddressedAllowed = unaddressedSocketsAllowed(policies, l.defaultPolicyResult, l.proxyRestricted)
+
 	fmt.Printf("Loaded %d connect IP rules (skipped %d wildcard, %d unresolved)\n", l.numPolicyRules, skippedWildcard, failedResolves)
 	if explicitDefault {
 		if l.defaultPolicyResult {
@@ -296,6 +306,12 @@ func (l *ConnectLsm) LoadPolicies(policies []ConnectPolicyRule, defaultOverride 
 		} else {
 			fmt.Printf("Default connect policy result: DENY (no wildcard rule found)\n")
 		}
+	}
+
+	if l.unaddressedAllowed {
+		fmt.Printf("Packet/raw/SCTP sockets: ALLOWED (the policy restricts no destination)\n")
+	} else {
+		fmt.Printf("Packet/raw/SCTP sockets: DENIED (the policy restricts egress; no address rule can govern them)\n")
 	}
 
 	// If eBPF collection is already loaded, update the BPF maps
@@ -315,6 +331,31 @@ func (l *ConnectLsm) LoadPolicies(policies []ConnectPolicyRule, defaultOverride 
 	return nil
 }
 
+// unaddressedSocketsAllowed decides whether the workload may create the
+// sockets whose traffic no address hook sees (#188): AF_PACKET and AF_XDP
+// sockets, SOCK_RAW on AF_INET/AF_INET6, and SCTP. A packet or IP_HDRINCL
+// raw socket bound with bind() sends with send() and no address; SCTP adds
+// peers through sctp_connectx(), the sendmsg SCTP_DSTADDRV4/V6 list and the
+// peer's own address list, none of which pass socket_connect. No connect rule
+// can name such traffic, so these sockets are allowed only when the policy
+// restricts nothing they could bypass: the connect default is allow, there is
+// no deny connect rule of any kind (address, port, hostname or wildcard),
+// and the proxy enforces no forbid (proxyRestricted). Every other policy
+// denies them: under a default-deny policy (the usual case) and under a
+// default-allow policy with a forbid alike, since a raw socket could reach
+// the forbidden host.
+func unaddressedSocketsAllowed(rules []ConnectPolicyRule, defaultAllow, proxyRestricted bool) bool {
+	if !defaultAllow || proxyRestricted {
+		return false
+	}
+	for _, r := range rules {
+		if r.Action != PolicyAllow {
+			return false
+		}
+	}
+	return true
+}
+
 // checkRootConnectPolicy checks if there's a wildcard rule that allows all connections
 func (l *ConnectLsm) checkRootConnectPolicy() {
 	// Default is false (deny)
@@ -331,7 +372,7 @@ func (l *ConnectLsm) checkRootConnectPolicy() {
 
 func (l *ConnectLsm) LoadAndAttach(loader func() (*ebpf.CollectionSpec, error)) error {
 	config := BPFConfig{
-		ProgramNames:      []string{"lsm_connect", "lsm_sendmsg"},
+		ProgramNames:      []string{"lsm_connect", "lsm_sendmsg", "lsm_socket_create"},
 		EventMapName:      "connect_events",
 		AllowedCgroupsMap: "connect_allowed_cgroups",
 		TargetCgroupMap:   "connect_target_cgroup",
@@ -392,6 +433,18 @@ func (l *ConnectLsm) writePolicyMaps(lookup func(string) connectMapPutter) error
 	}
 	if err := defMap.Put(&key, &defaultResult); err != nil {
 		return fmt.Errorf("failed to update connect_default_policy map: %w", err)
+	}
+
+	unaddressed := uint32(0)
+	if l.unaddressedAllowed {
+		unaddressed = 1
+	}
+	unaddrMap, err := get("connect_unaddressed_policy")
+	if err != nil {
+		return err
+	}
+	if err := unaddrMap.Put(&key, &unaddressed); err != nil {
+		return fmt.Errorf("failed to update connect_unaddressed_policy map: %w", err)
 	}
 
 	numMap, err := get("connect_num_rules")
@@ -456,6 +509,11 @@ func (l *ConnectLsm) handleEvent(data []byte) {
 		return
 	}
 
+	if event.SockType != 0 {
+		l.logSocketCreate(&event, comm)
+		return
+	}
+
 	destIP := canonicalIPv4String(event.DestIP)
 	if event.Family == afInet6 {
 		destIP = net.IP(event.DestIP6[:]).String()
@@ -514,6 +572,36 @@ func (l *ConnectLsm) handleEvent(data []byte) {
 		l.dnsCacheMux.Lock()
 		l.dnsCache[event.DestIP] = hostname
 		l.dnsCacheMux.Unlock()
+	}
+}
+
+// Socket type names for net.socket events (linux/net.h).
+var sockTypeNames = map[uint16]string{1: "stream", 2: "dgram", 3: "raw", 4: "rdm", 5: "seqpacket", 10: "packet"}
+
+// Socket family names for net.socket events (linux/socket.h).
+var sockFamilyNames = map[uint32]string{afInet: "inet", afInet6: "inet6", 17: "packet", 44: "xdp"}
+
+// logSocketCreate logs one lsm_socket_create decision (#188): a packet, raw
+// IP, XDP or SCTP socket the workload tried to create.
+func (l *ConnectLsm) logSocketCreate(event *ConnectEvent, comm string) {
+	family := sockFamilyNames[event.Family]
+	if family == "" {
+		family = fmt.Sprintf("%d", event.Family)
+	}
+	typ := sockTypeNames[event.SockType&0xff]
+	if typ == "" {
+		typ = fmt.Sprintf("%d", event.SockType&0xff)
+	}
+	resultStr := "allowed"
+	if event.Result != 0 {
+		resultStr = "denied"
+	}
+	logEntry := fmt.Sprintf("time=%s event=net.socket pid=%d cgroup=%d exe=\"%s\" family=%s type=%s protocol=%d decision=%s",
+		time.Now().Format(time.RFC3339), event.PID, event.CgroupID, comm, family, typ, event.Protocol, resultStr)
+	l.logMutex.Lock()
+	defer l.logMutex.Unlock()
+	if l.logger != nil {
+		_ = l.logger.Write(logEntry)
 	}
 }
 

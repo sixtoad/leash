@@ -316,6 +316,14 @@ func TestLaunchTargetContainerPassesResourceLimits(t *testing.T) {
 	if strings.Contains(leash, "--memory") || strings.Contains(leash, "--pids-limit") || strings.Contains(leash, "--cpus") {
 		t.Fatalf("leash sidecar must not get the target limits: %s", leash)
 	}
+	// #188: the target never holds CAP_NET_RAW (packet/raw sockets bypass
+	// the address-based connect policy); the sidecar keeps its own caps.
+	if !strings.Contains(target, "--cap-drop NET_RAW") || strings.Index(target, "--cap-drop") > strings.Index(target, "example/target:latest") {
+		t.Fatalf("target run args must drop NET_RAW before the image: %s", target)
+	}
+	if strings.Contains(leash, "--cap-drop") {
+		t.Fatalf("the leash sidecar must not get the target's cap-drop: %s", leash)
+	}
 	// Flags must precede the image (the image and its args come last).
 	if strings.Index(target, "--pids-limit") > strings.Index(target, "example/target:latest") {
 		t.Fatalf("limits must come before the image: %s", target)

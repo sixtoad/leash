@@ -2611,6 +2611,18 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 		"--user", "0",
 		"--entrypoint", filepath.Join(leashPublicMount, entryName),
 		"--cgroupns", "host",
+		// No packet or raw IP sockets in the target (#188): a bound packet
+		// socket or an IP_HDRINCL raw socket sends with no destination
+		// address, so the address-based connect policy cannot see where it
+		// goes. Docker's default capability set grants NET_RAW; the native
+		// runtime never does. The eBPF LSM also denies these sockets
+		// (lsm_socket_create) unless the policy restricts no destination;
+		// dropping the capability is the second layer, for a container the
+		// LSM does not govern. ping keeps working through ICMP datagram
+		// sockets where the container's net.ipv4.ping_group_range admits
+		// the workload's group (docs/design/SECURITY-MODEL.md), subject to
+		// the connect policy.
+		"--cap-drop", "NET_RAW",
 	}
 	// Join the user-requested docker network (issue #69). The leash container
 	// attaches to this container's netns, so it follows onto the same network.
@@ -2764,6 +2776,9 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 	}
 	args = append(args, r.cfg.targetImage)
 	r.logContainerConfig("target", targetMounts, targetEnv)
+	if r.verbose && r.logger != nil {
+		r.logger.Print("event=runner.capabilities role=target cap_drop=NET_RAW")
+	}
 	if err := r.launchContainer(ctx, r.cfg.targetContainer, args...); err != nil {
 		return err
 	}

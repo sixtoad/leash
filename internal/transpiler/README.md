@@ -136,9 +136,13 @@ allow net.send *.example.com
 - Address families: the kernel connect/sendmsg hooks enforce `AF_INET` and
   `AF_INET6`; `AF_UNIX` and `AF_NETLINK` sockets are local IPC and are not
   checked; every other socket family (packet, vsock, ...) gets the connect
-  default, because no rule can name it. Packet and raw sockets also need
-  `CAP_NET_RAW`, which the native workload does not hold; a container
-  workload holds whatever the container runtime grants (#182).
+  default, because no rule can name it. Packet (`AF_PACKET`, `AF_XDP`), raw
+  IP (`SOCK_RAW`) and SCTP sockets are decided when they are created:
+  denied unless the policy restricts no destination (connect default allow,
+  no deny connect rule, no MCP forbid), because a bound packet or raw socket
+  sends with no address and SCTP adds peers past `socket_connect` (#188).
+  The native workload holds no `CAP_NET_RAW`, and container mode starts the
+  target with `--cap-drop NET_RAW`.
 - Complex Cedar expressions may not be fully supported
 - HTTP header rewrite rules are supported via `Action::"HttpRewrite"` with `context.header/value`
 - **MCP policies (V1 limitations)**:

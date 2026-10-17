@@ -58,7 +58,7 @@ struct connect_event {
     u32 protocol;          // IPPROTO_TCP, IPPROTO_UDP
     u32 dest_ip;           // Canonical IPv4 value (a<<24 | b<<16 | c<<8 | d), AF_INET
     u16 dest_port;         // Host-order destination port
-    u16 _pad0;             // Explicit padding
+    u16 sock_type;         // 0 for connect/sendmsg; a socket_create decision: 0x100 | socket type (SOCK_RAW, ...)
     s32 result;            // Result of the connect operation (0 = allowed, -EACCES = denied)
     char dest_hostname[MAX_HOSTNAME_LEN]; // Resolved hostname if available
     u32 dest_ip6[4];       // IPv6 address, network byte order, AF_INET6
@@ -125,7 +125,7 @@ CONNECT_ABI(connect_event, family, 40);
 CONNECT_ABI(connect_event, protocol, 44);
 CONNECT_ABI(connect_event, dest_ip, 48);
 CONNECT_ABI(connect_event, dest_port, 52);
-CONNECT_ABI(connect_event, _pad0, 54);
+CONNECT_ABI(connect_event, sock_type, 54);
 CONNECT_ABI(connect_event, result, 56);
 CONNECT_ABI(connect_event, dest_hostname, 60);
 CONNECT_ABI(connect_event, dest_ip6, 188);
@@ -178,6 +178,17 @@ struct {
     __type(key, u32);
     __type(value, u32);
 } connect_default_policy SEC(".maps");
+
+// Unaddressed sockets (lsm_socket_create): 1 = the workload may create
+// packet, raw IP, XDP and SCTP sockets, 0 (or unset) = denied. Userspace
+// writes 1 only when the policy restricts no destination (ConnectLsm
+// unaddressedAllowed).
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u32);
+} connect_unaddressed_policy SEC(".maps");
 
 // DNS hostname cache: IP -> hostname mapping
 struct {
@@ -538,4 +549,71 @@ int BPF_PROG(lsm_sendmsg, struct socket *sock, void *msg, int size)
 
     // msg_name is the kernel copy of the address (not a user pointer)
     return decide_destination(sock, msg_name, 1);
+}
+
+// Socket kinds whose traffic no address hook can decide (#188). A packet
+// (or XDP) socket bound with bind() and a raw IP socket with IP_HDRINCL send
+// with send()/write() and no destination address, so lsm_sendmsg never sees
+// where the frame goes. SCTP adds peers that pass no socket hook at all:
+// sctp_connectx() (security_sctp_bind_connect, not security_socket_connect),
+// the SCTP_DSTADDRV4/V6 address list of sendmsg (no LSM hook), and the
+// addresses a peer advertises in INIT/INIT-ACK and ASCONF. These sockets are
+// therefore decided once, at creation: denied unless the policy restricts no
+// destination at all.
+#define LEASH_AF_PACKET     17
+#define LEASH_AF_XDP        44
+#define LEASH_SOCK_RAW       3
+#define LEASH_SOCK_SEQPACKET 5
+#define LEASH_SOCK_TYPE_MASK 0xf
+#define LEASH_IPPROTO_SCTP 132
+
+static __always_inline bool is_unaddressed_socket(int family, int type, int protocol)
+{
+    if (family == LEASH_AF_PACKET || family == LEASH_AF_XDP) {
+        return true; // (AF_INET, SOCK_PACKET) is already AF_PACKET here
+    }
+    if (family != AF_INET && family != AF_INET6) {
+        return false;
+    }
+    type &= LEASH_SOCK_TYPE_MASK;
+    // SOCK_SEQPACKET on an IP family is SCTP even with protocol 0.
+    return type == LEASH_SOCK_RAW || type == LEASH_SOCK_SEQPACKET || protocol == LEASH_IPPROTO_SCTP;
+}
+
+SEC("lsm/socket_create")
+int BPF_PROG(lsm_socket_create, int family, int type, int protocol, int kern)
+{
+    // Kernel-internal sockets (kern = 1, e.g. accept's sock_create_lite)
+    // are not the workload's.
+    if (kern || !is_unaddressed_socket(family, type, protocol)) {
+        return 0;
+    }
+    if (!is_connect_target_cgroup()) {
+        return 0;
+    }
+
+    u32 key = 0;
+    u32 *allowed = bpf_map_lookup_elem(&connect_unaddressed_policy, &key);
+    int allow = allowed && *allowed == 1;
+
+    struct connect_event *event = bpf_ringbuf_reserve(&connect_events, sizeof(*event), 0);
+    if (event) {
+        __builtin_memset(event, 0, sizeof(*event));
+        u64 pid_tgid = bpf_get_current_pid_tgid();
+        event->pid = pid_tgid >> 32;
+        event->tgid = pid_tgid & 0xFFFFFFFF;
+        event->timestamp = bpf_ktime_get_ns();
+        event->cgroup_id = bpf_get_current_cgroup_id();
+        bpf_get_current_comm(event->comm, sizeof(event->comm));
+        event->family = (u32)family;
+        event->protocol = (u32)protocol;
+        // Never 0: a socket_create record is told apart by sock_type != 0.
+        event->sock_type = (u16)((type & LEASH_SOCK_TYPE_MASK) | 0x100);
+        event->result = allow ? 0 : -1;
+        bpf_ringbuf_submit(event, 0);
+    }
+
+    // -EPERM, the error a missing CAP_NET_RAW gives: ping implementations
+    // that fall back from a raw to an ICMP datagram socket do so on EPERM.
+    return allow ? 0 : -1;
 }
