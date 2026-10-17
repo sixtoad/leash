@@ -30,6 +30,30 @@ import (
 // a leash crash), or when the daemon goes away (the control connection
 // closes). It never loosens anything: every program it loads can only deny.
 
+// updateFailure is the answer to an update the worker's LSM manager could not
+// apply. The manager rolled the kernel back to the session's previous policy;
+// if that failed too, every program holds deny-all, and the workload is
+// stopped here, where the cgroup is known to be the validated one, before
+// leashd learns of it (#193). The error says which happened, so leashd fails
+// closed as well.
+func updateFailure(err error, cgroup string, kill func(string) error) Message {
+	msg := "update the kernel tables: " + err.Error()
+	var kerr *lsm.KernelApplyError
+	if !errors.As(err, &kerr) || !kerr.FailedClosed {
+		return Message{Type: TypeResult, Error: msg}
+	}
+	if kill == nil {
+		kill = KillCgroup
+	}
+	if killErr := kill(cgroup); killErr != nil {
+		msg += fmt.Sprintf("; stopping the workload failed: %v", killErr)
+	} else {
+		msg += "; the workload was stopped"
+	}
+	fmt.Fprintf(os.Stderr, "leash-enforcerd: FATAL: %s\n", msg)
+	return Message{Type: TypeResult, Error: msg}
+}
+
 // compileSessionPolicy compiles session policy text the way leashd compiles a
 // policy file: cedar.CompileLayers, which rewrites legacy text, builds the
 // engine and compiles the kernel tables (transpiler.CompileKernel), followed
@@ -106,6 +130,9 @@ type WorkerHooks struct {
 	PollInterval time.Duration
 	// SettleTimeout bounds the wait for every program to attach.
 	SettleTimeout time.Duration
+	// KillCgroup stops the workload when the kernel failed closed
+	// (default: KillCgroup).
+	KillCgroup func(path string) error
 }
 
 // RunWorker serves one session on conn (the daemon's end of a socketpair):
@@ -207,7 +234,7 @@ func RunWorker(conn io.ReadWriteCloser, hooks WorkerHooks) error {
 				}
 				hosts.set(r.Hosts)
 				if err := mgr.UpdateRuntimeRules(ps); err != nil {
-					out.send(Message{Type: TypeResult, Error: "update the kernel tables: " + err.Error()})
+					out.send(updateFailure(err, req.Cgroup, hooks.KillCgroup))
 					continue
 				}
 				out.send(Message{Type: TypeResult, OK: true})

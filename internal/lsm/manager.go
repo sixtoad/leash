@@ -3,6 +3,7 @@
 package lsm
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -26,6 +27,22 @@ type LSMManager struct {
 
 	reloadMutex sync.RWMutex
 	degradeOnce sync.Once
+
+	// applied is the last policy every module accepted: the rollback target
+	// when an update fails partway (nil before the first update, when the
+	// target is deny-all). failedClosed is sticky: once a rollback failed and
+	// the modules were set to deny-all, no further update is accepted.
+	applied      *PolicySet
+	failedClosed bool
+
+	// steps, when set (tests), replaces the per-module updaters.
+	steps []kernelStep
+
+	// attachFailed records modules whose programs failed to attach under
+	// --allow-proxy-only: they are not in the kernel, so updates skip them
+	// (their closed maps would only return EBADF).
+	attachMu     sync.Mutex
+	attachFailed map[string]bool
 
 	// attachWG tracks the initial LSM program attaches so a readiness watcher
 	// fires only after ALL of them settle (attached or failed), not the first.
@@ -69,6 +86,12 @@ func NewLSMManager(cgroupPath string, logger *SharedLogger, requireLSM bool) *LS
 // to degrade to), so the non-fatal branch — and its "L7 proxy remains active"
 // warning — is only reachable when the proxy is actually running.
 func (m *LSMManager) handleAttachFailure(label string, err error) {
+	m.attachMu.Lock()
+	if m.attachFailed == nil {
+		m.attachFailed = map[string]bool{}
+	}
+	m.attachFailed[label] = true
+	m.attachMu.Unlock()
 	if m.requireLSM {
 		fmt.Fprintf(os.Stderr, "leash: FATAL: %s LSM failed to attach (%v); refusing to run the workload unenforced (%s)\n", label, err, failClosedRemedy)
 		os.Exit(1)
@@ -299,7 +322,6 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 	return m.connectLsm.LoadPolicies(rules, defaultOverride)
 }
 
-// UpdateRuntimeRules updates all LSM modules with new runtime rules
 // EnforcesKernelPolicy reports whether UpdateRuntimeRules programs the kernel
 // (a scopable cgroup is configured). Without one it is a no-op (degraded
 // proxy-only mode), so kernel limits do not apply.
@@ -307,6 +329,67 @@ func (m *LSMManager) EnforcesKernelPolicy() bool {
 	return m != nil && m.cgroupPath != ""
 }
 
+// ErrKernelFailedClosed is returned for every update after the kernel failed
+// closed: the modules hold deny-all and the workload is being stopped.
+var ErrKernelFailedClosed = errors.New("kernel enforcement failed closed (deny-all); no further policy updates are accepted")
+
+// KernelApplyError reports a kernel policy update that failed in Module. The
+// update is never left half-applied: every module was put back on the
+// previous policy or, when that rollback failed too (RollbackErr), every
+// module was set to deny-all (FailedClosed).
+type KernelApplyError struct {
+	Module       string
+	Err          error
+	RollbackErr  error
+	FailedClosed bool
+}
+
+func (e *KernelApplyError) Error() string {
+	msg := fmt.Sprintf("%s LSM: %v", e.Module, e.Err)
+	switch {
+	case e.RollbackErr != nil:
+		msg += fmt.Sprintf("; restoring the previous kernel policy failed (%v): the kernel failed closed (deny-all)", e.RollbackErr)
+	case e.FailedClosed:
+		msg += "; the kernel failed closed (deny-all)"
+	default:
+		msg += "; the previous kernel policy was restored"
+	}
+	return msg
+}
+
+func (e *KernelApplyError) Unwrap() error { return e.Err }
+
+// kernelStep updates one LSM module. Steps run in order; a failed step is
+// rolled back together with every step before it.
+type kernelStep struct {
+	module string
+	apply  func(*PolicySet) error
+}
+
+func (m *LSMManager) kernelSteps() []kernelStep {
+	if m.steps != nil {
+		return m.steps
+	}
+	return []kernelStep{
+		{"file-open", m.updateOpenLSM},
+		{"exec", m.updateExecLSM},
+		{"connect", m.updateConnectLSM},
+	}
+}
+
+func (m *LSMManager) moduleAttachFailed(module string) bool {
+	m.attachMu.Lock()
+	defer m.attachMu.Unlock()
+	return m.attachFailed[module]
+}
+
+// UpdateRuntimeRules updates all LSM modules with new rules as one
+// transaction. When a module fails, every module already updated, and the
+// failed one (which may be half-written), is put back on the last policy that
+// was fully applied. If that rollback fails, every module is set to deny-all
+// and the manager refuses further updates (fail closed), so the kernel is
+// never left more permissive than the last good policy. Failures are
+// reported as *KernelApplyError.
 func (m *LSMManager) UpdateRuntimeRules(policies *PolicySet) error {
 	m.reloadMutex.Lock()
 	defer m.reloadMutex.Unlock()
@@ -318,20 +401,90 @@ func (m *LSMManager) UpdateRuntimeRules(policies *PolicySet) error {
 		// policy. See internal/leashd/runtime.go preFlight and issue #67.
 		return nil
 	}
+	if m.failedClosed {
+		return &KernelApplyError{Module: "every", Err: ErrKernelFailedClosed, FailedClosed: true}
+	}
+	if policies == nil {
+		policies = &PolicySet{}
+	}
 
 	// Validate every module's kernel limits before touching any of them, so
 	// a rule one module would reject cannot leave the others half-updated.
 	if err := ValidateKernelPolicyLimits(policies); err != nil {
 		return err
 	}
-	if err := m.updateOpenLSM(policies); err != nil {
+
+	steps := m.kernelSteps()
+	for i, step := range steps {
+		if m.moduleAttachFailed(step.module) {
+			continue
+		}
+		err := step.apply(policies.Clone())
+		if err == nil {
+			continue
+		}
+		kerr := &KernelApplyError{Module: step.module, Err: err}
+		if rbErr := m.rollbackLocked(steps[:i+1]); rbErr != nil {
+			kerr.RollbackErr = rbErr
+			kerr.FailedClosed = true
+			_ = m.failClosedLocked()
+		}
+		return kerr
+	}
+	m.applied = policies.Clone()
+	return nil
+}
+
+// rollbackLocked re-applies the last fully applied policy (deny-all before
+// the first) to steps, in order. It tries every step and reports each failure.
+func (m *LSMManager) rollbackLocked(steps []kernelStep) error {
+	target := m.applied
+	if target == nil {
+		target = &PolicySet{}
+	}
+	var errs []error
+	for _, step := range steps {
+		if m.moduleAttachFailed(step.module) {
+			continue
+		}
+		if err := step.apply(target.Clone()); err != nil {
+			errs = append(errs, fmt.Errorf("%s LSM: %w", step.module, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// FailClosed sets every LSM module to deny-all (an empty policy denies every
+// file open, exec and connect) and refuses further updates. Every module is
+// tried. The error names the modules that could not be set: their kernel
+// state is unknown, so the caller must stop the workload.
+func (m *LSMManager) FailClosed() error {
+	if m == nil {
+		return nil
+	}
+	m.reloadMutex.Lock()
+	defer m.reloadMutex.Unlock()
+	if m.cgroupPath == "" {
+		return nil
+	}
+	return m.failClosedLocked()
+}
+
+func (m *LSMManager) failClosedLocked() error {
+	m.failedClosed = true
+	var errs []error
+	for _, step := range m.kernelSteps() {
+		if m.moduleAttachFailed(step.module) {
+			continue
+		}
+		if err := step.apply(&PolicySet{}); err != nil {
+			errs = append(errs, fmt.Errorf("%s LSM: %w", step.module, err))
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		fmt.Fprintf(os.Stderr, "leash: FATAL: could not set the kernel LSM to deny-all: %v\n", err)
 		return err
 	}
-	if err := m.updateExecLSM(policies); err != nil {
-		return err
-	}
-	if err := m.updateConnectLSM(policies); err != nil {
-		return err
-	}
+	fmt.Fprintf(os.Stderr, "leash: FATAL: kernel LSM policy failed closed: every module is set to deny-all\n")
 	return nil
 }
