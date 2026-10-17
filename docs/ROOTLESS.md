@@ -103,7 +103,7 @@ rootless user namespace, which owns the pod's network namespace.
 |---|---|---|
 | file open (read / write), directory mutations, hard links | eBPF LSM | same programs, same tables |
 | exec | eBPF LSM | same |
-| network connect / sendmsg (IPv4, by IP) | eBPF LSM | same; hostnames resolved in the workload's netns as before |
+| network connect / sendmsg (IPv4 and IPv6, by IP) | eBPF LSM | same; hostnames resolved in the workload's netns as before |
 | HTTP(S) proxy, MCP, header rewrites | MITM proxy | same |
 | netfilter redirect, QUIC drop, control-plane block | in the pod netns | same (verified with slirp4netns, podman 4.9's default, and pasta, podman 5's) |
 | exec argv capture in event logs | tracepoint, root | not available: tracefs is root-only, and the daemon does not have the privilege |

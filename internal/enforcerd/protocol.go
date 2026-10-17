@@ -77,7 +77,7 @@ type Request struct {
 	// Policy is the session's active policy as strict Cedar text (attach,
 	// update): cedar.Compilation.StrictText.
 	Policy string `json:"policy,omitempty"`
-	// Hosts are the IPv4 addresses the client resolved, in the workload's
+	// Hosts are the IPv4 and IPv6 addresses the client resolved, in the workload's
 	// network namespace, for the policy's hostname connect rules (the kernel
 	// matches connects by IP; the daemon has no network).
 	Hosts map[string][]string `json:"hosts,omitempty"`

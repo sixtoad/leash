@@ -37,8 +37,9 @@ func newRemoteKernel(socket, cgroup string, events func(string)) *remoteKernel {
 	return &remoteKernel{socket: socket, cgroup: cgroup, events: events, lookup: net.LookupIP, dial: enforcerd.Dial}
 }
 
-// resolveHosts resolves the hostname connect rules of a policy to IPv4
-// addresses (the kernel connect program matches IPv4 only).
+// resolveHosts resolves the hostname connect rules of a policy to the
+// addresses the local loader would use (A and AAAA: the kernel connect
+// program matches IPv4 and IPv6).
 func (k *remoteKernel) resolveHosts(active *cedarutil.Compilation) map[string][]string {
 	if active == nil {
 		return nil
@@ -49,18 +50,20 @@ func (k *remoteKernel) resolveHosts(active *cedarutil.Compilation) map[string][]
 		if err != nil {
 			continue // unresolved, as the local loader skips it
 		}
-		var v4 []string
+		var addrs []string
 		for _, ip := range ips {
 			if ip4 := ip.To4(); ip4 != nil {
-				v4 = append(v4, ip4.String())
+				addrs = append(addrs, ip4.String())
+			} else if ip16 := ip.To16(); ip16 != nil {
+				addrs = append(addrs, ip16.String())
 			}
 		}
-		sort.Strings(v4)
-		if len(v4) > enforcerd.MaxIPsPerHost {
-			v4 = v4[:enforcerd.MaxIPsPerHost]
+		sort.Strings(addrs)
+		if len(addrs) > enforcerd.MaxIPsPerHost {
+			addrs = addrs[:enforcerd.MaxIPsPerHost]
 		}
-		if len(v4) > 0 {
-			out[name] = v4
+		if len(addrs) > 0 {
+			out[name] = addrs
 		}
 	}
 	return out

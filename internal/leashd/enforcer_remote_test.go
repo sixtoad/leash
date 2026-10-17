@@ -108,8 +108,8 @@ func TestRemoteKernelAttachSendsActivePolicyAndResolvedHosts(t *testing.T) {
 	if reqs[0].Policy != comp.StrictText || reqs[0].Cgroup != "/sys/fs/cgroup/user.slice/x" {
 		t.Fatalf("attach carried the wrong policy or cgroup: %+v", reqs[0])
 	}
-	if got := reqs[0].Hosts; len(got) != 1 || len(got["example.com"]) != 1 || got["example.com"][0] != "93.184.215.14" {
-		t.Fatalf("resolved hosts = %v, want only example.com's IPv4 address (the kernel matches IPv4)", got)
+	if got := reqs[0].Hosts; len(got) != 1 || len(got["example.com"]) != 2 || got["example.com"][0] != "2606:2800::1" || got["example.com"][1] != "93.184.215.14" {
+		t.Fatalf("resolved hosts = %v, want example.com's IPv6 and IPv4 addresses (the kernel matches both)", got)
 	}
 
 	next, err := cedarutil.CompileString("leash.cedar", remotePolicy+`
