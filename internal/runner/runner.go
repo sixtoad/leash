@@ -3648,28 +3648,6 @@ func isNoSuchObjectError(err error) bool {
 	return strings.Contains(msg, "no such object") || strings.Contains(msg, "no such container")
 }
 
-func isNoSuchImageError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "no such image")
-}
-
-func (r *runner) ensureLocalImage(ctx context.Context, image string) error {
-	if _, err := r.rt().Output(ctx, "image", "inspect", image); err != nil {
-		if isNoSuchObjectError(err) || isNoSuchImageError(err) {
-			r.diagnosticf("Pulling container image %s...\n", image)
-			if pullErr := r.rt().Run(ctx, "pull", image); pullErr != nil {
-				return fmt.Errorf("pull image %s: %w", image, pullErr)
-			}
-			return nil
-		}
-		return err
-	}
-	return nil
-}
-
 var commandOutput = commandOutputImpl
 
 func commandOutputImpl(ctx context.Context, name string, args ...string) (string, error) {
