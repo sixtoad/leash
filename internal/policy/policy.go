@@ -173,12 +173,76 @@ var ErrCompile = errors.New("policy does not compile")
 // applied: the previous policy stays active everywhere.
 var ErrRejected = errors.New("policy rejected, previous policy kept")
 
+// ErrNotApplied marks a policy change that failed while it was being applied
+// (a kernel module, the enforcer daemon or the userspace publish) and was
+// rolled back: the previous policy is still in effect everywhere. The error
+// is an *ApplyError naming the component.
+var ErrNotApplied = errors.New("policy not applied, previous policy restored")
+
+// ErrFailedClosed marks a change whose apply failed and whose rollback failed
+// too: enforcement was set to deny-all in the kernel and in userspace, and
+// every later change is refused. The workload must be stopped.
+var ErrFailedClosed = errors.New("policy enforcement failed closed (deny-all)")
+
+// Component names used in ApplyError.
+const (
+	ComponentRemoteKernel = "enforcer daemon"
+	ComponentPublish      = "userspace policy publish (proxy, MCP, authz)"
+)
+
+// ApplyError reports a policy change that failed in Component while it was
+// being applied. Unless FailedClosed, every component was put back on the
+// previous policy. With FailedClosed, restoring it failed (RollbackErr) and
+// enforcement was set to deny-all instead.
+type ApplyError struct {
+	Component    string
+	Err          error
+	RollbackErr  error
+	FailedClosed bool
+}
+
+func (e *ApplyError) Error() string {
+	msg := fmt.Sprintf("policy not applied: %s failed: %v", e.Component, e.Err)
+	if !e.FailedClosed {
+		return msg + "; the previous policy is still in effect"
+	}
+	if e.RollbackErr != nil {
+		msg += fmt.Sprintf("; restoring the previous policy failed (%v)", e.RollbackErr)
+	}
+	return msg + "; enforcement failed closed (deny-all)"
+}
+
+func (e *ApplyError) Unwrap() []error {
+	if e.FailedClosed {
+		return []error{ErrFailedClosed, e.Err}
+	}
+	return []error{ErrNotApplied, e.Err}
+}
+
+// Kernel is the local eBPF LSM as the manager drives it (*lsm.LSMManager).
+// UpdateRuntimeRules must be transactional itself: on error the kernel is on
+// the previous policy, or deny-all when the error is an
+// *lsm.KernelApplyError with FailedClosed set.
+type Kernel interface {
+	UpdateRuntimeRules(*lsm.PolicySet) error
+	EnforcesKernelPolicy() bool
+	FailClosed() error
+}
+
 // Manager holds the policy layers (the file and the runtime overlay) as
 // Cedar and keeps one active policy compiled from them (#142): the legacy
 // layers are rewritten to strict Cedar together, the strict layers are added
 // as written, and one engine and one set of kernel tables are built from the
 // result. Every change recompiles the merge; a change that does not compile
 // is rejected with ErrCompile and the previous policy stays active.
+//
+// Applying a change is a transaction (#193): the kernel (local LSM, then the
+// enforcer daemon) is programmed first, then userspace (proxy, MCP, authz)
+// is switched, and only then is the change committed. A failure at any step
+// rolls every component back to the previous policy and returns an
+// *ApplyError naming the component. If that rollback fails, enforcement
+// fails closed: deny-all in the kernel and in userspace, the fail-closed
+// handler runs (leashd stops the workload), and later changes are refused.
 type Manager struct {
 	fileRules        *lsm.PolicySet
 	fileHTTPRules    []proxy.HeaderRewriteRule
@@ -186,22 +250,29 @@ type Manager struct {
 	runtimeHTTPRules []proxy.HeaderRewriteRule
 	runtimeOnly      bool // when true, active rules are runtime-only (ignore file layer)
 	active           *cedar.Compilation
+	failedClosed     bool
 	lastRewrite      string
 	lastWarnings     string
 	runtimeMutex     sync.RWMutex
 
-	// applyMutex orders changes: compile, commit and apply happen as one
+	// applyMutex orders changes: compile, apply and commit happen as one
 	// step, so subsystems see policy changes in order.
 	applyMutex sync.Mutex
 
 	// Subsystem references for live updates
-	lsmManager *lsm.LSMManager
-	onChange   func(*cedar.Compilation) // receives every newly active policy
+	kernel  Kernel
+	publish func(*cedar.Compilation) error // switches userspace to a policy
 
 	// remoteKernel, when set, programs the kernel through the rootless
-	// enforcer daemon instead of a local lsmManager (docs/ROOTLESS.md). It
+	// enforcer daemon instead of a local kernel (docs/ROOTLESS.md). It
 	// receives every newly active policy; an error is an LSM update failure.
 	remoteKernel func(*cedar.Compilation) error
+
+	// onFailClosed runs once when enforcement fails closed.
+	onFailClosed func(*ApplyError)
+
+	// denyAll is the fail-closed policy (denyAllCedar).
+	denyAll *cedar.Compilation
 }
 
 // SetRemoteKernel routes kernel updates to f (the enforcer daemon client).
@@ -213,24 +284,64 @@ func (m *Manager) SetRemoteKernel(f func(*cedar.Compilation) error) {
 	m.remoteKernel = f
 }
 
+// SetFailClosedHandler sets f to run when a change and its rollback both
+// failed and enforcement was set to deny-all. f must stop the workload; it
+// runs with the manager's apply lock held and must not change the policy.
+func (m *Manager) SetFailClosedHandler(f func(*ApplyError)) {
+	m.applyMutex.Lock()
+	defer m.applyMutex.Unlock()
+	m.onFailClosed = f
+}
+
 // NewManager creates a new policy manager. onChange receives every newly
 // active policy (kernel tables, engine, HTTP rewrites), in order.
 func NewManager(lsmManager *lsm.LSMManager, onChange func(active *cedar.Compilation)) *Manager {
+	var kernel Kernel
+	if lsmManager != nil {
+		kernel = lsmManager
+	}
+	var publish func(*cedar.Compilation) error
+	if onChange != nil {
+		publish = func(c *cedar.Compilation) error {
+			onChange(c)
+			return nil
+		}
+	}
+	return NewManagerWithKernel(kernel, publish)
+}
+
+// NewManagerWithKernel creates a policy manager over kernel (nil: none) and
+// publish, which switches userspace (proxy, MCP, authz) to a policy and may
+// fail. Both receive every newly active policy, in order.
+func NewManagerWithKernel(kernel Kernel, publish func(*cedar.Compilation) error) *Manager {
 	m := &Manager{
 		fileRules:        &lsm.PolicySet{},
 		fileHTTPRules:    []proxy.HeaderRewriteRule{},
 		runtimeRules:     &lsm.PolicySet{},
 		runtimeHTTPRules: []proxy.HeaderRewriteRule{},
-		lsmManager:       lsmManager,
-		onChange:         onChange,
+		kernel:           kernel,
+		publish:          publish,
 	}
 	active, err := m.compile(m.fileRules, m.fileHTTPRules, m.runtimeRules, m.runtimeHTTPRules, false)
 	if err != nil {
 		panic(fmt.Sprintf("policy: the empty policy does not compile: %v", err))
 	}
 	m.active = active
+	denyAll, err := cedar.CompileLayers([]cedar.Layer{{Source: &lsm.PolicySource{Name: "deny-all.cedar", Text: denyAllCedar}}})
+	if err != nil {
+		panic(fmt.Sprintf("policy: the deny-all policy does not compile: %v", err))
+	}
+	m.denyAll = denyAll
 	return m
 }
+
+// denyAllCedar is the fail-closed policy: one strict forbid of everything,
+// so the engine denies every request (MCP included, which the empty legacy
+// policy allows) and the kernel tables deny every file open, exec, mutation
+// and connect.
+const denyAllCedar = `@leash_semantics("cedar")
+forbid (principal, action, resource);
+`
 
 // PolicySetCompat is a type alias to expose *lsm.PolicySet to external packages with minimal coupling.
 type PolicySetCompat = lsm.PolicySet
@@ -249,7 +360,7 @@ func (m *Manager) compile(file *lsm.PolicySet, fileHTTP []proxy.HeaderRewriteRul
 }
 
 // change compiles the layers with mutate applied and, when they compile,
-// commits and applies them.
+// applies them everywhere and commits them; see Manager.
 func (m *Manager) change(mutate func(file, runtime **lsm.PolicySet, fileHTTP, runtimeHTTP *[]proxy.HeaderRewriteRule, runtimeOnly *bool)) error {
 	m.applyMutex.Lock()
 	defer m.applyMutex.Unlock()
@@ -258,7 +369,13 @@ func (m *Manager) change(mutate func(file, runtime **lsm.PolicySet, fileHTTP, ru
 	file, runtime := m.fileRules, m.runtimeRules
 	fileHTTP, runtimeHTTP := m.fileHTTPRules, m.runtimeHTTPRules
 	runtimeOnly := m.runtimeOnly
+	prev := m.active
+	failedClosed := m.failedClosed
 	m.runtimeMutex.RUnlock()
+
+	if failedClosed {
+		return fmt.Errorf("%w: refusing policy changes until leash restarts", ErrFailedClosed)
+	}
 
 	mutate(&file, &runtime, &fileHTTP, &runtimeHTTP, &runtimeOnly)
 	active, err := m.compile(file, fileHTTP, runtime, runtimeHTTP, runtimeOnly)
@@ -271,14 +388,17 @@ func (m *Manager) change(mutate func(file, runtime **lsm.PolicySet, fileHTTP, ru
 		return err
 	}
 
+	if err := m.apply(prev, active); err != nil {
+		return err
+	}
+
 	m.runtimeMutex.Lock()
 	m.fileRules, m.runtimeRules = file, runtime
 	m.fileHTTPRules, m.runtimeHTTPRules = fileHTTP, runtimeHTTP
 	m.runtimeOnly = runtimeOnly
 	m.active = active
 	m.runtimeMutex.Unlock()
-
-	return m.apply(active)
+	return nil
 }
 
 // GetActiveRules returns the active kernel tables and HTTP rewrites.
@@ -289,11 +409,19 @@ func (m *Manager) GetActiveRules() (*lsm.PolicySet, []proxy.HeaderRewriteRule) {
 }
 
 // Active returns the active policy: the merged strict Cedar, its engine and
-// kernel tables. It is immutable.
+// kernel tables. It is immutable. After enforcement failed closed it is the
+// deny-all policy.
 func (m *Manager) Active() *cedar.Compilation {
 	m.runtimeMutex.RLock()
 	defer m.runtimeMutex.RUnlock()
 	return m.active
+}
+
+// FailedClosed reports whether enforcement failed closed (see Manager).
+func (m *Manager) FailedClosed() bool {
+	m.runtimeMutex.RLock()
+	defer m.runtimeMutex.RUnlock()
+	return m.failedClosed
 }
 
 // UpdateFileRules replaces the file layer. A PolicySet compiled from Cedar
@@ -331,7 +459,7 @@ func (m *Manager) validateKernelLimits(active *cedar.Compilation) error {
 	if active == nil {
 		return nil
 	}
-	if m.remoteKernel == nil && (m.lsmManager == nil || !m.lsmManager.EnforcesKernelPolicy()) {
+	if m.remoteKernel == nil && (m.kernel == nil || !m.kernel.EnforcesKernelPolicy()) {
 		return nil
 	}
 	if err := lsm.ValidateKernelPolicyLimits(active.Policies); err != nil {
@@ -340,27 +468,114 @@ func (m *Manager) validateKernelLimits(active *cedar.Compilation) error {
 	return nil
 }
 
-func (m *Manager) apply(active *cedar.Compilation) error {
-	m.logRewrite(active)
+// apply switches every component from prev to next: the local kernel, the
+// enforcer daemon, then userspace. On a failure it rolls back what changed
+// and returns an *ApplyError; if the rollback fails, it fails closed.
+func (m *Manager) apply(prev, next *cedar.Compilation) error {
+	m.logRewrite(next)
 
-	// Attempt LSM update; record error but do not short-circuit proxy updates so
-	// that the userspace proxy reflects current policy even on non-Linux hosts
-	// or early bootstrap when LSM may be unavailable.
-	var lsmErr error
-	if m.lsmManager != nil {
-		if err := m.lsmManager.UpdateRuntimeRules(active.Policies.Clone()); err != nil {
-			lsmErr = fmt.Errorf("failed to update LSM: %w", err)
+	localApplied := false
+	if m.kernel != nil {
+		if err := m.kernel.UpdateRuntimeRules(next.Policies.Clone()); err != nil {
+			component := "kernel LSM"
+			var kerr *lsm.KernelApplyError
+			if errors.As(err, &kerr) {
+				component = fmt.Sprintf("kernel LSM (%s)", kerr.Module)
+				if kerr.FailedClosed {
+					// err already describes the kernel's failed rollback.
+					return m.failClosed(component, err, nil)
+				}
+			}
+			// The kernel restored its previous policy itself; nothing else
+			// was touched.
+			return &ApplyError{Component: component, Err: err}
+		}
+		localApplied = true
+	}
+
+	if m.remoteKernel != nil {
+		if err := m.remoteKernel(next); err != nil {
+			// The daemon's outcome is unknown (a refusal is rolled back by
+			// its worker, a timeout or a dropped session may not be), so
+			// the previous policy is sent again.
+			if rbErr := m.rollbackKernel(prev, localApplied, true); rbErr != nil {
+				return m.failClosed(ComponentRemoteKernel, err, rbErr)
+			}
+			return &ApplyError{Component: ComponentRemoteKernel, Err: err}
 		}
 	}
-	if m.remoteKernel != nil && lsmErr == nil {
-		if err := m.remoteKernel(active); err != nil {
-			lsmErr = fmt.Errorf("failed to update LSM (enforcer daemon): %w", err)
+
+	if m.publish != nil {
+		if err := m.publish(next); err != nil {
+			// The publish may have switched some consumers: switch them all
+			// back, and the kernel with them.
+			rbErr := m.rollbackKernel(prev, localApplied, m.remoteKernel != nil)
+			if pubErr := m.publish(prev); pubErr != nil {
+				rbErr = errors.Join(rbErr, fmt.Errorf("%s: %w", ComponentPublish, pubErr))
+			}
+			if rbErr != nil {
+				return m.failClosed(ComponentPublish, err, rbErr)
+			}
+			return &ApplyError{Component: ComponentPublish, Err: err}
 		}
 	}
-	if m.onChange != nil {
-		m.onChange(active)
+	return nil
+}
+
+// rollbackKernel puts the kernel components that took next back on prev.
+func (m *Manager) rollbackKernel(prev *cedar.Compilation, local, remote bool) error {
+	var errs []error
+	if local && m.kernel != nil {
+		if err := m.kernel.UpdateRuntimeRules(prev.Policies.Clone()); err != nil {
+			errs = append(errs, fmt.Errorf("kernel LSM: %w", err))
+		}
 	}
-	return lsmErr
+	if remote && m.remoteKernel != nil {
+		if err := m.remoteKernel(prev); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", ComponentRemoteKernel, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// failClosed sets every component to deny-all, marks the manager failed
+// closed and runs the fail-closed handler. It returns the ApplyError for the
+// change that caused it.
+func (m *Manager) failClosed(component string, cause, rollbackErr error) error {
+	aerr := &ApplyError{Component: component, Err: cause, RollbackErr: rollbackErr, FailedClosed: true}
+	deny := m.denyAll
+
+	var errs []error
+	if m.kernel != nil {
+		if err := m.kernel.FailClosed(); err != nil {
+			errs = append(errs, fmt.Errorf("kernel LSM: %w", err))
+		}
+	}
+	if m.remoteKernel != nil {
+		if err := m.remoteKernel(deny); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", ComponentRemoteKernel, err))
+		}
+	}
+	if m.publish != nil {
+		if err := m.publish(deny); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", ComponentPublish, err))
+		}
+	}
+
+	m.runtimeMutex.Lock()
+	m.failedClosed = true
+	m.active = deny
+	m.runtimeMutex.Unlock()
+
+	if err := errors.Join(errs...); err != nil {
+		log.Printf("leash: FATAL: setting deny-all failed (%v); only stopping the workload keeps it from running unenforced", err)
+	}
+	if m.onFailClosed != nil {
+		m.onFailClosed(aerr)
+	} else {
+		log.Printf("leash: FATAL: %v", aerr)
+	}
+	return aerr
 }
 
 // logRewrite logs what the legacy rewrite changed and where the kernel is

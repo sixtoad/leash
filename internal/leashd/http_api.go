@@ -528,7 +528,7 @@ func (api *policyAPI) handlePatch(w http.ResponseWriter, r *http.Request) {
 		if softLSMError(err) {
 			logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
 		} else {
-			_ = api.mgr.UpdateFileRules(prevFile, prevHTTP) // keep the previous policy
+			// The manager rolled back (or failed closed) itself (#193).
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
@@ -664,7 +664,7 @@ func (api *policyAPI) handlePersistPolicies(w http.ResponseWriter, r *http.Reque
 		if softLSMError(err) {
 			logPolicyEvent("lsm.update.skip", map[string]any{"reason": err.Error()})
 		} else {
-			_ = api.mgr.UpdateFileRules(prevFile, prevHTTP) // keep the previous policy
+			// The manager rolled back (or failed closed) itself (#193).
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
@@ -1111,6 +1111,13 @@ func softLSMError(err error) bool {
 	}
 	// A policy that does not compile was not applied anywhere: never soft.
 	if errors.Is(err, policy.ErrCompile) {
+		return false
+	}
+	// Neither is a change the kernel refused or failed to apply: it was
+	// applied nowhere, or rolled back everywhere, or enforcement failed
+	// closed (#193). Treating it as soft would persist a policy that is not
+	// in effect.
+	if errors.Is(err, policy.ErrRejected) || errors.Is(err, policy.ErrNotApplied) || errors.Is(err, policy.ErrFailedClosed) {
 		return false
 	}
 	// Allow soft-fail on non-Linux hosts where LSM is unavailable.
