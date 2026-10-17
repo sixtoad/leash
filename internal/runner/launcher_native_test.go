@@ -211,7 +211,11 @@ func TestNativeBoxLifecycle_Integration(t *testing.T) {
 
 	// Teardown removes the unit.
 	n.Remove(ctx)
-	rel, _ := hostOutput(ctx, "systemctl", "--user", "show", "-p", "ControlGroup", "--value", n.unitName())
+	// Query the manager the box was created under: as root that is the system
+	// manager, and `systemctl --user` there fails to connect to the bus, which
+	// would read as a leftover unit (#180).
+	show := append(n.userFlag(), "show", "-p", "ControlGroup", "--value", n.unitName())
+	rel, _ := hostOutput(ctx, "systemctl", show...)
 	if strings.TrimSpace(rel) != "" {
 		t.Fatalf("unit %s still present after Remove (ControlGroup=%q)", n.unitName(), strings.TrimSpace(rel))
 	}

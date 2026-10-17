@@ -10,6 +10,18 @@ import (
 	"testing"
 )
 
+// spawnInjectAsSelf makes spawnInjectService run the plugin as the test's own
+// user. Under `sudo go test`, $SUDO_USER would otherwise make it drop to the
+// invoking user via runuser, and that user cannot create the socket inside a
+// root-owned 0700 t.TempDir() (a pre-existing dir is never chowned, by design),
+// so the plugin exits before its socket appears (#180).
+func spawnInjectAsSelf(t *testing.T) {
+	t.Helper()
+	for _, k := range []string{"SUDO_USER", "SUDO_UID", "SUDO_GID"} {
+		t.Setenv(k, "")
+	}
+}
+
 func TestParseInjectServiceValid(t *testing.T) {
 	svc, err := parseInjectService("plugin=helper,env=HELPER_ADDR,socket=/tmp/helper.sock")
 	if err != nil {
@@ -176,6 +188,7 @@ func writeStubInjectPlugin(t *testing.T, dir string) string {
 // flags that bind the socket dir into the workload container and point the env var
 // at it. Uses a stubbed plugin (no real daemon).
 func TestSpawnInjectServicesContainerDockerArgs(t *testing.T) {
+	spawnInjectAsSelf(t)
 	dir := t.TempDir()
 	plugin := writeStubInjectPlugin(t, dir)
 	sock := filepath.Join(dir, "helper.sock")
@@ -237,6 +250,7 @@ func TestSpawnInjectServicesContainerRejectsDuplicates(t *testing.T) {
 // teardownInjectedPlugins (shared by native + container Remove) stops the plugin
 // and removes its recorded socket.
 func TestTeardownInjectedPluginsRemovesSocket(t *testing.T) {
+	spawnInjectAsSelf(t)
 	dir := t.TempDir()
 	plugin := writeStubInjectPlugin(t, dir)
 	sock := filepath.Join(dir, "helper.sock")

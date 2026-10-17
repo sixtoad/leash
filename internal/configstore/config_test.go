@@ -667,6 +667,9 @@ func TestLoadCorruptTomlReturnsTypedError(t *testing.T) {
 // This test manipulates config directories and permissions; run serially to
 // avoid cross-test interference.
 func TestSaveUnwritableDirectoryFailsWithoutPartialFile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permission bits, so the directory is never unwritable (#180)")
+	}
 	testSetEnv(t, "LEASH_HOME", "")
 	base := t.TempDir()
 	testSetEnv(t, "XDG_CONFIG_HOME", base)

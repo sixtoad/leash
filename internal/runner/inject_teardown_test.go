@@ -135,6 +135,7 @@ func shortInjectGrace(t *testing.T) {
 // path (#128).
 func TestInjectedHelpersReapedOnEveryTeardownPath(t *testing.T) {
 	shortInjectGrace(t)
+	spawnInjectAsSelf(t)
 
 	t.Run("normal exit", func(t *testing.T) {
 		h := spawnTeardownHelper(t, false)
