@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -144,6 +145,14 @@ func runExec(args []string) error {
 	if err := preflightDarwinEnforcement(); err != nil {
 		return err
 	}
+	// The daemon checks its policy path too, but it runs detached with its
+	// output in the log file; refuse an unsafe LEASH_POLICY here so the reason
+	// reaches the terminal (#12).
+	if p := strings.TrimSpace(os.Getenv("LEASH_POLICY")); p != "" {
+		if err := checkPolicyPathSafe(p); err != nil {
+			return err
+		}
+	}
 
 	handle, err := acquireExecServer()
 	if err != nil {
@@ -259,7 +268,12 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 
 	defaultPolicyPath := strings.TrimSpace(os.Getenv("LEASH_POLICY"))
 	if defaultPolicyPath == "" {
-		defaultPolicyPath = "/tmp/tmp.leash.policy"
+		// Not /tmp (#12): the per-user state directory, mode 0700.
+		p, err := defaultDarwinPolicyPath()
+		if err != nil {
+			return nil, err
+		}
+		defaultPolicyPath = p
 	}
 	policyPath := fs.String("policy", defaultPolicyPath, "Policy file path")
 
@@ -307,7 +321,11 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 		if wsDefault == "" {
 			wsDefault = "18080"
 		}
-		uiBind = ":" + wsDefault
+		// Loopback only: the Control UI and websocket API can rewrite the
+		// enforced policy, and on macOS they run on the host itself rather
+		// than inside a container network namespace. --serve still binds any
+		// address explicitly (e.g. 0.0.0.0:18080).
+		uiBind = net.JoinHostPort(darwinLoopback, wsDefault)
 	} else if strings.Count(uiBind, ":") == 0 && !strings.HasPrefix(uiBind, "[") {
 		uiBind = ":" + uiBind
 	}
@@ -344,7 +362,9 @@ func preFlight(cfg *runtimeConfig) error {
 	if policyPath == "" {
 		return fmt.Errorf("policy file path required")
 	}
-	if err := policy.EnsureDefaultCedarFile(policyPath); err != nil {
+	// Refuse a policy file another local user could have planted or could
+	// replace, and create a missing one without following a symlink (#12).
+	if err := ensurePolicyFile(policyPath); err != nil {
 		return err
 	}
 	if _, err := policy.Parse(policyPath); err != nil {
@@ -476,6 +496,9 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 	if _, err := os.Stat(cfg.PolicyPath); err != nil {
 		return nil, fmt.Errorf("policy file required: %w", err)
 	}
+	if err := checkPolicyPathSafe(cfg.PolicyPath); err != nil {
+		return nil, err
+	}
 
 	logger, err := lsm.NewSharedLogger(cfg.LogPath)
 	if err != nil {
@@ -530,6 +553,7 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 	// macOS has no SO_ORIGINAL_DST — read the original destination from the PROXY
 	// protocol v1 header the transparent proxy provider prepends to each flow.
 	mitmProxy.SetProxyProtocolIngestion(true)
+	mitmProxy.SetListenHost(darwinLoopback)
 	logPolicyEvent("proxy.mode", map[string]any{
 		"status":    "enabled",
 		"port":      cfg.ProxyPort,
@@ -601,7 +625,7 @@ func (rt *runtimeState) Run() error {
 
 	if rt.lsmManager == nil {
 		logPolicyEvent("lsm.start", map[string]any{"status": "skipped", "reason": "skip-cgroup"})
-		log.Printf("LSM manager disabled (skip-cgroup); operating in proxy-only mode")
+		log.Printf("LSM manager disabled (skip-cgroup); file, exec and socket policy is enforced by the macOS extensions")
 		waitForShutdown()
 		return nil
 	}
@@ -720,6 +744,13 @@ func (rt *runtimeState) openControlUI() {
 
 func (rt *runtimeState) startPolicyWatcher() error {
 	cancel, err := policy.WatchCedar(rt.cfg.PolicyPath, time.Second, func(newCfg *policy.Config) {
+		// The file was safe at startup; refuse a reload if it has since been
+		// swapped for a symlink or a file another user owns or can write.
+		// The previous policy stays active.
+		if err := checkPolicyPathSafe(rt.cfg.PolicyPath); err != nil {
+			logPolicyEvent("policy.update", map[string]any{"source": "file", "error": err.Error()})
+			return
+		}
 		if err := rt.policyManager.UpdateFileRules(newCfg.LSMPolicies, newCfg.HTTPRewrites); err != nil {
 			logPolicyEvent("policy.update", map[string]any{"source": "file", "error": err.Error()})
 			return
@@ -909,24 +940,6 @@ func (rt *runtimeState) dispatchClientEnvelope(clientID string, env *messages.En
 		}
 		rt.sendResponse(clientID, env, "ok", "policy event stored", map[string]any{"success": true})
 
-	case messages.TypeMacPolicyDecision:
-		var decision messages.MacPolicyDecisionPayload
-		if err := messages.UnmarshalPayload(env, &decision); err != nil {
-			log.Printf("macsync: invalid policy decision from %s: %v", clientID, err)
-			rt.sendResponse(clientID, env, "error", "invalid policy decision", nil)
-			return
-		}
-		if rt.macSync != nil {
-			if err := rt.macSync.ProcessPolicyDecision(&decision); err != nil {
-				log.Printf("macsync: failed to process policy decision: %v", err)
-				rt.sendResponse(clientID, env, "error", err.Error(), nil)
-				return
-			}
-			// Broadcast rule update to all clients
-			rt.broadcastRuleUpdate()
-		}
-		rt.sendResponse(clientID, env, "ok", "decision processed", map[string]any{"success": true})
-
 	case messages.TypeMacRuleQuery:
 		if rt.macSync == nil {
 			rt.sendResponse(clientID, env, "error", "macsync not available", nil)
@@ -934,39 +947,6 @@ func (rt *runtimeState) dispatchClientEnvelope(clientID string, env *messages.En
 		}
 		rules := rt.macSync.GetPolicyRules()
 		rt.sendResponse(clientID, env, "ok", "rules retrieved", map[string]any{"rules": rules})
-
-	case messages.TypeMacRuleAdd:
-		var payload messages.MacRuleAddPayload
-		if err := messages.UnmarshalPayload(env, &payload); err != nil {
-			log.Printf("macsync: invalid rule add from %s: %v", clientID, err)
-			rt.sendResponse(clientID, env, "error", "invalid rule add payload", nil)
-			return
-		}
-		if rt.macSync != nil {
-			rt.macSync.AddPolicyRules(payload.Rules)
-			rt.broadcastRuleUpdate()
-		}
-		rt.sendResponse(clientID, env, "ok", fmt.Sprintf("added %d rules", len(payload.Rules)), map[string]any{"success": true})
-
-	case messages.TypeMacRuleRemove:
-		var payload messages.MacRuleRemovePayload
-		if err := messages.UnmarshalPayload(env, &payload); err != nil {
-			log.Printf("macsync: invalid rule remove from %s: %v", clientID, err)
-			rt.sendResponse(clientID, env, "error", "invalid rule remove payload", nil)
-			return
-		}
-		if rt.macSync != nil {
-			rt.macSync.RemovePolicyRules(payload.IDs)
-			rt.broadcastRuleUpdate()
-		}
-		rt.sendResponse(clientID, env, "ok", fmt.Sprintf("removed %d rules", len(payload.IDs)), map[string]any{"success": true})
-
-	case messages.TypeMacRuleClear:
-		if rt.macSync != nil {
-			rt.macSync.ClearPolicyRules()
-			rt.broadcastRuleUpdate()
-		}
-		rt.sendResponse(clientID, env, "ok", "all rules cleared", map[string]any{"success": true})
 
 	case messages.TypeMacNetworkRuleQuery:
 		if rt.macSync == nil {
@@ -997,18 +977,16 @@ func (rt *runtimeState) dispatchClientEnvelope(clientID string, env *messages.En
 			"components": rt.macSync.ConnectedComponents(),
 		})
 
-	case messages.TypeMacNetworkRuleUpdate:
-		var payload messages.MacNetworkRuleUpdatePayload
-		if err := messages.UnmarshalPayload(env, &payload); err != nil {
-			log.Printf("macsync: invalid network rule update from %s: %v", clientID, err)
-			rt.sendResponse(clientID, env, "error", "invalid network rule payload", nil)
-			return
-		}
-		if rt.macSync != nil {
-			rt.macSync.UpdateNetworkRules(payload.Rules)
-			rt.broadcastNetworkRuleUpdate()
-		}
-		rt.sendResponse(clientID, env, "ok", fmt.Sprintf("updated %d network rules", len(payload.Rules)), map[string]any{"success": true})
+	// Enforced rules come only from the Cedar policy (file or Control UI), compiled
+	// by policy.Manager. A websocket client may not add, remove, clear or replace
+	// them, nor turn an interactive decision into a rule: anything that can reach
+	// 127.0.0.1:18080 could otherwise rewrite the policy the extensions enforce,
+	// outside the Cedar engine and its kernel-subset checks. No leash component
+	// sends these.
+	case messages.TypeMacPolicyDecision, messages.TypeMacRuleAdd, messages.TypeMacRuleRemove,
+		messages.TypeMacRuleClear, messages.TypeMacNetworkRuleUpdate:
+		logPolicyEvent("mac.rule.refused", map[string]any{"client": clientID, "type": env.Type})
+		rt.sendResponse(clientID, env, "error", errClientRuleMutation, nil)
 
 	case messages.TypeMacMITMConfig:
 		var cfg messages.MacMITMConfigPayload

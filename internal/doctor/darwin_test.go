@@ -60,7 +60,7 @@ func TestDarwinReadinessMatrix(t *testing.T) {
 			want: StatusReady,
 		},
 		{
-			// The macOS Layer 1. There is no proxy-only fallback on darwin, so
+			// The macOS Layer 1. There is no fallback on darwin, so
 			// this is unavailable rather than degraded.
 			name:      "ES extension not activated",
 			mutate:    func(d *DarwinHost) { d.ESExtension = macext.StateMissing },

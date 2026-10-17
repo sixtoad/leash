@@ -141,8 +141,7 @@ allow net.send *.example.com
   denied unless the policy restricts no destination (connect default allow,
   no deny connect rule, no MCP forbid), because a bound packet or raw socket
   sends with no address and SCTP adds peers past `socket_connect` (#188).
-  This holds whatever capabilities the workload has; a container run that
-  may continue proxy-only also drops `NET_RAW` from the target.
+  This holds whatever capabilities the workload has.
 - Complex Cedar expressions may not be fully supported
 - HTTP header rewrite rules are supported via `Action::"HttpRewrite"` with `context.header/value`
 - **MCP policies (V1 limitations)**:

@@ -239,7 +239,7 @@ func TestPolicyFailedClosedStopsWorkload(t *testing.T) {
 		{"local, stop failed", "/sys/fs/cgroup/leash/w", false, errors.New("permission denied"), true, false},
 		// The rootless watcher kills the target once the leash container stops.
 		{"enforcer daemon, stop failed", "/sys/fs/cgroup/user.slice/w", true, errors.New("permission denied"), true, true},
-		{"no cgroup (proxy-only)", "", false, nil, false, false},
+		{"no cgroup", "", false, nil, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -53,21 +53,24 @@ func withDaemon(t *testing.T, rep enforcerd.Report) *int {
 	return &calls
 }
 
-func rootlessRunner(rt Runtime, requireLSM bool) *runner {
-	return &runner{runtime: rt, logger: log.New(io.Discard, "", 0), cfg: config{requireLSM: requireLSM}}
+func rootlessRunner(rt Runtime) *runner {
+	return &runner{runtime: rt, logger: log.New(io.Discard, "", 0)}
 }
 
 func TestRootlessPodmanWithoutDaemonIsRefused(t *testing.T) {
 	withDaemon(t, enforcerd.Report{Error: "dial unix /run/leash/enforcerd.sock: connect: no such file or directory", Remedy: enforcerd.RemedyFor(errors.New("no such file or directory"))})
-	r := rootlessRunner(infoRuntime{name: "podman", info: "true\n"}, true)
+	r := rootlessRunner(infoRuntime{name: "podman", info: "true\n"})
 	err := r.preflightRootless(context.Background())
 	if err == nil {
 		t.Fatal("a rootless run without a usable daemon must be refused")
 	}
-	for _, want := range []string{"rootless podman", "fail-closed", "sudo leash daemon install", "leash daemon status", "--allow-proxy-only", "no such file or directory"} {
+	for _, want := range []string{"rootless podman", "fail-closed", "sudo leash daemon install", "leash daemon status", "no such file or directory"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("refusal lacks %q:\n%s", want, err)
 		}
+	}
+	if strings.Contains(err.Error(), "allow-proxy-only") || strings.Contains(err.Error(), "L7 proxy") {
+		t.Errorf("refusal must not offer a proxy-only way out:\n%s", err)
 	}
 	if r.enforcerSocket != "" {
 		t.Fatal("no socket may be configured for a refused run")
@@ -76,26 +79,15 @@ func TestRootlessPodmanWithoutDaemonIsRefused(t *testing.T) {
 
 func TestRootlessPodmanPermissionDeniedNamesTheGroup(t *testing.T) {
 	withDaemon(t, enforcerd.Report{Error: "connect: permission denied", Remedy: enforcerd.RemedyFor(errors.New("connect: permission denied"))})
-	err := rootlessRunner(infoRuntime{name: "podman", info: "true"}, true).preflightRootless(context.Background())
+	err := rootlessRunner(infoRuntime{name: "podman", info: "true"}).preflightRootless(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "usermod -aG leash") {
 		t.Fatalf("permission denied must name the group fix: %v", err)
 	}
 }
 
-func TestRootlessPodmanAllowProxyOnlyProceedsWithoutDaemon(t *testing.T) {
-	withDaemon(t, enforcerd.Report{Error: "no such file or directory"})
-	r := rootlessRunner(infoRuntime{name: "podman", info: "true"}, false)
-	if err := r.preflightRootless(context.Background()); err != nil {
-		t.Fatalf("--allow-proxy-only must proceed: %v", err)
-	}
-	if r.enforcerSocket != "" || len(r.enforcerDaemonArgs()) != 0 {
-		t.Fatal("proxy-only must not wire the daemon")
-	}
-}
-
 func TestRootlessPodmanUsesUsableDaemon(t *testing.T) {
 	withDaemon(t, enforcerd.Report{Reachable: true, Usable: true, Status: &enforcerd.Status{Version: "v1", BPFLSM: "active"}})
-	r := rootlessRunner(infoRuntime{name: "podman", info: "true"}, true)
+	r := rootlessRunner(infoRuntime{name: "podman", info: "true"})
 	if err := r.preflightRootless(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +109,7 @@ func TestRootfulAndUndetectableEnginesSkipTheDaemon(t *testing.T) {
 		infoRuntime{name: "podman", infoErr: errors.New("boom")}, // leashd still fails closed on its own
 		infoRuntime{name: "docker", info: `["name=apparmor","name=seccomp,profile=builtin"]`},
 	} {
-		r := rootlessRunner(rt, true)
+		r := rootlessRunner(rt)
 		if err := r.preflightRootless(context.Background()); err != nil {
 			t.Fatalf("%s: %v", rt.Name(), err)
 		}
@@ -130,20 +122,22 @@ func TestRootfulAndUndetectableEnginesSkipTheDaemon(t *testing.T) {
 	}
 }
 
-func TestRootlessDockerIsRefusedUnlessProxyOnly(t *testing.T) {
+// Rootless Docker has no enforcer daemon support yet (#207), so it is always
+// refused.
+func TestRootlessDockerIsRefused(t *testing.T) {
 	withDaemon(t, enforcerd.Report{})
 	rt := infoRuntime{name: "docker", info: `["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]`}
-	err := rootlessRunner(rt, true).preflightRootless(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "rootless docker") || !strings.Contains(err.Error(), "--allow-proxy-only") {
+	err := rootlessRunner(rt).preflightRootless(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "rootless docker") || !strings.Contains(err.Error(), "issues/207") || !strings.Contains(err.Error(), "fail-closed") {
 		t.Fatalf("rootless docker: %v", err)
 	}
-	if err := rootlessRunner(rt, false).preflightRootless(context.Background()); err != nil {
-		t.Fatalf("rootless docker with --allow-proxy-only: %v", err)
+	if strings.Contains(err.Error(), "allow-proxy-only") {
+		t.Fatalf("rootless docker refusal must not offer a proxy-only way out: %v", err)
 	}
 }
 
 func TestEnforcementLineNamesTheDaemon(t *testing.T) {
-	st := enforcement.Describe(true, true, true)
+	st := enforcement.Describe(true, true)
 	if got := formatEnforcementLine(st); got != "leash: enforcement=lsm layer1=active layer2=active" {
 		t.Fatalf("rootful line changed: %q", got)
 	}

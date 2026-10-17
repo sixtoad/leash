@@ -47,13 +47,19 @@ var enforcementWatchInterval = 500 * time.Millisecond
 // watchContainerEnforcement stops the workload if the leash container exits
 // while it runs. In a daemon-enforced (rootless podman) run leashd exits when
 // the daemon reports the session lost; in a rootful run leashd itself attached
-// the LSM, so its exit leaves the workload unenforced either way.
-func (r *runner) watchContainerEnforcement(ctx context.Context) {
+// the LSM, so its exit leaves the workload unenforced either way. The returned
+// channel is closed once the watch goroutine has returned.
+func (r *runner) watchContainerEnforcement(ctx context.Context) <-chan struct{} {
+	// Read the interval before starting the goroutine, so the watch does not
+	// touch package state after its caller has moved on.
+	interval := enforcementWatchInterval
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		// Block until the sidecar stops (prompt); fall back to polling if the
 		// runtime's `wait` is unavailable or returns early.
 		_, _ = r.rt().Output(ctx, "wait", r.cfg.leashContainer)
-		t := time.NewTicker(enforcementWatchInterval)
+		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			if ctx.Err() != nil || r.workloadFinished.Load() {
@@ -71,6 +77,7 @@ func (r *runner) watchContainerEnforcement(ctx context.Context) {
 			}
 		}
 	}()
+	return done
 }
 
 func (r *runner) containerEnforcementLost(ctx context.Context, state string) {
@@ -114,16 +121,20 @@ func (r *runner) leashContainerDiagnostics(ctx context.Context, state string) st
 }
 
 // watchNativeEnforcement kills the box if native leashd exits while the
-// workload runs.
-func (n nativeLauncher) watchNativeEnforcement(ctx context.Context) {
+// workload runs. The returned channel is closed once the watch has returned
+// (at once when there is no leashd to watch).
+func (n nativeLauncher) watchNativeEnforcement(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
 	n.r.leashdMu.Lock()
 	p := n.r.leashd
 	n.r.leashdMu.Unlock()
 	if p == nil {
-		return
+		close(done)
+		return done
 	}
 	cgroupPath := n.r.cgroupPath
 	go func() {
+		defer close(done)
 		select {
 		case <-ctx.Done():
 			return
@@ -153,6 +164,7 @@ func (n nativeLauncher) watchNativeEnforcement(ctx context.Context) {
 		}
 		fmt.Fprintf(os.Stderr, "leash: FATAL: %s\n", firstLine(msg))
 	}()
+	return done
 }
 
 // killCgroup SIGKILLs every process in a cgroup-v2 cgroup: cgroup.kill (5.14+)

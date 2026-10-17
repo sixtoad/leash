@@ -69,15 +69,14 @@ type Box struct {
 ```
 
 `WorkloadSpec` (Image is empty in native — no rootfs), `EnforcementSpec`
-(carries `RequireLSM`, policy, ports — independent of how the box was made), and
+(carries policy and ports — independent of how the box was made), and
 `ExecSpec` round it out; see the sketch for fields.
 
 **Fail-closed contract (unchanged):** `WaitReady` must not return nil until
 enforcement is bootstrapped; on error the runner tears down without ever running
-the workload. `RequireLSM=false` still degrades to proxy-only with a loud
-warning (Layer 2 survives) — only "no boundary at all" is fatal. This is the
-#66 spirit, now a property of the interface rather than scattered in the
-container path.
+the workload. An unavailable eBPF LSM (Layer 1) is always fatal: leash never
+runs a workload with only the L7 proxy (Layer 2) enforcing (#117). This is a
+property of the interface rather than scattered in the container path.
 
 ## How the two worlds map onto the lifecycle
 

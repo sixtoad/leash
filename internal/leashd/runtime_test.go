@@ -408,57 +408,22 @@ func TestParseConfigListenFlagOverridesEnv(t *testing.T) {
 	}
 }
 
-func TestParseConfigRequireLSM(t *testing.T) {
+// Fail-closed is the only posture: --require-lsm / LEASH_REQUIRE_LSM stay
+// accepted as no-ops (Walk passes them), and there is no proxy-only flag.
+func TestParseConfigPosture(t *testing.T) {
 	t.Setenv("LEASH_REQUIRE_LSM", "")
-	t.Setenv("LEASH_ALLOW_PROXY_ONLY", "")
-	// Default: fail closed (issue #117).
-	cfg, err := parseConfig([]string{"leashd"})
-	if err != nil {
+	if _, err := parseConfig([]string{"leashd"}); err != nil {
 		t.Fatalf("parseConfig returned error: %v", err)
 	}
-	if !cfg.RequireLSM {
-		t.Fatalf("RequireLSM should default to true (fail closed)")
+	if _, err := parseConfig([]string{"leashd", "--require-lsm"}); err != nil {
+		t.Fatalf("--require-lsm must stay accepted: %v", err)
 	}
-	// --require-lsm stays accepted (redundant).
-	cfg, err = parseConfig([]string{"leashd", "--require-lsm"})
-	if err != nil {
-		t.Fatalf("parseConfig returned error: %v", err)
+	t.Setenv("LEASH_REQUIRE_LSM", "0")
+	if _, err := parseConfig([]string{"leashd"}); err != nil {
+		t.Fatalf("LEASH_REQUIRE_LSM must stay accepted: %v", err)
 	}
-	if !cfg.RequireLSM {
-		t.Fatalf("--require-lsm should keep RequireLSM")
-	}
-	// Explicit opt-out.
-	cfg, err = parseConfig([]string{"leashd", "--allow-proxy-only"})
-	if err != nil {
-		t.Fatalf("parseConfig returned error: %v", err)
-	}
-	if cfg.RequireLSM {
-		t.Fatalf("--allow-proxy-only should clear RequireLSM")
-	}
-	// Both flags conflict.
-	if _, err := parseConfig([]string{"leashd", "--require-lsm", "--allow-proxy-only"}); err == nil {
-		t.Fatalf("--require-lsm with --allow-proxy-only should be rejected")
-	}
-	// Env opt-out, and the explicit flag beating an inherited env.
-	t.Setenv("LEASH_ALLOW_PROXY_ONLY", "1")
-	cfg, err = parseConfig([]string{"leashd"})
-	if err != nil {
-		t.Fatalf("parseConfig returned error: %v", err)
-	}
-	if cfg.RequireLSM {
-		t.Fatalf("LEASH_ALLOW_PROXY_ONLY=1 should clear RequireLSM")
-	}
-	cfg, err = parseConfig([]string{"leashd", "--require-lsm"})
-	if err != nil {
-		t.Fatalf("parseConfig returned error: %v", err)
-	}
-	if !cfg.RequireLSM {
-		t.Fatalf("--require-lsm flag should beat LEASH_ALLOW_PROXY_ONLY env")
-	}
-	// Both env vars conflict.
-	t.Setenv("LEASH_REQUIRE_LSM", "1")
-	if _, err := parseConfig([]string{"leashd"}); err == nil {
-		t.Fatalf("LEASH_REQUIRE_LSM=1 with LEASH_ALLOW_PROXY_ONLY=1 should be rejected")
+	if _, err := parseConfig([]string{"leashd", "--allow-proxy-only"}); err == nil {
+		t.Fatal("--allow-proxy-only is not a leashd flag")
 	}
 }
 

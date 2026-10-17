@@ -69,6 +69,17 @@ func fastWatch(t *testing.T) {
 	t.Cleanup(func() { enforcementWatchInterval = orig })
 }
 
+// waitWatchDone joins a watch goroutine, so it never outlives the test (and its
+// restores of package-level stubs).
+func waitWatchDone(t *testing.T, done <-chan struct{}, d time.Duration) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatal("watch goroutine did not return")
+	}
+}
+
 func containerWatchRunner(rt *flipRuntime) *runner {
 	r := &runner{runtime: rt, logger: log.New(io.Discard, "", 0)}
 	r.cfg.targetContainer = "agent"
@@ -86,7 +97,7 @@ func TestContainerWatchKillsWorkloadWhenLeashdDies(t *testing.T) {
 	r := containerWatchRunner(rt)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r.watchContainerEnforcement(ctx)
+	done := r.watchContainerEnforcement(ctx)
 
 	deadline := time.Now().Add(2 * time.Second)
 	for !rt.killed() && time.Now().Before(deadline) {
@@ -98,6 +109,8 @@ func TestContainerWatchKillsWorkloadWhenLeashdDies(t *testing.T) {
 	for r.enforcementLost.get() == nil && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
+	// The watch returns after the kill; join it before the stubs are restored.
+	waitWatchDone(t, done, 2*time.Second)
 	err := r.finishLifecycle(ctx, 137, nil)
 	if err == nil || !strings.Contains(err.Error(), "ring buffer reader died") || !strings.Contains(err.Error(), "fail-closed") {
 		t.Fatalf("run must fail with leashd's reason, got %v", err)
@@ -112,8 +125,12 @@ func TestContainerWatchIgnoresNormalTeardown(t *testing.T) {
 	r.workloadFinished.Store(true)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r.watchContainerEnforcement(ctx)
+	done := r.watchContainerEnforcement(ctx)
+	// Past the leash container's stop: a watch that still ran would see it.
 	time.Sleep(300 * time.Millisecond)
+	// The watch must have ended on its own (workload finished), without the
+	// context being canceled.
+	waitWatchDone(t, done, 2*time.Second)
 	if rt.killed() || r.enforcementLost.get() != nil {
 		t.Fatal("teardown after the workload finished was treated as enforcement loss")
 	}
@@ -158,7 +175,7 @@ func TestNativeWatchKillsWorkloadWhenLeashdDies(t *testing.T) {
 	startFakeNativeLeashd(t, r, `echo "leash: FATAL: proxy: listener closed"; sleep 0.2; exit 1`)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	nativeLauncher{r: r}.watchNativeEnforcement(ctx)
+	done := nativeLauncher{r: r}.watchNativeEnforcement(ctx)
 
 	r.waitLeashdExitForTest(t, 2*time.Second)
 	exited := time.Now()
@@ -166,6 +183,7 @@ func TestNativeWatchKillsWorkloadWhenLeashdDies(t *testing.T) {
 	for r.enforcementLost.get() == nil && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
+	waitWatchDone(t, done, 2*time.Second)
 	if killedAt.Load() == 0 {
 		t.Fatal("box cgroup not killed after leashd exited")
 	}
@@ -197,9 +215,9 @@ func TestNativeWatchIgnoresNormalTeardown(t *testing.T) {
 	r.workloadFinished.Store(true)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	nativeLauncher{r: r}.watchNativeEnforcement(ctx)
+	done := nativeLauncher{r: r}.watchNativeEnforcement(ctx)
 	r.waitLeashdExitForTest(t, 2*time.Second)
-	time.Sleep(100 * time.Millisecond)
+	waitWatchDone(t, done, 2*time.Second)
 	if killed.Load() || r.enforcementLost.get() != nil {
 		t.Fatal("normal teardown treated as enforcement loss")
 	}

@@ -67,52 +67,43 @@ func shellQuoteSingle(s string) string {
 // End to end through the CLI entry point: a policy that cannot load must abort
 // the run with its reason before anything is provisioned — the workload never
 // runs (its marker file never appears) — under the container and native
-// runtimes, with and without --allow-proxy-only (issue #162).
+// runtimes (issue #162).
 func TestBadPolicyAbortsRunBeforeWorkload(t *testing.T) {
 	for _, runtimeName := range []string{"docker", "native"} {
-		for _, allowProxyOnly := range []bool{false, true} {
-			for _, tc := range badPolicies {
-				name := runtimeName + "/" + tc.name
-				if allowProxyOnly {
-					name += "/allow-proxy-only"
+		for _, tc := range badPolicies {
+			name := runtimeName + "/" + tc.name
+			t.Run(name, func(t *testing.T) {
+				calls := writeFakeBins(t)
+				work := t.TempDir()
+				t.Setenv("HOME", t.TempDir())
+				t.Setenv("LEASH_WORK_DIR", "")
+				chdirForTest(t, work)
+
+				policyPath := filepath.Join(work, "bad.cedar")
+				if tc.cedar != "" {
+					if err := os.WriteFile(policyPath, []byte(tc.cedar), 0o644); err != nil {
+						t.Fatal(err)
+					}
 				}
-				t.Run(name, func(t *testing.T) {
-					calls := writeFakeBins(t)
-					work := t.TempDir()
-					t.Setenv("HOME", t.TempDir())
-					t.Setenv("LEASH_WORK_DIR", "")
-					chdirForTest(t, work)
+				marker := filepath.Join(work, "workload-ran")
 
-					policyPath := filepath.Join(work, "bad.cedar")
-					if tc.cedar != "" {
-						if err := os.WriteFile(policyPath, []byte(tc.cedar), 0o644); err != nil {
-							t.Fatal(err)
-						}
-					}
-					marker := filepath.Join(work, "workload-ran")
+				args := []string{"--runtime", runtimeName, "--policy", policyPath, "--no-interactive", "--", "sh", "-c", "touch " + shellQuoteSingle(marker)}
 
-					args := []string{"--runtime", runtimeName, "--policy", policyPath, "--no-interactive"}
-					if allowProxyOnly {
-						args = append(args, "--allow-proxy-only")
-					}
-					args = append(args, "--", "sh", "-c", "touch "+shellQuoteSingle(marker))
-
-					err := execute("leash", args)
-					if err == nil {
-						t.Fatal("run must fail when the policy cannot load")
-					}
-					msg := err.Error()
-					if !strings.Contains(msg, "failed to load") || !strings.Contains(msg, tc.reason) || !strings.Contains(msg, policyPath) {
-						t.Fatalf("error must name the policy and the reason %q:\n%s", tc.reason, msg)
-					}
-					if _, statErr := os.Stat(marker); statErr == nil {
-						t.Fatal("the workload ran despite the bad policy")
-					}
-					if data, _ := os.ReadFile(calls); provisioned(string(data)) {
-						t.Fatalf("the run provisioned something before rejecting the policy:\n%s", data)
-					}
-				})
-			}
+				err := execute("leash", args)
+				if err == nil {
+					t.Fatal("run must fail when the policy cannot load")
+				}
+				msg := err.Error()
+				if !strings.Contains(msg, "failed to load") || !strings.Contains(msg, tc.reason) || !strings.Contains(msg, policyPath) {
+					t.Fatalf("error must name the policy and the reason %q:\n%s", tc.reason, msg)
+				}
+				if _, statErr := os.Stat(marker); statErr == nil {
+					t.Fatal("the workload ran despite the bad policy")
+				}
+				if data, _ := os.ReadFile(calls); provisioned(string(data)) {
+					t.Fatalf("the run provisioned something before rejecting the policy:\n%s", data)
+				}
+			})
 		}
 	}
 }

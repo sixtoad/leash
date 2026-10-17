@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -625,11 +624,6 @@ func (n nativeLauncher) hostLeashdArgv(self, netnsPath, cgroupPath string) []str
 	if !n.layer2Active() {
 		leashd = append(leashd, "--lsm-only")
 	}
-	if n.r.cfg.requireLSM {
-		leashd = append(leashd, "--require-lsm")
-	} else {
-		leashd = append(leashd, "--allow-proxy-only")
-	}
 	leashd = append(leashd, "--cgroup", cgroupPath)
 	if cfgDir := strings.TrimSpace(n.r.cfg.cfgDir); cfgDir != "" {
 		leashd = append(leashd, "--policy", filepath.Join(cfgDir, "leash.cedar"))
@@ -718,8 +712,7 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 			return nil
 		}
 		// Fast path: if leashd already exited it will never publish the marker.
-		// A dead leashd also means no proxy, so --allow-proxy-only has nothing
-		// to fall back to: always refuse (e.g. a policy that failed to load).
+		// Refuse at once (e.g. a policy that failed to load).
 		if n.leashdDied() {
 			return n.leashdExitedError()
 		}
@@ -742,22 +735,19 @@ func nativeReadyTimeout(configured time.Duration) time.Duration {
 	return configured
 }
 
-// notReady resolves an unconfirmed-enforcement situation: fail closed by
-// default (refuse to run the workload unenforced); only with --allow-proxy-only
-// AND an active Layer 2 warn and proceed (degrade to the proxy). The leashd log
-// has the specifics either way.
+// notReady resolves an unconfirmed-enforcement situation: fail closed (refuse
+// to run the workload unenforced). The leashd log has the specifics.
 func (n nativeLauncher) notReady(reason string) error {
 	if detail := leashdFailureReason(n.leashdLogPath()); detail != "" {
 		reason += " (leashd: " + detail + ")"
 	}
-	return notReadyVerdict(reason, n.r.cfg.requireLSM, n.layer2Active(), n.leashdLogPath(), n.r.logger)
+	return notReadyVerdict(reason, n.leashdLogPath())
 }
 
 // leashdExitedError is the refusal for a leashd that exited before publishing
-// the enforcement-ready marker. It is fail-closed regardless of
-// --allow-proxy-only: leashd is also the L7 proxy, so once it has exited
-// nothing would enforce anything. It names leashd's FATAL reason, or the log
-// tail when there is none.
+// the enforcement-ready marker: leashd is also the L7 proxy, so once it has
+// exited nothing would enforce anything. It names leashd's FATAL reason, or
+// the log tail when there is none.
 func (n nativeLauncher) leashdExitedError() error {
 	return leashdExitedVerdict(n.leashdLogPath())
 }
@@ -770,7 +760,7 @@ func leashdExitedVerdict(logPath string) error {
 	} else if tail := leashdLogTail(logPath); tail != "" {
 		msg += ".\nRecent leashd log:\n" + indentLines(tail, "  ")
 	}
-	return fmt.Errorf("%s\nrefusing to run the workload unenforced (fail-closed: leashd is not running, so neither the eBPF LSM nor the L7 proxy would enforce; --allow-proxy-only does not apply). See %s", msg, logPath)
+	return fmt.Errorf("%s\nrefusing to run the workload unenforced (fail-closed: leashd is not running, so neither the eBPF LSM nor the L7 proxy would enforce). See %s", msg, logPath)
 }
 
 // leashdLogTail returns a bounded, sanitized, credential-redacted excerpt of
@@ -812,20 +802,10 @@ func leashdFailureReason(path string) string {
 	return lastFatalLine(data)
 }
 
-// notReadyVerdict is notReady's pure decision. Without Layer 2 (rootless, or
-// egress setup failed -> leashd --lsm-only) there is no proxy to fall back on,
-// so --allow-proxy-only cannot apply: proceeding would run with no enforcement.
-func notReadyVerdict(reason string, requireLSM, layer2Active bool, logPath string, logger *log.Logger) error {
-	if !layer2Active {
-		return fmt.Errorf("%s; refusing to run the workload unenforced (fail-closed: %s). See %s", reason, enforcement.FailClosedRemedy(false), logPath)
-	}
-	if requireLSM {
-		return fmt.Errorf("%s; refusing to run the workload unenforced (fail-closed: %s). See %s", reason, enforcement.FailClosedRemedy(true), logPath)
-	}
-	if logger != nil {
-		logger.Printf("Warning: %s; continuing proxy-only (--allow-proxy-only): the workload may run before Layer 1 is active. See %s", reason, logPath)
-	}
-	return nil
+// notReadyVerdict is notReady's pure form: always a refusal, whether or not
+// the L7 proxy is up.
+func notReadyVerdict(reason, logPath string) error {
+	return fmt.Errorf("%s; refusing to run the workload unenforced (fail-closed: %s). See %s", reason, enforcement.FailClosedRemedy, logPath)
 }
 
 // userReadableCACert is a world-readable copy of leash's CA under /tmp (which

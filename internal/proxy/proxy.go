@@ -42,6 +42,7 @@ type MITMProxy struct {
 	certCache      map[string]*tls.Certificate
 	certCacheMux   sync.RWMutex
 	port           string
+	listenHost     string // "" listens on every interface (the Linux netns case)
 	headerRewriter *HeaderRewriter
 	logMutex       sync.Mutex
 	sharedLogger   *lsm.SharedLogger // Shared event logger
@@ -261,7 +262,7 @@ func getOriginalDest(conn net.Conn) (string, error) {
 }
 
 func (p *MITMProxy) Run() error {
-	listener, err := net.Listen("tcp", ":"+p.port)
+	listener, err := net.Listen("tcp", net.JoinHostPort(p.listenHost, p.port))
 	if err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
@@ -282,6 +283,15 @@ func (p *MITMProxy) Run() error {
 			go p.handleTransparentConnection(conn)
 		}
 	}
+}
+
+// SetListenHost restricts the listener to one address. The macOS daemon binds
+// 127.0.0.1: its proxy runs on the host, where every interface would make it
+// an open forward proxy (with the policy's header injections) for anyone who
+// can reach the machine, and the transparent proxy provider only ever relays
+// to loopback.
+func (p *MITMProxy) SetListenHost(host string) {
+	p.listenHost = host
 }
 
 // SetProxyProtocolIngestion selects how the original destination is obtained for

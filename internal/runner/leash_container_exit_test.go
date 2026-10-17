@@ -50,7 +50,7 @@ func TestWaitForEnforcementReadyReportsLeashSidecarExit(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		logs.WriteString("noise line\n")
 	}
-	logs.WriteString("leash: FATAL: enforcement=proxy-only (layer1=unavailable layer2=active): \"bpf\" is not among the active LSMs (lockdown,apparmor); but fail-closed is in effect\x1b[31m\n")
+	logs.WriteString("leash: FATAL: enforcement=none (layer1=unavailable layer2=active): \"bpf\" is not among the active LSMs (lockdown,apparmor); fail-closed, refusing to run the workload\x1b[31m\n")
 
 	r := &runner{runtime: sidecarRuntime{
 		states: map[string]string{

@@ -38,7 +38,7 @@ func TestObservedRejectionOverridesAnActiveLSMList(t *testing.T) {
 		t.Error("a kernel that refuses leash's programs is not ready, whatever the LSM list says")
 	}
 	if got.Native.Status != StatusDegraded {
-		t.Errorf("native status = %v, want degraded (the runtime still runs proxy-only)", got.Native.Status)
+		t.Errorf("native status = %v, want degraded (the runtime is usable; only the kernel is not)", got.Native.Status)
 	}
 	if got.Container.Status != StatusDegraded {
 		t.Errorf("container status = %v, want degraded: a local container shares this kernel", got.Container.Status)
@@ -128,7 +128,7 @@ func TestAttachableCannotResurrectAnInactiveLSMList(t *testing.T) {
 		t.Error("bpf is not in the active LSM list, so the hooks are never invoked: this host does NOT enforce Layer 1, whatever attached")
 	}
 	if got.Native.Status != StatusDegraded {
-		t.Errorf("native status = %v, want degraded (the runtime still runs proxy-only)", got.Native.Status)
+		t.Errorf("native status = %v, want degraded (the runtime is usable; only the kernel is not)", got.Native.Status)
 	}
 	if got.Container.Status != StatusDegraded {
 		t.Errorf("container status = %v, want degraded: a local container shares this kernel", got.Container.Status)

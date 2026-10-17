@@ -23,11 +23,11 @@ func enableEnforcementReady(cfg *runtimeConfig) {
 		once.Do(func() {
 			lsmState, lsmReason := enforcement.ClassifyLSMList(readActiveLSMList())
 			st := effectiveEnforcement(cfg, lsm.Layer1Degraded(), lsm.Layer1AttachedPrograms(), lsmState, lsmReason)
-			// Never publish the release marker for a level the posture forbids
-			// (e.g. "none": --allow-proxy-only with the proxy also off, or no
-			// LSM program attached under fail-closed). Exiting without the
-			// marker keeps every launcher's existence gate closed.
-			if err := st.Check(st.RequireLSM); err != nil {
+			// Never publish the release marker unless Layer 1 is active (no
+			// scopable cgroup, an attach failure, no program attached, or bpf
+			// not an active LSM). Exiting without the marker keeps every
+			// launcher's existence gate closed.
+			if err := st.Check(); err != nil {
 				fmt.Fprintf(os.Stderr, "leash: FATAL: %v\n", err)
 				logPolicyEvent("enforcement.level", statusFields(st))
 				os.Exit(1)
@@ -65,24 +65,18 @@ func effectiveEnforcement(cfg *runtimeConfig, layer1Degraded bool, attachedProgr
 		}
 	}
 	layer1 := reason == ""
-	var st enforcement.Status
-	if cfg == nil {
-		st = enforcement.Describe(layer1, true, true)
-	} else {
-		st = enforcement.Describe(layer1, !cfg.LSMOnly, cfg.failClosed())
-	}
+	st := enforcement.Describe(layer1, cfg == nil || !cfg.LSMOnly)
 	st.Reason = reason
 	return st
 }
 
 func statusFields(st enforcement.Status) map[string]any {
 	return map[string]any{
-		"enforcement":    st.Enforcement,
-		"layer1":         st.Layer1,
-		"layer2":         st.Layer2,
-		"requireLSM":     st.RequireLSM,
-		"allowProxyOnly": st.AllowProxyOnly,
-		"reason":         st.Reason,
+		"enforcement": st.Enforcement,
+		"layer1":      st.Layer1,
+		"layer2":      st.Layer2,
+		"requireLSM":  st.RequireLSM,
+		"reason":      st.Reason,
 	}
 }
 

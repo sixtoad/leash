@@ -6,83 +6,43 @@ import (
 	"testing"
 )
 
-func TestResolveRequireLSM(t *testing.T) {
-	cases := []struct {
-		name          string
-		require       bool
-		allow         bool
-		env           map[string]string
-		want, wantErr bool
-	}{
-		{name: "nothing set fails closed", want: true},
-		{name: "--require-lsm accepted", require: true, want: true},
-		{name: "--allow-proxy-only opts out", allow: true, want: false},
-		{name: "both flags conflict", require: true, allow: true, wantErr: true},
-		{name: "LEASH_REQUIRE_LSM=1 redundant", env: map[string]string{EnvRequireLSM: "1"}, want: true},
-		{name: "falsy LEASH_REQUIRE_LSM does not opt out", env: map[string]string{EnvRequireLSM: "false"}, want: true},
-		{name: "LEASH_ALLOW_PROXY_ONLY=yes opts out", env: map[string]string{EnvAllowProxyOnly: "yes"}, want: false},
-		{name: "LEASH_ALLOW_PROXY_ONLY=0 is not an opt-out", env: map[string]string{EnvAllowProxyOnly: "0"}, want: true},
-		{name: "both env conflict", env: map[string]string{EnvRequireLSM: "1", EnvAllowProxyOnly: "1"}, wantErr: true},
-		{name: "allow flag beats require env", allow: true, env: map[string]string{EnvRequireLSM: "1"}, want: false},
-		{name: "require flag beats allow env", require: true, env: map[string]string{EnvAllowProxyOnly: "1"}, want: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			getenv := func(k string) string { return tc.env[k] }
-			got, err := ResolveRequireLSM(tc.require, tc.allow, getenv)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("want error")
-				}
-				if !got {
-					t.Fatal("a conflict must still resolve to fail-closed")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if got != tc.want {
-				t.Fatalf("requireLSM = %v, want %v", got, tc.want)
-			}
-		})
-	}
-	if got, err := ResolveRequireLSM(false, false, nil); err != nil || !got {
-		t.Fatalf("nil getenv: got (%v, %v), want (true, nil)", got, err)
-	}
-	if _, err := ResolveRequireLSM(true, true, nil); !errors.Is(err, ErrConflictingLSMMode) {
-		t.Fatalf("flag conflict should be ErrConflictingLSMMode, got %v", err)
-	}
-}
-
+// Only "lsm" releases a workload: Layer 1 unavailable is refused whether or
+// not the L7 proxy is up.
 func TestStatusCheck(t *testing.T) {
-	if err := Describe(true, false, true).Check(true); err != nil {
-		t.Fatalf("lsm under fail-closed must pass: %v", err)
+	if err := Describe(true, true).Check(); err != nil {
+		t.Fatalf("lsm must pass: %v", err)
 	}
-	if err := Describe(false, true, false).Check(false); err != nil {
-		t.Fatalf("proxy-only when allowed must pass: %v", err)
+	if err := Describe(true, false).Check(); err != nil {
+		t.Fatalf("lsm with the proxy off (--lsm-only) must pass: %v", err)
 	}
-	if err := Describe(false, true, true).Check(true); err == nil {
-		t.Fatal("proxy-only under fail-closed must be refused")
+	if err := Describe(false, true).Check(); err == nil {
+		t.Fatal("Layer 1 unavailable with the proxy up must be refused")
 	}
-	if err := Describe(false, false, false).Check(false); err == nil {
-		t.Fatal("none must be refused even with proxy-only allowed")
+	if err := Describe(false, false).Check(); err == nil {
+		t.Fatal("Layer 1 unavailable with the proxy off must be refused")
+	}
+	if err := (Status{Enforcement: "proxy-only", Layer1: LayerUnavailable, Layer2: LayerActive}).Check(); err == nil {
+		t.Fatal("a proxy-only marker from an older leashd must be refused")
 	}
 }
 
 func TestDescribe(t *testing.T) {
 	cases := []struct {
-		l1, l2, require bool
-		want            Status
+		l1, l2 bool
+		want   Status
 	}{
-		{true, true, true, Status{LevelLSM, LayerActive, LayerActive, true, false, "", ""}},
-		{true, false, true, Status{LevelLSM, LayerActive, LayerDisabled, true, false, "", ""}},
-		{false, true, false, Status{LevelProxyOnly, LayerUnavailable, LayerActive, false, true, "", ""}},
-		{false, false, false, Status{LevelNone, LayerUnavailable, LayerDisabled, false, true, "", ""}},
+		{true, true, Status{LevelLSM, LayerActive, LayerActive, true, "", ""}},
+		{true, false, Status{LevelLSM, LayerActive, LayerDisabled, true, "", ""}},
+		{false, true, Status{LevelNone, LayerUnavailable, LayerActive, true, "", ""}},
+		{false, false, Status{LevelNone, LayerUnavailable, LayerDisabled, true, "", ""}},
 	}
 	for _, tc := range cases {
-		if got := Describe(tc.l1, tc.l2, tc.require); got != tc.want {
-			t.Errorf("Describe(%v,%v,%v) = %+v, want %+v", tc.l1, tc.l2, tc.require, got, tc.want)
+		got := Describe(tc.l1, tc.l2)
+		if got != tc.want {
+			t.Errorf("Describe(%v,%v) = %+v, want %+v", tc.l1, tc.l2, got, tc.want)
+		}
+		if got.Enforcement == "proxy-only" {
+			t.Errorf("Describe(%v,%v) produced proxy-only", tc.l1, tc.l2)
 		}
 	}
 }
@@ -112,73 +72,58 @@ func TestClassifyLSMList(t *testing.T) {
 	}
 }
 
-// Review nits from the real-kernel re-check: the remedy must match the
-// session (no "--allow-proxy-only" advice when the proxy is off), and the
-// reason must join without stray punctuation.
+// The refusal names the reason without stray punctuation, carries the
+// remedy, and never suggests the removed opt-out.
 func TestCheckMessages(t *testing.T) {
 	_, inactive := ClassifyLSMList([]byte("lockdown,capability,yama,apparmor"), nil)
 
-	// --allow-proxy-only set, proxy off (--lsm-only): level none.
-	none := Describe(false, false, false)
-	none.Reason = inactive
-	err := none.Check(false)
-	if err == nil {
-		t.Fatal("none must be refused")
-	}
-	msg := err.Error()
-	for _, want := range []string{
-		`enforcement=none (layer1=unavailable layer2=disabled): "bpf" is not among the active LSMs`,
-		"boot parameter; no layer enforces policy, refusing to run the workload",
-		"proxy-only is not possible even with --allow-proxy-only",
-		"fix the egress setup or run as root",
-	} {
-		if !strings.Contains(msg, want) {
-			t.Fatalf("none message missing %q:\n%s", want, msg)
+	for _, l2 := range []bool{true, false} {
+		st := Describe(false, l2)
+		st.Reason = inactive
+		err := st.Check()
+		if err == nil {
+			t.Fatal("Layer 1 unavailable must be refused")
 		}
-	}
-	for _, bad := range []string{";:", ";;", "pass --allow-proxy-only to continue"} {
-		if strings.Contains(msg, bad) {
-			t.Fatalf("none message contains %q:\n%s", bad, msg)
+		msg := err.Error()
+		for _, want := range []string{
+			`(layer1=unavailable layer2=`,
+			`"bpf" is not among the active LSMs`,
+			"boot parameter; fail-closed, refusing to run the workload",
+			FailClosedRemedy,
+		} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("message missing %q:\n%s", want, msg)
+			}
 		}
-	}
-
-	// Fail-closed with the proxy up: suggest the opt-out.
-	proxy := Describe(false, true, true)
-	proxy.Reason = "an eBPF LSM program failed to attach (see the leashd log)."
-	err = proxy.Check(true)
-	if err == nil {
-		t.Fatal("proxy-only under fail-closed must be refused")
-	}
-	msg = err.Error()
-	if !strings.Contains(msg, "(see the leashd log); fail-closed is in effect, refusing to run the workload unenforced (enable the bpf LSM, or pass --allow-proxy-only to continue with only the L7 proxy)") {
-		t.Fatalf("fail-closed message:\n%s", msg)
-	}
-	if strings.Contains(msg, ".;") {
-		t.Fatalf("stray punctuation:\n%s", msg)
+		for _, bad := range []string{";:", ";;", ".;", "--allow-proxy-only", "pass --allow"} {
+			if strings.Contains(msg, bad) {
+				t.Fatalf("message contains %q:\n%s", bad, msg)
+			}
+		}
 	}
 
 	// No reason: no dangling colon.
-	bare := Describe(false, false, false)
-	if msg := bare.Check(false).Error(); !strings.HasPrefix(msg, "enforcement=none (layer1=unavailable layer2=disabled); no layer") {
+	bare := Describe(false, false)
+	if msg := bare.Check().Error(); !strings.HasPrefix(msg, "enforcement=none (layer1=unavailable layer2=disabled); fail-closed") {
 		t.Fatalf("bare message: %s", msg)
 	}
 }
 
 func TestNarrowNeverRaises(t *testing.T) {
-	full := Describe(true, true, true)
+	full := Describe(true, true)
 	n := full.Narrow("client preflight: bpf inactive")
-	if n.Enforcement != LevelProxyOnly || n.Layer1 != LayerUnavailable || n.Reason == "" {
+	if n.Enforcement != LevelNone || n.Layer1 != LayerUnavailable || n.Reason == "" {
 		t.Fatalf("narrowed = %+v", n)
 	}
-	if err := n.Check(true); err == nil || !strings.Contains(err.Error(), "bpf inactive") {
-		t.Fatalf("narrowed status must be refused under fail-closed with the reason: %v", err)
+	if err := n.Check(); err == nil || !strings.Contains(err.Error(), "bpf inactive") {
+		t.Fatalf("narrowed status must be refused with the reason: %v", err)
 	}
-	proxy := Describe(false, true, false)
-	proxy.Reason = "orig"
-	if got := proxy.Narrow("other"); got != proxy {
+	down := Describe(false, true)
+	down.Reason = "orig"
+	if got := down.Narrow("other"); got != down {
 		t.Fatalf("Narrow must not change an already-unavailable layer: %+v", got)
 	}
-	if got := Describe(true, false, true).Narrow("x"); got.Enforcement != LevelNone {
+	if got := Describe(true, false).Narrow("x"); got.Enforcement != LevelNone {
 		t.Fatalf("narrowing lsm-only must give none, got %+v", got)
 	}
 }

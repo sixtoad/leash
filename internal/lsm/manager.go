@@ -8,6 +8,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/strongdm/leash/internal/enforcement"
 )
 
 // LSMManager manages multiple LSM programs and handles policy reloading
@@ -15,8 +17,9 @@ type LSMManager struct {
 	cgroupPath string
 	logger     *SharedLogger
 
-	// requireLSM makes an eBPF LSM attach failure fatal instead of degrading to
-	// proxy-only enforcement. True unless proxy-only was explicitly allowed.
+	// requireLSM makes an eBPF LSM attach failure exit the process (leashd).
+	// False only for callers that report the failure and refuse the run
+	// themselves (the enforcer daemon's worker, tests).
 	requireLSM      bool
 	containerRootfs bool
 
@@ -26,7 +29,6 @@ type LSMManager struct {
 	connectLsm *ConnectLsm
 
 	reloadMutex sync.RWMutex
-	degradeOnce sync.Once
 
 	// applied is the last policy every module accepted: the rollback target
 	// when an update fails partway (nil before the first update, when the
@@ -37,12 +39,6 @@ type LSMManager struct {
 
 	// steps, when set (tests), replaces the per-module updaters.
 	steps []kernelStep
-
-	// attachFailed records modules whose programs failed to attach under
-	// --allow-proxy-only: they are not in the kernel, so updates skip them
-	// (their closed maps would only return EBADF).
-	attachMu     sync.Mutex
-	attachFailed map[string]bool
 
 	// attachWG tracks the initial LSM program attaches so a readiness watcher
 	// fires only after ALL of them settle (attached or failed), not the first.
@@ -79,31 +75,18 @@ func NewLSMManager(cgroupPath string, logger *SharedLogger, requireLSM bool) *LS
 
 // handleAttachFailure decides what happens when an eBPF LSM program fails to
 // attach (most often because the kernel doesn't have "bpf" as an active LSM).
-// Fail-closed is the default (issue #117): unless proxy-only was explicitly
-// allowed (--allow-proxy-only / LEASH_ALLOW_PROXY_ONLY) it is fatal. With the
-// opt-out, leash degrades to proxy-only (Layer 2, fail-closed) and continues,
-// warning loudly once. leashd forces requireLSM in --lsm-only mode (no proxy
-// to degrade to), so the non-fatal branch — and its "L7 proxy remains active"
-// warning — is only reachable when the proxy is actually running.
+// It is always fail-closed: with requireLSM (leashd) the process exits; without
+// it (the enforcer daemon's worker) the failure is recorded so the caller
+// refuses the session. No path continues with the workload unenforced.
 func (m *LSMManager) handleAttachFailure(label string, err error) {
-	m.attachMu.Lock()
-	if m.attachFailed == nil {
-		m.attachFailed = map[string]bool{}
-	}
-	m.attachFailed[label] = true
-	m.attachMu.Unlock()
 	if m.requireLSM {
-		fmt.Fprintf(os.Stderr, "leash: FATAL: %s LSM failed to attach (%v); refusing to run the workload unenforced (%s)\n", label, err, failClosedRemedy)
+		fmt.Fprintf(os.Stderr, "leash: FATAL: %s LSM failed to attach (%v); refusing to run the workload unenforced (%s)\n", label, err, enforcement.FailClosedRemedy)
 		os.Exit(1)
 	}
 	markLayer1Degraded()
 	// The attach attempt is counted as settled by the defer in
 	// LoadAndAttachBPFWithSetup (fires on failure too), so no Done() here.
-	m.degradeOnce.Do(func() {
-		fmt.Fprintf(os.Stderr, "leash: WARNING: eBPF LSM enforcement (Layer 1) is unavailable (%s: %v).\n", label, err)
-		fmt.Fprintf(os.Stderr, "leash: continuing in degraded proxy-only mode because --allow-proxy-only is set — filesystem/exec/socket policies are NOT enforced; the L7 proxy (Layer 2) remains active and fail-closed.\n")
-		fmt.Fprintf(os.Stderr, "leash: enable the bpf LSM (lsm=...,bpf in the kernel cmdline), or drop --allow-proxy-only / LEASH_ALLOW_PROXY_ONLY to make this fatal.\n")
-	})
+	fmt.Fprintf(os.Stderr, "leash: %s LSM failed to attach (%v); the run is refused\n", label, err)
 }
 
 // trackAttach registers one pending attach attempt. It lazily wires the
@@ -346,8 +329,8 @@ func (m *LSMManager) updateConnectLSM(policies *PolicySet) error {
 }
 
 // EnforcesKernelPolicy reports whether UpdateRuntimeRules programs the kernel
-// (a scopable cgroup is configured). Without one it is a no-op (degraded
-// proxy-only mode), so kernel limits do not apply.
+// (a scopable cgroup is configured). Without one it is a no-op (the
+// enforcer daemon holds the programs), so local kernel limits do not apply.
 func (m *LSMManager) EnforcesKernelPolicy() bool {
 	return m != nil && m.cgroupPath != ""
 }
@@ -400,12 +383,6 @@ func (m *LSMManager) kernelSteps() []kernelStep {
 	}
 }
 
-func (m *LSMManager) moduleAttachFailed(module string) bool {
-	m.attachMu.Lock()
-	defer m.attachMu.Unlock()
-	return m.attachFailed[module]
-}
-
 // UpdateRuntimeRules updates all LSM modules with new rules as one
 // transaction. When a module fails, every module already updated, and the
 // failed one (which may be half-written), is put back on the last policy that
@@ -418,10 +395,11 @@ func (m *LSMManager) UpdateRuntimeRules(policies *PolicySet) error {
 	defer m.reloadMutex.Unlock()
 
 	if m.cgroupPath == "" {
-		// Degraded mode: without a scopable cgroup we cannot attach cgroup-scoped
-		// BPF-LSM programs (they would govern the whole host, not the target).
-		// Skip kernel enforcement entirely; the proxy layer still enforces L7
-		// policy. See internal/leashd/runtime.go preFlight and issue #67.
+		// No local kernel programs: the enforcer daemon holds them (leashd
+		// keeps the compiled tables but attaches nothing), or the caller has
+		// no cgroup to scope them to. leashd refuses to run a workload without
+		// a scopable cgroup (internal/leashd/runtime.go, issue #67), so this
+		// never means the workload runs unenforced.
 		return nil
 	}
 	if m.failedClosed {
@@ -439,9 +417,6 @@ func (m *LSMManager) UpdateRuntimeRules(policies *PolicySet) error {
 
 	steps := m.kernelSteps()
 	for i, step := range steps {
-		if m.moduleAttachFailed(step.module) {
-			continue
-		}
 		err := step.apply(policies.Clone())
 		if err == nil {
 			continue
@@ -467,9 +442,6 @@ func (m *LSMManager) rollbackLocked(steps []kernelStep) error {
 	}
 	var errs []error
 	for _, step := range steps {
-		if m.moduleAttachFailed(step.module) {
-			continue
-		}
 		if err := step.apply(target.Clone()); err != nil {
 			errs = append(errs, fmt.Errorf("%s LSM: %w", step.module, err))
 		}
@@ -497,9 +469,6 @@ func (m *LSMManager) failClosedLocked() error {
 	m.failedClosed = true
 	var errs []error
 	for _, step := range m.kernelSteps() {
-		if m.moduleAttachFailed(step.module) {
-			continue
-		}
 		if err := step.apply(&PolicySet{}); err != nil {
 			errs = append(errs, fmt.Errorf("%s LSM: %w", step.module, err))
 		}

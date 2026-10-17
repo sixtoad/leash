@@ -42,7 +42,7 @@ func (rt *runtimeState) policyFailedClosed(aerr *policy.ApplyError) {
 
 	stopped := false
 	if cgroup == "" {
-		fields["workload"] = "no workload cgroup (proxy-only); the proxy denies everything"
+		fields["workload"] = "no workload cgroup to stop; the proxy denies everything"
 	} else if err := killWorkloadCgroup(cgroup); err != nil {
 		fmt.Fprintf(os.Stderr, "leash: FATAL: could not stop the workload in %s: %v\n", cgroup, err)
 		fields["workload"] = "stop failed: " + err.Error()
