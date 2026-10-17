@@ -115,6 +115,7 @@ func TestParseConfigOpenEnvOverriddenByFlag(t *testing.T) {
 }
 
 func TestPreFlightSetsDefaultPrivateDir(t *testing.T) {
+	stubEnforcementOK(t)
 	trustTestRoot(t, os.TempDir())
 	// t.Parallel avoided: this test mutates process-wide environment variables and
 	// log sinks; running in parallel would race with other tests that rely on the
@@ -169,6 +170,7 @@ func TestPreFlightSetsDefaultPrivateDir(t *testing.T) {
 }
 
 func TestPreFlightRepairsPrivateDirPermissions(t *testing.T) {
+	stubEnforcementOK(t)
 	trustTestRoot(t, os.TempDir())
 	// t.Parallel avoided: relies on shared environment variables and redirects the
 	// global logger, both of which are process-wide state.
@@ -233,6 +235,7 @@ func TestPreFlightRepairsPrivateDirPermissions(t *testing.T) {
 }
 
 func TestPreFlightRepairsPrivateKeyPermissions(t *testing.T) {
+	stubEnforcementOK(t)
 	trustTestRoot(t, os.TempDir())
 	// t.Parallel avoided: manipulates global env vars and logger output.
 	origPublic, hadPublic := os.LookupEnv("LEASH_DIR")

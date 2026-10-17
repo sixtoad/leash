@@ -153,29 +153,29 @@ Examples:
 - Requires macOS 14+ for extension activation.
 - Only supports connecting to the server at `localhost:18080`
 
-## Enforcement preflight (native mode) — work in progress
+## Enforcement preflight (native mode)
 
-Native `--darwin` enforcement depends on the Endpoint Security (ES) and Network
-Extension (NE) system extensions being **activated and approved**. There is no
-Layer‑2 MITM proxy fallback on macOS, so if those extensions are not active,
-nothing enforces. Previously leash would start and run silently unprotected.
+Native `--darwin` enforcement is the Endpoint Security (ES) and Network
+Extension (NE) system extensions. There is no second layer behind them on
+macOS, so leash **refuses to start** unless both are activated: `leash --darwin
+exec` (in the terminal, before the daemon is started) and the daemon itself
+query `systemextensionsctl list` and stop with the per-extension state and the
+activation steps. There is no opt-out and no degraded mode: the old
+`LEASH_REQUIRE_ENFORCEMENT` switch is gone because refusing is now the only
+behaviour. A `systemextensionsctl` that cannot be run (for example exit 69,
+`EX_NOPERM`) counts as "not active", and its error is printed.
 
-`leashd` now runs a preflight (`internal/darwind/preflight_extensions_darwin.go`)
-that queries `systemextensionsctl list` and reports the ES/NE activation state.
-By default it **warns** that the agent will run unenforced and continues; set
-`LEASH_REQUIRE_ENFORCEMENT=1` to make a missing/inactive extension a **hard
-stop** (the macOS analog of Linux's `--require-lsm`).
+The match is on the bundle-id column exactly, so a sibling extension whose id
+starts with leash's cannot make leash look enforced.
 
 Full Disk Access and "is the extension actually receiving rules" are answered by
 `leash doctor` rather than by this preflight — see [Verify Status](#verify-status).
 Both come from the running daemon (`GET /health/darwin`), because neither can be
 observed from outside the processes that hold them.
 
-Still open — see the `TODO(macOS agent)` block in
-`preflight_extensions_darwin.go`:
-- verify `systemextensionsctl list` parsing against captured output (the parser
-  in `internal/macext` is ported from the Swift `interpretExtensionEntry` and is
-  unit‑tested, but the live format should be confirmed);
-- decide the **default**: warn‑and‑continue (current) vs. hard‑stop. Linux
-  always hard‑stops when its kernel layer is unavailable, so hard‑stop is the
-  consistent default here too.
+## Not supported in native macOS mode
+
+- `--inject-service` (and its `authz=` plugin authorization socket, #152) is
+  refused by `leash --darwin exec`: darwind serves no plugin authorization
+  socket and there is no box to bind a plugin's socket into. Use the Linux
+  runtime (container or native Linux) for plugins.
