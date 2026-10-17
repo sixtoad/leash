@@ -50,6 +50,11 @@ TRACEFS=()
 if [ -d /sys/kernel/tracing ]; then
   TRACEFS=(-v /sys/kernel/tracing:/sys/kernel/tracing)
 fi
+# Expose securityfs so the test can read the active LSM list.
+if [ -r /sys/kernel/security/lsm ]; then
+  TRACEFS+=(-v /sys/kernel/security:/sys/kernel/security:ro)
+  printf '%s\n' "verify-lsm-kernel-load: active LSMs: $(cat /sys/kernel/security/lsm)" >&2
+fi
 
 printf '%s\n' "verify-lsm-kernel-load: loading lsm_open/lsm_exec/lsm_connect on kernel $(uname -r)..." >&2
 docker run --rm --name "$CONTAINER" \
@@ -60,7 +65,27 @@ docker run --rm --name "$CONTAINER" \
   -test.run '^TestKernelLoadAllModulesWithExecRule$' | tee "$WORKDIR/output"
 
 # A renamed or skipped test must not pass the gate vacuously.
-grep -q -- '^--- PASS: TestKernelLoadAllModulesWithExecRule' "$WORKDIR/output" || {
-  printf '%s\n' "verify-lsm-kernel-load: kernel load validation did not run and pass" >&2
-  exit 1
-}
+if grep -q -- '^--- PASS: TestKernelLoadAllModulesWithExecRule' "$WORKDIR/output"; then
+  exit 0
+fi
+
+# CI only (never the release gate): on a kernel with CONFIG_BPF_LSM but without
+# bpf in the active LSM list, the test verifies and attaches every program and
+# then skips its enforcement checks with an LSM-INERT marker. Accept exactly
+# that skip, and only after the verify and attach lines were logged.
+if [ "${LEASH_KERNEL_LOAD_ALLOW_INERT:-}" = 1 ] &&
+  grep -q -- '^--- SKIP: TestKernelLoadAllModulesWithExecRule' "$WORKDIR/output" &&
+  grep -q -- 'LSM-INERT: verified and attached' "$WORKDIR/output" &&
+  grep -q -- 'lsm_open, lsm_exec and lsm_connect loaded and attached' "$WORKDIR/output"; then
+  for object in lsm_open lsm_exec lsm_connect; do
+    grep -q -- "$object object verified" "$WORKDIR/output" || {
+      printf '%s\n' "verify-lsm-kernel-load: $object verification line missing" >&2
+      exit 1
+    }
+  done
+  printf '%s\n' "verify-lsm-kernel-load: verified and attached; enforcement not checked (bpf not in the active LSM list)" >&2
+  exit 0
+fi
+
+printf '%s\n' "verify-lsm-kernel-load: kernel load validation did not run and pass" >&2
+exit 1

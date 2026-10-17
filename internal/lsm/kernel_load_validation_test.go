@@ -516,6 +516,19 @@ collect:
 	t.Logf("lsm_open, lsm_exec and lsm_connect loaded and attached with %d open, %d exec and %d connect rules",
 		len(policies.Open), len(policies.Exec), len(policies.Connect))
 
+	// On a kernel built with CONFIG_BPF_LSM but without "bpf" in the active
+	// LSM list (e.g. GitHub-hosted runners), the programs verify and attach
+	// but the hooks never run, so every enforcement assertion below would
+	// fail. Verification and attach are proven by this point; skip the rest
+	// rather than report enforcement that cannot happen. The marker below is
+	// what scripts/verify-lsm-kernel-load.sh LEASH_KERNEL_LOAD_ALLOW_INERT=1
+	// accepts. An unreadable list (known=false) keeps going: never skip on a guess.
+	if active, known := bpfInActiveLSMStack(); known && !active {
+		lsms, _ := os.ReadFile(activeLSMPath)
+		t.Skipf("LSM-INERT: verified and attached, but bpf is not in the active LSM list (%s = %q); enforcement checks need lsm=...,bpf",
+			activeLSMPath, strings.TrimSpace(string(lsms)))
+	}
+
 	// Exercise the attached exec hook on real, resolvable paths inside the
 	// scoped cgroup: the "/" exec permit must allow true, and the exec deny
 	// must refuse false.
