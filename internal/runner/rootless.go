@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
-	"time"
 
 	"github.com/strongdm/leash/internal/enforcement"
 	"github.com/strongdm/leash/internal/enforcerd"
@@ -129,37 +128,6 @@ func (r *runner) enforcerDaemonArgs() []string {
 		"--group-add", "keep-groups",
 		"-e", enforcerd.EnvSocket + "=" + filepath.Join(enforcerSocketDirInContainer, base),
 	}
-}
-
-// watchDaemonEnforcement stops the workload if the leash container exits
-// while it runs: in a daemon-enforced run leashd exits when the daemon
-// reports the session lost (the daemon stopped or its worker died), and the
-// workload must not outlive its kernel enforcement.
-func (r *runner) watchDaemonEnforcement(ctx context.Context) {
-	if r.enforcerSocket == "" {
-		return
-	}
-	go func() {
-		t := time.NewTicker(time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-			}
-			if r.workloadFinished.Load() {
-				return
-			}
-			state := r.containerSummary(ctx, r.cfg.leashContainer)
-			if !isTerminalStatus(state) || r.workloadFinished.Load() {
-				continue
-			}
-			fmt.Fprintf(os.Stderr, "leash: FATAL: the leash container stopped (%s) while the workload was running; kernel enforcement through the enforcer daemon is no longer guaranteed, stopping the workload\n", state)
-			_ = r.rt().Run(cleanupContext(ctx), "kill", r.cfg.targetContainer)
-			return
-		}
-	}()
 }
 
 // workloadFinishedFlag is embedded in runner (see runner.workloadFinished).
