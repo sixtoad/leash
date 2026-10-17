@@ -2,7 +2,6 @@ package macsync
 
 import (
 	"bytes"
-	"fmt"
 	"sort"
 	"strings"
 
@@ -186,12 +185,8 @@ func networkTarget(rule *lsm.PolicyRule) (string, string) {
 		}
 		return "domain", value
 	}
-	if rule.DestIP > 0 {
-		a := byte((rule.DestIP >> 24) & 0xFF)
-		b := byte((rule.DestIP >> 16) & 0xFF)
-		c := byte((rule.DestIP >> 8) & 0xFF)
-		d := byte(rule.DestIP & 0xFF)
-		return "ipAddress", fmt.Sprintf("%d.%d.%d.%d", a, b, c, d)
+	if ip := lsm.ConnectRuleAddr(rule.DestIP, rule.DestIP6); ip != "" {
+		return "ipAddress", ip
 	}
 	return "", ""
 }

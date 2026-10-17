@@ -7,17 +7,14 @@ import (
 	"sync"
 )
 
-// The kernel connect program matches IPv4 addresses, so hostname rules are
+// The kernel connect program matches IPv4 and IPv6 addresses, so hostname rules are
 // resolved to addresses when the policy loads. leashd resolves in the
 // workload's network namespace with net.LookupIP. The rootless enforcer
 // daemon runs without a network (PrivateNetwork=yes) and in another network
 // namespace anyway, so it loads the addresses its client resolved in the
 // workload's namespace instead (SetHostResolver).
 
-var (
-	hostResolverMu sync.RWMutex
-	hostResolver   = net.LookupIP
-)
+var hostResolverMu sync.RWMutex
 
 // SetHostResolver replaces the lookup used for hostname connect rules. nil
 // restores net.LookupIP. Set it once, before any policy loads.
@@ -27,12 +24,12 @@ func SetHostResolver(f func(host string) ([]net.IP, error)) {
 	if f == nil {
 		f = net.LookupIP
 	}
-	hostResolver = f
+	lookupConnectHost = f
 }
 
 func lookupHostIPs(host string) ([]net.IP, error) {
 	hostResolverMu.RLock()
-	f := hostResolver
+	f := lookupConnectHost
 	hostResolverMu.RUnlock()
 	return f(host)
 }

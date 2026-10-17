@@ -128,11 +128,8 @@ func resourceClauseForRule(rule lsm.PolicyRule) string {
 			}
 			return fmt.Sprintf("resource == Host::\"%s\"", escapeCedarString(host))
 		}
-		if rule.DestIP != 0 {
-			host = fmt.Sprintf("%d.%d.%d.%d", (rule.DestIP>>24)&0xFF, (rule.DestIP>>16)&0xFF, (rule.DestIP>>8)&0xFF, rule.DestIP&0xFF)
-			if rule.DestPort > 0 {
-				host = fmt.Sprintf("%s:%d", host, rule.DestPort)
-			}
+		if host = lsm.ConnectRuleAddr(rule.DestIP, rule.DestIP6); host != "" {
+			host = lsm.JoinConnectTarget(host, rule.DestPort)
 			return fmt.Sprintf("resource == Host::\"%s\"", escapeCedarString(host))
 		}
 		// Fallback to wildcard when no explicit host/ip is present.

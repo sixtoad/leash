@@ -82,7 +82,7 @@ func sortExecRulesByPrecedence(rules []ExecPolicyRule) {
 }
 
 // sortConnectBPFRulesByPrecedence orders kernel connect rules in place: denies
-// first, then by port and IP.
+// first, then by port, family and address.
 func sortConnectBPFRulesByPrecedence(rules []ConnectPolicyRuleBPF) {
 	sort.SliceStable(rules, func(i, j int) bool {
 		a, b := &rules[i], &rules[j]
@@ -92,8 +92,14 @@ func sortConnectBPFRulesByPrecedence(rules []ConnectPolicyRuleBPF) {
 		if a.DestPort != b.DestPort {
 			return a.DestPort < b.DestPort
 		}
+		if a.Family != b.Family {
+			return a.Family < b.Family
+		}
 		if a.DestIP != b.DestIP {
 			return a.DestIP < b.DestIP
+		}
+		if c := bytes.Compare(a.DestIP6[:], b.DestIP6[:]); c != 0 {
+			return c < 0
 		}
 		return a.Operation < b.Operation
 	})

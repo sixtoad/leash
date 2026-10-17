@@ -153,7 +153,15 @@ The kernel subset, required of every policy that can apply to
 - `action == Action::"FileOpen"` is rejected: it matches no request.
 
 Anything else fails the load with the policy named and the reason.
-MCP and plugin policies are userspace only and may use the full language.
+MCP and plugin policies are userspace only and may use the full language,
+with one limit for MCP (#164): the MCP adapters (the proxy's tools/call
+check and the socket's built-in `McpCall` query) send the workload as
+principal, `MCP::Tool`/`MCP::Server` entities without attributes or tags,
+and a context holding only `server`. An `McpCall` policy whose condition
+reads another context key, the principal, or an attribute or tag could
+never apply as written, so it fails the load (permit or forbid), naming the
+policy, its line and the construct. Plugin policies are not restricted: the
+plugin sends the context they test.
 
 **Files and execs: regions.** Every `FilePrefix`/`Dir` entity named by a
 kernel policy is a *prefix point*; every exact `File`, and (for opens) every
@@ -268,6 +276,7 @@ to longest-prefix matching.
 | End to end | `TestKernelCompileOfRewrittenLegacyPolicies`: legacy → rewrite → kernel tables (open, exec, connect, mutation, link) vs cedar.Authorize; every rewritten legacy file must compile | 2000 files (13 with a warned exact-path over-denial), 640,000 decisions; equal, except the documented mutation over-denials |
 | Legacy model == kernel | `TestLegacyModel*MatchesKernel*` pin the oracle to the loaders | 5000 sets each |
 | Plugin decisions | `TestPluginDecisionsAreCedarAuthorize`, namespace rule, `@expires`, routing | |
+| Unenforceable constraints (#164) | `TestLegacyRejectsUnenforceablePermits`, `TestLegacyRejectsNarrowedForbids`, `TestLegacyForbidWithDroppedConditionIsStricter`, `TestStrictMCPConditionsMustBeSupplied`, `TestPluginConditionsAreEvaluatedWithRequestContext`, `TestServerPluginConditionsSurviveTheUnenforceableCheck`; the random generators above flag such policies, assert the rewrite rejects exactly those that have an effect, and check equivalence on the rest | |
 
 The oracle (`internal/lsm/legacy_model_test.go`) is test-only: it is the
 #150 `Decider` matcher code, kept as the statement of the legacy semantics
@@ -329,12 +338,23 @@ Nesting needs nothing special: `forbid /a`, `permit /a/b`, `forbid /a/b/c`,
 `forbid /a/b/c unless [/a/b/c/d]`, `permit /a/b/c/d`.
 
 Principals and conditions: legacy semantics ignore principal constraints and
-every condition except `resource in [...]` and `context.hostname` on built-in
-actions, so a narrower permit applied to everyone. Carrying those
-constraints into the exceptions would change decisions; the rewrite instead
-emits exactly the rules legacy enforced and reports each dropped construct.
-A strict file that constrains the principal of a built-in policy fails the
-load.
+every condition except a whole `resource in [...]` or `context.hostname`
+`==`/`like` clause on built-in actions, and read `unless` as `when`. A
+permit enforced that way grants more than it says (fail-open), so since #164
+the rewrite **rejects** every permit that carries such a constraint and still
+grants a file, exec or connect rule, naming the policy, its line and the
+construct; a permit that grants nothing (an MCP permit, a policy whose
+resources sat inside the ignored condition) is dropped with a note as before.
+A forbid enforced without its constraint only forbids more (stricter): it is
+emitted without it, with a note. A forbid that would be enforced on *fewer*
+requests than written is rejected as well: one whose resources appear only
+in an ignored condition or an `unless` (legacy would drop it, or forbid
+exactly what it exempts), or an MCP forbid that names servers or tools inside
+such a condition (the legacy MCP lowering scans the whole policy for
+servers). The check reads the policy's AST, not the legacy parser's guesses,
+so `context.path in [Dir::"/a/"]` or `principal in Group::"g"` (which the
+legacy parser took for resources) count as ignored conditions. A strict file
+that constrains the principal of a built-in policy fails the load.
 
 ### 4.3 Every legacy deviation
 
@@ -347,9 +367,9 @@ load.
 | 5 | `Dir::"/x"` is `/x/`: the subtree and, for opens, `/x` itself | the hierarchy (`Dir::"/x"` = `Dir::"/x/"`; self for opens) | exec has no self match |
 | 6 | `resource == E` in the head means `in E` | `resource in E` (with E's legacy meaning: `FilePrefix` for a file) | strict `==` is exact |
 | 7 | The head resource and `resource in [...]` conditions are a union | one resource list | |
-| 8 | `unless { resource in [...] }` is read as `when` | `when`, with a note | |
-| 9 | Principal constraints ignored | dropped, with a note | rejected in strict |
-| 10 | Conditions other than `resource in` and `context.hostname` ignored | dropped, with a note | |
+| 8 | `unless { resource in [...] }` is read as `when` | forbid with a resource in its head: `when`, with a note (stricter). Permit: **rejected** (#164) | **behaviour change:** a permit granted what its `unless` excludes; a forbid whose only resources are in the `unless` forbade exactly what it exempts, and is rejected too |
+| 9 | Principal constraints ignored | forbid: dropped, with a note (stricter). Permit granting a file, exec or connect rule: **rejected** (#164) | **behaviour change**; rejected in strict |
+| 10 | Conditions other than a whole `resource in` or `context.hostname` clause ignored | forbid: dropped, with a note (stricter), unless its resources are only in the ignored condition, then **rejected**. Permit granting a rule: **rejected** (#164) | **behaviour change**: the permit was enforced unconditionally (fail-open) |
 | 11 | `context.hostname ==`/`like` names the host | `resource in Host::"..."` | |
 | 12 | A policy that lowers to no rule (unsupported action, no resource, unconstrained action) is skipped with a warning | dropped, with a note | in strict an unconstrained action applies to every built-in action |
 | 13 | MCP is default-allow; MCP permits are no-ops | `@leash_rewrite("mcp-default-allow") permit (principal, action == Action::"McpCall", resource)`; legacy MCP permits dropped, with a note | |
@@ -382,12 +402,19 @@ load.
   `FilePrefix` the kernel may deny mutations Cedar allows (documented
   over-denial). The kernel is never looser than Cedar.
 - **Exec argument denies** (line format): no Cedar form; such layers fail.
+- **#8, #9, #10 on a permit** (and on a forbid they would narrow) are
+  deliberately not reproduced since #164: the legacy behaviour allowed more
+  than the policy said. Such files fail to load until the constraint is
+  removed or the file is made strict.
 
 ## 5. Migration
 
 - **Nothing to do for a working legacy file**: it is rewritten at load, with
   the info log describing every change. Decisions are unchanged except #20,
-  #21, #24 and #28.
+  #21, #24 and #28. A file with a permit whose principal constraint,
+  condition or `unless` legacy semantics ignored (#8, #9, #10) no longer loads
+  (#164); `leash policy migrate` and the linter (`unenforceable_condition`)
+  report the same error.
 - `leash policy migrate <file>` prints the strict file (marked on every
   policy, with a header listing the exceptions and dropped constructs);
   `--write` replaces the file atomically. The output is checked like a load

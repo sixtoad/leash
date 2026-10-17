@@ -70,3 +70,49 @@ func TestCompileLayersPrefixesPolicyIDs(t *testing.T) {
 		t.Fatalf("decision %+v", d)
 	}
 }
+
+// #164: a permit whose condition no adapter can enforce fails the load with
+// the policy, its line and the reason, in legacy and strict files.
+func TestCompileStringRejectsUnenforceablePermits(t *testing.T) {
+	for _, tc := range []struct {
+		name, text, want string
+		line             int
+	}{
+		{"legacy", `permit (principal, action == Action::"FileOpen", resource in Dir::"/a/");
+
+@id("tty-only")
+permit (principal, action == Action::"ProcessExec", resource in Dir::"/usr/bin/") when { context.tty == true };`, "tty-only", 3},
+		{"legacy-principal", `permit (principal == User::"alice", action == Action::"NetworkConnect", resource == Host::"api.example.com");`, "policy0", 1},
+		{"strict-mcp", `@leash_semantics("cedar")
+permit (principal, action == Action::"McpCall", resource in MCP::Server::"s");
+@leash_semantics("cedar")
+permit (principal, action == Action::"McpCall", resource) when { context.args == "x" };`, "policy1", 3},
+	} {
+		_, err := CompileString("leash.cedar", tc.text)
+		var detail *ErrorDetail
+		if !errors.As(err, &detail) {
+			t.Fatalf("%s: want an ErrorDetail, got %v", tc.name, err)
+		}
+		if detail.Code != "CEDAR_UNENFORCEABLE_CONDITION" || detail.Line != tc.line || detail.Policy != tc.want || detail.File != "leash.cedar" {
+			t.Errorf("%s: code %s line %d policy %q file %q: %s", tc.name, detail.Code, detail.Line, detail.Policy, detail.File, detail.Message)
+		}
+		if !strings.Contains(detail.Message, "cannot be enforced as written") {
+			t.Errorf("%s: message %q", tc.name, detail.Message)
+		}
+	}
+}
+
+// A forbid enforced without its condition is stricter and still loads.
+func TestCompileStringKeepsForbidWithDroppedCondition(t *testing.T) {
+	comp, err := CompileString("leash.cedar", `permit (principal, action == Action::"ProcessExec", resource in Dir::"/");
+forbid (principal, action == Action::"ProcessExec", resource in Dir::"/opt/") when { context.tty == true };`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if comp.Engine.DecideExec("/opt/x").Allow || !comp.Engine.DecideExec("/bin/x").Allow {
+		t.Fatal("the forbid applies unconditionally")
+	}
+	if !strings.Contains(strings.Join(comp.Rewrite.Summary(), "\n"), "(stricter)") {
+		t.Fatalf("the rewrite report must say the forbid got stricter: %v", comp.Rewrite.Summary())
+	}
+}

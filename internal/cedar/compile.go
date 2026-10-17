@@ -163,6 +163,10 @@ func formatCedarError(err error, filePath, cedar string) *ErrorDetail {
 			policyID = m[1]
 		}
 		switch policyErr.Kind {
+		case PolicyUnenforceableCondition:
+			code = "CEDAR_UNENFORCEABLE_CONDITION"
+			summary = "policy condition not enforceable: " + message
+			suggestion = "Leash refuses a permit whose condition or principal constraint it cannot enforce, because enforcing it without that constraint would allow more than the policy says; see docs/design/AUTHZ-SERVICE.md section 4.3."
 		case PolicyNotEnforceable:
 			code = "CEDAR_NOT_ENFORCEABLE"
 			summary = "policy not enforceable by the kernel: " + message

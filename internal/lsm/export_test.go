@@ -89,9 +89,10 @@ func (k *KernelForTest) Exec(path string) bool {
 	return execDecision(k.exec, k.execDefault, path, nil) == PolicyAllow
 }
 
+// Connect decides a connection to an IPv4, IPv4-mapped IPv6 or IPv6 address
+// the way lsm_connect does (read_inet_dest, then check_connect_policy).
 func (k *KernelForTest) Connect(ip string, port uint16) bool {
-	addr, _ := canonicalIPv4(net.ParseIP(ip))
-	return connectBPFDecision(k.connect, k.connectDefault, addr, port) == PolicyAllow
+	return connectBPFDecisionDest(k.connect, k.connectDefault, connectDestOf(net.ParseIP(ip), port)) == PolicyAllow
 }
 
 // OpenDecisionForTest runs rules through the same pipeline LoadPolicies uses
