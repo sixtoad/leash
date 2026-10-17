@@ -557,7 +557,7 @@ Environment variables:
   LEASH_LOG_DIR                Log directory (defaults to $LEASH_WORK_DIR/log).
   LEASH_CFG_DIR                Config directory (defaults to $LEASH_WORK_DIR/cfg).
   LEASH_WORKSPACE_DIR          Workspace directory (defaults to $LEASH_WORK_DIR/workspace).
-  LEASH_SHARE_DIR              Override for the shared state directory.
+  LEASH_SHARE_DIR              Override for the shared state directory (may be reused across runs; leash's CA is regenerated per run unless its key persists alongside).
   LEASH_POLICY_FILE            Policy file to mount into the runtime.
   LEASH_WORKSPACE              Overrides project workspace detection.
   LEASH_BOOTSTRAP_TIMEOUT      Controls bootstrap timeout duration (also how long native mode waits for the LSM to attach; default 2m).
@@ -1814,6 +1814,14 @@ func (r *runner) startContainers(ctx context.Context) error {
 	}
 	if err := clearStaleEnforcementMarker(r.cfg.shareDir); err != nil {
 		return err
+	}
+	// The CA certificate (share dir) and key (private dir) must share one
+	// lifetime: a reused LEASH_SHARE_DIR would otherwise hand leashd the
+	// previous run's certificate without its key (#165).
+	if removed, err := reconcileCAState(r.cfg.shareDir, r.cfg.privateDir); err != nil {
+		return err
+	} else if len(removed) > 0 {
+		r.debugf("removed stale CA state (leashd generates a fresh pair): %s", strings.Join(removed, ", "))
 	}
 	if err := os.MkdirAll(r.cfg.logDir, 0o755); err != nil {
 		return fmt.Errorf("create log dir: %w", err)
@@ -3624,6 +3632,11 @@ func (r *runner) stopContainers(ctx context.Context) error {
 		if r.cfg.privateDirCreated || strings.HasPrefix(r.cfg.privateDir, r.cfg.workDir+string(os.PathSeparator)) {
 			_ = os.RemoveAll(r.cfg.privateDir)
 		}
+	}
+	if r.cfg.shareDirFromEnv {
+		// The key went with the private dir; do not leave its certificate in
+		// the reused share dir (#165).
+		removeOrphanedCACert(r.cfg.shareDir, r.cfg.privateDir)
 	}
 	if r.cfg.workDirIsTemp && r.cfg.workDir != "" {
 		if err := os.RemoveAll(r.cfg.workDir); err != nil {

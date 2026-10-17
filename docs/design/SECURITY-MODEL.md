@@ -64,6 +64,7 @@ that need raw sockets (`tcpdump`, `nmap -sS`, `mtr`, `arping`).
 ### Proxy Certificate Management
 
 - Public/private CA split: Target container only sees `/leash/ca-cert.pem`, while leashd reads `/leash-private/ca-key.pem` via `LEASH_PRIVATE_DIR` (0700) and keeps the key file mode at `0600`.
+- CA lifetime: the certificate and key always share one lifetime. Before leashd starts, the runner keeps an existing pair only when both files are present and match; a certificate without its key (e.g. a reused `LEASH_SHARE_DIR` whose previous per-run private dir is gone), a key without its certificate, a mismatched pair, or a legacy key in the share dir is removed, and leashd generates a fresh pair. When a run ends and its private dir is removed, the certificate is also removed from a reused `LEASH_SHARE_DIR`. Reusing `LEASH_SHARE_DIR` across runs is supported; the key is never moved into, copied to or made readable from the share dir.
 
 ## Scoping
 
