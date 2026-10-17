@@ -25,6 +25,7 @@ import (
 	"github.com/strongdm/leash/internal/authz"
 	cedarutil "github.com/strongdm/leash/internal/cedar"
 	"github.com/strongdm/leash/internal/enforcement"
+	"github.com/strongdm/leash/internal/enforcerd"
 	"github.com/strongdm/leash/internal/entrypoint"
 	"github.com/strongdm/leash/internal/httpserver"
 	"github.com/strongdm/leash/internal/idmap"
@@ -165,8 +166,12 @@ type runtimeConfig struct {
 	HostMode         bool
 	LSMOnly          bool
 	RequireLSM       bool
-	MCPConfig        proxy.MCPConfig
-	TelemetryConfig  otel.Config
+	// EnforcerSocket, when set, is the leash enforcer daemon's socket: the
+	// eBPF LSM programs are attached by the daemon instead of by leashd
+	// (rootless runs, docs/ROOTLESS.md).
+	EnforcerSocket  string
+	MCPConfig       proxy.MCPConfig
+	TelemetryConfig otel.Config
 }
 
 // failClosed reports whether an unavailable eBPF LSM must stop the run. It is
@@ -187,6 +192,9 @@ type runtimeState struct {
 	policyManager     *policy.Manager
 	decisions         *policy.Decisions // the engine shared by the proxy and the authz socket
 	authzServer       *authz.Server     // plugin authz sockets (#142); nil when no plugin asked for one
+	remote            *remoteKernel     // the enforcer daemon session (rootless); nil when leashd attaches itself
+	remotePrograms    int               // programs the daemon attached
+	remoteErr         error             // why the daemon did not attach
 	policyWatcherStop func()
 	policyReady       atomic.Bool
 	closeOnce         sync.Once
@@ -220,6 +228,7 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 	bulkMaxBytes := fs.Int("ws-bulk-max-bytes", 1_000_000, "Max bytes to include in initial WebSocket bulk message (0 = unlimited)")
 	defaultCgroupPath := strings.TrimSpace(os.Getenv("LEASH_CGROUP_PATH"))
 	cgroupFlag := fs.String("cgroup", defaultCgroupPath, "Cgroup path to monitor")
+	enforcerSocket := fs.String("enforcer-socket", strings.TrimSpace(os.Getenv(enforcerd.EnvSocket)), "Attach the eBPF LSM through the leash enforcer daemon listening on this socket (rootless runs) instead of loading it in this process")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: %s [flags]\n\n", name)
 		fmt.Fprintf(fs.Output(), "Flags:\n")
@@ -287,6 +296,7 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 		HostMode:         *hostMode,
 		LSMOnly:          *lsmOnly,
 		RequireLSM:       requireLSM,
+		EnforcerSocket:   strings.TrimSpace(*enforcerSocket),
 	}
 	cfg.MCPConfig = loadMCPConfigFromEnv()
 	cfg.TelemetryConfig = otel.LoadConfigFromEnv()
@@ -447,7 +457,13 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 
 	// Fail closed on an eBPF LSM attach failure unless proxy-only was
 	// explicitly allowed (resolved once in parseConfig, issue #117).
-	lsmManager := lsm.NewLSMManager(cfg.CgroupPath, logger, cfg.failClosed())
+	// With the enforcer daemon the programs live in the daemon: the local
+	// manager keeps the compiled tables but attaches nothing.
+	lsmCgroup := cfg.CgroupPath
+	if cfg.EnforcerSocket != "" {
+		lsmCgroup = ""
+	}
+	lsmManager := lsm.NewLSMManager(lsmCgroup, logger, cfg.failClosed())
 	lsmManager.SetContainerRootfs(!cfg.HostMode)
 	lsm.BumpMemlockRlimit()
 
@@ -503,6 +519,11 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 		state.decisions.Publish(active.Engine, state.mitmProxy.SetEngine)
 	})
 
+	if cfg.EnforcerSocket != "" {
+		state.remote = newRemoteKernel(cfg.EnforcerSocket, cfg.CgroupPath, func(line string) { _ = logger.Write(line) })
+		policyManager.SetRemoteKernel(state.remote.update)
+	}
+
 	if err := policyManager.UpdateFileRules(initialPolicy.LSMPolicies, initialPolicy.HTTPRewrites); err != nil {
 		state.Close()
 		return nil, fmt.Errorf("failed to load file policies: %w", err)
@@ -531,6 +552,22 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 func (rt *runtimeState) Run() error {
 	if err := rt.startFrontend(); err != nil {
 		return err
+	}
+
+	// The daemon attaches before the bootstrap, as leashd's own initial
+	// policy load does in a rootful run: the bootstrap (leash-entry, the CA
+	// install) is governed by the policy too.
+	if rt.remote != nil {
+		rt.remotePrograms, rt.remoteErr = rt.remote.attach(rt.policyManager.Active)
+		defer rt.remote.detach() // every exit path, including an aborted bootstrap
+		if rt.remoteErr != nil && rt.cfg.failClosed() {
+			st := enforcement.Describe(false, !rt.cfg.LSMOnly, true)
+			st.Reason = rt.remoteErr.Error()
+			cerr := st.Check(true)
+			fmt.Fprintf(os.Stderr, "leash: FATAL: %v\n", cerr)
+			logPolicyEvent("enforcement.level", statusFields(st))
+			return cerr
+		}
 	}
 
 	if err := rt.waitForBootstrap(); err != nil {
@@ -582,6 +619,10 @@ func (rt *runtimeState) activate() error {
 		}()
 	}
 
+	if rt.remote != nil {
+		return rt.activateRemote()
+	}
+
 	// Release a host launcher only once ALL LSM programs have attached (or
 	// failed) — before LoadAndStart blocks. The initial policy load already
 	// spawned the attach goroutines.
@@ -596,6 +637,47 @@ func (rt *runtimeState) activate() error {
 	// Note: LoadAndStart blocks until shutdown, so the actual enforcement-ready
 	// signal is fired from the LSM settle hook installed in Main (host mode).
 	return nil
+}
+
+// activateRemote attaches the eBPF LSM through the enforcer daemon, publishes
+// the enforcement level, and holds the session until shutdown. Losing the
+// session (the daemon or its worker went away) is fatal: the workload would
+// no longer be kernel-enforced.
+func (rt *runtimeState) activateRemote() error {
+	programs, err := rt.remotePrograms, rt.remoteErr
+	var st enforcement.Status
+	if err != nil {
+		st = enforcement.Describe(false, !rt.cfg.LSMOnly, rt.cfg.failClosed())
+		st.Reason = err.Error()
+		if cerr := st.Check(st.RequireLSM); cerr != nil {
+			fmt.Fprintf(os.Stderr, "leash: FATAL: %v\n", cerr)
+			logPolicyEvent("enforcement.level", statusFields(st))
+			return cerr
+		}
+	} else {
+		st = enforcement.Describe(true, !rt.cfg.LSMOnly, rt.cfg.failClosed())
+		st.Layer1Via = enforcement.Layer1ViaEnforcerDaemon
+		log.Printf("leash: eBPF LSM attached by the enforcer daemon (%d programs) on %s", programs, rt.cfg.CgroupPath)
+	}
+	writeEnforcementReadyMarker(getLeashDirFromEnv(), st)
+	logPolicyEvent("bootstrap.activate", map[string]any{"status": "ok", "layer1Via": st.Layer1Via})
+	rt.policyReady.Store(true)
+
+	lsm.InstallShutdownHandler()
+	select {
+	case <-lsm.ShutdownRequested():
+		rt.remote.detach()
+		return nil
+	case <-rt.remote.ended():
+		select {
+		case <-lsm.ShutdownRequested():
+			return nil // teardown raced the session end
+		default:
+		}
+		lost := fmt.Errorf("kernel enforcement lost: %v; refusing to keep the workload running unenforced", rt.remote.err())
+		fmt.Fprintf(os.Stderr, "leash: FATAL: %v\n", lost)
+		return lost
+	}
 }
 
 func (rt *runtimeState) waitForBootstrap() error {

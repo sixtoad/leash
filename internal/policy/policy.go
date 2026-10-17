@@ -197,6 +197,20 @@ type Manager struct {
 	// Subsystem references for live updates
 	lsmManager *lsm.LSMManager
 	onChange   func(*cedar.Compilation) // receives every newly active policy
+
+	// remoteKernel, when set, programs the kernel through the rootless
+	// enforcer daemon instead of a local lsmManager (docs/ROOTLESS.md). It
+	// receives every newly active policy; an error is an LSM update failure.
+	remoteKernel func(*cedar.Compilation) error
+}
+
+// SetRemoteKernel routes kernel updates to f (the enforcer daemon client).
+// Kernel limits are then validated before every change, as with a local
+// LSM. Call it before the first policy change.
+func (m *Manager) SetRemoteKernel(f func(*cedar.Compilation) error) {
+	m.applyMutex.Lock()
+	defer m.applyMutex.Unlock()
+	m.remoteKernel = f
 }
 
 // NewManager creates a new policy manager. onChange receives every newly
@@ -314,7 +328,10 @@ func (m *Manager) SetRuntimeOnly(enabled bool) error {
 // leaves the LSM modules half-updated. Only meaningful with an LSM to enforce
 // them.
 func (m *Manager) validateKernelLimits(active *cedar.Compilation) error {
-	if m.lsmManager == nil || !m.lsmManager.EnforcesKernelPolicy() || active == nil {
+	if active == nil {
+		return nil
+	}
+	if m.remoteKernel == nil && (m.lsmManager == nil || !m.lsmManager.EnforcesKernelPolicy()) {
 		return nil
 	}
 	if err := lsm.ValidateKernelPolicyLimits(active.Policies); err != nil {
@@ -333,6 +350,11 @@ func (m *Manager) apply(active *cedar.Compilation) error {
 	if m.lsmManager != nil {
 		if err := m.lsmManager.UpdateRuntimeRules(active.Policies.Clone()); err != nil {
 			lsmErr = fmt.Errorf("failed to update LSM: %w", err)
+		}
+	}
+	if m.remoteKernel != nil && lsmErr == nil {
+		if err := m.remoteKernel(active); err != nil {
+			lsmErr = fmt.Errorf("failed to update LSM (enforcer daemon): %w", err)
 		}
 	}
 	if m.onChange != nil {

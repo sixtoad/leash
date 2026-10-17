@@ -206,6 +206,39 @@ Claude Code handling on top.
   narrow the reported level, and a native refusal now echoes leashd's FATAL
   reason instead of only pointing at the log.
 
+### Added — kernel enforcement for rootless podman: the leash enforcer daemon
+- Rootless podman cannot load the eBPF LSM, so a rootless run used to fail
+  closed (or run proxy-only with `--allow-proxy-only`). `sudo leash daemon
+  install` now installs the **leash enforcer daemon**: a socket-activated
+  systemd service, running as a dedicated user with only `CAP_BPF` and
+  `CAP_PERFMON`, no network and a narrow syscall filter. Members of the new
+  `leash` group can ask it, over `/run/leash/enforcerd.sock` (`root:leash`
+  `0660`), to attach leash's eBPF LSM programs to their own containers'
+  cgroups. It compiles the session's policy with the same pipeline as leashd
+  (`cedar.CompileLayers` → `transpiler.CompileKernel`) and loads it with the
+  same `lsm.LSMManager`, one worker process per session. A rootless podman
+  run then reports `enforcement=lsm` (`layer1Via: "enforcer-daemon"`), and
+  file, exec, mutation and connect denials are identical to a rootful run.
+- Callers are authenticated by `SO_PEERCRED`: group membership, subordinate
+  uids attributed to their owner, and no connection or request from inside a
+  governed cgroup. Targets must be inside the caller's delegated
+  `user@<uid>.service` subtree, owned by the caller and populated; overlaps
+  are refused. Every request is audited to
+  `/var/log/leash-enforcerd/audit.log`. Sessions detach when the client
+  detaches, the cgroup empties or disappears (including after a leash crash),
+  or the daemon stops. A client disconnect alone keeps enforcement attached.
+- A rootless podman run without a usable daemon is refused before anything
+  starts, with `sudo leash daemon install` / `leash daemon status` in the
+  error. `--allow-proxy-only` is unchanged. Rootless Docker is refused (not
+  supported yet) unless `--allow-proxy-only`.
+- If the daemon session is lost mid-run, leashd exits (`kernel enforcement
+  lost`) and the runner kills the workload container.
+- `leash daemon install|uninstall|status [--json]`; new capability
+  `rootless-daemon`. See [`docs/ROOTLESS.md`](docs/ROOTLESS.md) for the
+  security model. **Walk follow-up:** `enforcement` is still `lsm`, so Walk
+  needs no change to accept these runs; it may want to surface `layer1Via`
+  and drop its `userns=host` override (#121).
+
 ### Fixed — rootless podman with `userns = "keep-id"` (#121)
 - With `userns = "keep-id"` in `containers.conf` (a common rootless podman
   setting) the target container gets its own user namespace. The leash

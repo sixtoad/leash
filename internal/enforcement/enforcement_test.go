@@ -75,10 +75,10 @@ func TestDescribe(t *testing.T) {
 		l1, l2, require bool
 		want            Status
 	}{
-		{true, true, true, Status{LevelLSM, LayerActive, LayerActive, true, false, ""}},
-		{true, false, true, Status{LevelLSM, LayerActive, LayerDisabled, true, false, ""}},
-		{false, true, false, Status{LevelProxyOnly, LayerUnavailable, LayerActive, false, true, ""}},
-		{false, false, false, Status{LevelNone, LayerUnavailable, LayerDisabled, false, true, ""}},
+		{true, true, true, Status{LevelLSM, LayerActive, LayerActive, true, false, "", ""}},
+		{true, false, true, Status{LevelLSM, LayerActive, LayerDisabled, true, false, "", ""}},
+		{false, true, false, Status{LevelProxyOnly, LayerUnavailable, LayerActive, false, true, "", ""}},
+		{false, false, false, Status{LevelNone, LayerUnavailable, LayerDisabled, false, true, "", ""}},
 	}
 	for _, tc := range cases {
 		if got := Describe(tc.l1, tc.l2, tc.require); got != tc.want {
