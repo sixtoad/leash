@@ -76,18 +76,21 @@ func (r *runner) watchContainerEnforcement(ctx context.Context) {
 func (r *runner) containerEnforcementLost(ctx context.Context, state string) {
 	killCtx, cancel := context.WithTimeout(cleanupContext(ctx), 10*time.Second)
 	defer cancel()
-	_ = r.rt().Run(killCtx, "kill", r.cfg.targetContainer)
 
 	what := "kernel enforcement is no longer guaranteed"
 	if r.enforcerSocket != "" {
 		what = "kernel enforcement through the enforcer daemon is no longer guaranteed"
 	}
 	msg := fmt.Sprintf("the leash container stopped (%s) while the workload was running; %s, so the workload was stopped (fail-closed)", state, what)
-	if detail := r.leashContainerDiagnostics(killCtx, state); detail != "" {
-		msg += detail
-	}
-	fmt.Fprintf(os.Stderr, "leash: FATAL: %s\n", firstLine(msg))
+	// Collect the sidecar's logs before the kill: once the workload exits the
+	// runner tears the containers down, logs included. The reason is recorded
+	// before the kill too, so the run's result can never miss it.
+	diagCtx, diagCancel := context.WithTimeout(killCtx, 2*time.Second)
+	msg += r.leashContainerDiagnostics(diagCtx, state)
+	diagCancel()
 	r.enforcementLost.set(errors.New(msg))
+	fmt.Fprintf(os.Stderr, "leash: FATAL: %s\n", firstLine(msg))
+	_ = r.rt().Run(killCtx, "kill", r.cfg.targetContainer)
 }
 
 // leashContainerDiagnostics is leashd's FATAL reason and a bounded,
@@ -129,23 +132,26 @@ func (n nativeLauncher) watchNativeEnforcement(ctx context.Context) {
 		if n.r.workloadFinished.Load() || ctx.Err() != nil {
 			return
 		}
-		killed := killCgroup(cgroupPath)
-		if !killed {
-			killCtx, cancel := context.WithTimeout(cleanupContext(ctx), 5*time.Second)
-			_, _ = hostOutput(killCtx, "systemctl", append(n.userFlag(), "kill", "--signal=SIGKILL", n.unitName())...)
-			cancel()
-		}
 		msg := "native leashd exited while the workload was running; neither the eBPF LSM nor the L7 proxy enforces any more, so the workload was killed (fail-closed)"
 		logPath := n.leashdLogPath()
 		if detail := leashdFailureReason(logPath); detail != "" {
 			msg += ": leashd: " + detail
+		} else if code := p.exitDescription(); code != "" {
+			msg += " (leashd " + code + ")"
 		}
 		if tail := leashdLogTail(logPath); tail != "" {
 			msg += ".\nRecent leashd log:\n" + indentLines(tail, "  ")
 		}
 		msg += "\nSee " + logPath
-		fmt.Fprintf(os.Stderr, "leash: FATAL: %s\n", firstLine(msg))
+		// Record the reason before the kill so the run's result can never
+		// miss it (the workload's exit races this goroutine otherwise).
 		n.r.enforcementLost.set(errors.New(msg))
+		if !killCgroup(cgroupPath) {
+			killCtx, cancel := context.WithTimeout(cleanupContext(ctx), 5*time.Second)
+			_, _ = hostOutput(killCtx, "systemctl", append(n.userFlag(), "kill", "--signal=SIGKILL", n.unitName())...)
+			cancel()
+		}
+		fmt.Fprintf(os.Stderr, "leash: FATAL: %s\n", firstLine(msg))
 	}()
 }
 

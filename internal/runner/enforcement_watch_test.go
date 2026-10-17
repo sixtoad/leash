@@ -140,11 +140,19 @@ func startFakeNativeLeashd(t *testing.T, r *runner, script string) {
 func TestNativeWatchKillsWorkloadWhenLeashdDies(t *testing.T) {
 	var killedAt atomic.Int64
 	var killedPath atomic.Value
+	var reasonBeforeKill atomic.Bool
+	r := &runner{runtime: nativeRuntime{}, logger: log.New(io.Discard, "", 0)}
 	orig := killCgroup
-	killCgroup = func(p string) bool { killedPath.Store(p); killedAt.Store(time.Now().UnixNano()); return true }
+	killCgroup = func(p string) bool {
+		// The workload's exit races the watch: the reason must already be
+		// recorded when the kill happens, or the run could end without it.
+		reasonBeforeKill.Store(r.enforcementLost.get() != nil)
+		killedPath.Store(p)
+		killedAt.Store(time.Now().UnixNano())
+		return true
+	}
 	t.Cleanup(func() { killCgroup = orig })
 
-	r := &runner{runtime: nativeRuntime{}, logger: log.New(io.Discard, "", 0)}
 	r.cfg.targetContainer = "watch-" + filepath.Base(t.TempDir())
 	r.cgroupPath = "/sys/fs/cgroup/system.slice/fake.service"
 	startFakeNativeLeashd(t, r, `echo "leash: FATAL: proxy: listener closed"; sleep 0.2; exit 1`)
@@ -160,6 +168,9 @@ func TestNativeWatchKillsWorkloadWhenLeashdDies(t *testing.T) {
 	}
 	if killedAt.Load() == 0 {
 		t.Fatal("box cgroup not killed after leashd exited")
+	}
+	if !reasonBeforeKill.Load() {
+		t.Fatal("the reason must be recorded before the workload is killed")
 	}
 	if got := killedPath.Load(); got != r.cgroupPath {
 		t.Fatalf("killed %v, want %s", got, r.cgroupPath)
