@@ -206,6 +206,20 @@ Claude Code handling on top.
   narrow the reported level, and a native refusal now echoes leashd's FATAL
   reason instead of only pointing at the log.
 
+### Fixed — rootless podman with `userns = "keep-id"` (#121)
+- With `userns = "keep-id"` in `containers.conf` (a common rootless podman
+  setting) the target container gets its own user namespace. The leash
+  container stayed in podman's default one, so it had no `CAP_NET_ADMIN` over
+  the target's network namespace and crun refused to start it (`mount sysfs to
+  sys: Operation not permitted`); the run failed before bootstrap. The podman
+  leash container now joins the target's user namespace whenever the target has
+  one of its own (`HostConfig.UsernsMode` other than empty/`host`), so keep-id,
+  `auto` and explicit mappings work and stay the user's choice. Rootful podman,
+  rootless podman's default namespace and Docker are unchanged.
+- leash-entry, when it is not container root and has no sudo, now says which
+  uid it runs as and what overrode leash's `--user 0`, instead of "must run as
+  root or have sudo available".
+
 ### Fixed — HTTP/2 clients bypassed header rewrite and MCP enforcement (#57)
 - **Full HTTP/2 MITM.** The proxy used to offer `h2, http/1.1` to every client
   and tunnel any h2 connection opaquely, so header-rewrite rules, MCP
