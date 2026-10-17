@@ -702,7 +702,13 @@ func (n nativeLauncher) WaitReady(ctx context.Context) error {
 			if n.layer2Active() {
 				n.exportCACert(shareDir)
 			}
-			return n.r.reportEnforcement(ready)
+			if err := n.r.reportEnforcement(ready); err != nil {
+				return err
+			}
+			// From here leashd is the only thing enforcing: if it exits while
+			// the workload runs, kill the workload (fail-closed).
+			n.watchNativeEnforcement(ctx)
+			return nil
 		}
 		// Fast path: if leashd already exited it will never publish the marker.
 		// A dead leashd also means no proxy, so --allow-proxy-only has nothing

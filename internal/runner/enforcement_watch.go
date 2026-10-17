@@ -1,0 +1,181 @@
+package runner
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+// Fail closed when enforcement dies mid-run: once the workload has been
+// released, leashd (native) or the leash sidecar running it (container) is the
+// only thing enforcing — the eBPF LSM links close with leashd's FDs and the
+// proxy is gone with it. If it exits while the workload still runs, the
+// workload is killed at once and the run fails with leashd's reason, instead of
+// the workload carrying on unenforced.
+
+// enforcementLost records why the workload was killed, for finishLifecycle.
+type enforcementLost struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (l *enforcementLost) set(err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.err == nil {
+		l.err = err
+	}
+}
+
+func (l *enforcementLost) get() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.err
+}
+
+// enforcementWatchInterval is the container watch's fallback polling interval
+// (it normally blocks in `<runtime> wait`). Variable for tests.
+var enforcementWatchInterval = 500 * time.Millisecond
+
+// watchContainerEnforcement stops the workload if the leash container exits
+// while it runs. In a daemon-enforced (rootless podman) run leashd exits when
+// the daemon reports the session lost; in a rootful run leashd itself attached
+// the LSM, so its exit leaves the workload unenforced either way.
+func (r *runner) watchContainerEnforcement(ctx context.Context) {
+	go func() {
+		// Block until the sidecar stops (prompt); fall back to polling if the
+		// runtime's `wait` is unavailable or returns early.
+		_, _ = r.rt().Output(ctx, "wait", r.cfg.leashContainer)
+		t := time.NewTicker(enforcementWatchInterval)
+		defer t.Stop()
+		for {
+			if ctx.Err() != nil || r.workloadFinished.Load() {
+				return
+			}
+			state := r.containerSummary(ctx, r.cfg.leashContainer)
+			if isTerminalStatus(state) && !r.workloadFinished.Load() && ctx.Err() == nil {
+				r.containerEnforcementLost(ctx, state)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+		}
+	}()
+}
+
+func (r *runner) containerEnforcementLost(ctx context.Context, state string) {
+	killCtx, cancel := context.WithTimeout(cleanupContext(ctx), 10*time.Second)
+	defer cancel()
+	_ = r.rt().Run(killCtx, "kill", r.cfg.targetContainer)
+
+	what := "kernel enforcement is no longer guaranteed"
+	if r.enforcerSocket != "" {
+		what = "kernel enforcement through the enforcer daemon is no longer guaranteed"
+	}
+	msg := fmt.Sprintf("the leash container stopped (%s) while the workload was running; %s, so the workload was stopped (fail-closed)", state, what)
+	if detail := r.leashContainerDiagnostics(killCtx, state); detail != "" {
+		msg += detail
+	}
+	fmt.Fprintf(os.Stderr, "leash: FATAL: %s\n", firstLine(msg))
+	r.enforcementLost.set(errors.New(msg))
+}
+
+// leashContainerDiagnostics is leashd's FATAL reason and a bounded,
+// credential-redacted log tail from the sidecar (the #136/#137 helpers).
+func (r *runner) leashContainerDiagnostics(ctx context.Context, state string) string {
+	if statusCategory(state) == "missing" {
+		return "; the leash container was removed, so no logs are available"
+	}
+	raw, err := r.rt().Output(ctx, "logs", "--tail", "200", r.cfg.leashContainer)
+	if err != nil {
+		return ""
+	}
+	var b strings.Builder
+	if fatal := lastFatalLine(raw); fatal != "" {
+		b.WriteString(": leashd: " + fatal)
+	}
+	if tail := sanitizeContainerLogs(raw); tail != "" {
+		fmt.Fprintf(&b, "\nRecent logs (%s):\n%s", r.cfg.leashContainer, indentLines(tail, "  "))
+	}
+	return b.String()
+}
+
+// watchNativeEnforcement kills the box if native leashd exits while the
+// workload runs.
+func (n nativeLauncher) watchNativeEnforcement(ctx context.Context) {
+	n.r.leashdMu.Lock()
+	p := n.r.leashd
+	n.r.leashdMu.Unlock()
+	if p == nil {
+		return
+	}
+	cgroupPath := n.r.cgroupPath
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.done:
+		}
+		if n.r.workloadFinished.Load() || ctx.Err() != nil {
+			return
+		}
+		killed := killCgroup(cgroupPath)
+		if !killed {
+			killCtx, cancel := context.WithTimeout(cleanupContext(ctx), 5*time.Second)
+			_, _ = hostOutput(killCtx, "systemctl", append(n.userFlag(), "kill", "--signal=SIGKILL", n.unitName())...)
+			cancel()
+		}
+		msg := "native leashd exited while the workload was running; neither the eBPF LSM nor the L7 proxy enforces any more, so the workload was killed (fail-closed)"
+		logPath := n.leashdLogPath()
+		if detail := leashdFailureReason(logPath); detail != "" {
+			msg += ": leashd: " + detail
+		}
+		if tail := leashdLogTail(logPath); tail != "" {
+			msg += ".\nRecent leashd log:\n" + indentLines(tail, "  ")
+		}
+		msg += "\nSee " + logPath
+		fmt.Fprintf(os.Stderr, "leash: FATAL: %s\n", firstLine(msg))
+		n.r.enforcementLost.set(errors.New(msg))
+	}()
+}
+
+// killCgroup SIGKILLs every process in a cgroup-v2 cgroup: cgroup.kill (5.14+)
+// in one atomic step, else each PID in cgroup.procs. Variable for tests.
+var killCgroup = func(cgroupPath string) bool {
+	if strings.TrimSpace(cgroupPath) == "" {
+		return false
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.kill"), []byte("1"), 0); err == nil {
+		return true
+	}
+	data, err := os.ReadFile(filepath.Join(cgroupPath, "cgroup.procs"))
+	if err != nil {
+		return false
+	}
+	any := false
+	for _, f := range strings.Fields(string(data)) {
+		if pid, err := strconv.Atoi(f); err == nil && pid > 0 {
+			if syscall.Kill(pid, syscall.SIGKILL) == nil {
+				any = true
+			}
+		}
+	}
+	return any
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
