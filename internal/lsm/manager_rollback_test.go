@@ -182,18 +182,22 @@ func TestFailClosedTriesEveryModule(t *testing.T) {
 	}
 }
 
-// A module whose programs failed to attach (--allow-proxy-only) is not in
-// the kernel: updates skip it rather than failing on its closed maps.
-func TestUpdateRuntimeRulesSkipsModulesThatFailedToAttach(t *testing.T) {
+// No module is ever skipped: a module whose programs failed to attach is not
+// treated as absent, so an update that cannot reach it fails (and rolls back)
+// instead of reporting success with part of the policy unenforced.
+func TestUpdateRuntimeRulesNeverSkipsAFailedAttach(t *testing.T) {
 	m, mods := newFakeKernel()
 	m.requireLSM = false
+	t.Cleanup(func() { layer1Degraded.Store(false) })
 	m.handleAttachFailure("connect", errors.New("attach refused"))
-	mods[2].fail = func(string) (error, bool) { return errors.New("bad file descriptor"), false }
-	if err := m.UpdateRuntimeRules(policyNamed("/next/")); err != nil {
-		t.Fatalf("update with a detached module: %v", err)
+	if !Layer1Degraded() {
+		t.Fatal("an attach failure must be recorded so the caller refuses the run")
 	}
-	if mods[0].state != "/next/" || mods[1].state != "/next/" {
-		t.Fatalf("attached modules not updated: %q %q", mods[0].state, mods[1].state)
+	mods[2].fail = func(string) (error, bool) { return errors.New("bad file descriptor"), false }
+	err := m.UpdateRuntimeRules(policyNamed("/next/"))
+	var kerr *KernelApplyError
+	if !errors.As(err, &kerr) || kerr.Module != "connect" {
+		t.Fatalf("update with an unattached module = %v, want a connect KernelApplyError", err)
 	}
 }
 

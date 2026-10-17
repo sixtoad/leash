@@ -119,8 +119,6 @@ type options struct {
 	allowDisplay    bool            // keep DISPLAY/XAUTHORITY + the X11 socket (GUI apps)
 	allowDBus       bool            // keep DBUS_SESSION_BUS_ADDRESS + the keyring/D-Bus runtime dir
 	shareIPC        bool            // share the host IPC namespace (e.g. X MIT-SHM)
-	requireLSM      bool            // --require-lsm: accepted for compatibility; fail-closed is the default
-	allowProxyOnly  bool            // --allow-proxy-only: opt out of fail-closed when the eBPF LSM can't attach
 	loginShell      bool            // --login-shell: (container) run the governed command via `<shell> -lc` (sources /etc/profile)
 	allowNamespaces bool            // skip the seccomp mount/unshare block (reopens the userns bind-mount bypass)
 	injectServices  []injectService // --inject-service: helper plugins to spawn and bind into the box
@@ -188,7 +186,6 @@ type config struct {
 	listenExplicit      bool
 	dockerNetwork       string
 	runtime             string
-	requireLSM          bool
 	dropUser            string
 	// loginShell runs the container governed command through a login shell
 	// (`-lc`). Off by default: a login shell sources /etc/profile, which on
@@ -521,7 +518,7 @@ entrypoint is left running.
 Subcommands:
   version [--json]                Print build metadata. --json adds the contract range provisioners check before driving leash.
   daemon install|status|uninstall The leash enforcer daemon: eBPF LSM enforcement for rootless podman (sudo for install/uninstall; see docs/ROOTLESS.md).
-  doctor [--json]                 Report whether this machine can enforce, per runtime. Exits 0 only when a runtime enforces both layers; 3 when one runs proxy-only; 1 when none runs.
+  doctor [--json]                 Report whether this machine can enforce, per runtime. Exits 0 only when a runtime enforces both layers; 3 when a runtime is usable but a layer is off (leash run then refuses); 1 when none runs.
 
 Flags:
   -I, --no-interactive            Skip the interactive TTY; run the command non-interactively.
@@ -537,8 +534,7 @@ Flags:
   --allow-display                 (native) Let the workload reach the X11 display (keep DISPLAY; don't mask the X socket). For GUI apps.
   --allow-dbus                    (native) Let the workload reach the session D-Bus/keyring (keep DBUS_SESSION_BUS_ADDRESS; don't mask /run/user).
   --share-ipc                     (native) Share the host IPC namespace (e.g. X MIT-SHM). Default: isolated.
-  --allow-proxy-only              Opt out of fail-closed: if the eBPF LSM (Layer 1) can't attach, warn and continue with only the L7 proxy (Layer 2). Filesystem/exec/socket policies are then NOT enforced.
-  --require-lsm                   Accepted for compatibility; fail-closed is now the default. Mutually exclusive with --allow-proxy-only.
+  --require-lsm                   Accepted for compatibility; no effect. leash always refuses to start when the eBPF LSM (Layer 1) is unavailable.
   --user <name>                   (native) Drop the workload to this user, overriding $SUDO_USER. Use when invoking leash as root without sudo (e.g. a scheduler) so the agent never runs as root by accident. Pass --user root to run as root deliberately.
   --allow-namespaces              (native) Let the workload create user/mount namespaces (unshare/mount) — for nested containers or sandbox tools. Reopens the userns bind-mount path-LSM bypass, so default is hardened (off).
   --inject-service <spec>         (native) Spawn a helper plugin as the invoking user, expose its socket to the box, and set an env var pointing at it. spec is comma-separated: plugin=<binary>,env=<VAR>,socket=<path>[,config=<opaque>][,authz=<Ns>[+<Ns>...][,id=<id>]]. config is optional and opaque (leash never interprets it). authz gives the plugin a private Cedar authorization socket (LEASH_AUTHZ_SOCKET) for actions in those namespaces (Action = Leash's own); id names its principal Plugin::"<id>". Fail-closed if the plugin can't start. Repeatable.
@@ -569,8 +565,7 @@ Environment variables:
   LEASH_RUNTIME                Container runtime CLI: docker (default) or podman (overridden by --runtime).
   LEASH_EXTRA_ARGS             Additional arguments passed into leash-entry.
   LEASH_CGROUP_PATH            Override cgroup path for the leash container.
-  LEASH_ALLOW_PROXY_ONLY       Truthy to allow proxy-only enforcement when the eBPF LSM can't attach (same as --allow-proxy-only).
-  LEASH_REQUIRE_LSM            Accepted for compatibility; fail-closed is the default (a falsy value does NOT opt out).
+  LEASH_REQUIRE_LSM            Accepted for compatibility; no effect (fail-closed is the only posture; a falsy value does NOT opt out).
   LEASH_LOGIN_SHELL            Truthy to run the container command via a login shell (same as --login-shell).
   LEASH_CPUS                   Target container CPU limit (same as --cpus).
   LEASH_MEMORY                 Target container memory limit (same as --memory).
@@ -763,9 +758,7 @@ func parseArgs(args []string) (options, error) {
 		case "--share-ipc":
 			opts.shareIPC = true
 		case "--require-lsm":
-			opts.requireLSM = true
-		case "--allow-proxy-only":
-			opts.allowProxyOnly = true
+			// Accepted for compatibility; no effect (always fail-closed).
 		case "--login-shell":
 			opts.loginShell = true
 		case "--allow-namespaces":
@@ -923,8 +916,6 @@ func parseArgs(args []string) (options, error) {
 				return opts, fmt.Errorf("-o does not take a value")
 			case strings.HasPrefix(arg, "--require-lsm="):
 				return opts, fmt.Errorf("--require-lsm does not take a value")
-			case strings.HasPrefix(arg, "--allow-proxy-only="):
-				return opts, fmt.Errorf("--allow-proxy-only does not take a value")
 			case strings.HasPrefix(arg, "--machine-output="):
 				return opts, fmt.Errorf("--machine-output does not take a value")
 			case strings.HasPrefix(arg, "-v="):
@@ -1576,14 +1567,7 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 		cfg.runtime = defaultRuntimeName()
 	}
 
-	// Fail closed when the eBPF LSM layer can't attach unless proxy-only is
-	// explicitly allowed (issue #117). Flags beat LEASH_* env vars.
-	requireLSM, err := enforcement.ResolveRequireLSM(opts.requireLSM, opts.allowProxyOnly, os.Getenv)
-	if err != nil {
-		return cfg, nil, err
-	}
-	cfg.requireLSM = requireLSM
-	if err := validatePostureOverrides(opts.envVars, cfg.extraArgs); err != nil {
+	if err := validatePostureOverrides(opts.envVars); err != nil {
 		return cfg, nil, err
 	}
 
@@ -2671,7 +2655,6 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 		"--entrypoint", filepath.Join(leashPublicMount, entryName),
 		"--cgroupns", "host",
 	}
-	args = append(args, r.targetCapArgs()...)
 	// Join the user-requested docker network (issue #69). The leash container
 	// attaches to this container's netns, so it follows onto the same network.
 	if net := r.cfg.dockerNetwork; net != "" {
@@ -2824,9 +2807,6 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 	}
 	args = append(args, r.cfg.targetImage)
 	r.logContainerConfig("target", targetMounts, targetEnv)
-	if caps := r.targetCapArgs(); len(caps) > 0 && r.verbose && r.logger != nil {
-		r.logger.Print("event=runner.capabilities role=target cap_drop=NET_RAW reason=proxy-only-allowed")
-	}
 	if err := r.launchContainer(ctx, r.cfg.targetContainer, args...); err != nil {
 		return err
 	}
@@ -2843,25 +2823,6 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 		}
 	}
 	return nil
-}
-
-// targetCapArgs are the target container's capability flags (#188). A bound
-// packet socket or an IP_HDRINCL raw socket sends with no destination
-// address, so the address-based connect policy cannot see where it goes, and
-// it also bypasses the proxy's redirect. The eBPF LSM refuses those sockets
-// at creation (lsm_socket_create) unless the policy restricts no
-// destination, whatever capabilities the workload holds; a fail-closed run
-// never starts without it. When proxy-only is allowed the run may continue
-// without the LSM, so the target also loses NET_RAW (which Docker grants by
-// default). The capability is otherwise kept: Debian and Ubuntu install
-// iputils ping with the cap_net_raw+ep file capability, which cannot be
-// executed at all without NET_RAW in the bounding set, and ping already uses
-// an ICMP datagram socket first (decided by the connect rules).
-func (r *runner) targetCapArgs() []string {
-	if r.cfg.requireLSM {
-		return nil
-	}
-	return []string{"--cap-drop", "NET_RAW"}
 }
 
 func (r *runner) detectImageArch(ctx context.Context) (string, error) {
@@ -3054,15 +3015,11 @@ func (r *runner) launchLeashContainer(ctx context.Context, cgroupPath string) er
 		leashEnv = append(leashEnv, idmap.Env+"=<redacted>")
 	}
 
-	// Propagate the resolved posture explicitly either way: LEASH_REQUIRE_LSM=1
-	// keeps an older leashd image (whose default was proxy-only) fail-closed,
-	// and LEASH_ALLOW_PROXY_ONLY=1 carries the explicit opt-out to a leashd
-	// whose default is fail-closed.
+	// LEASH_REQUIRE_LSM=1 keeps an older leashd image (whose default was to
+	// continue with only the proxy) fail-closed. It is a no-op for a current
+	// leashd, which always fails closed.
 	{
 		value := enforcement.EnvRequireLSM + "=1"
-		if !r.cfg.requireLSM {
-			value = enforcement.EnvAllowProxyOnly + "=1"
-		}
 		args = append(args, "-e", value)
 		leashEnv = append(leashEnv, value)
 	}
@@ -3408,7 +3365,7 @@ func readEnforcementStatus(path string) (enforcement.Status, bool) {
 }
 
 // formatEnforcementLine is the stable, machine-parseable diagnostic line that
-// states the effective enforcement level ("lsm" | "proxy-only" | "none").
+// states the effective enforcement level ("lsm" | "none").
 func formatEnforcementLine(st enforcement.Status) string {
 	return fmt.Sprintf("leash: enforcement=%s layer1=%s layer2=%s", st.Enforcement, st.Layer1, st.Layer2) + enforcementVia(st)
 }
@@ -3425,7 +3382,7 @@ func (r *runner) reportEnforcement(marker string) error {
 	if ok && (st.Enforcement != enforcement.LevelLSM || r.opts.machineOutput || r.verbose) {
 		r.diagnosticln(formatEnforcementLine(st))
 	}
-	return checkReleasedEnforcement(st, ok, r.cfg.requireLSM)
+	return checkReleasedEnforcement(st, ok)
 }
 
 func describeBootstrapMarker(path string) string {

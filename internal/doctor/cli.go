@@ -20,7 +20,7 @@ const (
 	exitReady     = 0 // at least one runtime enforces with every layer it has
 	exitNoRuntime = 1 // no runtime can run a workload at all
 	exitUsage     = 2 // bad invocation (also --help: not a verdict)
-	exitDegraded  = 3 // a runtime runs, but not every enforcement layer is active
+	exitDegraded  = 3 // a runtime is usable, but not every enforcement layer is active or verified
 	exitInternal  = 4 // doctor could not render or deliver its own report
 )
 
@@ -28,8 +28,9 @@ const usageExitNotes = `exit codes:
   0  a runtime enforces with every layer it has
   1  no runtime can run a workload
   2  usage error, or --help (never a readiness verdict)
-  3  a runtime runs, but not every layer enforces
-     (Linux: eBPF LSM / Layer 1 off, proxy-only. macOS: see the macOS section.)
+  3  a runtime is usable, but not every layer enforces
+     (Linux: eBPF LSM / Layer 1 off, so leash run refuses to start.
+     macOS: see the macOS section.)
   4  doctor could not render or write its report
 `
 

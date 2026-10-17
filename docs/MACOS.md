@@ -156,6 +156,6 @@ Still open — see the `TODO(macOS agent)` block in
 - verify `systemextensionsctl list` parsing against captured output (the parser
   in `internal/macext` is ported from the Swift `interpretExtensionEntry` and is
   unit‑tested, but the live format should be confirmed);
-- decide the **default**: warn‑and‑continue (current) vs. hard‑stop. Because
-  native macOS has no proxy fallback, hard‑stop is a defensible default here even
-  though Linux degrades to proxy‑only.
+- decide the **default**: warn‑and‑continue (current) vs. hard‑stop. Linux
+  always hard‑stops when its kernel layer is unavailable, so hard‑stop is the
+  consistent default here too.

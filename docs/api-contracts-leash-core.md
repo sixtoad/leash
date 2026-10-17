@@ -186,7 +186,7 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
   "contractVersion": 2,             // current CLI surface
   "minCompatibleContract": 0,       // oldest caller contract still served
   "capabilities": [                 // surface elements a provisioner can drive
-    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "allow-proxy-only", "rootless-daemon", "raw-socket-gate"
+    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "rootless-daemon", "raw-socket-gate"
   ],
   "policyLimits": {                 // enforced policy path lengths, in bytes
     "filePathBytes": 255,           // file.open rules: every byte matched; longer rules rejected at load
@@ -213,7 +213,7 @@ Value domains a caller must accept rather than reject:
 
 **The `-dirty` marker is best-effort and not guaranteed on any given path.** Today only the Makefile `build` target appends it; `scripts/release.sh`, `scripts/install-leash.sh`, `build/publish-docker.sh` and `.goreleaser.yaml` stamp the bare hash. Its presence means the tree was modified; **its absence is not proof of a clean tree** and must not be treated as a provenance guarantee.
 
-**Compatibility rule.** The contract covers the flags a provisioner drives (`--policy`, `--inject-service`, `--runtime`, `--user`, `--require-lsm`, `--allow-proxy-only`, `--machine-output`, `--idmap-volume`) plus the shape of this document. A caller written against contract `C` proceeds iff:
+**Compatibility rule.** The contract covers the flags a provisioner drives (`--policy`, `--inject-service`, `--runtime`, `--user`, `--require-lsm`, `--machine-output`, `--idmap-volume`) plus the shape of this document. A caller written against contract `C` proceeds iff:
 
 ```
 minCompatibleContract <= C <= contractVersion
@@ -266,22 +266,20 @@ Two traps that snippet avoids. Decoding straight into value types makes `null`, 
 
 `policyLimits` (with the `policy-path-limits` capability) tells a policy generator how long a resolved rule path may be — a directory's trailing `/` included — and still be enforced byte-for-byte. A longer rule (or a larger rule set) is rejected before any kernel module is updated — at startup the run fails closed, and on a live reload the previous policy stays in force. At runtime, a file whose absolute path exceeds `filePathBytes` cannot be matched byte-for-byte and is denied (file open and hard-link source alike), whatever the rules say. A policy reload is atomic across file-open and directory-mutation enforcement; a hook racing a reload is denied rather than decided on a half-loaded policy. A document without `policyLimits` comes from a build that silently skipped any file or exec rule longer than 64 bytes; a caller must treat 64 as that build's limit.
 
-**Contract 2** (issue #117) is the fail-closed-by-default posture: a build at contract `>= 2` refuses to run the workload when the eBPF LSM cannot attach unless `--allow-proxy-only` is passed, and advertises the `allow-proxy-only` capability. Nothing was removed, so `minCompatibleContract` stays `0` and callers written against contract 0 or 1 remain `compatible`; a caller that relies on the fail-closed default can require contract 2 (or test for the capability).
-
-`allow-proxy-only` means this build **fails closed by default** when the eBPF LSM (Layer 1) cannot attach or has no scopable cgroup: `leash run` refuses to start the workload instead of degrading to proxy-only. `--allow-proxy-only` (or `LEASH_ALLOW_PROXY_ONLY=1`) is the explicit opt-out. `--require-lsm` / `LEASH_REQUIRE_LSM` stay accepted (and `require-lsm` stays advertised) but are now redundant; a falsy `LEASH_REQUIRE_LSM` does **not** opt out. Flags beat the environment, and asking for both at the same level is an error. A build without `allow-proxy-only` has the old default (warn and continue proxy-only), so a caller that needs fail-closed on such a build must keep passing `--require-lsm`.
+**Contract 2** (issue #117) is the fail-closed posture: a build at contract `>= 2` **always** refuses to run the workload when the eBPF LSM (Layer 1) cannot attach or the workload has no scopable cgroup — it never runs a workload with only the L7 proxy enforcing, and there is no opt-out. `--require-lsm` / `LEASH_REQUIRE_LSM` stay accepted (and `require-lsm` stays advertised) as no-ops; a falsy `LEASH_REQUIRE_LSM` does **not** opt out. Nothing was removed, so `minCompatibleContract` stays `0` and callers written against contract 0 or 1 remain `compatible`; a caller that relies on fail-closed can require contract 2. A build below contract 2 had the old default (warn and continue with only the proxy), so a caller that needs fail-closed on such a build must keep passing `--require-lsm`.
 
 **Effective enforcement level.** Once every LSM attach has settled, leashd writes the enforcement-ready marker (`enforcement.ready` in the share dir; launchers gate on its existence, unchanged) as a JSON document, and logs an `enforcement.level` event with the same fields:
 
 ```jsonc
-{"enforcement": "lsm", "layer1": "active", "layer2": "active", "requireLSM": true, "allowProxyOnly": false}
+{"enforcement": "lsm", "layer1": "active", "layer2": "active", "requireLSM": true}
 // when Layer 1 is not active, a "reason" string says why
 ```
 
-`enforcement` is `lsm` (Layer 1 active: every LSM program attached, at least one did, the workload has a scopable cgroup, **and** `bpf` is listed in `/sys/kernel/security/lsm` — attach success alone is not enough, since with `CONFIG_BPF_LSM=y` but bpf inactive the programs attach and never run; an unreadable list counts as not active), `proxy-only` (Layer 1 unavailable, only reachable with `--allow-proxy-only`) or `none` (enforcement skipped). `layer1` is `active` | `unavailable`; `layer2` is `active` | `disabled` (`--lsm-only`). The client prints `leash: enforcement=<level> layer1=<state> layer2=<state>` on the diagnostic stream — always under `--machine-output` (stderr), always when the level is not `lsm`, otherwise with `--verbose`. An older leashd writes a bare `ready` line, for which nothing is printed.
+`enforcement` is `lsm` (Layer 1 active: every LSM program attached, at least one did, the workload has a scopable cgroup, **and** `bpf` is listed in `/sys/kernel/security/lsm` — attach success alone is not enough, since with `CONFIG_BPF_LSM=y` but bpf inactive the programs attach and never run; an unreadable list counts as not active) or `none` (Layer 1 unavailable, with a `reason`; or enforcement skipped). A workload is only ever released at `lsm` — leashd does not publish the marker for any other level except on the skip-enforcement path, and the client refuses any other level it reads. `requireLSM` is always `true`. `layer1` is `active` | `unavailable`; `layer2` is `active` | `disabled` (`--lsm-only`). The client prints `leash: enforcement=<level> layer1=<state> layer2=<state>` on the diagnostic stream — always under `--machine-output` (stderr), always when the level is not `lsm`, otherwise with `--verbose`. An older leashd writes a bare `ready` line, for which nothing is printed.
 
-`rootless-daemon` means a rootless podman run gets Layer 1 through the leash enforcer daemon (`leash daemon install|status|uninstall`, [ROOTLESS.md](ROOTLESS.md)). Such a run's marker reports `"enforcement": "lsm"` plus `"layer1Via": "enforcer-daemon"` (absent when leashd attached the programs itself), and the client's line ends with ` via=enforcer-daemon`. `enforcement` keeps its three values, so a caller comparing it with `"lsm"` | `"proxy-only"` needs no change. Without a usable daemon a rootless run is refused before anything is provisioned (the error names `sudo leash daemon install` and `leash daemon status`), unless `--allow-proxy-only` is passed, in which case it runs `proxy-only` as before. If the daemon session is lost while the workload runs, leashd exits and the client kills the workload container. `leash daemon status --json` is `{"socket", "reachable", "usable", "error", "remedy", "daemon": {"version", "protocol", "bpfLSM", "uid", "sessions"}}` and exits 0 only when `usable`.
+`rootless-daemon` means a rootless podman run gets Layer 1 through the leash enforcer daemon (`leash daemon install|status|uninstall`, [ROOTLESS.md](ROOTLESS.md)). Such a run's marker reports `"enforcement": "lsm"` plus `"layer1Via": "enforcer-daemon"` (absent when leashd attached the programs itself), and the client's line ends with ` via=enforcer-daemon`. `enforcement` is unchanged, so a caller comparing it with `"lsm"` needs no change. Without a usable daemon a rootless run is refused before anything is provisioned (the error names `sudo leash daemon install` and `leash daemon status`). Rootless Docker is not supported yet (#207) and is refused. If the daemon session is lost while the workload runs, leashd exits and the client kills the workload container. `leash daemon status --json` is `{"socket", "reachable", "usable", "error", "remedy", "daemon": {"version", "protocol", "bpfLSM", "uid", "sessions"}}` and exits 0 only when `usable`.
 
-`raw-socket-gate` means packet (`AF_PACKET`, `AF_XDP`), raw IP (`SOCK_RAW`) and SCTP sockets are refused at creation (`EPERM`, logged as `event=net.socket`) by the eBPF LSM in the governed cgroup unless the policy restricts no destination, whatever capabilities the workload holds, and a container run that may continue proxy-only (`--allow-proxy-only`) starts its target with `--cap-drop NET_RAW` (#188). ICMP datagram sockets (iputils `ping`) are decided by the connect rules.
+`raw-socket-gate` means packet (`AF_PACKET`, `AF_XDP`), raw IP (`SOCK_RAW`) and SCTP sockets are refused at creation (`EPERM`, logged as `event=net.socket`) by the eBPF LSM in the governed cgroup unless the policy restricts no destination, whatever capabilities the workload holds (#188); no run starts without this gate. ICMP datagram sockets (iputils `ping`) are decided by the connect rules.
 
 `container-resource-limits` means this build accepts target-container limits: `--cpus <n>` (decimal CPUs), `--memory <n[b|k|m|g]>` (hard cap, minimum `6m`; swap is pinned to the same value) and `--pids-limit <n>` (positive integer). They can also come from `LEASH_CPUS` / `LEASH_MEMORY` / `LEASH_PIDS_LIMIT` or a `[leash.resources]` table (`cpus`, `memory`, `pids_limit`) in the global config or `.leash.toml`. Precedence is per field: flag, then env, then config. An invalid value fails the run before anything is provisioned. The limits apply only to the docker/podman runtimes: the native runtime refuses them instead of ignoring them. Once the target container starts, leash reads `HostConfig` back from the engine and fails closed if a requested limit was not applied. Otherwise it writes one line to the diagnostics stream (stderr under `--machine-output`) with the fields in a fixed order and unset limits omitted, e.g. `event=runner.resource-limits status=applied cpus=1.5 nano_cpus=1500000000 memory=512m memory_bytes=536870912 pids_limit=256`.
 
@@ -433,13 +431,13 @@ Field names are snake_case here (they were fixed by issue #23 before the camelCa
 
 `--quick` skips it. The opt-out is the flag rather than an opt-in, so the honest answer is the default one; the report always declares what a `--quick` run did not check. The probe leaves nothing attached and does not disturb a leash already enforcing on the host.
 
-**The three states.** Two were not enough. A host whose container engine works but whose kernel has no active `bpf` LSM *will* start a workload — leash enforces the fail-closed egress proxy (Layer 2) while filesystem, exec and socket policy (Layer 1) is off. `ready` would be a false assurance and `unavailable` would hide a machine that still runs agents:
+**The three states.** Two were not enough. A host whose container engine works but whose kernel has no active `bpf` LSM has a usable runtime and a broken kernel: `ready` would be a false assurance, and `unavailable` would point at the wrong remedy (install a runtime). On Linux `leash run` refuses to start in that state — leash never runs a workload with only the fail-closed egress proxy (Layer 2) enforcing — until Layer 1 is fixed:
 
-| `status` | leash will | Layer 1 (eBPF LSM) | Layer 2 (fail-closed proxy) |
+| `status` | runtime | Layer 1 (eBPF LSM) | `leash run` on Linux |
 |---|---|---|---|
-| `ready` | run | enforced | enforced |
-| `degraded` | run | **not enforced, or not verifiable** | enforced |
-| `unavailable` | not run | — | — |
+| `ready` | usable | enforced | runs |
+| `degraded` | usable | **not enforced, or not verifiable** | refuses when Layer 1 is off (an unverifiable remote/VM kernel is decided by leashd there) |
+| `unavailable` | not usable | — | cannot run |
 
 `ready` never widens to include `degraded`: it is the field a provisioner gates on.
 
@@ -476,7 +474,7 @@ In both cases doctor reports the gap as its own degradation (`unchecked` gains `
 
 **Full Disk Access has no external probe.** macOS exposes no API for reading another process's TCC grant, and the tempting substitutes answer a different question (probing a TCC-gated path tells you about whoever ran doctor). The signal is LeashES's own report to the daemon, relayed through `/health/darwin` — see that endpoint above for why `unknown` is common. **`unknown` never reaches `ready`.** Without FDA, LeashES observes no file events at all while looking perfectly healthy from the outside, so an unverified grant is treated the way an unread capability set is on Linux: reported as absent, never assumed. `unchecked` gains `macos_full_disk_access`.
 
-**What makes a Mac `unavailable`** — enforcement cannot work at all, and there is no macOS equivalent of Linux's proxy-only fallback:
+**What makes a Mac `unavailable`** — enforcement cannot work at all, and there is no fallback layer:
 
 - the ES extension is definitively not activated, or is activated but not connected to the daemon (no file/exec policy, and nothing else gates them),
 - Full Disk Access was reported **denied**,
@@ -504,7 +502,7 @@ All blockers are reported together, not one at a time.
 | `0` | a runtime enforces with both layers | none |
 | `1` | no runtime can run a workload at all | install or repair a runtime |
 | `2` | usage error — **including `--help`** | fix the invocation |
-| `3` | a runtime runs, but not every layer enforces (Linux: Layer 1 off, proxy-only; macOS: see the `darwin` section) | the runtime is fine, the kernel or the extension stack is not |
+| `3` | a runtime is usable, but not every layer enforces (Linux: Layer 1 off, so `leash run` refuses to start; macOS: see the `darwin` section) | the runtime is fine, the kernel or the extension stack is not |
 | `4` | doctor could not render or write its own report | not a verdict; retry / check the pipe |
 
 Exit `0` is the answer to "can this machine enforce?", so `leash doctor && …` fails closed on `3`. `--help` deliberately exits `2`, not `0`: a provisioner gating on the status must not get a free pass from `leash doctor -help`.

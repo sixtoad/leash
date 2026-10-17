@@ -14,20 +14,16 @@ func TestValidatePostureOverrides(t *testing.T) {
 	cases := []struct {
 		name      string
 		env       []string
-		extra     string
 		wantErrIn string
 	}{
-		{name: "nothing", env: []string{"FOO=1", "BAR"}, extra: "--verbose"},
-		{name: "-e LEASH_ALLOW_PROXY_ONLY=1", env: []string{"LEASH_ALLOW_PROXY_ONLY=1"}, wantErrIn: "LEASH_ALLOW_PROXY_ONLY"},
+		{name: "nothing", env: []string{"FOO=1", "BAR"}},
+		{name: "-e LEASH_REQUIRE_LSM=0", env: []string{"LEASH_REQUIRE_LSM=0"}, wantErrIn: "LEASH_REQUIRE_LSM"},
 		{name: "-e LEASH_REQUIRE_LSM (inherit)", env: []string{"LEASH_REQUIRE_LSM"}, wantErrIn: "LEASH_REQUIRE_LSM"},
 		{name: "similar key is fine", env: []string{"LEASH_REQUIRE_LSM_X=1"}},
-		{name: "extra --allow-proxy-only", extra: "--foo --allow-proxy-only", wantErrIn: "--allow-proxy-only"},
-		{name: "extra -require-lsm=true", extra: "-require-lsm=true", wantErrIn: "--require-lsm"},
-		{name: "extra value that merely mentions it", extra: "--note allow-proxy-only"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validatePostureOverrides(tc.env, tc.extra)
+			err := validatePostureOverrides(tc.env)
 			if tc.wantErrIn == "" {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
@@ -41,27 +37,25 @@ func TestValidatePostureOverrides(t *testing.T) {
 	}
 }
 
-// Review finding on #117: the client cross-checks leashd's reported level, so
-// a diverged leashd posture cannot release a less-enforced workload.
+// The client cross-checks leashd's reported level: only "lsm" is released,
+// so an older leashd that reports any other level (including the
+// "proxy-only" an older image could write) cannot run the workload.
 func TestCheckReleasedEnforcement(t *testing.T) {
-	lsmFull := enforcement.Describe(true, true, true)
-	proxyOnly := enforcement.Describe(false, true, false)
-	none := enforcement.Describe(false, false, false)
 	cases := []struct {
 		name    string
 		st      enforcement.Status
 		ok      bool
-		require bool
 		wantErr bool
 	}{
-		{"legacy marker", enforcement.Status{}, false, true, false},
-		{"lsm under fail-closed", lsmFull, true, true, false},
-		{"proxy-only under fail-closed (diverged leashd)", proxyOnly, true, true, true},
-		{"proxy-only when allowed", proxyOnly, true, false, false},
-		{"none is never released", none, true, false, true},
+		{"legacy marker", enforcement.Status{}, false, false},
+		{"lsm", enforcement.Describe(true, true), true, false},
+		{"lsm, proxy off", enforcement.Describe(true, false), true, false},
+		{"layer 1 unavailable, proxy up", enforcement.Describe(false, true), true, true},
+		{"layer 1 unavailable, proxy off", enforcement.Describe(false, false), true, true},
+		{"older leashd proxy-only marker", enforcement.Status{Enforcement: "proxy-only", Layer1: enforcement.LayerUnavailable, Layer2: enforcement.LayerActive}, true, true},
 	}
 	for _, tc := range cases {
-		if err := checkReleasedEnforcement(tc.st, tc.ok, tc.require); (err != nil) != tc.wantErr {
+		if err := checkReleasedEnforcement(tc.st, tc.ok); (err != nil) != tc.wantErr {
 			t.Fatalf("%s: err = %v, wantErr %v", tc.name, err, tc.wantErr)
 		}
 	}
@@ -69,27 +63,22 @@ func TestCheckReleasedEnforcement(t *testing.T) {
 
 func TestLoadConfigRejectsPostureEnvOverride(t *testing.T) {
 	t.Setenv("LEASH_REQUIRE_LSM", "")
-	t.Setenv("LEASH_ALLOW_PROXY_ONLY", "")
 	t.Setenv("LEASH_EXTRA_ARGS", "")
 	t.Setenv("LEASH_WORK_DIR", t.TempDir())
 	t.Setenv("LEASH_HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	if _, _, err := loadConfig(t.TempDir(), options{envVars: []string{"LEASH_ALLOW_PROXY_ONLY=1"}}); err == nil {
-		t.Fatal("-e LEASH_ALLOW_PROXY_ONLY=1 must be rejected with a clear client error")
-	}
-	t.Setenv("LEASH_EXTRA_ARGS", "--allow-proxy-only")
-	if _, _, err := loadConfig(t.TempDir(), options{}); err == nil {
-		t.Fatal("LEASH_EXTRA_ARGS=--allow-proxy-only must be rejected")
+	if _, _, err := loadConfig(t.TempDir(), options{envVars: []string{"LEASH_REQUIRE_LSM=0"}}); err == nil {
+		t.Fatal("-e LEASH_REQUIRE_LSM=0 must be rejected with a clear client error")
 	}
 }
 
 // Real-kernel finding on #117: an older/confused leashd may report lsm while
 // the client preflight already saw bpf inactive. The client's observation can
-// only narrow the level, never raise it.
+// only narrow the level, never raise it, and a narrowed level is refused.
 func TestReportEnforcementNarrowsWithPreflight(t *testing.T) {
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "enforcement.ready")
-	lsmLevel := `{"enforcement":"lsm","layer1":"active","layer2":"active","requireLSM":false,"allowProxyOnly":true}`
+	lsmLevel := `{"enforcement":"lsm","layer1":"active","layer2":"active","requireLSM":true}`
 	if err := os.WriteFile(marker, []byte(lsmLevel+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -97,36 +86,32 @@ func TestReportEnforcementNarrowsWithPreflight(t *testing.T) {
 	r := &runner{diagnostics: &diag}
 	r.layer1PreflightDown = "bpf is not an active LSM on this host (lockdown,apparmor)"
 
-	// Proxy-only allowed: released, but reported as proxy-only, not lsm.
-	if err := r.reportEnforcement(marker); err != nil {
-		t.Fatalf("proxy-only allowed should release: %v", err)
-	}
-	if !strings.Contains(diag.String(), "enforcement=proxy-only") {
-		t.Fatalf("narrowed level not reported: %q", diag.String())
-	}
-
-	// Fail-closed: refused, with the reason echoed.
-	r.cfg.requireLSM = true
 	err := r.reportEnforcement(marker)
 	if err == nil || !strings.Contains(err.Error(), "bpf is not an active LSM") {
-		t.Fatalf("fail-closed must refuse and echo the reason: %v", err)
+		t.Fatalf("a narrowed level must be refused with the reason: %v", err)
+	}
+	if !strings.Contains(diag.String(), "enforcement=none layer1=unavailable layer2=active") {
+		t.Fatalf("narrowed level not reported: %q", diag.String())
+	}
+	if strings.Contains(diag.String(), "proxy-only") {
+		t.Fatalf("proxy-only must never be reported: %q", diag.String())
 	}
 
 	// Without a preflight finding, a reported lsm stays lsm.
 	r.layer1PreflightDown = ""
 	if err := r.reportEnforcement(marker); err != nil {
-		t.Fatalf("lsm under fail-closed should release: %v", err)
+		t.Fatalf("lsm should release: %v", err)
 	}
 }
 
 func TestLeashdFailureReason(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "leashd.log")
-	log := "starting\nleash: FATAL: old\nmore\nleash: FATAL: enforcement=proxy-only (layer1=unavailable layer2=active): \"bpf\" is not among the active LSMs (lockdown,apparmor); but fail-closed is in effect\ntrailer\n"
+	log := "starting\nleash: FATAL: old\nmore\nleash: FATAL: enforcement=none (layer1=unavailable layer2=active): \"bpf\" is not among the active LSMs (lockdown,apparmor); fail-closed, refusing to run the workload\ntrailer\n"
 	if err := os.WriteFile(path, []byte(log), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	got := leashdFailureReason(path)
-	if !strings.HasPrefix(got, "enforcement=proxy-only") || !strings.Contains(got, "not among the active LSMs") {
+	if !strings.HasPrefix(got, "enforcement=none") || !strings.Contains(got, "not among the active LSMs") {
 		t.Fatalf("reason = %q, want the last FATAL line", got)
 	}
 	if leashdFailureReason(filepath.Join(t.TempDir(), "missing")) != "" {

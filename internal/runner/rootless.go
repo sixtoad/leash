@@ -19,8 +19,8 @@ import (
 // the leash enforcer daemon attaches it instead (docs/ROOTLESS.md): leashd
 // reaches the daemon through the daemon's socket, mounted into the leash
 // container, and the run reports enforcement=lsm exactly as a rootful one.
-// Without a usable daemon a rootless run is refused before anything starts,
-// unless --allow-proxy-only was passed explicitly.
+// Without a usable daemon a rootless run is refused before anything starts:
+// leash never runs a workload with only the L7 proxy enforcing.
 
 // enforcerSocketInContainer is where the daemon's socket directory is mounted
 // in the leash container.
@@ -64,24 +64,21 @@ func rootlessRefusal(engine string, rep *enforcerd.Report) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "rootless %s cannot load the eBPF LSM (Layer 1) itself, so leash will not start (fail-closed).\n", engine)
 	if rep == nil {
-		b.WriteString("The leash enforcer daemon, which gives rootless runs the same kernel enforcement, supports rootless podman only.\n")
-		b.WriteString("Use rootless podman with the daemon (sudo leash daemon install), rootful Docker or podman, or")
+		b.WriteString("The leash enforcer daemon, which gives rootless runs the same kernel enforcement, supports rootless podman only (rootless Docker: https://github.com/sixtoad/leash/issues/207).\n")
+		b.WriteString("Use rootless podman with the daemon (sudo leash daemon install), or rootful Docker or podman.")
 	} else {
 		fmt.Fprintf(&b, "Kernel enforcement for rootless runs comes from the leash enforcer daemon, which is not usable: %s.\n", rep.Error)
 		if rep.Remedy != "" && !strings.Contains(rep.Remedy, "leash daemon install") {
 			fmt.Fprintf(&b, "  fix: %s\n", rep.Remedy)
 		}
 		b.WriteString("Install it once with:  sudo leash daemon install\n")
-		b.WriteString("Check it with:         leash daemon status\n")
-		b.WriteString("Or")
+		b.WriteString("Check it with:         leash daemon status")
 	}
-	b.WriteString(" pass --allow-proxy-only to run with only the L7 proxy (filesystem, exec and socket policies are then NOT enforced).")
 	return errors.New(b.String())
 }
 
 // preflightRootless decides how a rootless run is enforced: through the
-// enforcer daemon (r.enforcerSocket), proxy-only with an explicit
-// --allow-proxy-only, or not at all.
+// enforcer daemon (r.enforcerSocket), or not at all.
 func (r *runner) preflightRootless(ctx context.Context) error {
 	if r.usingNativeRuntime() || rootlessHostOS != "linux" {
 		return nil
@@ -95,11 +92,7 @@ func (r *runner) preflightRootless(ctx context.Context) error {
 	}
 	engine := r.rt().Name()
 	if engine != "podman" {
-		if r.cfg.requireLSM {
-			return rootlessRefusal(engine, nil)
-		}
-		r.diagnosticf("WARNING: rootless %s: eBPF LSM enforcement is unavailable; continuing proxy-only because --allow-proxy-only is set. Filesystem/exec/socket policies will NOT be enforced.\n", engine)
-		return nil
+		return rootlessRefusal(engine, nil)
 	}
 	rep := checkEnforcerDaemon(ctx, enforcerd.SocketPath())
 	if rep.Usable {
@@ -107,11 +100,7 @@ func (r *runner) preflightRootless(ctx context.Context) error {
 		r.debugf("rootless podman: eBPF LSM enforcement through the leash enforcer daemon at %s (daemon %s)", rep.Socket, rep.Status.Version)
 		return nil
 	}
-	if r.cfg.requireLSM {
-		return rootlessRefusal(engine, &rep)
-	}
-	r.diagnosticf("WARNING: rootless podman: the leash enforcer daemon is not usable (%s); continuing proxy-only because --allow-proxy-only is set. Filesystem/exec/socket policies will NOT be enforced. Install the daemon with `sudo leash daemon install`.\n", rep.Error)
-	return nil
+	return rootlessRefusal(engine, &rep)
 }
 
 // enforcerDaemonArgs are the leash container's extra arguments for a run

@@ -61,10 +61,10 @@ import (
 // literals in the same change.
 //
 // Contract 2 (issue #117) changed the meaning of running without a posture
-// flag: leash now fails closed when the eBPF LSM can't attach, and proxy-only
-// requires the new `--allow-proxy-only` (capability "allow-proxy-only").
-// `--require-lsm` stays accepted, so nothing a contract-0/1 caller drives was
-// removed.
+// flag: leash fails closed when the eBPF LSM can't attach (or the workload has
+// no scopable cgroup), always — there is no way to run with only the L7 proxy.
+// `--require-lsm` stays accepted as a no-op, so nothing a contract-0/1 caller
+// drives was removed.
 //
 // MinCompatibleContract is 0 today because neither contract 1 (which only added
 // the document) nor contract 2 took away anything an older caller drives. That also makes the
@@ -121,24 +121,17 @@ const (
 	// id=) and leashd serves that plugin a private Cedar authorization socket
 	// speaking protocol v1 (pkg/authz, docs/design/AUTHZ-SERVICE.md).
 	CapabilityAuthzSocket = "authz-socket"
-	// CapabilityAllowProxyOnly is the `--allow-proxy-only` flag (and
-	// LEASH_ALLOW_PROXY_ONLY). Its presence also means fail-closed is the
-	// default when the eBPF LSM can't attach (issue #117): without the flag a
-	// run refuses to start proxy-only. `--require-lsm` stays accepted.
-	CapabilityAllowProxyOnly = "allow-proxy-only"
 	// CapabilityRootlessDaemon means a rootless podman run gets the eBPF LSM
 	// through the leash enforcer daemon (`leash daemon install|status|
 	// uninstall`, docs/ROOTLESS.md) and reports enforcement=lsm with
 	// layer1Via=enforcer-daemon in the enforcement-ready marker; without a
-	// usable daemon such a run is refused before anything starts unless
-	// --allow-proxy-only is passed.
+	// usable daemon such a run is refused before anything starts.
 	CapabilityRootlessDaemon = "rootless-daemon"
 	// CapabilityRawSocketGate means packet, raw IP and SCTP sockets, whose
 	// traffic no address rule can see, are refused at creation by the eBPF
 	// LSM unless the policy restricts no destination (logged as
-	// event=net.socket), and a container run that may continue proxy-only
-	// starts its target without CAP_NET_RAW (issue #188). ICMP datagram
-	// sockets (ping) are decided by the connect rules.
+	// event=net.socket; issue #188). ICMP datagram sockets (ping) are decided
+	// by the connect rules.
 	CapabilityRawSocketGate = "raw-socket-gate"
 )
 
@@ -181,7 +174,6 @@ var capabilities = []string{
 	CapabilityPolicyPathLimits,
 	CapabilityContainerResourceLimits,
 	CapabilityAuthzSocket,
-	CapabilityAllowProxyOnly,
 	CapabilityRootlessDaemon,
 	CapabilityRawSocketGate,
 }

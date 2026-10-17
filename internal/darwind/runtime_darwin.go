@@ -594,7 +594,7 @@ func (rt *runtimeState) Run() error {
 
 	if rt.lsmManager == nil {
 		logPolicyEvent("lsm.start", map[string]any{"status": "skipped", "reason": "skip-cgroup"})
-		log.Printf("LSM manager disabled (skip-cgroup); operating in proxy-only mode")
+		log.Printf("LSM manager disabled (skip-cgroup); file, exec and socket policy is enforced by the macOS extensions")
 		waitForShutdown()
 		return nil
 	}

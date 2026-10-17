@@ -115,7 +115,7 @@ type Status int
 
 const (
 	StatusUnavailable Status = iota // leash cannot run through this runtime at all
-	StatusDegraded                  // runs, but Layer 1 (eBPF LSM) is unavailable
+	StatusDegraded                  // the runtime is usable, but Layer 1 (eBPF LSM) is unavailable or unverified
 	StatusReady                     // runs with both enforcement layers
 )
 
@@ -251,7 +251,7 @@ Add bpf to the lsm= kernel boot parameter and reboot, on a kernel built with CON
 
 // The Layer 1 consequence, named once and used by both runtimes: this sentence
 // is the whole point of the degraded state.
-const layer1Consequence = "eBPF LSM enforcement (Layer 1) is unavailable, so filesystem, exec and socket policy will NOT be enforced; only the fail-closed egress proxy (Layer 2) applies. `leash run` refuses to start in this state unless --allow-proxy-only is passed."
+const layer1Consequence = "eBPF LSM enforcement (Layer 1) is unavailable, so filesystem, exec and socket policy will NOT be enforced and `leash run` refuses to start: leash never runs a workload with only the egress proxy (Layer 2) enforcing."
 
 // Prerequisites issue #23 names that this command does not verify. Declared
 // rather than silently omitted, so "ready" is read for exactly what it means.
@@ -343,13 +343,10 @@ func evaluateNative(h Host) NativeReport {
 	}
 
 	// Native gets the same three-state treatment as the container runtime, on
-	// the same axis, because the real code paths behave the same way: an
-	// inactive bpf LSM is fatal by default in decideBPFLSM but only a *warning*
-	// under --allow-proxy-only (issue #117), and classifyNativeRuntime never
-	// consults the LSM at all. So on a Linux host with systemd, root and no
-	// Layer 1, `leash run --allow-proxy-only` starts and enforces proxy-only. Reporting that as "cannot enforce with ANY runtime"
-	// (which is what the all-or-nothing rule did) is a false negative of
-	// exactly the kind CAP-1 forbids in the other direction.
+	// the same axis: with systemd and root but no Layer 1 the runtime itself
+	// is fine and only the kernel is not, so the remedy is "fix the kernel"
+	// (degraded, exit 3), not "install a runtime" (unavailable, exit 1).
+	// `leash run` refuses to start in either state (issue #117).
 	switch {
 	case blockers > 0:
 		n.Status = StatusUnavailable
@@ -602,7 +599,8 @@ func (r Report) Verdict() Status {
 // ExitCode is the script-facing verdict.
 //
 //	0  a runtime enforces with both layers
-//	3  a runtime will run, but only with proxy-only enforcement (degraded)
+//	3  a runtime is installed and usable, but not every layer enforces or is
+//	   verified (degraded); on Linux `leash run` refuses until Layer 1 is fixed
 //	1  no runtime can run at all
 //
 // Degraded is non-zero on purpose. Exit 0 is the answer to "can this machine

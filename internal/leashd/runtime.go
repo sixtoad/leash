@@ -103,10 +103,9 @@ func Main(args []string) error {
 		enableHostMode()
 	}
 
-	// Select fail-closed vs degrade-to-proxy for LSM attach failures before any
-	// attach happens.
-	lsm.SetRequireLSM(cfg.failClosed())
-	lsm.SetFailClosedRemedy(enforcement.FailClosedRemedy(!cfg.LSMOnly))
+	// An LSM attach failure exits leashd before the attempt is reported
+	// settled (fail-closed), so no launcher is ever released past it.
+	lsm.SetRequireLSM(true)
 
 	// Clear any stale readiness markers before anything can fail: a leashd that
 	// exits during preflight (e.g. a policy that does not parse) must never
@@ -165,21 +164,12 @@ type runtimeConfig struct {
 	BootstrapTimeout time.Duration
 	HostMode         bool
 	LSMOnly          bool
-	RequireLSM       bool
 	// EnforcerSocket, when set, is the leash enforcer daemon's socket: the
 	// eBPF LSM programs are attached by the daemon instead of by leashd
 	// (rootless runs, docs/ROOTLESS.md).
 	EnforcerSocket  string
 	MCPConfig       proxy.MCPConfig
 	TelemetryConfig otel.Config
-}
-
-// failClosed reports whether an unavailable eBPF LSM must stop the run. It is
-// the resolved posture (RequireLSM), forced on in --lsm-only mode: with the L7
-// proxy off there is nothing to degrade to, so --allow-proxy-only cannot apply
-// and proceeding would release the workload with no enforcement at all.
-func (cfg *runtimeConfig) failClosed() bool {
-	return cfg.RequireLSM || cfg.LSMOnly
 }
 
 type runtimeState struct {
@@ -215,8 +205,7 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 	policyPath := fs.String("policy", strings.TrimSpace(os.Getenv("LEASH_POLICY")), "Cedar policy file path")
 	hostMode := fs.Bool("host", leashdEnvTruthy("LEASH_HOST"), "Run as a host process (no container): host-appropriate path defaults; enforcement needs CAP_BPF and an active bpf LSM. See docs/LEASHD-HOST-MODE.md")
 	lsmOnly := fs.Bool("lsm-only", leashdEnvTruthy("LEASH_LSM_ONLY"), "Enforce with the eBPF LSM only (file/exec/network-connect); skip the L7 MITM proxy and its netfilter. Used by native until netns egress lands.")
-	requireLSMFlag := fs.Bool("require-lsm", false, "Accepted for compatibility; fail-closed is now the default. Refuse to run the workload unenforced if the eBPF LSM can't attach. Mutually exclusive with --allow-proxy-only.")
-	allowProxyOnlyFlag := fs.Bool("allow-proxy-only", false, "Opt out of fail-closed: if the eBPF LSM can't attach (or there is no scopable cgroup), warn and continue with only the L7 proxy (Layer 2). Default from LEASH_ALLOW_PROXY_ONLY.")
+	_ = fs.Bool("require-lsm", false, "Accepted for compatibility; no effect. leash always refuses to run the workload unenforced if the eBPF LSM can't attach.")
 
 	proxyPort := fs.String("proxy-port", "18000", "Proxy port")
 	listenFlag := &stringFlag{}
@@ -233,7 +222,7 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 		fmt.Fprintf(fs.Output(), "Usage: %s [flags]\n\n", name)
 		fmt.Fprintf(fs.Output(), "Flags:\n")
 		fs.PrintDefaults()
-		fmt.Fprintf(fs.Output(), "\nEnvironment:\n  LEASH_CGROUP_PATH       Default value for --cgroup\n  LEASH_LISTEN            Default value for --listen (blank disables Control UI)\n  LEASH_EXTRA_ARGS        Additional CLI arguments\n  LEASH_ALLOW_PROXY_ONLY  Truthy to allow proxy-only enforcement (same as --allow-proxy-only)\n  LEASH_REQUIRE_LSM       Accepted for compatibility; fail-closed is the default\n")
+		fmt.Fprintf(fs.Output(), "\nEnvironment:\n  LEASH_CGROUP_PATH       Default value for --cgroup\n  LEASH_LISTEN            Default value for --listen (blank disables Control UI)\n  LEASH_EXTRA_ARGS        Additional CLI arguments\n  LEASH_REQUIRE_LSM       Accepted for compatibility; no effect (fail-closed is the only posture)\n")
 	}
 
 	var flagArgs []string
@@ -246,13 +235,6 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 
 	if len(fs.Args()) > 0 {
 		return nil, fmt.Errorf("unexpected extra arguments: %v", fs.Args())
-	}
-
-	// Fail closed by default when the eBPF LSM can't attach (issue #117).
-	// Explicit flags beat the environment; proxy-only needs an explicit opt-out.
-	requireLSM, err := enforcement.ResolveRequireLSM(*requireLSMFlag, *allowProxyOnlyFlag, os.Getenv)
-	if err != nil {
-		return nil, err
 	}
 
 	listenCfg := listen.Default()
@@ -295,7 +277,6 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 		BootstrapTimeout: timeout,
 		HostMode:         *hostMode,
 		LSMOnly:          *lsmOnly,
-		RequireLSM:       requireLSM,
 		EnforcerSocket:   strings.TrimSpace(*enforcerSocket),
 	}
 	cfg.MCPConfig = loadMCPConfigFromEnv()
@@ -351,30 +332,21 @@ func preFlight(cfg *runtimeConfig) error {
 	if strings.TrimSpace(cfg.CgroupPath) == "" {
 		// No scopable cgroup (e.g. Docker Desktop Kubernetes, where the
 		// container's private cgroup namespace reports "0::/"): kernel BPF-LSM
-		// enforcement cannot be scoped to the target. Fail closed by default
-		// (issue #117); with --allow-proxy-only run proxy-only: the MITM proxy
-		// still enforces L7 policy, and the control-plane block falls back to a
-		// namespace-wide rule. Mirrors the cgroup-unavailable network fallback
-		// (#66). See issue #67.
-		if cfg.LSMOnly {
-			return fmt.Errorf("no cgroup path: eBPF LSM enforcement (file/exec/connect) cannot be scoped to the workload and the L7 proxy is off (--lsm-only); refusing to run it with no enforcement")
-		}
-		if cfg.failClosed() {
-			return fmt.Errorf("no cgroup path: eBPF LSM enforcement (file/exec/connect) cannot be scoped to the workload; refusing to run it unenforced. Pass --allow-proxy-only (or LEASH_ALLOW_PROXY_ONLY=1) to run with only the L7 proxy")
-		}
-		log.Println("leash: WARNING: no cgroup path; running in degraded proxy-only mode — kernel LSM enforcement (file/exec/connect) disabled, L7 proxy enforcement remains active")
-	} else {
-		info, err := os.Stat(cfg.CgroupPath)
-		if err != nil {
-			return fmt.Errorf("invalid cgroup path %q: %w", cfg.CgroupPath, err)
-		}
-		if !info.IsDir() {
-			return fmt.Errorf("invalid cgroup path %q: not a directory", cfg.CgroupPath)
-		}
-		controllersPath := filepath.Join(cfg.CgroupPath, "cgroup.controllers")
-		if _, err := os.Stat(controllersPath); err != nil {
-			return fmt.Errorf("invalid cgroup path %q: %v", cfg.CgroupPath, err)
-		}
+		// enforcement cannot be scoped to the target, so the run is refused —
+		// leash never runs a workload with only the L7 proxy enforcing. See
+		// issue #67.
+		return fmt.Errorf("no cgroup path: eBPF LSM enforcement (file/exec/connect) cannot be scoped to the workload; refusing to run it unenforced (%s)", enforcement.FailClosedRemedy)
+	}
+	info, err := os.Stat(cfg.CgroupPath)
+	if err != nil {
+		return fmt.Errorf("invalid cgroup path %q: %w", cfg.CgroupPath, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("invalid cgroup path %q: not a directory", cfg.CgroupPath)
+	}
+	controllersPath := filepath.Join(cfg.CgroupPath, "cgroup.controllers")
+	if _, err := os.Stat(controllersPath); err != nil {
+		return fmt.Errorf("invalid cgroup path %q: %v", cfg.CgroupPath, err)
 	}
 
 	logPath := strings.TrimSpace(cfg.LogPath)
@@ -415,7 +387,7 @@ func preFlight(cfg *runtimeConfig) error {
 	if privateDir == "" {
 		return fmt.Errorf("LEASH_PRIVATE_DIR environment variable is required")
 	}
-	info, err := os.Stat(privateDir)
+	info, err = os.Stat(privateDir)
 	if err != nil {
 		return fmt.Errorf("validate LEASH_PRIVATE_DIR %q: %w", privateDir, err)
 	}
@@ -455,15 +427,14 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 	go wsHub.Run()
 	logger.SetBroadcaster(wsHub)
 
-	// Fail closed on an eBPF LSM attach failure unless proxy-only was
-	// explicitly allowed (resolved once in parseConfig, issue #117).
-	// With the enforcer daemon the programs live in the daemon: the local
+	// An eBPF LSM attach failure is fatal (fail-closed). With the enforcer
+	// daemon the programs live in the daemon: the local
 	// manager keeps the compiled tables but attaches nothing.
 	lsmCgroup := cfg.CgroupPath
 	if cfg.EnforcerSocket != "" {
 		lsmCgroup = ""
 	}
-	lsmManager := lsm.NewLSMManager(lsmCgroup, logger, cfg.failClosed())
+	lsmManager := lsm.NewLSMManager(lsmCgroup, logger, true)
 	lsmManager.SetContainerRootfs(!cfg.HostMode)
 	lsm.BumpMemlockRlimit()
 
@@ -564,10 +535,10 @@ func (rt *runtimeState) Run() error {
 	if rt.remote != nil {
 		rt.remotePrograms, rt.remoteErr = rt.remote.attach(rt.policyManager.Active)
 		defer rt.remote.detach() // every exit path, including an aborted bootstrap
-		if rt.remoteErr != nil && rt.cfg.failClosed() {
-			st := enforcement.Describe(false, !rt.cfg.LSMOnly, true)
+		if rt.remoteErr != nil {
+			st := enforcement.Describe(false, !rt.cfg.LSMOnly)
 			st.Reason = rt.remoteErr.Error()
-			cerr := st.Check(true)
+			cerr := st.Check()
 			fmt.Fprintf(os.Stderr, "leash: FATAL: %v\n", cerr)
 			logPolicyEvent("enforcement.level", statusFields(st))
 			return cerr
@@ -594,11 +565,10 @@ func (rt *runtimeState) activate() error {
 		logPolicyEvent("bootstrap.activate", map[string]any{"status": "skipped"})
 		rt.policyReady.Store(true)
 		writeEnforcementReadyMarker(getLeashDirFromEnv(), enforcement.Status{
-			Enforcement:    enforcement.LevelNone,
-			Layer1:         enforcement.LayerDisabled,
-			Layer2:         enforcement.LayerDisabled,
-			RequireLSM:     rt.cfg.RequireLSM,
-			AllowProxyOnly: !rt.cfg.RequireLSM,
+			Enforcement: enforcement.LevelNone,
+			Layer1:      enforcement.LayerDisabled,
+			Layer2:      enforcement.LayerDisabled,
+			RequireLSM:  true,
 		})
 		waitForShutdown()
 		return nil
@@ -649,20 +619,17 @@ func (rt *runtimeState) activate() error {
 // no longer be kernel-enforced.
 func (rt *runtimeState) activateRemote() error {
 	programs, err := rt.remotePrograms, rt.remoteErr
-	var st enforcement.Status
 	if err != nil {
-		st = enforcement.Describe(false, !rt.cfg.LSMOnly, rt.cfg.failClosed())
+		st := enforcement.Describe(false, !rt.cfg.LSMOnly)
 		st.Reason = err.Error()
-		if cerr := st.Check(st.RequireLSM); cerr != nil {
-			fmt.Fprintf(os.Stderr, "leash: FATAL: %v\n", cerr)
-			logPolicyEvent("enforcement.level", statusFields(st))
-			return cerr
-		}
-	} else {
-		st = enforcement.Describe(true, !rt.cfg.LSMOnly, rt.cfg.failClosed())
-		st.Layer1Via = enforcement.Layer1ViaEnforcerDaemon
-		log.Printf("leash: eBPF LSM attached by the enforcer daemon (%d programs) on %s", programs, rt.cfg.CgroupPath)
+		cerr := st.Check()
+		fmt.Fprintf(os.Stderr, "leash: FATAL: %v\n", cerr)
+		logPolicyEvent("enforcement.level", statusFields(st))
+		return cerr
 	}
+	st := enforcement.Describe(true, !rt.cfg.LSMOnly)
+	st.Layer1Via = enforcement.Layer1ViaEnforcerDaemon
+	log.Printf("leash: eBPF LSM attached by the enforcer daemon (%d programs) on %s", programs, rt.cfg.CgroupPath)
 	writeEnforcementReadyMarker(getLeashDirFromEnv(), st)
 	logPolicyEvent("bootstrap.activate", map[string]any{"status": "ok", "layer1Via": st.Layer1Via})
 	rt.policyReady.Store(true)

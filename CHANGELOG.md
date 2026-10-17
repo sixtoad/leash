@@ -157,58 +157,49 @@ Claude Code handling on top.
   resource in [...] }` is enforced as written. Design:
   [`docs/design/AUTHZ-SERVICE.md`](docs/design/AUTHZ-SERVICE.md) §4.3.
 
-### Changed — fail closed by default when the eBPF LSM can't attach (#117)
+### Changed — fail closed when the eBPF LSM can't attach (#117)
 - **Behavior change.** When the eBPF LSM (Layer 1) cannot attach — kernel
-  without an active `bpf` LSM, rootless podman, or no scopable cgroup — leash
-  now **refuses to run the workload** instead of warning and continuing
-  proxy-only. This applies to the client preflight, native readiness, and
-  leashd (container and host mode).
-- **New opt-out: `--allow-proxy-only`** (env `LEASH_ALLOW_PROXY_ONLY=1`, also a
-  leashd flag) restores the old degrade: warn and continue with only the
-  fail-closed L7 proxy; filesystem/exec/socket policies are then not enforced.
+  without an active `bpf` LSM, rootless podman without the enforcer daemon,
+  rootless Docker, or no scopable cgroup — leash now **refuses to run the
+  workload** instead of warning and continuing with only the L7 proxy. There
+  is no opt-out: leash never runs a workload with only the proxy enforcing.
+  This applies to the client preflight, native readiness, and leashd
+  (container and host mode, including the former no-cgroup degraded mode of
+  #67).
 - **`--require-lsm` / `LEASH_REQUIRE_LSM` stay accepted** (and the
-  `require-lsm` capability stays advertised) but are now redundant. A falsy
-  `LEASH_REQUIRE_LSM` does not opt out. Flags beat env vars; asking for both
-  fail-closed and proxy-only at the same level is an error.
-- **New capability `allow-proxy-only`** in `leash version --json`; its presence
-  means this build fails closed by default.
-- **`contractVersion` is now `2`** (contract 2 = fail-closed-by-default posture
-  plus `--allow-proxy-only`). `minCompatibleContract` stays `0`: nothing was
-  removed, so callers written against contract 0 or 1 (e.g. Walk's
-  `walkLeashContract=1`) remain compatible.
+  `require-lsm` capability stays advertised) as no-ops. A falsy
+  `LEASH_REQUIRE_LSM` does not opt out.
+- **`contractVersion` is now `2`** (contract 2 = the fail-closed posture).
+  `minCompatibleContract` stays `0`: nothing was removed, so callers written
+  against contract 0 or 1 (e.g. Walk's `walkLeashContract=1`) remain
+  compatible.
 - **Effective enforcement level is machine-readable.** The enforcement-ready
   marker (still gated on by existence) is now a JSON document
-  `{"enforcement":"lsm"|"proxy-only"|"none","layer1":…,"layer2":…,"requireLSM":…,"allowProxyOnly":…}`,
+  `{"enforcement":"lsm"|"none","layer1":…,"layer2":…,"requireLSM":true}`,
   leashd logs an `enforcement.level` event, and the client prints
   `leash: enforcement=<level> layer1=<state> layer2=<state>` on the diagnostic
-  stream (always under `--machine-output`, always when not `lsm`).
-- The client now always tells leashd its resolved posture
-  (`LEASH_REQUIRE_LSM=1` or `LEASH_ALLOW_PROXY_ONLY=1` in the container,
-  `--require-lsm` or `--allow-proxy-only` for native leashd), and native
-  readiness now honors `LEASH_REQUIRE_LSM` (it previously read only the flag).
-- **`--allow-proxy-only` never releases an unenforced workload.** When the L7
-  proxy is also off (native `--lsm-only`: rootless, or egress setup failed),
-  there is nothing to degrade to, so an LSM attach failure stays fatal and
-  native readiness refuses. leashd also refuses to publish the ready marker for
-  a level the posture forbids — `none`, or anything but `lsm` under
-  fail-closed, including when no LSM program attached at all.
-- **The client cross-checks leashd's reported level** against its own posture
-  and refuses to release on a mismatch, and rejects posture overrides that
-  would make the two diverge: `-e LEASH_REQUIRE_LSM` / `-e
-  LEASH_ALLOW_PROXY_ONLY` and posture flags inside `LEASH_EXTRA_ARGS`.
+  stream (always under `--machine-output`, always when not `lsm`). A workload
+  is only ever released at `lsm`; `none` appears only on the skip-enforcement
+  path.
+- The client always sets `LEASH_REQUIRE_LSM=1` in the leash container, so an
+  older leashd image (which continued with only the proxy by default) stays
+  fail-closed, and rejects a user `-e LEASH_REQUIRE_LSM` that could undo it.
+- leashd refuses to publish the ready marker for anything but `lsm`,
+  including when no LSM program attached at all.
+- **The client cross-checks leashd's reported level** and refuses to release
+  the workload at any level other than `lsm`.
 - The enforcement-ready marker is written atomically (temp file + rename).
 - **Layer 1 is reported active only when the kernel confirms it.** On a kernel
   with `CONFIG_BPF_LSM=y` but `bpf` not in `/sys/kernel/security/lsm` (Ubuntu
   24.04's default) the LSM programs attach and are never invoked; leashd now
   also requires `bpf` in the active list (an unreadable list counts as not
-  active), so that case fails closed by default and reports `proxy-only` with
-  a `reason` under `--allow-proxy-only`. The client's own preflight can only
-  narrow the reported level, and a native refusal now echoes leashd's FATAL
-  reason instead of only pointing at the log.
+  active), so that case is refused with a `reason`. The client's own preflight
+  can only narrow the reported level, and a native refusal now echoes leashd's
+  FATAL reason instead of only pointing at the log.
 
 ### Added — kernel enforcement for rootless podman: the leash enforcer daemon
 - Rootless podman cannot load the eBPF LSM, so a rootless run used to fail
-  closed (or run proxy-only with `--allow-proxy-only`). `sudo leash daemon
+  closed. `sudo leash daemon
   install` now installs the **leash enforcer daemon**: a socket-activated
   systemd service, running as a dedicated user with only `CAP_BPF` and
   `CAP_PERFMON`, no network and a narrow syscall filter. Members of the new
@@ -229,8 +220,7 @@ Claude Code handling on top.
   or the daemon stops. A client disconnect alone keeps enforcement attached.
 - A rootless podman run without a usable daemon is refused before anything
   starts, with `sudo leash daemon install` / `leash daemon status` in the
-  error. `--allow-proxy-only` is unchanged. Rootless Docker is refused (not
-  supported yet) unless `--allow-proxy-only`.
+  error. Rootless Docker is refused (not supported yet, #207).
 - If the daemon session is lost mid-run, leashd exits (`kernel enforcement
   lost`) and the runner kills the workload container.
 - `leash daemon install|uninstall|status [--json]`; new capability

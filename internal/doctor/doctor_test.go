@@ -534,7 +534,7 @@ func TestTextIndentsMultiLineAdvice(t *testing.T) {
 // shape is why two rounds of review shipped two false verdicts: darwin +
 // reachable docker read as `ready` (the probed kernel is not the container's),
 // and a Linux host with root, systemd and no active bpf LSM read as "cannot
-// enforce with ANY runtime" (a real `leash run` starts it proxy-only). Neither
+// enforce with ANY runtime" (the runtime is usable; only the kernel needs fixing). Neither
 // host is one field from the baseline, so no single-axis case could see them.
 //
 // These cases therefore spell the host out in full, across
@@ -884,10 +884,10 @@ func TestEvaluateAxisMatrix(t *testing.T) {
 	}
 }
 
-// CAP-2, pinned on its own: the exact host from the review. A real `leash run`
-// on it starts and enforces proxy-only, so "this machine cannot enforce with
-// ANY runtime" + exit 1 was a false negative — the mirror image of the false
-// `ready` this PR exists to remove.
+// CAP-2, pinned on its own: the exact host from the review. Its runtime is
+// usable and only the kernel lacks Layer 1 (`leash run` refuses until that is
+// fixed), so "this machine cannot run with ANY runtime" + exit 1 would point
+// at the wrong remedy; it is degraded, exit 3.
 func TestNativeDegradesRatherThanDying(t *testing.T) {
 	h := hostAxes{
 		goos: "linux", systemd: true, euid: 0,
