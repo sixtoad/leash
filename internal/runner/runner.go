@@ -245,6 +245,9 @@ type runner struct {
 	// workloadFinished is set once the workload exited, so the daemon
 	// enforcement watch does not report the normal teardown as a loss.
 	workloadFinished workloadFinishedFlag
+	// enforcementLost is set (with leashd's reason) when the enforcement watch
+	// killed the workload because leashd / the leash sidecar exited mid-run.
+	enforcementLost enforcementLost
 
 	// leashd is the native leashd host-mode process (StartEnforcement), started
 	// in its own process group with a parent-death signal and a reaper. WaitReady
@@ -3242,7 +3245,7 @@ func (r *runner) waitForEnforcementReady(ctx context.Context) error {
 			if err := r.reportEnforcement(marker); err != nil {
 				return err
 			}
-			r.watchDaemonEnforcement(ctx)
+			r.watchContainerEnforcement(ctx)
 			return nil
 		}
 
@@ -3593,6 +3596,11 @@ func cleanupContext(ctx context.Context) context.Context {
 // it stops containers unless keepContainers is set and preserves the command's exit semantics.
 func (r *runner) finishLifecycle(ctx context.Context, exitCode int, runErr error) error {
 	r.workloadFinished.Store(true)
+	if lost := r.enforcementLost.get(); lost != nil {
+		// The workload was killed because enforcement died: the run fails with
+		// that reason whatever exit status the killed workload reported.
+		runErr = lost
+	}
 	if r.keepContainers {
 		// Kept containers outlive leash, but the injected helpers are leash's
 		// children and would only be orphaned when it exits (#128). The same

@@ -94,3 +94,12 @@ func (p *injectedProc) stop(grace, killWait time.Duration) bool {
 		return false
 	}
 }
+
+// exitDescription renders how the reaped process ended ("exit status 1",
+// "signal: killed"), or "" while it runs.
+func (p *injectedProc) exitDescription() string {
+	if p == nil || !p.exited() || p.cmd == nil || p.cmd.ProcessState == nil {
+		return ""
+	}
+	return p.cmd.ProcessState.String()
+}
