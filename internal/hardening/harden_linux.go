@@ -82,7 +82,7 @@ func buildFilter(denied []uint32, arch uint32) []unix.SockFilter {
 	f := []unix.SockFilter{
 		bpfStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, 4), // A = seccomp_data.arch
 		bpfJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, arch, 1, 0),
-		bpfStmt(unix.BPF_RET|unix.BPF_K, retEPERM), // arch mismatch → deny
+		bpfStmt(unix.BPF_RET|unix.BPF_K, retEPERM),      // arch mismatch → deny
 		bpfStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, 0), // A = seccomp_data.nr
 	}
 	n := len(denied)

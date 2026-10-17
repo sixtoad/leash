@@ -1,0 +1,288 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Matches release.yml and Dockerfile.leash; go.mod's `go` line is only the
+  # language minimum.
+  GO_VERSION: '1.25.3'
+  # Pinned as in the Makefile (lsm-generate) and Dockerfile.leash.
+  BPF2GO_VERSION: v0.19.0
+  GOFLAGS: -buildvcs=false
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6.1.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # internal/ui embeds dist/**; the real Control UI build is not needed to
+      # type-check Go (see #174 for the pnpm build issue).
+      - name: Control UI placeholder
+        run: mkdir -p internal/ui/dist && printf '<!doctype html><title>leash</title>\n' > internal/ui/dist/index.html
+
+      - name: gofmt
+        run: |
+          unformatted="$(git ls-files -z '*.go' | xargs -0 gofmt -l)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"
+            echo "$unformatted"
+            echo "$unformatted" | xargs gofmt -d
+            exit 1
+          fi
+
+      - name: go mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum || {
+            echo "::error::go.mod/go.sum are not tidy; run go mod tidy"
+            exit 1
+          }
+
+      # Linux vet runs in test-linux, after the eBPF objects are generated.
+      - name: go vet (darwin)
+        run: |
+          GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet ./...
+          GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go vet ./...
+
+      # Scoped to shell scripts this change touches, so pre-existing warnings
+      # elsewhere do not fail unrelated PRs.
+      - name: shellcheck (changed scripts)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE_SHA" ] || ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            echo "no usable base commit; skipping shellcheck"
+            exit 0
+          fi
+          mapfile -t scripts < <(git diff --name-only --diff-filter=d "$BASE_SHA" HEAD -- '*.sh')
+          if [ "${#scripts[@]}" -eq 0 ]; then
+            echo "no shell scripts changed"
+            exit 0
+          fi
+          shellcheck --version | head -2
+          shellcheck -S warning "${scripts[@]}"
+
+  test-linux:
+    name: test-linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6.1.0
+        with:
+          # releasecontract tests read git metadata.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install eBPF toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends clang llvm libbpf-dev pkg-config
+          clang --version | head -1
+
+      - name: Generate eBPF objects and embedded leash-entry
+        run: |
+          go install "github.com/cilium/ebpf/cmd/bpf2go@${BPF2GO_VERSION}"
+          go generate ./internal/lsm ./internal/entrypoint
+
+      - name: Control UI placeholder
+        run: mkdir -p internal/ui/dist && printf '<!doctype html><title>leash</title>\n' > internal/ui/dist/index.html
+
+      - name: go vet (linux)
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test -race (non-root)
+        run: go test -race -count=1 ./...
+
+  kernel-load:
+    name: kernel-load
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6.1.0
+
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Runner kernel
+        run: |
+          uname -a
+          echo "active LSMs: $(cat /sys/kernel/security/lsm)"
+          grep -E '^CONFIG_(BPF_LSM|SECURITY_PATH|DEBUG_INFO_BTF)=' "/boot/config-$(uname -r)" || true
+
+      - name: Install eBPF toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends clang llvm libbpf-dev pkg-config
+
+      - name: Generate eBPF objects
+        run: |
+          go install "github.com/cilium/ebpf/cmd/bpf2go@${BPF2GO_VERSION}"
+          go generate ./internal/lsm
+
+      # Same gate the release runs: the objects `go build` embeds are loaded by
+      # the real kernel verifier, then attached, inside a privileged
+      # --cgroupns=host container scoped to an empty child cgroup. Any verifier
+      # rejection fails the job. The runner kernel has CONFIG_BPF_LSM=y but
+      # (normally) no bpf in the active LSM list, so the hooks are inert and the
+      # enforcement assertions are skipped; LEASH_KERNEL_LOAD_ALLOW_INERT=1
+      # accepts only that skip. Never set it on the release gate.
+      - name: Verifier load + attach
+        env:
+          LEASH_KERNEL_LOAD_ALLOW_INERT: '1'
+        run: |
+          set -o pipefail
+          scripts/verify-lsm-kernel-load.sh 2>&1 | tee kernel-load.log
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### eBPF kernel load"
+            echo
+            echo "- kernel: \`$(uname -r)\`"
+            echo "- active LSMs: \`$(cat /sys/kernel/security/lsm)\`"
+            if grep -q -- '^--- PASS: TestKernelLoadAllModulesWithExecRule' kernel-load.log 2>/dev/null; then
+              echo "- result: verified, attached and enforcement checked"
+            elif grep -q 'LSM-INERT' kernel-load.log 2>/dev/null; then
+              echo "- result: verified and attached; enforcement not checked (bpf not an active LSM)"
+            else
+              echo "- result: **failed** (see log)"
+            fi
+            echo
+            echo "| program | verifier-processed instructions |"
+            echo "|---|---:|"
+            sed -nE 's#.* ([a-z_]+/[A-Za-z0-9_]+): ([0-9]+) verifier-processed instructions.*#| \1 | \2 |#p' kernel-load.log 2>/dev/null
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  test-darwin:
+    name: test-darwin
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6.1.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Control UI placeholder
+        run: mkdir -p internal/ui/dist && printf '<!doctype html><title>leash</title>\n' > internal/ui/dist/index.html
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # releasecontract runs the release shell scripts, which need GNU
+      # timeout(1) and bash >= 4 (empty arrays under set -u); macOS ships
+      # neither (/bin/bash is 3.2).
+      - name: GNU coreutils and bash
+        run: |
+          brew install bash coreutils
+          echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+
+      # The default TMPDIR (/var/folders/...) is a symlink into /private, and
+      # releasecontract compares script-printed physical paths against
+      # t.TempDir(); RUNNER_TEMP has no symlink in its path.
+      - name: go test
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: go test -count=1 ./...
+
+  mac-leash:
+    name: mac-leash
+    # The LeashProxy target needs the macOS 26 SDK (MACOSX_DEPLOYMENT_TARGET 26.0).
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6.1.0
+
+      - name: Xcode
+        run: |
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+
+      - name: Resolve Swift packages
+        run: xcodebuild -resolvePackageDependencies -project mac-leash/Leash.xcodeproj -scheme Leash -derivedDataPath "$RUNNER_TEMP/dd"
+
+      # Compile-only: catch Swift errors in the app, CLI and all three system
+      # extensions. Signing is off. CODE_SIGNING_ALLOWED is passed lowercase on
+      # purpose: Xcode reads it as NO, but the "Ad-hoc Sign (local, no account)"
+      # run-script phase compares it to the literal "NO" and skips. That phase is
+      # only meaningful for the SIP-relaxed dev VM, and on a clean build it can
+      # run before Sparkle.framework is embedded.
+      - name: xcodebuild (Debug, unsigned)
+        run: |
+          xcodebuild build \
+            -project mac-leash/Leash.xcodeproj \
+            -scheme Leash \
+            -configuration Debug \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            CODE_SIGNING_ALLOWED=no \
+            | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E '(error|warning: unre|\*\* BUILD)' || true
+          grep -q '\*\* BUILD SUCCEEDED \*\*' "$RUNNER_TEMP/xcodebuild.log"
+
+  test-web:
+    name: test-web
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6.1.0
+
+      # Pinned as tests.yml did; an unpinned pnpm >= 10 build is #174.
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.18.0 --activate
+          node --version
+          pnpm --version
+
+      - name: Install
+        working-directory: controlui/web
+        run: pnpm install --frozen-lockfile
+
+      - name: vitest
+        working-directory: controlui/web
+        run: pnpm test
+
+      - name: next build
+        working-directory: controlui/web
+        run: pnpm run build
+
+  # TODO(e2e-docker): the e2e suite (./test_e2e.sh, LEASH_E2E=1) needs the leash
+  # manager image built from Dockerfile.leash (which also needs the Control UI
+  # build, #174) plus the LEASH_E2E_* target images. Wire it up once the UI build
+  # is reproducible; until then it would be slow and flaky here.
