@@ -3,7 +3,9 @@
 # are currently generated in internal/lsm -- the exact objects `go build`
 # embeds into the leash CLI -- with a policy that has open, exec and connect
 # rules (issue #110), plus file-policy rules longer than 64 bytes whose permit,
-# forbid, mutation and hard-link outcomes are asserted (issues #108/#109).
+# forbid, mutation and hard-link outcomes are asserted (issues #108/#109), and
+# container-mode writes to the container's own overlay rootfs, which must obey
+# default deny and forbids like any other path (issues #186/#125).
 # Each module is only loaded when the policy has rules for
 # it, so a policy without an exec rule never sends lsm_exec to the verifier.
 #

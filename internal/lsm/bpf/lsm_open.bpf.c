@@ -563,6 +563,8 @@ static __noinline int emit_current_mutation(u32 operation, int allowed)
 
 struct task_struct___leash {
     unsigned int flags;
+    const struct cred *cred;
+    const struct cred *real_cred;
 } __attribute__((preserve_access_index));
 
 static __always_inline bool current_is_io_worker()
@@ -570,6 +572,17 @@ static __always_inline bool current_is_io_worker()
     struct task_struct___leash *task = (void *)bpf_get_current_task_btf();
     unsigned int flags = BPF_CORE_READ(task, flags);
     return (flags & PF_IO_WORKER) != 0;
+}
+
+// overlayfs performs its nested backing-store opens (real-file open, copy-up)
+// with its mounter's credentials installed over the task's own, so the
+// subjective cred differs from real_cred exactly while overlayfs acts. An
+// open the task makes itself in the same syscall (a second inline io_uring
+// openat, say) runs on its own cred and must not ride the correlation.
+static __always_inline bool current_creds_overridden()
+{
+    struct task_struct___leash *task = (void *)bpf_get_current_task_btf();
+    return BPF_CORE_READ(task, cred) != BPF_CORE_READ(task, real_cred);
 }
 
 static __always_inline int mark_allowed_overlay_mutation(const struct path *dir)
@@ -643,9 +656,13 @@ int BPF_PROG(lsm_rename_source, const struct path *old_dir, struct dentry *old_d
 {
     if (ret != 0) return ret;
     if (!is_target_cgroup()) return 0;
-    if (mutation_overlay_context_active()) return 0;
-    // A denial is emitted by the shared check; an allow stays silent until the
-    // destination program confirms the other endpoint.
+    // Never skip on the overlay correlation here (#186/#125). The two rename
+    // halves share one hook, and BPF trampolines run the most recently attached
+    // link first, so the destination half (attached last) runs before this one
+    // and has already installed the correlation for its own allowed endpoint.
+    // No overlayfs backing operation re-enters security_path_rename, so each
+    // half always checks its endpoint, whatever order the kernel runs them in.
+    // A denial is emitted by the shared check; an allow stays silent.
     return check_directory_mutation(old_dir, old_dentry, OP_RENAME, false);
 }
 
@@ -654,10 +671,13 @@ int BPF_PROG(lsm_rename_destination, const struct path *old_dir, struct dentry *
              const struct path *new_dir, struct dentry *new_dentry, unsigned int flags, int ret)
 {
     // Preserve an earlier source denial exactly; do not inspect or audit the
-    // destination as allowed after the operation is already forbidden.
+    // destination as allowed after the operation is already forbidden. When
+    // the kernel runs this half first, its success record precedes the source
+    // check; a source denial then follows as its own record.
     if (ret != 0) return ret;
     if (!is_target_cgroup()) return 0;
-    if (mutation_overlay_context_active()) return 0;
+    // As in the source half: no correlation skip, so neither endpoint check
+    // depends on the order the kernel runs the two halves.
     ret = check_directory_mutation(new_dir, new_dentry, OP_RENAME, false);
     if (ret != 0) return ret;
     if (mark_allowed_overlay_mutation(new_dir) != 0) return emit_current_mutation(OP_RENAME, 0);
@@ -891,6 +911,31 @@ static __always_inline int canonicalize_proc_runtime_path(struct file *file, cha
     return true;
 }
 
+// After an allowed write decision on the container-visible overlay path, let
+// the backing-store opens overlayfs performs inside the same syscall (copy-up,
+// real-file open) through, until sys_exit clears the correlation. The mark is
+// installed here, by the program that made the decision, and only after it.
+// It used to be a separate lsm/file_open program, but BPF trampolines run the
+// most recently attached link first, so that marker ran before lsm_open and
+// turned every overlay-rootfs write open into an allow (#186/#125).
+static __always_inline int mark_allowed_overlay_open(struct file *file)
+{
+    u32 key = 0;
+    u32 *container_mode = bpf_map_lookup_elem(&container_overlay_mode, &key);
+    if (!container_mode || !*container_mode) return 0;
+    fmode_t mode = BPF_CORE_READ(file, f_mode);
+    if (!(mode & FMODE_WRITE)) return 0;
+    struct vfsmount___proc *vm = (void *)BPF_CORE_READ(file, f_path.mnt);
+    struct super_block___proc *sb = BPF_CORE_READ(vm, mnt_sb);
+    if (BPF_CORE_READ(sb, s_magic) != OVERLAYFS_SUPER_MAGIC) return 0;
+    // io_uring workers may not pass through this task's sys_exit; leave the
+    // nested backing opens to ordinary policy instead of a reusable entry.
+    if (current_is_io_worker()) return 0;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    u8 correlation = 1;
+    return bpf_map_update_elem(&overlay_write_context, &pid_tgid, &correlation, BPF_ANY) < 0 ? -1 : 0;
+}
+
 SEC("lsm/file_open")
 int BPF_PROG(lsm_open, struct file *file)
 {
@@ -903,7 +948,7 @@ int BPF_PROG(lsm_open, struct file *file)
     u8 *active = bpf_map_lookup_elem(&overlay_write_context, &context_key);
     if (current_is_io_worker()) {
         bpf_map_delete_elem(&overlay_write_context, &context_key);
-    } else if (active) {
+    } else if (active && current_creds_overridden()) {
         return 0;
     }
 
@@ -1026,6 +1071,11 @@ int BPF_PROG(lsm_open_policy, struct file *file)
         policy_result = 0;
     }
 
+    // A correlation that cannot be installed fails closed, like mutations.
+    if (policy_result && mark_allowed_overlay_open(file) != 0) {
+        policy_result = 0;
+    }
+
     if (event) {
         event->result = policy_result ? 0 : -13;
         bpf_ringbuf_submit(event, 0);
@@ -1033,38 +1083,6 @@ int BPF_PROG(lsm_open_policy, struct file *file)
 
     // Return policy decision: 0 = allow, negative = deny
     return policy_result ? 0 : -13; // -EACCES = 13
-}
-
-SEC("lsm/file_open")
-int BPF_PROG(lsm_mark_overlay_write, struct file *file, int ret)
-{
-    if (ret != 0) return ret;
-
-    u32 key = 0;
-    u32 *container_mode = bpf_map_lookup_elem(&container_overlay_mode, &key);
-    if (!container_mode || !*container_mode) {
-        return ret;
-    }
-
-    fmode_t mode = BPF_CORE_READ(file, f_mode);
-    if (!(mode & FMODE_WRITE)) {
-        return ret;
-    }
-
-    struct vfsmount___proc *vm = (void *)BPF_CORE_READ(file, f_path.mnt);
-    struct super_block___proc *sb = BPF_CORE_READ(vm, mnt_sb);
-    if (BPF_CORE_READ(sb, s_magic) != OVERLAYFS_SUPER_MAGIC) {
-        return ret;
-    }
-
-    u64 pid_tgid = bpf_get_current_pid_tgid();
-    if (current_is_io_worker()) {
-        bpf_map_delete_elem(&overlay_write_context, &pid_tgid);
-        return ret;
-    }
-    u8 correlation = 1;
-    bpf_map_update_elem(&overlay_write_context, &pid_tgid, &correlation, BPF_ANY);
-    return ret;
 }
 
 // The correlation is operation-bounded, not time/counter-bounded: every syscall

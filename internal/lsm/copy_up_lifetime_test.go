@@ -18,25 +18,39 @@ func copyUpBPFSource(t *testing.T) string {
 	return string(source)
 }
 
-func TestContainerCopyUpMarkerPreservesDeniedDecision(t *testing.T) {
+// The overlay correlation must be installed by the program that made the
+// allow decision, after that decision. A second program on lsm/file_open runs
+// before lsm_open (trampolines run the newest link first), and a marker there
+// turned every overlay-rootfs write into an allow (#186/#125).
+func TestContainerCopyUpMarkerFollowsTheDecision(t *testing.T) {
 	text := copyUpBPFSource(t)
-	start := strings.Index(text, "int BPF_PROG(lsm_mark_overlay_write")
+	if strings.Count(text, `SEC("lsm/file_open")`) != 3 {
+		t.Fatal("lsm/file_open must carry only lsm_open and its two tail-call stages")
+	}
+	if strings.Contains(text, "lsm_mark_overlay_write") {
+		t.Fatal("separate overlay marker program reintroduced")
+	}
+	start := strings.Index(text, "static __always_inline int mark_allowed_overlay_open(struct file *file)")
 	if start < 0 {
-		t.Fatal("container copy-up marker program not found")
+		t.Fatal("overlay open marker helper not found")
 	}
-	rest := text[start:]
-	end := strings.Index(rest, `SEC("raw_tracepoint/sys_exit")`)
-	if end < 0 {
-		t.Fatal("syscall-exit cleanup program not found after marker")
+	helper := text[start:]
+	helper = helper[:strings.Index(helper, "\n}\n")]
+	for _, guard := range []string{"FMODE_WRITE", "OVERLAYFS_SUPER_MAGIC", "container_overlay_mode", "current_is_io_worker()", "bpf_map_update_elem(&overlay_write_context"} {
+		if !strings.Contains(helper, guard) {
+			t.Fatalf("overlay open marker lacks %q", guard)
+		}
 	}
-	marker := rest[:end]
-	deny := strings.Index(marker, "if (ret != 0)")
-	mark := strings.Index(marker, "bpf_map_update_elem(&overlay_write_context")
-	if deny < 0 || mark < 0 || deny > mark {
-		t.Fatal("denied accumulated decision is not preserved before correlation marking")
+	policy := text[strings.Index(text, "int BPF_PROG(lsm_open_policy"):]
+	policy = policy[:strings.Index(policy, `SEC("raw_tracepoint/sys_exit")`)]
+	token := strings.Index(policy, "*confirmed_token != lookup->activation_token")
+	mark := strings.Index(policy, "if (policy_result && mark_allowed_overlay_open(file) != 0) {")
+	submit := strings.Index(policy, "bpf_ringbuf_submit(event, 0);\n    }\n\n    // Return policy decision")
+	if token < 0 || mark < 0 || submit < 0 || !(token < mark && mark < submit) {
+		t.Fatal("overlay correlation is not installed only after the final allow decision")
 	}
-	if !strings.Contains(marker, "FMODE_WRITE") || !strings.Contains(marker, "OVERLAYFS_SUPER_MAGIC") {
-		t.Fatal("marker is not limited to allowed overlay writes")
+	if !strings.Contains(policy[mark:], "policy_result = 0;") {
+		t.Fatal("a failed overlay correlation does not fail closed")
 	}
 }
 
@@ -59,11 +73,55 @@ func TestContainerCopyUpAttachmentOrderAndRequiredCleanup(t *testing.T) {
 	}
 
 	container := &OpenLsm{containerOverlay: true}
-	wantContainer := append(append([]string{}, want...), "lsm_mark_overlay_write")
-	if got := container.requiredProgramNames(); !reflect.DeepEqual(got, wantContainer) {
+	if got := container.requiredProgramNames(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("container required program order = %v", got)
 	}
 	if err := container.attachCopyUpExitTracepoint(&ebpf.Collection{}); err == nil {
 		t.Fatal("container setup accepted missing required syscall-exit cleanup program")
+	}
+}
+
+// Both rename halves share lsm/path_rename and the kernel runs the one attached
+// last first; the destination half installs the overlay correlation for its
+// endpoint, so a correlation skip in the other half let a rename of a
+// non-mutable source succeed whenever the destination was permitted.
+func TestRenameHalvesNeverSkipOnOverlayCorrelation(t *testing.T) {
+	text := copyUpBPFSource(t)
+	for _, signature := range []string{"int BPF_PROG(lsm_rename_source,", "int BPF_PROG(lsm_rename_destination,"} {
+		start := strings.Index(text, signature)
+		if start < 0 {
+			t.Fatalf("%s not found", signature)
+		}
+		body := text[start:]
+		body = body[:strings.Index(body, "\n}\n")]
+		if strings.Contains(body, "mutation_overlay_context_active()") {
+			t.Fatalf("%s skips its endpoint check on the overlay correlation", signature)
+		}
+		if !strings.Contains(body, "check_directory_mutation(") {
+			t.Fatalf("%s does not check its endpoint", signature)
+		}
+	}
+}
+
+// The correlation lets through only opens overlayfs makes on its own behalf
+// (under its mounter's credentials). Without the cred check, a second open the
+// task issued in the same syscall, such as a second inline io_uring openat
+// after an allowed overlay write, skipped policy.
+func TestOverlayCorrelationSkipsOnlyOverlayfsCredentialOpens(t *testing.T) {
+	text := copyUpBPFSource(t)
+	start := strings.Index(text, "int BPF_PROG(lsm_open, struct file *file)")
+	if start < 0 {
+		t.Fatal("lsm_open not found")
+	}
+	body := text[start:]
+	body = body[:strings.Index(body, "\n}\n")]
+	if !strings.Contains(body, "} else if (active && current_creds_overridden()) {\n        return 0;") {
+		t.Fatal("lsm_open skips on the overlay correlation without requiring overlayfs's overridden credentials")
+	}
+	if strings.Contains(body, "} else if (active) {") {
+		t.Fatal("lsm_open still skips on the bare overlay correlation")
+	}
+	if !strings.Contains(text, "return BPF_CORE_READ(task, cred) != BPF_CORE_READ(task, real_cred);") {
+		t.Fatal("credential-override check is not a cred/real_cred comparison")
 	}
 }
