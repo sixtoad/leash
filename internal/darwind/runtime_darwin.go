@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -297,7 +298,11 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 		if wsDefault == "" {
 			wsDefault = "18080"
 		}
-		uiBind = ":" + wsDefault
+		// Loopback only: the Control UI and websocket API can rewrite the
+		// enforced policy, and on macOS they run on the host itself rather
+		// than inside a container network namespace. --serve still binds any
+		// address explicitly (e.g. 0.0.0.0:18080).
+		uiBind = net.JoinHostPort(darwinLoopback, wsDefault)
 	} else if strings.Count(uiBind, ":") == 0 && !strings.HasPrefix(uiBind, "[") {
 		uiBind = ":" + uiBind
 	}
@@ -523,6 +528,7 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 	// macOS has no SO_ORIGINAL_DST — read the original destination from the PROXY
 	// protocol v1 header the transparent proxy provider prepends to each flow.
 	mitmProxy.SetProxyProtocolIngestion(true)
+	mitmProxy.SetListenHost(darwinLoopback)
 	logPolicyEvent("proxy.mode", map[string]any{
 		"status":    "enabled",
 		"port":      cfg.ProxyPort,

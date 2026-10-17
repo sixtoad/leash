@@ -10,6 +10,25 @@ import (
 	"github.com/strongdm/leash/internal/messages"
 )
 
+// The Control UI/API can rewrite the enforced policy, so by default it listens
+// on loopback only; --serve still binds an explicit address.
+func TestControlUIBindsLoopbackByDefault(t *testing.T) {
+	cfg, err := parseConfig(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebBind != "127.0.0.1:18080" {
+		t.Fatalf("default WebBind = %q, want 127.0.0.1:18080", cfg.WebBind)
+	}
+	cfg, err = parseConfig([]string{"--serve", "0.0.0.0:18080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebBind != "0.0.0.0:18080" {
+		t.Fatalf("explicit --serve = %q", cfg.WebBind)
+	}
+}
+
 // A websocket client must not be able to change the rules the extensions
 // enforce: they are compiled from the Cedar policy only.
 func TestClientRuleMutationsAreRefused(t *testing.T) {
