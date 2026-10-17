@@ -95,6 +95,10 @@ func main() {
 			os.Exit(enforcerd.Main(args[2:], version, os.Stdout, os.Stderr))
 		case "doctor": // node readiness self-check; exit 0 enforces, 3 runs proxy-only, 1 cannot run at all.
 			os.Exit(doctor.Main(args[2:], os.Stdout, os.Stderr))
+		case "--native-holder": // internal: the native box holder, bound to the owning leash's lifetime (#158).
+			os.Exit(runner.NativeHolderMain(args[2:]))
+		case "--native-reap-box": // internal: reap one native box whose owning leash died (#158).
+			os.Exit(runner.NativeReapBoxMain(args[2:]))
 		case "--harden-exec": // internal: seccomp-harden this process, then exec the workload.
 			if err := hardenExec(args[2:]); err != nil {
 				log.Fatal(err)
