@@ -8,11 +8,11 @@ import "testing"
 // the wrong ancestor and silently mis-scope enforcement.
 func TestCgroupLevel(t *testing.T) {
 	cases := map[string]int{
-		"/sys/fs/cgroup":                                     0,
-		"/sys/fs/cgroup/":                                    0,
-		"/sys/fs/cgroup/system.slice":                        1,
-		"/sys/fs/cgroup/system.slice/leash-native-x.service": 2,
-		"/sys/fs/cgroup/system.slice/leash-native-x.service/": 2,
+		"/sys/fs/cgroup":              0,
+		"/sys/fs/cgroup/":             0,
+		"/sys/fs/cgroup/system.slice": 1,
+		"/sys/fs/cgroup/system.slice/leash-native-x.service":                      2,
+		"/sys/fs/cgroup/system.slice/leash-native-x.service/":                     2,
 		"/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.service": 4,
 	}
 	for path, want := range cases {
