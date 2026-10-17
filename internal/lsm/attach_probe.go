@@ -44,8 +44,9 @@ const attachProbeProgram = "lsm_open"
 // the loader it is supposed to be reporting on: a real run whose optional
 // hard-link guard fails verification drops that one hook and keeps enforcing,
 // so a probe that called the whole kernel unattachable there would report a
-// working host as broken.
-var attachProbeOptionalPrograms = []string{"lsm_link"}
+// working host as broken. The guard's tail-called decision stage is stripped
+// with it, as the loader does.
+var attachProbeOptionalPrograms = []string{"lsm_link", "lsm_link_policy"}
 
 // AttachState is the tri-state answer to "can leash's eBPF LSM programs attach
 // on this kernel?", deliberately shaped like runner.LSMState so the two read

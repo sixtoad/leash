@@ -510,6 +510,7 @@ func validateEventArrays(arrays ...[]byte) bool {
 type BPFConfig struct {
 	ProgramNames         []string                     // Programs to attach; a failure fails enforcement (caller decides degrade vs --require-lsm)
 	OptionalProgramNames []string                     // Best-effort programs: a failure degrades only that hook, not the whole enforcement
+	OptionalStageNames   []string                     // Tail-called stages of optional programs: stripped with them, never attached
 	AfterRequiredAttach  func(*ebpf.Collection) error // Required setup after ordered core attachments, before optional hooks
 	EventMapName         string                       // Name of the event ring buffer map
 	AllowedCgroupsMap    string                       // Name of the allowed cgroups map
@@ -589,7 +590,7 @@ func LoadAndAttachBPFWithSetup(
 		// spec with the optional programs stripped so core enforcement survives;
 		// the optional attach loop no-ops when a program is absent.
 		if fresh, lerr := loader(); lerr == nil {
-			for _, name := range config.OptionalProgramNames {
+			for _, name := range append(append([]string(nil), config.OptionalProgramNames...), config.OptionalStageNames...) {
 				delete(fresh.Programs, name)
 			}
 			if coll2, cerr := ebpf.NewCollection(fresh); cerr == nil {

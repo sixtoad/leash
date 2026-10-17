@@ -155,6 +155,7 @@ func TestHardlinkGuardValidation(t *testing.T) {
 
 	rules := ConvertToFileOpenRules([]PolicyRule{
 		hlRule(PolicyAllow, OpOpen, "/"),   // default allow
+		hlRule(PolicyAllow, OpOpenRW, "/"), // link destinations need rw-directory authority (#29)
 		hlRule(PolicyDeny, OpOpen, secret), // deny reading the secret
 	})
 

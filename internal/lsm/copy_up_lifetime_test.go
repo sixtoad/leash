@@ -125,3 +125,26 @@ func TestOverlayCorrelationSkipsOnlyOverlayfsCredentialOpens(t *testing.T) {
 		t.Fatal("credential-override check is not a cred/real_cred comparison")
 	}
 }
+
+// The hard-link decision stage is tail-called. Every OptionalProgramNames entry
+// is attached as an LSM program, so the stage must never be listed there: an
+// attached lsm_link_policy would run without lsm_link's reconstruction (#29).
+func TestHardlinkDecisionStageIsStrippedButNeverAttached(t *testing.T) {
+	for _, overlay := range []bool{false, true} {
+		config := (&OpenLsm{containerOverlay: overlay}).bpfConfig()
+		if !reflect.DeepEqual(config.OptionalProgramNames, []string{"lsm_link"}) {
+			t.Fatalf("optional attached programs = %v", config.OptionalProgramNames)
+		}
+		if !reflect.DeepEqual(config.OptionalStageNames, []string{"lsm_link_policy"}) {
+			t.Fatalf("optional tail-called stages = %v", config.OptionalStageNames)
+		}
+		for _, name := range config.ProgramNames {
+			if name == "lsm_link_policy" {
+				t.Fatal("decision stage listed as a required attached program")
+			}
+		}
+	}
+	if !reflect.DeepEqual(attachProbeOptionalPrograms, []string{"lsm_link", "lsm_link_policy"}) {
+		t.Fatalf("attach probe strips %v, want the guard and its stage", attachProbeOptionalPrograms)
+	}
+}
