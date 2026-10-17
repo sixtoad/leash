@@ -55,6 +55,7 @@ func TestInjectAuthzRejectsDuplicateIDs(t *testing.T) {
 // authz server built from the runner's LEASH_AUTHZ_PLUGINS) serves it; the
 // plugin's client gets decisions from the live policy.
 func TestInjectAuthzRunnerToLeashdContract(t *testing.T) {
+	spawnInjectAsSelf(t)
 	dir := t.TempDir()
 	envDump := filepath.Join(dir, "plugin.env")
 	plugin := filepath.Join(dir, "authz-plugin.sh")
