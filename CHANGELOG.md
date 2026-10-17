@@ -8,6 +8,20 @@ Claude Code handling on top.
 
 ## [Unreleased]
 
+### Security — macOS policy file out of /tmp (#12)
+- The darwin daemon's default policy moves from `/tmp/tmp.leash.policy` (which
+  any local user could create, or symlink, before leash first ran) to
+  `policy.cedar` in the per-user state directory (mode `0700`, repaired if
+  looser, refused if not owned by you). A missing file is created `0600` with
+  `O_EXCL|O_NOFOLLOW`.
+- Every policy path is checked before it is created or read and on each
+  reload: regular file, no symlink, owned by you or root, not group/other
+  writable, and no directory above it writable by others unless sticky. An
+  unsafe path stops the daemon; an unsafe reload is refused and the previous
+  policy stays active.
+- `LEASH_POLICY` given to `leash --darwin exec` is now passed to the daemon it
+  starts instead of being overridden.
+
 ### Added — build & compatibility document
 - **`leash version --json`** (also `--output json`): the build metadata as a
   machine-readable document — `version`, `commit`, `builtAt`, `enforcing`,
