@@ -441,6 +441,7 @@ func execute(cmdName string, args []string) error {
 			// (#128, #143).
 			r.killInjectedPluginsNow()
 			r.killLeashdNow()
+			r.forcedExitCleanup()
 			os.Exit(1)
 		}
 	}()
@@ -453,6 +454,29 @@ func execute(cmdName string, args []string) error {
 	}
 	return nil
 }
+
+// forcedExitCleanup is the bounded, best-effort teardown on a forced exit:
+// os.Exit skips every deferred cleanup, so the native box (netns, egress,
+// holder unit, temp work dir) is removed here, within forcedExitBudget (#158).
+func (r *runner) forcedExitCleanup() {
+	if !r.usingNativeRuntime() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), forcedExitBudget)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		nativeLauncher{r: r}.forceRemove(ctx)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
+// forcedExitBudget bounds forcedExitCleanup so a forced exit stays prompt.
+var forcedExitBudget = 3 * time.Second
 
 func terminationSignals() []os.Signal {
 	return []os.Signal{os.Interrupt, syscall.SIGTERM}

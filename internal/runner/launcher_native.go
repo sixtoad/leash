@@ -109,19 +109,25 @@ func (n nativeLauncher) PullImages(ctx context.Context) error {
 // eBPF LSM to.
 func (n nativeLauncher) Provision(ctx context.Context, stopSignal string) (string, error) {
 	unit := n.unitName()
+	// Reap boxes left by dead runs (SIGKILL, forced exit, crash) before
+	// creating ours (#158). Only boxes whose owning leash is provably gone.
+	if reaped := reapStaleNativeBoxesIn(ctx, nativeStateDir(n.useUserManager())); len(reaped) > 0 {
+		n.r.debugf("native: reaped stale boxes from dead runs: %s", strings.Join(reaped, ", "))
+	}
 	// Clear any stale unit from a crashed prior run (best-effort).
 	n.stopUnit(ctx, unit)
 
 	// A transient *service* (not --scope) is the right systemd primitive for a
 	// holder systemd itself starts: it is detached and managed, and Delegate=yes
-	// still yields a delegated cgroup-v2 subtree we own. "sleep infinity" just
-	// holds the box open until Remove.
-	runArgs := append(n.userFlag(),
-		"--quiet", "--collect", "--property=Delegate=yes",
-		"--unit="+unit, "--", "sleep", "infinity")
+	// still yields a delegated cgroup-v2 subtree we own. The holder's main
+	// process is bound to this leash's lifetime (holderArgv): when leash exits
+	// — even by SIGKILL — the holder exits, systemd kills whatever is left in
+	// the box (fail-closed) and ExecStopPost reaps the netns/egress/files.
+	runArgs := append(n.userFlag(), n.holderUnitArgs(unit)...)
 	if out, err := hostOutput(ctx, "systemd-run", runArgs...); err != nil {
 		return "", fmt.Errorf("native: start cgroup holder %q: %w (%s)", unit, err, strings.TrimSpace(out))
 	}
+	n.recordBoxState()
 
 	rel, err := hostOutput(ctx, "systemctl", append(n.userFlag(), "show", "-p", "ControlGroup", "--value", unit)...)
 	rel = strings.TrimSpace(rel)
@@ -205,6 +211,7 @@ func (n nativeLauncher) StartEnforcement(ctx context.Context, cgroupPath string)
 	if err := n.r.startLeashd(cmd, logf); err != nil {
 		return err
 	}
+	n.recordBoxState()
 	if err := n.injectServices(ctx); err != nil {
 		return err
 	}
@@ -853,7 +860,115 @@ func (n nativeLauncher) Remove(ctx context.Context) error {
 		_ = os.Remove(n.userReadableCACert())
 	}
 	n.stopUnit(ctx, n.unitName())
+	n.removeBoxState()
 	return nil
+}
+
+// forceRemove is the forced-exit teardown (a second interrupt calls os.Exit,
+// skipping Remove and every deferred cleanup): SIGKILL leashd, then delete the
+// netns/egress and stop the holder, all bounded by ctx so a wedged host tool can
+// never hold the exit hostage. Anything it misses is reaped by the holder's
+// ExecStopPost or the next run (#158).
+func (n nativeLauncher) forceRemove(ctx context.Context) {
+	n.r.killInjectedPluginsNow()
+	n.r.killLeashdNow()
+	n.r.waitLeashdExit(time.Second)
+	if nativeLayer2Enabled && !n.useUserManager() {
+		n.teardownEgress(ctx)
+		_, _ = hostOutput(ctx, "ip", "netns", "del", n.netnsName())
+		_ = os.Remove(n.userReadableCACert())
+	}
+	_, _ = hostOutput(ctx, "systemctl", append(n.userFlag(), "stop", "--no-block", n.unitName())...)
+	_ = os.Remove(n.leashdLogPath())
+	if n.r.cfg.workDirIsTemp && safeReapPath(n.r.cfg.workDir) {
+		_ = os.RemoveAll(n.r.cfg.workDir)
+	}
+	n.removeBoxState()
+}
+
+// holderUnitArgs is the systemd-run argv (after any --user) for the holder.
+func (n nativeLauncher) holderUnitArgs(unit string) []string {
+	args := []string{"--quiet", "--collect", "--property=Delegate=yes",
+		// Whatever is still in the box when the holder exits is killed at once:
+		// the workload must not outlive its owner (and its enforcement).
+		"--property=KillMode=control-group", "--property=KillSignal=SIGKILL",
+		"--property=TimeoutStopSec=10",
+	}
+	self, selfErr := os.Executable()
+	if post := n.reapExecStopPost(self, selfErr); post != "" {
+		args = append(args, "--property=ExecStopPost="+post)
+	}
+	args = append(args, "--unit="+unit, "--")
+	return append(args, n.holderArgv(self, selfErr)...)
+}
+
+// holderArgv is the holder's main process: `leash --native-holder <pid>
+// <start>` (exits when this leash does), or `sleep infinity` when this leash's
+// own identity can't be determined (then only Remove/forceRemove/the reaper
+// clean up, as before #158).
+func (n nativeLauncher) holderArgv(self string, selfErr error) []string {
+	start, err := procStartTime(os.Getpid())
+	if selfErr != nil || err != nil || self == "" {
+		return []string{"sleep", "infinity"}
+	}
+	return []string{self, "--native-holder", strconv.Itoa(os.Getpid()), strconv.FormatUint(start, 10)}
+}
+
+// reapExecStopPost launches the box reaper in its own transient unit, off the
+// box's (LSM-scoped) cgroup, so the reap's own file/exec operations are not
+// subject to the workload policy while the dying leashd detaches. "-" ignores a
+// failure: the next run and `leash doctor --reap` are the backstops.
+func (n nativeLauncher) reapExecStopPost(self string, selfErr error) string {
+	sdRun, err := exec.LookPath("systemd-run")
+	if selfErr != nil || self == "" || err != nil {
+		return ""
+	}
+	argv := []string{"-" + sdRun}
+	argv = append(argv, n.userFlag()...)
+	argv = append(argv, "--quiet", "--collect", "--no-block",
+		"--unit="+n.boxBaseName()+"-reap", "--", self, "--native-reap-box", n.boxBaseName())
+	return strings.Join(argv, " ")
+}
+
+// boxState is this run's record (see nativeBoxState).
+func (n nativeLauncher) boxState() nativeBoxState {
+	st := nativeBoxState{
+		Name:        n.boxBaseName(),
+		Unit:        n.unitName(),
+		UserManager: n.useUserManager(),
+		OwnerPID:    os.Getpid(),
+		BootID:      currentBootID(),
+		Files:       []string{n.leashdLogPath()},
+	}
+	st.OwnerStart, _ = procStartTime(st.OwnerPID)
+	if nativeLayer2Enabled && !n.useUserManager() {
+		st.Netns = n.netnsName()
+		st.Files = append(st.Files, n.userReadableCACert())
+	}
+	if n.r.cfg.workDirIsTemp {
+		st.WorkDir = n.r.cfg.workDir
+	}
+	n.r.leashdMu.Lock()
+	if p := n.r.leashd; p != nil && p.cmd != nil && p.cmd.Process != nil {
+		st.LeashdPID = p.cmd.Process.Pid
+		st.LeashdStart, _ = procStartTime(st.LeashdPID)
+	}
+	n.r.leashdMu.Unlock()
+	return st
+}
+
+// recordBoxState writes/refreshes this run's record (best-effort: without it,
+// cleanup after a SIGKILL falls back to the holder binding alone).
+func (n nativeLauncher) recordBoxState() {
+	if err := writeNativeBoxState(nativeStateDir(n.useUserManager()), n.boxState()); err != nil {
+		n.r.debugf("native: record box state: %v", err)
+	}
+}
+
+func (n nativeLauncher) removeBoxState() {
+	if dir := nativeStateDir(n.useUserManager()); dir != "" {
+		_ = os.Remove(nativeStatePath(dir, n.boxBaseName()))
+	}
 }
 
 func (n nativeLauncher) addNetns(ctx context.Context) error {
@@ -963,8 +1078,11 @@ func fnv32(s string) uint32 {
 	return h
 }
 
-func (n nativeLauncher) egress() egressNet {
-	ns := n.netnsName()
+func (n nativeLauncher) egress() egressNet { return egressFor(n.netnsName()) }
+
+// egressFor derives the egress parameters from a netns name alone, so a reaper
+// can undo a dead run's egress from its recorded netns name.
+func egressFor(ns string) egressNet {
 	h := fnv32(ns)
 	// 10.<100..199>.<0..253>.0/30 → ~25k distinct /30s, collision-unlikely.
 	subnet := fmt.Sprintf("10.%d.%d", 100+int(h%100), int((h/100)%254))
@@ -1018,8 +1136,9 @@ func (n nativeLauncher) setupEgress(ctx context.Context) error {
 
 // teardownEgress reverses setupEgress, best-effort (each step ignores errors so a
 // partial setup still cleans up). Deleting vethHost removes its netns peer.
-func (n nativeLauncher) teardownEgress(ctx context.Context) {
-	e := n.egress()
+func (n nativeLauncher) teardownEgress(ctx context.Context) { teardownEgressFor(ctx, n.egress()) }
+
+func teardownEgressFor(ctx context.Context, e egressNet) {
 	// Delete each rule setupEgress added (-A → -D), best-effort; -w waits for the
 	// xtables lock like setup does.
 	for _, r := range egressNATRules(e) {
