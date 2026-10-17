@@ -4,22 +4,74 @@ import os.log
 import Darwin
 
 extension LeashMonitor {
+    /// AUTH events decided for leashed processes. Besides exec and open these
+    /// are the file-system mutations the Linux LSM decides (mkdir, unlink,
+    /// rmdir, rename, hard link) and the macOS ways to create or replace a
+    /// file without an AUTH_OPEN (create, truncate, clone, copyfile,
+    /// exchangedata). Subscribed while any leashed process is alive.
+    static let authEventTypes: [es_event_type_t] = [
+        ES_EVENT_TYPE_AUTH_EXEC,
+        ES_EVENT_TYPE_AUTH_OPEN,
+        ES_EVENT_TYPE_AUTH_CREATE,
+        ES_EVENT_TYPE_AUTH_UNLINK,
+        ES_EVENT_TYPE_AUTH_RENAME,
+        ES_EVENT_TYPE_AUTH_LINK,
+        ES_EVENT_TYPE_AUTH_TRUNCATE,
+        ES_EVENT_TYPE_AUTH_CLONE,
+        ES_EVENT_TYPE_AUTH_COPYFILE,
+        ES_EVENT_TYPE_AUTH_EXCHANGEDATA
+    ]
+
     func handle(_ message: UnsafeMutablePointer<es_message_t>) {
         defer { es_release_message(message) }
 
         switch message.pointee.event_type {
         case ES_EVENT_TYPE_NOTIFY_EXEC:
             processNotifyExecMessage(message)
+        case ES_EVENT_TYPE_NOTIFY_FORK:
+            processForkMessage(message)
         case ES_EVENT_TYPE_AUTH_EXEC:
             processAuthExecMessage(message)
         case ES_EVENT_TYPE_AUTH_OPEN:
             processAuthOpenMessage(message)
+        case ES_EVENT_TYPE_AUTH_CREATE, ES_EVENT_TYPE_AUTH_UNLINK, ES_EVENT_TYPE_AUTH_RENAME,
+             ES_EVENT_TYPE_AUTH_LINK, ES_EVENT_TYPE_AUTH_TRUNCATE, ES_EVENT_TYPE_AUTH_CLONE,
+             ES_EVENT_TYPE_AUTH_COPYFILE, ES_EVENT_TYPE_AUTH_EXCHANGEDATA:
+            processAuthFileSystemMessage(message)
         case ES_EVENT_TYPE_NOTIFY_EXIT:
             processExitMessage(message)
         default:
-            break
+            // Every AUTH message must be answered before its deadline, or the
+            // kernel kills this client.
+            if message.pointee.action_type == ES_ACTION_TYPE_AUTH {
+                respondAuth(message, action: .allow, cache: false)
+            }
         }
     }
+
+    // MARK: - Decisions
+
+    /// Decides with the daemon's policy tables. No tables (none delivered
+    /// yet, a refused version, or a daemon gone for longer than the grace
+    /// period) is a deny: a leashed process is never allowed something the
+    /// policy was not consulted for.
+    func decide(_ check: (LeashPolicyMatcher) -> Bool) -> (action: LeashPolicyDecision.Action, reason: String?) {
+        guard let commService else {
+            return (.deny, "no communication service")
+        }
+        let (matcher, reason) = commService.currentMatcher()
+        guard let matcher else {
+            return (.deny, reason)
+        }
+        return check(matcher) ? (.allow, nil) : (.deny, nil)
+    }
+
+    func leashedContext(for process: es_process_t) -> TrackedLeashProcess? {
+        let pid = audit_token_to_pid(process.audit_token)
+        return leashInfo(for: process) ?? trackedLeashProcesses[pid]
+    }
+
+    // MARK: - Process tracking
 
     func processNotifyExecMessage(_ message: UnsafeMutablePointer<es_message_t>) {
         let execEvent = message.pointee.event.exec
@@ -30,7 +82,11 @@ extension LeashMonitor {
         let pid = audit_token_to_pid(targetProcess.audit_token)
         let isLeash = isLeashExecutable(targetProcess, executablePath: executablePath)
 
-        if isLeash && originatesFromInteractiveTerminal(targetProcess) {
+        // Every leashcli is a leash root, with or without a terminal: it only
+        // runs commands for `leash --darwin exec`, which waits for this
+        // extension to report it tracked before letting it start the command.
+        // (Requiring a TTY used to leave non-interactive runs unenforced.)
+        if isLeash {
             let arguments = extractArguments(from: message)
             let ttyPath = ttyPath(for: targetProcess)
             let cwd = Optional(execEvent.cwd).flatMap { string(from: $0.pointee.path) }
@@ -57,170 +113,104 @@ extension LeashMonitor {
                 enableAuthEvents()
             }
 
-            // Sync PIDs to network extension
             syncTrackedPIDsToNetwork()
             return
         }
 
-        if let leashInfo = leashInfo(for: targetProcess) {
-            os_log("NOTIFY_EXEC: leash child pid=%{public}d path=%{public}@ leashPID=%{public}d", log: log, type: .debug, pid, executablePath, leashInfo.leashPID ?? -1)
-
-            if trackedLeashProcesses[pid] == nil {
-                if let (tracked, event) = buildExecContext(message: message, process: targetProcess, leashInfo: leashInfo) {
-                    trackedLeashProcesses[pid] = tracked
-                    syncTrackedPIDsToNetwork()
-
-                    let decision = checkPolicyOrAllowDefault(for: event)
-                    os_log("Fallback tracked exec pid=%{public}d (%{public}@) decision=%{public}@", log: log, type: .debug, pid, event.processPath, decision.action.rawValue.uppercased())
-                    logEventAsync(event, decision: decision.action)
-                }
+        if let leashInfo = leashInfo(for: targetProcess), trackedLeashProcesses[pid] == nil {
+            if let (tracked, event) = buildExecContext(message: message, process: targetProcess, leashInfo: leashInfo) {
+                trackedLeashProcesses[pid] = tracked
+                syncTrackedPIDsToNetwork()
+                let decision = decide { $0.allowsExec(path: event.processPath, arguments: event.processArguments) }
+                logEventAsync(event, decision: decision.action, reason: decision.reason)
             }
         }
     }
 
-    func processAuthExecMessage(_ message: UnsafeMutablePointer<es_message_t>) {
-        let targetProcess = message.pointee.event.exec.target.pointee
+    /// A process forked by a leashed process is leashed too. Without this a
+    /// child that never execs was unknown to the network filter and the
+    /// transparent proxy, which only enforce for the PIDs this extension
+    /// reports (its file opens were already caught by the parent lookup).
+    func processForkMessage(_ message: UnsafeMutablePointer<es_message_t>) {
+        let parent = message.pointee.process.pointee
+        let parentPID = audit_token_to_pid(parent.audit_token)
+        let child = message.pointee.event.fork.child.pointee
+        let childPID = audit_token_to_pid(child.audit_token)
 
-        guard let leashInfo = leashInfo(for: targetProcess) else {
-            respondAuth(message, action: .allow, cache: false)
-            return
-        }
+        guard let source = trackedLeashProcesses[parentPID] ?? leashInfo(for: parent) else { return }
 
-        guard let (trackedProcess, event) = buildExecContext(message: message, process: targetProcess, leashInfo: leashInfo) else {
-            respondAuth(message, action: .allow, cache: false)
-            return
-        }
-
-        trackedLeashProcesses[trackedProcess.pid] = trackedProcess
-
-        let decision = checkPolicyOrAllowDefault(for: event)
-
-        os_log("AUTH_EXEC[leash=%{public}d]: %{public}@ (pid=%d) → %{public}@",
-               log: log, type: .default,
-               leashInfo.leashPID ?? -1,
-               event.processPath, event.pid,
-               decision.action == .allow ? "ALLOW" : "DENY")
-
-        logEventAsync(event, decision: decision.action)
-
-        syncTrackedPIDsToNetwork()
-
-        respondAuth(message, action: decision.action, cache: false)
-    }
-
-    func processAuthOpenMessage(_ message: UnsafeMutablePointer<es_message_t>) {
-        let process = message.pointee.process.pointee
-        let pid = audit_token_to_pid(process.audit_token)
-
-        let fileEvent = message.pointee.event.open
-        let requestedFlags = fileEvent.fflag
-
-        guard let leashInfo = leashInfo(for: process) ?? trackedLeashProcesses[pid] else {
-            respondOpen(message, action: .allow, requestedFlags: requestedFlags, cache: false)
-            return
-        }
-
-        var filePath = resolvePath(for: fileEvent.file)
-
-        let operation: LeashPolicyEvent.FileOperation
-        let flags = requestedFlags
-        let writeRequested = (flags & FWRITE) != 0
-        let createRequested = (flags & O_CREAT) != 0
-
-        if createRequested {
-            operation = .create
-        } else if writeRequested {
-            operation = .write
-        } else {
-            operation = .open
-        }
-
-        if (filePath == nil || filePath?.isEmpty == true) && (createRequested || writeRequested) {
-            if let args = trackedLeashProcesses[pid]?.arguments {
-                if let candidate = args.dropFirst().first(where: { !$0.isEmpty && !$0.hasPrefix("-") }) {
-                    if candidate.hasPrefix("/") {
-                        filePath = candidate
-                    } else if let cwd = trackedLeashProcesses[pid]?.currentWorkingDirectory {
-                        let resolved = URL(fileURLWithPath: candidate, relativeTo: URL(fileURLWithPath: cwd))
-                        filePath = resolved.standardized.path
-                    } else {
-                        filePath = candidate
-                    }
-                }
-            }
-        }
-
-        guard var concretePath = filePath?.trimmingCharacters(in: .whitespacesAndNewlines), !concretePath.isEmpty else {
-            respondOpen(message, action: .allow, requestedFlags: requestedFlags, cache: false)
-            return
-        }
-
-        let cwd = trackedLeashProcesses[pid]?.currentWorkingDirectory
-
-        if !concretePath.hasPrefix("/") {
-            if let cwd {
-                let base = URL(fileURLWithPath: cwd, isDirectory: true)
-                concretePath = URL(fileURLWithPath: concretePath, relativeTo: base).standardizedFileURL.path
-            } else {
-                concretePath = URL(fileURLWithPath: concretePath).standardizedFileURL.path
-            }
-        } else {
-            concretePath = URL(fileURLWithPath: concretePath).standardizedFileURL.path
-        }
-
-        let executablePath = trackedLeashProcesses[pid]?.executablePath ?? processPath(pid: pid) ?? ""
-        let arguments = trackedLeashProcesses[pid]?.arguments ?? []
-        let tty = trackedLeashProcesses[pid]?.ttyPath
-
-        let event = LeashPolicyEvent(
-            id: UUID(),
-            timestamp: Date(),
-            kind: .fileAccess,
-            processPath: executablePath,
-            processArguments: arguments,
-            currentWorkingDirectory: cwd,
-            filePath: concretePath,
-            fileOperation: operation,
-            parentProcessPath: leashInfo.executablePath,
-            ttyPath: tty,
-            leashProcessPath: leashInfo.executablePath,
-            leashPid: leashInfo.leashPID,
-            leashArguments: leashInfo.arguments,
-            leashTTYPath: leashInfo.ttyPath,
-            pid: pid,
-            parentPid: process.ppid
+        trackedLeashProcesses[childPID] = TrackedLeashProcess(
+            pid: childPID,
+            executablePath: source.executablePath,
+            arguments: source.arguments,
+            ttyPath: source.ttyPath,
+            signingIdentifier: source.signingIdentifier,
+            teamIdentifier: source.teamIdentifier,
+            currentWorkingDirectory: source.currentWorkingDirectory,
+            leashPID: source.leashPID ?? parentPID,
+            leashArguments: source.leashArguments,
+            leashTTYPath: source.leashTTYPath,
+            leashExecutablePath: source.leashExecutablePath
         )
-
-        let decision = checkPolicyOrAllowDefault(for: event)
-
-        os_log("AUTH_OPEN[leash=%{public}d]: %{public}@ → %{public}@ (%{public}@) → %{public}@",
-               log: log, type: .default,
-               leashInfo.leashPID ?? -1,
-               executablePath, filePath ?? "", operation.rawValue,
-               decision.action == .allow ? "ALLOW" : "DENY")
-
-        logEventAsync(event, decision: decision.action)
-
-        respondOpen(message, action: decision.action, requestedFlags: requestedFlags, cache: false)
+        syncTrackedPIDsToNetwork()
     }
 
     func processExitMessage(_ message: UnsafeMutablePointer<es_message_t>) {
         let process = message.pointee.process.pointee
         let pid = audit_token_to_pid(process.audit_token)
 
-        if let removed = trackedLeashProcesses.removeValue(forKey: pid) {
+        // Each leashed process stays tracked until it exits itself. Processes
+        // the workload left running after leashcli exited (a daemonized
+        // server, a background job) used to be dropped with it and ran on
+        // unenforced; on Linux they stay in the cgroup.
+        if trackedLeashProcesses.removeValue(forKey: pid) != nil {
             os_log("Leash-tracked process exiting: pid=%{public}d", log: log, type: .default, pid)
-
-            // If the leash CLI exited, drop any child state that still references it
-            if removed.leashPID == removed.pid {
-                let childKeys = trackedLeashProcesses.filter { $0.value.leashPID == removed.pid }.map { $0.key }
-                childKeys.forEach { trackedLeashProcesses.removeValue(forKey: $0) }
-            }
-
             syncTrackedPIDsToNetwork()
 
             if authEventsEnabled && trackedLeashProcesses.isEmpty {
                 scheduleAuthDisable()
+            }
+        }
+    }
+
+    /// Re-tracks processes the daemon still lists as leashed (the set this
+    /// extension reported before it restarted): tracking lives in memory, so
+    /// without this a restarted extension would stop enforcing for a
+    /// workload that is still running. A PID is restored only while it is
+    /// alive and still runs the executable that was reported for it.
+    func restoreTrackedPIDs(_ payload: [String: Any]) {
+        guard let entries = payload["entries"] as? [[String: Any]] else { return }
+        callbackQueue.async { [weak self] in
+            guard let self else { return }
+            var restored = 0
+            for entry in entries {
+                guard let rawPID = entry["pid"] as? Int,
+                      let executable = entry["executable"] as? String else { continue }
+                let pid = pid_t(rawPID)
+                guard self.trackedLeashProcesses[pid] == nil,
+                      let current = self.processPath(pid: pid), current == executable else { continue }
+                let leashPID = (entry["leash_pid"] as? Int).map { pid_t($0) } ?? pid
+                self.trackedLeashProcesses[pid] = TrackedLeashProcess(
+                    pid: pid,
+                    executablePath: executable,
+                    arguments: [],
+                    ttyPath: entry["tty_path"] as? String,
+                    signingIdentifier: nil,
+                    teamIdentifier: nil,
+                    currentWorkingDirectory: entry["cwd"] as? String,
+                    leashPID: leashPID,
+                    leashArguments: nil,
+                    leashTTYPath: nil,
+                    leashExecutablePath: nil
+                )
+                restored += 1
+            }
+            if restored > 0 {
+                os_log("Restored %{public}d leashed processes from the daemon", log: self.log, type: .default, restored)
+                if !self.authEventsEnabled {
+                    self.enableAuthEvents()
+                }
+                self.syncTrackedPIDsToNetwork()
             }
         }
     }
@@ -241,9 +231,239 @@ extension LeashMonitor {
         callbackQueue.asyncAfter(deadline: .now() + authDisableGracePeriod, execute: work)
     }
 
+    // MARK: - Exec and open
+
+    func processAuthExecMessage(_ message: UnsafeMutablePointer<es_message_t>) {
+        let targetProcess = message.pointee.event.exec.target.pointee
+
+        guard let leashInfo = leashInfo(for: targetProcess) else {
+            respondAuth(message, action: .allow, cache: false)
+            return
+        }
+
+        guard let (trackedProcess, event) = buildExecContext(message: message, process: targetProcess, leashInfo: leashInfo) else {
+            // A leashed exec whose path cannot be read cannot be decided.
+            respondAuth(message, action: .deny, cache: false)
+            return
+        }
+
+        trackedLeashProcesses[trackedProcess.pid] = trackedProcess
+
+        let decision = decide { $0.allowsExec(path: event.processPath, arguments: event.processArguments) }
+
+        os_log("AUTH_EXEC[leash=%{public}d]: %{public}@ (pid=%d) → %{public}@",
+               log: log, type: .default,
+               leashInfo.leashPID ?? -1,
+               event.processPath, event.pid,
+               decision.action == .allow ? "ALLOW" : "DENY")
+
+        logEventAsync(event, decision: decision.action, reason: decision.reason)
+        syncTrackedPIDsToNetwork()
+        respondAuth(message, action: decision.action, cache: false)
+    }
+
+    func processAuthOpenMessage(_ message: UnsafeMutablePointer<es_message_t>) {
+        let process = message.pointee.process.pointee
+        let openEvent = message.pointee.event.open
+        let requestedFlags = openEvent.fflag
+
+        guard let leashInfo = leashedContext(for: process) else {
+            respondOpen(message, action: .allow, requestedFlags: requestedFlags, cache: false)
+            return
+        }
+
+        guard let path = resolvePath(for: openEvent.file), path.hasPrefix("/") else {
+            respondOpen(message, action: .deny, requestedFlags: requestedFlags, cache: false)
+            return
+        }
+
+        // The kernel's two open modes: a write is any open requesting FWRITE.
+        let write = (requestedFlags & FWRITE) != 0
+        let operation: LeashPolicyEvent.FileOperation
+        if write && (requestedFlags & O_CREAT) != 0 {
+            operation = .create
+        } else if write {
+            operation = .write
+        } else {
+            operation = .open
+        }
+
+        let decision = decide { $0.allowsOpen(path: path, write: write) }
+        let event = fileEvent(process: process, leashInfo: leashInfo, path: path, operation: operation)
+
+        os_log("AUTH_OPEN[leash=%{public}d]: %{public}@ → %{public}@ (%{public}@) → %{public}@",
+               log: log, type: .default,
+               leashInfo.leashPID ?? -1,
+               event.processPath, path, operation.rawValue,
+               decision.action == .allow ? "ALLOW" : "DENY")
+
+        logEventAsync(event, decision: decision.action, reason: decision.reason)
+        respondOpen(message, action: decision.action, requestedFlags: requestedFlags, cache: false)
+    }
+
+    // MARK: - File-system mutations
+
+    /// One check a file-system AUTH event needs: the path it acts on and the
+    /// table lookup that decides it. An event is allowed only when every one
+    /// of its checks is.
+    private struct FileCheck {
+        let operation: LeashPolicyEvent.FileOperation
+        let path: String?
+        let check: (LeashPolicyMatcher, String) -> Bool
+    }
+
+    private static let creation: (LeashPolicyMatcher, String) -> Bool = { $0.allowsOpen(path: $1, write: true) }
+    private static let mutation: (LeashPolicyMatcher, String) -> Bool = { $0.allowsMutation(path: $1) }
+    private static let readSource: (LeashPolicyMatcher, String) -> Bool = { $0.allowsLink(source: $1) }
+
+    private func fileChecks(_ message: UnsafeMutablePointer<es_message_t>) -> [FileCheck] {
+        let event = message.pointee.event
+        switch message.pointee.event_type {
+        case ES_EVENT_TYPE_AUTH_CREATE:
+            let create = event.create
+            if create.destination_type == ES_DESTINATION_TYPE_NEW_PATH {
+                let newPath = create.destination.new_path
+                let path = joinPath(resolvePath(for: newPath.dir), string(from: newPath.filename))
+                let type = newPath.mode & S_IFMT
+                // A new regular file is an open for writing, as on Linux
+                // (file_open sees the created file). mkdir is a mutation; so is
+                // any other object (symlink, fifo, socket), which the Linux LSM
+                // does not gate at all: macOS is stricter there, never looser.
+                if type == 0 || type == S_IFREG {
+                    return [FileCheck(operation: .create, path: path, check: Self.creation)]
+                }
+                return [FileCheck(operation: .mkdir, path: path, check: Self.mutation)]
+            }
+            return [FileCheck(operation: .create, path: resolvePath(for: create.destination.existing_file), check: Self.creation)]
+
+        case ES_EVENT_TYPE_AUTH_UNLINK:
+            return [FileCheck(operation: .unlink, path: resolvePath(for: event.unlink.target), check: Self.mutation)]
+
+        case ES_EVENT_TYPE_AUTH_RENAME:
+            let rename = event.rename
+            let destination: String?
+            if rename.destination_type == ES_DESTINATION_TYPE_NEW_PATH {
+                destination = joinPath(resolvePath(for: rename.destination.new_path.dir), string(from: rename.destination.new_path.filename))
+            } else {
+                destination = resolvePath(for: rename.destination.existing_file)
+            }
+            return [
+                FileCheck(operation: .rename, path: resolvePath(for: rename.source), check: Self.mutation),
+                FileCheck(operation: .rename, path: destination, check: Self.mutation)
+            ]
+
+        case ES_EVENT_TYPE_AUTH_LINK:
+            let link = event.link
+            return [
+                FileCheck(operation: .link, path: resolvePath(for: link.source), check: Self.readSource),
+                FileCheck(operation: .link, path: joinPath(resolvePath(for: link.target_dir), string(from: link.target_filename)), check: Self.mutation)
+            ]
+
+        case ES_EVENT_TYPE_AUTH_TRUNCATE:
+            return [FileCheck(operation: .truncate, path: resolvePath(for: event.truncate.target), check: Self.creation)]
+
+        case ES_EVENT_TYPE_AUTH_CLONE:
+            let clone = event.clone
+            return [
+                FileCheck(operation: .clone, path: resolvePath(for: clone.source), check: Self.readSource),
+                FileCheck(operation: .clone, path: joinPath(resolvePath(for: clone.target_dir), string(from: clone.target_name)), check: Self.creation)
+            ]
+
+        case ES_EVENT_TYPE_AUTH_COPYFILE:
+            let copy = event.copyfile
+            let target = copy.target_file.flatMap { resolvePath(for: $0) }
+                ?? joinPath(resolvePath(for: copy.target_dir), string(from: copy.target_name))
+            return [
+                FileCheck(operation: .clone, path: resolvePath(for: copy.source), check: Self.readSource),
+                FileCheck(operation: .clone, path: target, check: Self.creation)
+            ]
+
+        case ES_EVENT_TYPE_AUTH_EXCHANGEDATA:
+            let exchange = event.exchangedata
+            return [
+                FileCheck(operation: .rename, path: resolvePath(for: exchange.file1), check: Self.creation),
+                FileCheck(operation: .rename, path: resolvePath(for: exchange.file2), check: Self.creation)
+            ]
+
+        default:
+            return []
+        }
+    }
+
+    func processAuthFileSystemMessage(_ message: UnsafeMutablePointer<es_message_t>) {
+        let process = message.pointee.process.pointee
+        guard let leashInfo = leashedContext(for: process) else {
+            respondAuth(message, action: .allow, cache: false)
+            return
+        }
+
+        let checks = fileChecks(message)
+        var decision: (action: LeashPolicyDecision.Action, reason: String?) = (checks.isEmpty ? .deny : .allow, nil)
+        var decided = checks.first
+        for c in checks {
+            guard let path = c.path, path.hasPrefix("/") else {
+                decision = (.deny, "unreadable path")
+                decided = c
+                break
+            }
+            let d = decide { c.check($0, path) }
+            if d.action == .deny {
+                decision = d
+                decided = c
+                break
+            }
+        }
+
+        let path = decided?.path ?? ""
+        let operation = decided?.operation ?? .create
+        let event = fileEvent(process: process, leashInfo: leashInfo, path: path, operation: operation)
+        os_log("AUTH_FS[leash=%{public}d]: %{public}@ → %{public}@ (%{public}@) → %{public}@",
+               log: log, type: .default,
+               leashInfo.leashPID ?? -1,
+               event.processPath, path, operation.rawValue,
+               decision.action == .allow ? "ALLOW" : "DENY")
+        logEventAsync(event, decision: decision.action, reason: decision.reason)
+        respondAuth(message, action: decision.action, cache: false)
+    }
+
+    func joinPath(_ dir: String?, _ name: String?) -> String? {
+        guard let dir, let name, !name.isEmpty, !name.contains("/") else { return nil }
+        return dir.hasSuffix("/") ? dir + name : dir + "/" + name
+    }
+
+    func fileEvent(process: es_process_t, leashInfo: TrackedLeashProcess, path: String, operation: LeashPolicyEvent.FileOperation) -> LeashPolicyEvent {
+        let pid = audit_token_to_pid(process.audit_token)
+        let tracked = trackedLeashProcesses[pid]
+        return LeashPolicyEvent(
+            id: UUID(),
+            timestamp: Date(),
+            kind: .fileAccess,
+            processPath: tracked?.executablePath ?? processPath(pid: pid) ?? "",
+            processArguments: tracked?.arguments ?? [],
+            currentWorkingDirectory: tracked?.currentWorkingDirectory,
+            filePath: path,
+            fileOperation: operation,
+            parentProcessPath: leashInfo.executablePath,
+            ttyPath: tracked?.ttyPath,
+            leashProcessPath: leashInfo.executablePath,
+            leashPid: leashInfo.leashPID,
+            leashArguments: leashInfo.arguments,
+            leashTTYPath: leashInfo.ttyPath,
+            pid: pid,
+            parentPid: process.ppid
+        )
+    }
+
+    func logEventAsync(_ event: LeashPolicyEvent, decision: LeashPolicyDecision.Action, reason: String? = nil) {
+        guard let commService else { return }
+        DispatchQueue.global(qos: .utility).async {
+            commService.logEvent(event, decision: decision, reason: reason)
+        }
+    }
+
     func respondAuth(_ message: UnsafeMutablePointer<es_message_t>,
-                             action: LeashPolicyDecision.Action,
-                             cache: Bool) {
+                     action: LeashPolicyDecision.Action,
+                     cache: Bool) {
         guard let client else { return }
         let result: es_auth_result_t = action == .allow ? ES_AUTH_RESULT_ALLOW : ES_AUTH_RESULT_DENY
         let response = es_respond_auth_result(client, message, result, cache)
@@ -256,9 +476,9 @@ extension LeashMonitor {
     }
 
     func respondOpen(_ message: UnsafeMutablePointer<es_message_t>,
-                             action: LeashPolicyDecision.Action,
-                             requestedFlags: Int32,
-                             cache: Bool) {
+                     action: LeashPolicyDecision.Action,
+                     requestedFlags: Int32,
+                     cache: Bool) {
         guard let client else { return }
         let flags: UInt32 = action == .allow ? UInt32.max : 0
         let response = es_respond_flags_result(client, message, flags, cache)
@@ -276,10 +496,7 @@ extension LeashMonitor {
         pendingAuthDisable = nil
         guard let client, !authEventsEnabled else { return }
 
-        var events: [es_event_type_t] = [
-            ES_EVENT_TYPE_AUTH_EXEC,
-            ES_EVENT_TYPE_AUTH_OPEN
-        ]
+        var events = Self.authEventTypes
         let result = es_subscribe(client, &events, UInt32(events.count))
         if result == ES_RETURN_SUCCESS {
             authEventsEnabled = true
@@ -292,55 +509,12 @@ extension LeashMonitor {
     func disableAuthEvents() {
         guard let client, authEventsEnabled else { return }
 
-        var events: [es_event_type_t] = [
-            ES_EVENT_TYPE_AUTH_EXEC,
-            ES_EVENT_TYPE_AUTH_OPEN
-        ]
+        var events = Self.authEventTypes
         if es_unsubscribe(client, &events, UInt32(events.count)) == ES_RETURN_SUCCESS {
             authEventsEnabled = false
             os_log("Unsubscribed from AUTH events", log: log, type: .default)
         } else {
             os_log("Failed to unsubscribe from AUTH events", log: log, type: .error)
-        }
-    }
-
-    func checkPolicyOrAllowDefault(for event: LeashPolicyEvent) -> LeashPolicyDecision {
-        guard let commService else {
-            // No comm service: policy can't be consulted. Enforcement is only
-            // meaningful with the daemon, so degrade to allow (logged).
-            os_log("No comm service; allowing %{public}@ unenforced", log: log, type: .error, event.processPath)
-            return LeashPolicyDecision(eventID: event.id, action: .allow, scope: .once)
-        }
-
-        if let action = commService.checkCachedPolicy(event) {
-            return LeashPolicyDecision(eventID: event.id, action: action, scope: .once)
-        }
-
-        // No matching rule. Mirror the Linux default-deny posture: once we hold an
-        // authoritative policy snapshot, a miss fails closed — and stays closed even if
-        // the daemon later disconnects (the cached policy is still the last authoritative
-        // state). Gating on live connectivity here would let a local process bypass
-        // enforcement by killing the daemon. (Blast radius is only leash-tracked
-        // processes; the shipped permissive Cedar policy keeps fresh setups working.)
-        if commService.hasLoadedPolicy {
-            os_log("No policy match for %{public}@ → DENY (default-deny)", log: log, type: .info, event.processPath)
-            return LeashPolicyDecision(eventID: event.id, action: .deny, scope: .once)
-        }
-
-        // Policy not yet loaded: this is the Linux "LSM unavailable but not
-        // --require-lsm" case — degrade to allow and log rather than brick the tracked
-        // workload. (Hard-fail-on-required needs the require flag plumbed into the
-        // extension; see docs/MACOS-PARITY.md P0.)
-        os_log("No policy match and daemon/policy unavailable; allowing %{public}@ unenforced (degrade)",
-               log: log, type: .error, event.processPath)
-        return LeashPolicyDecision(eventID: event.id, action: .allow, scope: .once)
-    }
-
-    func logEventAsync(_ event: LeashPolicyEvent, decision: LeashPolicyDecision.Action) {
-        guard let commService else { return }
-
-        DispatchQueue.global(qos: .utility).async {
-            commService.logEvent(event, decision: decision)
         }
     }
 

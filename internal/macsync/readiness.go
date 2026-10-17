@@ -1,6 +1,7 @@
 package macsync
 
 import (
+	"sort"
 	"strings"
 	"time"
 
@@ -101,7 +102,14 @@ func (m *Manager) Health() macext.DaemonHealth {
 	health := macext.DaemonHealth{
 		Components:     m.ConnectedComponents(),
 		FullDiskAccess: state.String(),
+		PolicyVersion:  m.PolicyVersion(),
+		PolicyApplied:  m.PolicyAppliedComponents(),
+		TrackedPIDs:    []int{},
 	}
+	for _, p := range m.CurrentTrackedPIDs() {
+		health.TrackedPIDs = append(health.TrackedPIDs, p.PID)
+	}
+	sort.Ints(health.TrackedPIDs)
 	if !at.IsZero() {
 		health.FullDiskAccessAt = at.UTC().Format(time.RFC3339)
 	}

@@ -87,80 +87,27 @@ extension FilterDataProvider {
         return drained
     }
 
+    /// Flows of processes whose PID metadata arrived late were already let
+    /// through (system-wide mode only); this records what the policy would
+    /// have decided, for the event log.
     func processPendingFlowBatches(_ batches: [(TrackedPIDInfo, [QueuedFlow])]) {
         let allowFallback = syncQueue.sync { systemWideEnforcementEnabled }
         guard allowFallback else { return }
 
         for (info, flows) in batches {
-            guard !flows.isEmpty else { continue }
-            os_log("NET draining %{public}d pending flows for pid=%{public}d leash=%{public}d %{public}@",
-                   log: log, type: .info,
-                   flows.count, info.pid, info.leashPID, info.executablePath)
-
             for flow in flows {
-                let socketProtocol = describeSocketProtocol(flow.socketProtocolNumber)
-                let decision = evaluateFlow(
-                    hostname: flow.hostname,
-                    port: flow.port,
-                    pidInfo: info,
-                    pid: flow.pid,
-                    socketProtocol: flow.socketProtocolNumber,
-                    allowInspection: false,
-                    isDNSQuery: flow.isDNSQuery,
-                    direction: flow.direction
-                )
-
-                let finalDecision: FlowDecision
-                switch decision {
-                case .allow:
-                    finalDecision = .allow
-                case .deny(let reason):
-                    finalDecision = .deny(reason: reason)
-                case .needsInspection:
-                    finalDecision = .allow
-                }
-
+                let decision = evaluateFlow(hostname: flow.hostname, port: flow.port, direction: flow.direction, exemptLocalScope: true)
                 emitNetworkEvent(
                     info: info,
                     pid: flow.pid,
                     hostname: flow.hostname,
                     port: flow.port,
                     socketType: flow.socketType,
-                    socketProtocol: socketProtocol,
-                    decision: finalDecision,
+                    socketProtocol: describeSocketProtocol(flow.socketProtocolNumber),
+                    decision: decision,
                     isDNSQuery: flow.isDNSQuery,
                     originalHostname: flow.originalHostname
                 )
-
-                switch finalDecision {
-                case .allow:
-                    let inspectionNote: String
-                    if case .needsInspection = decision {
-                        inspectionNote = " (late metadata; inspection unavailable)"
-                    } else {
-                        inspectionNote = " (late metadata)"
-                    }
-                    os_log("NET[leash=%{public}d] %{public}@:%{public}d → %{public}@:%{public}@ (%{public}@ %{public}@) cwd=%{public}@ → ALLOW%{public}@",
-                           log: log, type: .default,
-                           info.leashPID,
-                           info.executablePath, flow.pid,
-                           flow.hostname, flow.port,
-                           flow.socketType, socketProtocol,
-                           info.cwd ?? "none",
-                           inspectionNote)
-                case .deny(let reason):
-                    os_log("NET[leash=%{public}d] %{public}@:%{public}d → %{public}@:%{public}@ (%{public}@ %{public}@) cwd=%{public}@ → DENY (late metadata): %{public}@",
-                           log: log, type: .default,
-                           info.leashPID,
-                           info.executablePath, flow.pid,
-                           flow.hostname, flow.port,
-                           flow.socketType, socketProtocol,
-                           info.cwd ?? "none",
-                           reason)
-                case .needsInspection:
-                    // This branch is unreachable because we coerce .needsInspection to .allow above.
-                    break
-                }
             }
         }
     }

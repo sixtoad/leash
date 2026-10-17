@@ -92,6 +92,20 @@ type DaemonHealth struct {
 	// FullDiskAccessAt is when that report arrived (RFC3339), or "" when
 	// nothing has been reported.
 	FullDiskAccessAt string `json:"full_disk_access_at,omitempty"`
+
+	// PolicyVersion is the version of the policy tables the extensions must
+	// enforce ("" before the first policy compiled).
+	PolicyVersion string `json:"policy_version,omitempty"`
+
+	// PolicyApplied are the connected components that acknowledged applying
+	// exactly PolicyVersion. A connected extension missing here is enforcing
+	// an older policy, or none.
+	PolicyApplied []string `json:"policy_applied"`
+
+	// TrackedPIDs are the processes the Endpoint Security extension reports as
+	// leashed: the set the network filter and the transparent proxy enforce
+	// for.
+	TrackedPIDs []int `json:"tracked_pids"`
 }
 
 // ParseFDA is the inverse of FDA.String. An unrecognised word is FDAUnknown

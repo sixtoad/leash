@@ -12,6 +12,8 @@ private enum CLIError: LocalizedError {
     case missingDirectoryValue
     case unknownOption(String)
     case executableNotFound(String)
+    case notStartedByLeash
+    case enforcementNotConfirmed
 
     var errorDescription: String? {
         switch self {
@@ -23,6 +25,10 @@ private enum CLIError: LocalizedError {
             return "Unrecognized option: \(option)."
         case .executableNotFound(let executable):
             return "Unable to locate executable '\(executable)' in PATH."
+        case .notStartedByLeash:
+            return "leashcli runs commands only for `leash --darwin exec`, which confirms enforcement first."
+        case .enforcementNotConfirmed:
+            return "leash did not confirm that this command is leashed; not running it."
         }
     }
 }
@@ -105,6 +111,24 @@ private func resolveExecutable(_ executable: String, env: [String: String]) -> S
     return nil
 }
 
+private func awaitGoAhead(_ environment: [String: String]) throws {
+    guard let text = environment["LEASH_START_FD"], let fd = Int32(text), fd > 2 else {
+        throw CLIError.notStartedByLeash
+    }
+    defer { close(fd) }
+    var received: [UInt8] = []
+    var buffer = [UInt8](repeating: 0, count: 16)
+    while received.count < 3 {
+        let n = read(fd, &buffer, buffer.count)
+        if n < 0 && errno == EINTR { continue }
+        if n <= 0 { break }
+        received.append(contentsOf: buffer[0..<n])
+    }
+    guard received.starts(with: Array("go".utf8)) else {
+        throw CLIError.enforcementNotConfirmed
+    }
+}
+
 private func runCommand(config: CLIConfig) throws -> Int32 {
     guard !config.command.isEmpty else {
         throw CLIError.missingCommand
@@ -118,10 +142,13 @@ private func runCommand(config: CLIConfig) throws -> Int32 {
         throw CLIError.executableNotFound(executable)
     }
 
-    // Give the Endpoint Security extension a brief moment to switch into AUTH mode
-    // before spawning the child. Without this pause, very short-lived commands can
-    // finish before the monitor subscribes.
-    Thread.sleep(forTimeInterval: 0.5)
+    // Wait for `leash --darwin exec` to confirm that the Endpoint Security
+    // extension tracks this process (and so everything it spawns) and that
+    // the extensions enforce the daemon's current policy. It writes "go" on
+    // the descriptor named by LEASH_START_FD, or closes it to refuse. This
+    // replaces a fixed half-second sleep that hoped the extension had
+    // switched to AUTH mode in time.
+    try awaitGoAhead(environment)
 
     var pid: pid_t = 0
     var attrs: posix_spawnattr_t?
@@ -142,6 +169,7 @@ private func runCommand(config: CLIConfig) throws -> Int32 {
     // Only injected when a CA file is actually present, and never overriding a value
     // the caller already set. See docs/MACOS-P1-PROXY.md.
     var env = environment
+    env.removeValue(forKey: "LEASH_START_FD")
     if let caPath = resolveLeashCACertPath(env: environment) {
         for key in caTrustEnvKeys where env[key] == nil {
             env[key] = caPath
@@ -185,7 +213,13 @@ private func runCommand(config: CLIConfig) throws -> Int32 {
     var status: Int32 = 0
     waitpid(pid, &status, 0)
 
-    let exitStatus = Int32((status >> 8) & 0xff)
+    // A command killed by a signal (including an exec Endpoint Security
+    // denied) is a failure, reported the shell's way as 128 + signal; it used
+    // to come out as exit 0.
+    let termSignal = status & 0x7f
+    let exitStatus: Int32 = termSignal != 0 && termSignal != 0x7f
+        ? 128 + termSignal
+        : Int32((status >> 8) & 0xff)
 
     if config.verbose {
         FileHandle.standardError.write(Data("[leashcli] command exited with status \(exitStatus)\n".utf8))

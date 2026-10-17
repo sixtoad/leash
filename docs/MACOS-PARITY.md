@@ -1,146 +1,81 @@
-# macOS enforcement parity roadmap
+# macOS enforcement parity
 
-Tracks the work to bring the macOS native path (`mac-leash/` Swift extensions +
-`internal/darwind/` Go daemon) up to parity with the Linux native enforcement
-feature set. Target: **full parity** (P0–P2).
+What the native macOS path (`mac-leash/` Swift extensions + `internal/darwind/`
+Go daemon) enforces compared with Linux, and what it does not. The rule this
+document holds the code to: **anything macOS cannot enforce must fail closed
+or be refused, never silently weaker.**
 
-## Architecture recap
+## Architecture
 
-macOS does not use the Linux per-command model (cgroup + netns + eBPF LSM +
-transparent proxy). Instead:
+- **`internal/darwind/`** (Go) runs the Cedar engine (the single decision
+  core), the Control UI/API and websocket hub on `127.0.0.1:18080`, the MITM
+  proxy on `127.0.0.1:18000` and the macsync state.
+- **Policy pipeline.** `policy.Manager` compiles the Cedar policy once; the
+  engine decides every userspace request (proxy, MCP) and
+  `transpiler.CompileKernel` produces the kernel tables. On macOS a
+  `macKernel` takes the place of `LSMManager`: `lsm.MacTablesFor` runs the
+  kernel loaders' own compilation and `macsync.CompileTables` sends the result
+  to the extensions as `mac.policy.tables`. A policy the extensions cannot
+  enforce as written fails like a kernel refusal and the previous policy stays
+  active everywhere.
+- **LeashES** (Endpoint Security) tracks leashcli and everything it forks or
+  execs, and decides exec, open and the file-system mutations from the tables.
+- **LeashNetworkFilter** (`NEFilterDataProvider`) decides every TCP/UDP flow
+  of a tracked PID from the connect table.
+- **LeashProxy** (`NETransparentProxyProvider`) relays tracked TCP flows to
+  the MITM proxy, which decides host names, MCP and header rewrites with the
+  engine.
+- The Swift matcher (`mac-leash/Shared/PolicyCore`) implements the four BPF
+  lookups (open index, mutation index, exec rules, connect rules) and nothing
+  else.
 
-- **`internal/darwind/`** (Go) — runs Cedar policy, the Control UI/API on `:18080`,
-  the WebSocket hub the Swift extensions connect to, and instantiates a
-  `MITMProxy` + `HeaderRewriter` + `policy.Manager` + `macsync.Manager`.
-- **LeashES** (Swift, Endpoint Security) — real `exec` authorization + file `open`
-  gate for leash-tracked processes.
-- **LeashNetworkFilter** (Swift, `NEFilterDataProvider`) — real L4 flow allow/drop
-  + SNI/DNS learning.
-- eBPF LSM is stubbed on darwin (`internal/lsm/stubs.go`); the Swift extensions
-  replace kernel enforcement.
-- Process tracking is **PID-lineage** based (`leashPID` label), not cgroup.
+## What is enforced
 
-### The structural hole
-
-Nothing routes workload traffic through the MITM proxy on macOS. `NEFilterDataProvider`
-can only allow/drop, not redirect; there is no `NETransparentProxyProvider` /
-`NEAppProxyProvider`, and `darwind`'s workload launch injects no `HTTP(S)_PROXY`
-or CA env. So the proxy (and everything built on it — header rewrite, secret
-injection, MCP enforcement, TLS MITM, L7 host policy) is constructed but off to the
-side. `preflight_extensions_darwin.go` states plainly: *"native macOS has no proxy
-fallback"* and it runs **UNENFORCED** by default.
-
-## Parity matrix
-
-| Capability | Linux | macOS today | Workstream |
+| Capability | Linux | macOS | Notes |
 |---|---|---|---|
-| Exec control | eBPF LSM, default-deny | LeashES AUTH_EXEC (real), default-**allow** | P0 |
-| File-open control | eBPF LSM, default-deny | LeashES AUTH_OPEN (real), default-allow | P0 |
-| Network L4 egress | eBPF LSM IP+port, default-deny | Real drop; **CIDR fixed**; default-allow; UDP only DNS | P0 |
-| Fail-closed posture | default-deny, `--require-lsm` | fail-open (warns, runs unenforced) | P0 |
-| Interactive decisions | daemon/UI | async-by-design (ES deadline forbids sync block-and-wait) | P0 ✓ |
-| L7 MITM proxy | transparent redirect + SO_ORIGINAL_DST | proxy exists in daemon, **not in path** | P1 |
-| TLS CA injection | internal CA + env vars | none | P1 |
-| Header rewrite / secret injection | proxy rewriter | not reachable (no proxy path) | P1 |
-| MCP tool-call enforcement | proxy mcp_observer | not reachable (no proxy path) | P1 |
-| DNS control | resolve-for-rules + annotate | observe-only, not enforced | P1 |
-| Secret broker (`--inject-service`) | generic hook; keychain fetch | not wired on mac | P2 |
-| cgroup/netns isolation | cgroup-v2 subtree + netns | none (PID-lineage only) | P2 |
-| Control-plane port isolation | netfilter REJECT leash port | weak | P2 |
-| Process hardening (caps/seccomp/ns) | harden_linux.go | none (different OS model) | P2 |
+| Startup without the enforcement layer | refuses (fail closed) | refuses: both extensions must be activated | no opt-out (`LEASH_REQUIRE_ENFORCEMENT` removed) |
+| Workload launch | after the LSM is attached | after ES, NE and the proxy are connected, ES and NE applied the daemon's current tables, and ES tracks leashcli | `leash --darwin exec` gate; leashcli runs nothing without the go-ahead |
+| Policy semantics | kernel tables from Cedar | the same tables, the same lookups | parity test: random strict policies, Go model of the Swift matcher == `cedar.Authorize`; vectors replayed against Swift |
+| File open, by mode (read / write) | eBPF `file_open` | ES `AUTH_OPEN` | exact, prefix and directory entries; longest prefix; forbid-overrides-permit via the compiled exceptions |
+| File creation | `file_open` of the new file | ES `AUTH_CREATE` (write open of the new file), `AUTH_TRUNCATE`, `AUTH_CLONE`, `AUTH_COPYFILE`, `AUTH_EXCHANGEDATA` | |
+| Directory mutations (mkdir, unlink, rmdir, rename, link) | mutation table | ES `AUTH_CREATE` (non-regular), `AUTH_UNLINK`, `AUTH_RENAME`, `AUTH_LINK` | same table, same over-denials |
+| Hard-link source must be readable | link guard | `AUTH_LINK` | |
+| Exec | eBPF `bprm_check_security` | ES `AUTH_EXEC` | exact and prefix rules, kernel length limits apply |
+| Network: IPv4, IPv6, ports, default deny | eBPF connect/sendmsg | NE content filter | hostnames resolved at load, IPv4-mapped decided as IPv4 |
+| DNS | a UDP flow like any other | the same | queries through the system resolver come from `mDNSResponder`, not the workload, as on any macOS process |
+| Host names, wildcards, MCP, header rewrite / secret injection | MITM proxy | MITM proxy via LeashProxy | HTTP/1.1 and HTTP/2 |
+| No policy / stale policy | kernel keeps the last policy; workload stopped if leashd exits | no tables → deny; daemon gone > 30 s → deny (ES and NE) | |
+| Extension restart mid-run | n/a | LeashES re-tracks still-running leashed PIDs from the daemon | |
+| Forked children | cgroup | ES `NOTIFY_FORK` | |
+| Processes left running after leashcli exits | stay in the cgroup | stay tracked until they exit | |
+| Control-plane isolation | netfilter REJECT of the leash ports | daemon listeners bound to loopback; connections from tracked PIDs refused (peer PID check); websocket clients cannot change rules; only the ES extension may report tracked PIDs | |
+| Leash's own state (policy file, CA key, daemon log) | outside the box | protected paths, denied for every open, mutation and exec | |
+| Policy file | inside the leash container | per-user state dir `0700`; ownership/permission checks; no `/tmp` (#12) | |
 
-## Workstreams
+## Gaps (documented, not hidden)
 
-### P0 — Make existing enforcement trustworthy
+- **Loopback.** The content filter never sees loopback flows, so a leashed
+  process can connect to other local services (a database on `localhost`)
+  whatever the connect policy says. Leash's own ports are guarded by the peer
+  PID check. On Linux the workload's loopback is its own network namespace.
+- **Unaddressed sockets** (#188). The content filter sees TCP and UDP only.
+  An unprivileged process cannot open packet or raw sockets on macOS; ICMP
+  datagram sockets are not filtered.
+- **Containment.** No cgroup or network namespace: enforcement follows the
+  PID lineage ES observes (exec and fork). A process the workload gets
+  another service to start (`launchctl`, `open -a`, an XPC service) is not
+  leashed. The macOS path suits a careless-but-trusted agent; run hostile code
+  in the container runtime.
+- **Process hardening** (seccomp, capabilities, namespaces): no macOS
+  equivalent is applied.
+- **Plugins** (`--inject-service`, authz sockets): refused in native macOS
+  mode; darwind serves no plugin authorization socket.
+- **Time-of-check.** ES decides opens and execs by path at the time of the
+  event, like the eBPF LSM.
 
-- [x] **CIDR matching** — `isIPInRange` was a stub returning `false`; now real IPv4/IPv6
-      prefix matching (`FilterDataProvider+RuleEvaluation.swift`).
-- [x] **Fail-closed default (LeashES, exec/file)** — `checkPolicyOrAllowDefault` now
-      default-denies on a rule-miss when connected + a policy snapshot is loaded
-      (`policyLoaded` flag guards the connect→first-snapshot window); degrades to
-      allow + log when daemon/policy unavailable. `LeashMonitor+Handlers.swift`,
-      `LeashCommunicationService(+Handlers).swift`.
-- [ ] **Fail-closed default (LeashNetworkFilter)** — `evaluateFlow` returns `.allow`
-      on no-match (`FilterDataProvider+RuleEvaluation.swift:321`). **Verified blocker:**
-      `Host::"*"` transpiles to `ConnectDefaultAllow=true` and emits *no* concrete
-      connect rule (`cedar_to_leash.go:125-146`), and `ConvertPolicyToMacRules`
-      (`macsync/translator.go`) never propagates that default — so the permissive
-      default policy yields an **empty** mac network rule set. A naive default-deny
-      would therefore brick fresh setups (every tracked flow denied). Implementation
-      required (cross-language, ~7 sites), all mapped:
-      1. `macsync/manager.go`: add `networkDefaultAllow bool` (init true) +
-         `SetNetworkDefaultAllow` / `GetNetworkDefaultAllow` (avoid changing
-         `UpdateNetworkRules` signature so no call-site/test churn).
-      2. `runtime_darwin.go`: at the policy push (~1317) call
-         `SetNetworkDefaultAllow(policies.ConnectDefaultAllow)`; include
-         `network_default_allow` in the query response (~926) and
-         `broadcastNetworkRuleUpdate` (~1114) payload maps.
-      3. Swift `FilterDataProvider+State.swift`: parse `network_default_allow`
-         (default **true** if absent, for backward safety) + a `networkRulesLoaded`
-         flag; store both under `syncQueue`.
-      4. Swift `evaluateFlow`: on no-match — always `.allow` if `isDNSQuery` (DNS is
-         plumbing, not the enforcement point, mirroring Linux); else `.allow` if
-         `networkDefaultAllow`; else `.deny` only when connected + `networkRulesLoaded`
-         (same gating as LeashES); otherwise `.allow` (degrade).
-      Runtime-verify in the VM: DNS still resolves, permissive policy still allows,
-      tightened policy (remove `Host::"*"`) denies unmatched flows.
-- [x] **Interactive decisions — resolved as async-by-design.** ES `AUTH_EXEC`/`AUTH_OPEN`
-      handlers must answer before the kernel message **deadline** (very tight and
-      high-frequency for `AUTH_OPEN`); blocking the handler on a websocket round-trip —
-      let alone a human prompt taking seconds — would blow the deadline and get the ES
-      client killed. So the filter responds immediately from cached policy (now
-      default-deny once loaded) and emits the event to the daemon; a human decision
-      becomes a rule that governs *future* events. Synchronous block-and-wait is not
-      viable on macOS ES; async-with-caching is the correct model.
-- [x] **Domain persistence** — `persistResolvedDomains()` / `reloadResolvedDomains()`
-      implemented (best-effort JSON at `Application Support/<bundle>/resolved-domains.json`,
-      off the hot path, expired entries dropped, gaps-only restore on startup). Silent
-      no-op on any I/O failure (== prior behavior), so no downside.
-- [x] **`queryTrackedPIDs`** — removed (dead code, zero callers; tracked PIDs arrive via
-      the `mac.pid.sync` broadcast).
-- [ ] **Require-enforcement hard-fail into the extension** — the "if required, fail"
-      half. Env doesn't reach the system extension, and after the fail-closed fixes the
-      extensions already deny once policy is loaded; this only governs the
-      never-connected-daemon window. Needs app↔extension shared state (app group, or a
-      shared file with a user→root write/read permission story) **plus VM runtime
-      testing** — scoped as a follow-up, not half-built. `preflight_extensions_darwin.go`
-      already handles the launch-time gate.
-- [ ] **NEMachServiceName caveat** (issue #19) — empty team prefix under ad-hoc; verify
-      the network filter registers in the VM, mitigate if not. (VM-only.)
+## Validation
 
-### P1 — The L7 proxy layer (highest capability payoff)
-
-- [ ] **Transparent proxy provider** — add a `NETransparentProxyProvider` (new system
-      extension target, or convert the filter) that redirects leash-tracked TCP flows
-      into `darwind`'s existing `MITMProxy`. This single piece unlocks the four items
-      below, whose Go backends already exist.
-      - Alternative/interim: inject `HTTP(S)_PROXY` env from `leashcli` (works only for
-        proxy-respecting clients, not transparent).
-- [ ] **CA trust injection** — export the leash CA to the workload (env vars
-      `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` / `CURL_CA_BUNDLE` / …) from `leashcli`,
-      mirroring the Linux launcher. Enables TLS MITM.
-- [ ] **Header rewrite / secret injection** — once traffic traverses the proxy, wire
-      `HeaderRewriter` through on mac (backend done in `internal/proxy/rewriter.go`).
-- [ ] **MCP tool-call enforcement** — same; backend `internal/proxy/mcp_observer.go`.
-- [ ] **DNS enforcement** — stop skipping DNS-query flows in `evaluateFlow`; drop
-      queries to denied domains (or enforce at the proxy/resolver).
-
-### P2 — Containment & secrets
-
-- [ ] **Secret broker** — wire `--inject-service` on macOS (bind a helper's unix
-      socket into the workload env); `keychain_darwin.go` already fetches from Keychain.
-- [ ] **Containment story** — macOS has no cgroup/netns equivalent. Decide the
-      accepted containment model (PID-lineage + system-extension scoping) and document
-      the residual gap honestly.
-- [ ] **Control-plane isolation** — block workload access to the `:18080` daemon port
-      via the network filter (mac analog of the netfilter REJECT).
-- [ ] **Process hardening** — evaluate the macOS analog (App Sandbox profile / limited
-      entitlements for the launched workload); likely partial vs Linux seccomp/ns.
-
-## Notes
-
-- Local dev/build/run of the extensions: see `docs/MACOS-DEV.md` (ad-hoc signing,
-  SIP/AMFI-relaxed VM). Gate the VM with `mac-leash/devtools/esprobe/run.sh`.
-- Policy authoring is Cedar (shared with Linux, served by `darwind`); the Swift
-  extensions are clients of the daemon rule snapshot — there is no mac-side config
-  file today.
+- Unit: `go test ./internal/macsync ./internal/darwind ./internal/lsm`,
+  `swift test --package-path mac-leash`; CI builds the app and all extensions.
+- VM: the SIP/AMFI-relaxed validation VM (`docs/MACOS-VM-VALIDATION.md`,
+  `.claude/skills/leash-macos-vm`).

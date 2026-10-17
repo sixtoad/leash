@@ -36,6 +36,12 @@ func darwinHealthHandler(snapshot func() macext.DaemonHealth) http.HandlerFunc {
 			// will eventually handle one of them wrong.
 			health.Components = []string{}
 		}
+		if health.PolicyApplied == nil {
+			health.PolicyApplied = []string{}
+		}
+		if health.TrackedPIDs == nil {
+			health.TrackedPIDs = []int{}
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		if err := json.NewEncoder(w).Encode(health); err != nil {
 			log.Printf("failed to encode darwin health: %v", err)

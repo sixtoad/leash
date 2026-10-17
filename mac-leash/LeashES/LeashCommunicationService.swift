@@ -1,98 +1,107 @@
 import Foundation
 import os.log
 
+/// The Endpoint Security extension's link to the daemon: it receives the
+/// policy tables, answers every decision from them, and reports events.
 final class LeashCommunicationService: NSObject {
     let log = OSLog(subsystem: LeashIdentifiers.bundle, category: "communication")
     let daemon = DaemonSync.shared
     let queue = DispatchQueue(label: LeashIdentifiers.namespaced("communication"))
-    var eventCache: [UUID: LeashPolicyEvent] = [:]
-    var eventOrder: [UUID] = []
-    let cacheLimit = 200
     weak var monitor: LeashMonitor?
 
-    var cachedRules: [LeashPolicyRule] = []
-    let rulesQueue = DispatchQueue(label: LeashIdentifiers.namespaced("rules-cache"))
+    /// The tables this extension enforces; nil until the daemon delivered a
+    /// version this build can apply. Guarded by `matcherLock` so ES handlers
+    /// can read it without hopping queues (they must answer before the
+    /// message deadline).
+    private var matcher: LeashPolicyMatcher?
+    private let matcherLock = NSLock()
 
-    // True once we've received an authoritative rule snapshot from the daemon.
-    // Until then a rule-miss must not fail closed (we simply don't have policy yet).
-    private var policyLoaded = false
-
-    /// Whether the daemon has delivered a policy snapshot at least once.
-    var hasLoadedPolicy: Bool {
-        rulesQueue.sync { policyLoaded }
-    }
-
-    /// Mark policy as loaded. Precondition: caller is already on `rulesQueue`
-    /// (used from the rule snapshot/clear/load sites, which mutate cachedRules there).
-    func markPolicyLoadedLocked() {
-        policyLoaded = true
-    }
+    /// How long the extension keeps enforcing its last tables after the daemon
+    /// connection drops. After that every decision for a leashed process is a
+    /// deny: the policy may have changed since, and the daemon going away must
+    /// not leave the workload running on a policy nobody can update (on Linux
+    /// the workload is stopped when leashd exits).
+    let daemonLossGrace: TimeInterval = 30
 
     override init() {
         super.init()
-
-        daemon.subscribe(to: "mac.policy.decision") { [weak self] payload in
-            self?.handlePolicyDecisionNotification(payload)
+        daemon.subscribe(to: "mac.policy.tables") { [weak self] payload in
+            self?.applyTables(payload)
         }
-
-        // Subscribe to rule management messages
-        daemon.subscribe(to: "mac.rule.add") { [weak self] payload in
-            self?.handleRuleAddNotification(payload)
-        }
-
-        daemon.subscribe(to: "mac.rule.remove") { [weak self] payload in
-            self?.handleRuleRemoveNotification(payload)
-        }
-
-        daemon.subscribe(to: "mac.rule.clear") { [weak self] _ in
-            self?.handleClearRulesNotification()
-        }
-
-        daemon.subscribe(to: "mac.rule.snapshot") { [weak self] payload in
-            self?.handleRuleSnapshotNotification(payload)
+        // The daemon replays the tracked set on every hello; after a restart
+        // this is how the extension picks up a workload that is still running.
+        daemon.subscribe(to: "mac.pid.sync") { [weak self] payload in
+            self?.monitor?.restoreTrackedPIDs(payload)
         }
     }
 
     func start() {
         os_log("Communication service started (using WebSocket)", log: self.log, type: .info)
-        bootstrapState()
-    }
-
-    func checkCachedPolicy(_ event: LeashPolicyEvent) -> LeashPolicyDecision.Action? {
-        var matchingAction: LeashPolicyDecision.Action?
-        rulesQueue.sync {
-            for rule in cachedRules {
-                if rule.matches(event) {
-                    matchingAction = rule.action
-                    break
-                }
+        daemon.queryPolicyTables { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let payload):
+                self.applyTables(payload)
+            case .failure(let error):
+                os_log("Failed to query policy tables: %{public}@ (they arrive on the next hello)",
+                       log: self.log, type: .error, String(describing: error))
             }
         }
-
-        if let action = matchingAction {
-            os_log("Policy match found: %{public}@ → %{public}@",
-                   log: log, type: .debug,
-                   event.processPath,
-                   action == .allow ? "ALLOW" : "DENY")
-        }
-
-        return matchingAction
     }
 
-    func logEvent(_ event: LeashPolicyEvent, decision: LeashPolicyDecision.Action) {
+    /// Replaces the enforced tables. Tables this build cannot apply leave the
+    /// extension with none, so it denies, and the refusal is reported: keeping
+    /// the previous tables would enforce a policy the daemon no longer has.
+    func applyTables(_ payload: [String: Any]) {
+        let version = payload["version"] as? String ?? ""
+        do {
+            let tables = try LeashPolicyTables.decode(from: payload)
+            let next = try LeashPolicyMatcher(tables: tables)
+            matcherLock.lock()
+            let previous = matcher?.version
+            matcher = next
+            matcherLock.unlock()
+            if previous != next.version {
+                os_log("Applied policy tables %{public}@ (exec rules=%d file entries=%d)",
+                       log: log, type: .default, next.version,
+                       tables.exec.rules.count, tables.file.exact.count + tables.file.prefix.count)
+            }
+            daemon.sendPolicyApplied(version: next.version)
+        } catch {
+            matcherLock.lock()
+            matcher = nil
+            matcherLock.unlock()
+            os_log("REFUSED policy tables %{public}@: %{public}@; denying leashed operations until usable tables arrive",
+                   log: log, type: .fault, version, String(describing: error))
+            daemon.sendPolicyApplied(version: version, error: String(describing: error))
+        }
+    }
+
+    /// The matcher to decide with, or the reason there is none.
+    func currentMatcher() -> (LeashPolicyMatcher?, String) {
+        matcherLock.lock()
+        let m = matcher
+        matcherLock.unlock()
+        guard let m else {
+            return (nil, "no policy tables from the leash daemon")
+        }
+        if !daemon.isConnected, let since = daemon.disconnectedSince,
+           Date().timeIntervalSince(since) > daemonLossGrace {
+            return (nil, "leash daemon connection lost; policy may be stale")
+        }
+        return (m, "")
+    }
+
+    func logEvent(_ event: LeashPolicyEvent, decision: LeashPolicyDecision.Action, reason: String? = nil) {
         queue.async { [weak self] in
             guard let self else { return }
 
-            self.cacheEvent(event)
-
-            // Send policy event to daemon
             self.daemon.sendPolicyEvent(event) { error in
                 if let error {
                     os_log("Failed to send policy event: %{public}@", log: self.log, type: .error, String(describing: error))
                 }
             }
 
-            // Also send telemetry event
             var details: [String: String] = [
                 "process_path": event.processPath,
                 "pid": String(event.pid),
@@ -128,6 +137,9 @@ final class LeashCommunicationService: NSObject {
             if let leashTTY = event.leashTTYPath {
                 details["leash_tty"] = leashTTY
             }
+            if let reason {
+                details["reason"] = reason
+            }
             let eventName: String
             switch event.kind {
             case .processExec:
@@ -136,53 +148,29 @@ final class LeashCommunicationService: NSObject {
                 let fileOperation = event.fileOperation ?? .open
                 details["operation"] = fileOperation.rawValue
                 switch fileOperation {
-                case .create, .write:
+                case .create, .write, .truncate:
                     eventName = "file.open:rw"
                 case .open:
                     eventName = "file.open"
+                case .mkdir, .unlink, .rename, .link, .clone:
+                    eventName = "file.mutation"
                 }
             }
 
-            let severity = decision == .allow ? "info" : "warning"
-            if decision == .deny {
-                details["action"] = "deny"
-            } else {
-                details["action"] = "allow"
-            }
+            details["action"] = decision == .allow ? "allow" : "deny"
 
             self.daemon.sendEvent(
                 name: eventName,
                 details: details,
-                severity: severity,
+                severity: decision == .allow ? "info" : "warning",
                 source: "leash.es",
                 ruleID: nil
             )
-
-            os_log("Logged event [leash=%{public}d]: %{public}@ (%{public}@)", log: self.log, type: .default, event.leashPid ?? -1, event.processPath, decision == .allow ? "ALLOW" : "DENY")
         }
     }
 
     func pushTrackedPIDs(_ entries: [DaemonSync.PIDEntry]) {
         daemon.sendTrackedPIDs(entries)
         os_log("Synced %{public}d tracked PIDs", log: self.log, type: .info, entries.count)
-    }
-
-    private func bootstrapState() {
-        os_log("Bootstrapping state with daemon", log: log, type: .info)
-
-        // Query initial rules from daemon
-        daemon.queryRules { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success(let rules):
-                self.rulesQueue.async {
-                    self.cachedRules = rules.sorted(by: Self.ruleSortComparator)
-                    self.markPolicyLoadedLocked()
-                    os_log("Loaded %d rules from daemon", log: self.log, type: .info, rules.count)
-                }
-            case .failure(let error):
-                os_log("Failed to load rules from daemon: %{public}@", log: self.log, type: .error, String(describing: error))
-            }
-        }
     }
 }

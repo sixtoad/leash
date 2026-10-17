@@ -234,6 +234,11 @@ jobs:
           xcodebuild -version
           xcrun --sdk macosx --show-sdk-version
 
+      # The ES/NE policy matcher, replaying the Go parity vectors
+      # (internal/macsync parity_test.go) against the Swift code.
+      - name: swift test (policy matcher)
+        run: swift test --package-path mac-leash
+
       - name: Resolve Swift packages
         run: xcodebuild -resolvePackageDependencies -project mac-leash/Leash.xcodeproj -scheme Leash -derivedDataPath "$RUNNER_TEMP/dd"
 

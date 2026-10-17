@@ -8,6 +8,40 @@ Claude Code handling on top.
 
 ## [Unreleased]
 
+### Security — macOS enforces the Linux kernel tables
+- The macOS extensions now enforce exactly the tables the eBPF LSM enforces,
+  compiled from the Cedar policy by the same code (`lsm.MacTablesFor`) and
+  sent as `mac.policy.tables`; the Swift matcher implements the kernel's
+  lookups. Before, the translation lost the open mode (a read-only permit
+  allowed writes, a write forbid blocked reads), ordered file rules before
+  directory rules (a permit nested under a forbid was ignored), dropped
+  connect ports (`Host::"10.0.0.2:443"` allowed every port), never passed the
+  connect default (the content filter allowed everything unmatched) and
+  matched any IP to the first domain rule it saw.
+- Parity is tested: random strict policies decided by a Go model of the Swift
+  matcher equal `cedar.Authorize` (2500 sets, ~800,000 decisions); the same
+  vectors are replayed against the Swift code (`swift test --package-path
+  mac-leash`, in CI).
+- LeashES also decides file creation (`AUTH_CREATE`, `AUTH_TRUNCATE`,
+  `AUTH_CLONE`, `AUTH_COPYFILE`, `AUTH_EXCHANGEDATA`) and the directory
+  mutations (`AUTH_UNLINK`, `AUTH_RENAME`, `AUTH_LINK`, mkdir): new files used
+  to be created anywhere.
+- No policy, a refused policy, or a daemon gone for more than 30 s is a deny
+  for leashed operations (ES and NE). `leash --darwin exec` runs a command
+  only once ES, NE and the transparent proxy are connected, ES and NE applied
+  the daemon's current tables and ES tracks leashcli (it no longer needs a
+  terminal to be tracked, and leashcli no longer sleeps and hopes).
+- Forked children are tracked (`NOTIFY_FORK`); processes left running after
+  leashcli exits stay tracked; a restarted LeashES re-tracks running ones.
+- Leash's own state (state directory, CA key, policy file) is denied to the
+  workload whatever the policy says, and the daemon's listeners refuse
+  connections from leashed processes (the content filter never sees
+  loopback). Only the ES extension may report tracked PIDs.
+- A policy that names a path macOS only reaches as `/private/...` fails to
+  load on macOS instead of silently never matching.
+- leashcli reports a command killed by a signal (an exec ES denied) as
+  128 + signal instead of exit 0.
+
 ### Changed — native macOS refuses to start without its extensions
 - `leash --darwin exec` and the darwin daemon now **refuse to start** unless
   both the Endpoint Security and the Network Filter system extensions are

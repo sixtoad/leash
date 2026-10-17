@@ -7,7 +7,10 @@ import Darwin
 class FilterDataProvider: NEFilterDataProvider {
     let log = OSLog(subsystem: LeashIdentifiers.bundle, category: "network-filter")
     var trackedPIDs: [pid_t: TrackedPIDInfo] = [:]
-    var networkRules: [NetworkRule] = []
+    /// The daemon's policy tables (nil until a usable version arrives), and
+    /// why the last version was refused. Guarded by `syncQueue`.
+    var policyTables: LeashPolicyMatcher?
+    var tablesRefusal: String?
     let syncQueue = DispatchQueue(label: LeashIdentifiers.namespaced("filter.sync"))
     let persistenceQueue = DispatchQueue(label: LeashIdentifiers.namespaced("filter.persistence"), qos: .utility)
     let daemon = DaemonSync.shared
@@ -24,7 +27,6 @@ class FilterDataProvider: NEFilterDataProvider {
             .appendingPathComponent("resolved-domains.json")
     }()
     var domainResolutionCache: [String: DomainResolution] = [:]
-    var pendingInspections: [ObjectIdentifier: PendingInspectionState] = [:]
     var pendingDNSInspections: [ObjectIdentifier: DNSInspectionState] = [:]
     var pendingFlowsByPID: [pid_t: [QueuedFlow]] = [:]
     let maxPendingFlowsPerPID = 16
@@ -33,13 +35,9 @@ class FilterDataProvider: NEFilterDataProvider {
     var flowDelayEnabled = false
     var flowDelayRange: ClosedRange<TimeInterval>?
 
-    /// Fail-closed state (#62). `rulesAreAuthoritative` distinguishes "the daemon
-    /// says there are no matching rules" from "no policy ever arrived" — without
-    /// it a provider that never reached the daemon looks exactly like an empty
-    /// allow-all policy. Guarded by `syncQueue`; see
-    /// FilterDataProvider+PolicyAvailability. (How long the daemon has been gone
-    /// is owned by DaemonSync, which stamps the actual moment of the drop.)
-    var rulesAreAuthoritative = false
+    /// Fail-closed state (#62); see FilterDataProvider+PolicyAvailability.
+    /// (How long the daemon has been gone is owned by DaemonSync, which stamps
+    /// the actual moment of the drop.)
     var failClosedEngaged = false
     var filterStartTime = Date()
     let policyStartupGrace: TimeInterval = 15
@@ -65,18 +63,6 @@ class FilterDataProvider: NEFilterDataProvider {
         let executablePath: String
         let ttyPath: String?
         let cwd: String?
-    }
-
-    struct PendingInspectionState {
-        var pidInfo: TrackedPIDInfo
-        var pid: pid_t
-        var originalHostname: String
-        var port: String
-        var socketType: String
-        var socketProtocolName: String
-        var socketProtocolNumber: Int32
-        var direction: NETrafficDirection
-        var buffer: Data
     }
 
     struct DNSInspectionState {
@@ -108,7 +94,7 @@ class FilterDataProvider: NEFilterDataProvider {
         // actually starts, not at object construction.
         syncQueue.sync {
             filterStartTime = Date()
-            rulesAreAuthoritative = false
+            policyTables = nil
             failClosedEngaged = false
         }
 
@@ -118,11 +104,11 @@ class FilterDataProvider: NEFilterDataProvider {
 
         refreshRuntimeConfiguration(reason: "startup")
 
-        daemon.subscribe(to: "mac.network_rule.update") { [weak self] payload in
-            self?.handleNetworkRuleBroadcast(payload)
+        daemon.subscribe(to: "mac.policy.tables") { [weak self] payload in
+            self?.applyTables(payload)
         }
 
-        reloadNetworkRules()
+        reloadPolicyTables()
         reloadResolvedDomains()
 
         completionHandler(nil)
@@ -133,10 +119,7 @@ class FilterDataProvider: NEFilterDataProvider {
 
         syncQueue.sync {
             trackedPIDs.removeAll()
-            networkRules.removeAll()
-            // The rules we just dropped must not be treated as an authoritative
-            // empty policy if the provider is started again.
-            rulesAreAuthoritative = false
+            policyTables = nil
         }
 
         completionHandler()

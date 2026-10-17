@@ -58,7 +58,7 @@ final class DaemonSync: NSObject {
     let sessionID = UUID().uuidString
     var shimID = UUID().uuidString
 
-    var capabilities: [String] = ["pid-sync", "rule-sync", "event", "policy", "network-rules"]
+    var capabilities: [String] = ["pid-sync", "event", "policy", LeashPolicyTables.supportedSemantics]
     /// Which leash process this connection belongs to; reported in client.hello
     /// so the daemon (and the app's health check) can name a missing extension.
     var component: String = LeashIdentifiers.component
@@ -155,63 +155,6 @@ final class DaemonSync: NSObject {
             case ttyPath = "tty_path"
             case cwd
             case description
-        }
-    }
-
-    struct RuleSet: Encodable, Sendable {
-        struct FileRule: Encodable, Sendable {
-            let id: String
-            let action: String
-            let executable: String
-            let directory: String?
-            let file: String?
-            let kind: String?
-        }
-
-        struct ExecRule: Encodable, Sendable {
-            let id: String
-            let action: String
-            let executable: String
-            let argsHash: String?
-
-            enum CodingKeys: String, CodingKey {
-                case id
-                case action
-                case executable
-                case argsHash = "args_hash"
-            }
-        }
-
-        struct NetworkRule: Encodable, Sendable {
-            let id: String
-            let name: String?
-            let targetType: String
-            let targetValue: String
-            let action: String
-            let cwd: String?
-            let enabled: Bool
-
-            enum CodingKeys: String, CodingKey {
-                case id
-                case name
-                case targetType = "target_type"
-                case targetValue = "target_value"
-                case action
-                case cwd
-                case enabled
-            }
-        }
-
-        let fileRules: [FileRule]
-        let execRules: [ExecRule]
-        let networkRules: [NetworkRule]
-        let version: String
-
-        enum CodingKeys: String, CodingKey {
-            case fileRules = "file_rules"
-            case execRules = "exec_rules"
-            case networkRules = "network_rules"
-            case version
         }
     }
 

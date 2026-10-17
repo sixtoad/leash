@@ -39,7 +39,24 @@ const (
 	// extensions (payload {"enabled": bool}). Gated by LEASH_MAC_DEBUG on the
 	// daemon; toggling it is a daemon restart, no extension re-activation.
 	TypeMacDebug = "mac.debug"
+
+	// TypeMacPolicyTables carries the policy the extensions enforce, daemon to
+	// extension (payload: macsync.MacPolicyTables), on every hello and every
+	// policy change. TypeMacPolicyTablesQuery asks for it (response payload
+	// {"tables": ...}). TypeMacPolicyApplied is the extension's answer
+	// (MacPolicyAppliedPayload): `leash --darwin exec` starts a workload only
+	// once the ES and NE extensions applied the current version.
+	TypeMacPolicyTables      = "mac.policy.tables"
+	TypeMacPolicyTablesQuery = "mac.policy.tables.query"
+	TypeMacPolicyApplied     = "mac.policy.applied"
 )
+
+// MacPolicyAppliedPayload acknowledges a TypeMacPolicyTables version: applied
+// when Error is empty, refused (the extension now denies) otherwise.
+type MacPolicyAppliedPayload struct {
+	Version string `json:"version"`
+	Error   string `json:"error,omitempty"`
+}
 
 // DecisionType represents an allow/deny decision for a flow.
 type DecisionType string

@@ -145,13 +145,28 @@ Examples:
 
 ## Known Limitations
 
-- No HTTP header injection or rewrite on macOS: the local MITM proxy is not launched; enforcement is via the Network Extension only.
-- MCP logging is not emitted on macOS today.
-- IP range (CIDR) matching is not implemented yet; hostnames and single IPs are supported.
-- Default network behavior is fail‑open for flows missing PID metadata; enable “Enforce rules for untracked processes” in Settings to evaluate them.
-- `leash --darwin exec …` expects the companion CLI at `/Applications/Leash.app/Contents/Resources/leashcli`; moving the app can break launches.
+What macOS enforces, and what it cannot, is listed in
+[MACOS-PARITY.md](MACOS-PARITY.md). In short:
+
+- The extensions enforce the same tables the Linux eBPF LSM does (file opens
+  by mode, file creation and directory mutations, exec, IPv4/IPv6 connections
+  with ports, default deny); host names, MCP and header rewrites go through
+  the MITM proxy, as on Linux.
+- `leash --darwin exec` runs the command only once all three extensions are
+  connected, the ES and NE extensions enforce the daemon's current policy, and
+  the ES extension tracks leashcli. It waits up to a minute, then refuses.
+- Loopback connections are not filtered (the content filter never sees them);
+  leash's own ports refuse leashed clients.
+- A policy that names `/private/tmp`, `/private/etc` or `/private/var` (or a
+  prefix that only reaches them that way) fails to load on macOS: name `/tmp`,
+  `/etc`, `/var`.
+- Flows of processes leash did not start are only evaluated when “Enforce
+  rules for untracked processes” is enabled in Settings (experimental).
+- `leash --darwin exec …` expects the companion CLI at
+  `/Applications/Leash.app/Contents/Resources/leashcli`; leashcli runs commands
+  only for `leash --darwin exec`.
 - Requires macOS 14+ for extension activation.
-- Only supports connecting to the server at `localhost:18080`
+- The extensions connect to the daemon at `127.0.0.1:18080` only.
 
 ## Enforcement preflight (native mode)
 

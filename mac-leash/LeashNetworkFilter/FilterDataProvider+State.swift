@@ -77,47 +77,46 @@ extension FilterDataProvider {
         }
     }
 
-    func reloadNetworkRules() {
-        daemon.queryNetworkRules { [weak self] result in
+    func reloadPolicyTables() {
+        daemon.queryPolicyTables { [weak self] result in
             guard let self else { return }
             switch result {
-            case .success(let loaded):
-                self.applyNetworkRules(loaded)
+            case .success(let payload):
+                self.applyTables(payload)
             case .failure(let error):
-                os_log("Failed to query network rules: %{public}@", log: self.log, type: .error, String(describing: error))
+                os_log("Failed to query policy tables: %{public}@ (they arrive on the next hello)",
+                       log: self.log, type: .error, String(describing: error))
             }
         }
     }
 
-    func handleNetworkRuleBroadcast(_ payload: [String: Any]) {
-        guard let rulesData = payload["rules"] as? [[String: Any]] else { return }
-        let decoded = rulesData.compactMap { NetworkRule.fromDictionary($0) }
-        applyNetworkRules(decoded)
-    }
-
-    /// Applies a rule set received from the daemon. Every caller is daemon-sourced
-    /// (initial query or broadcast), so this is also the point where the policy
-    /// becomes authoritative and fail-closed can lift.
-    func applyNetworkRules(_ loaded: [NetworkRule]) {
-        markRulesAuthoritative()
-        syncQueue.async {
-            if loaded.count != self.networkRules.count {
-                os_log("Network rules updated: %{public}d → %{public}d rules",
-                       log: self.log, type: .default,
-                       self.networkRules.count, loaded.count)
-
-                for rule in loaded where rule.enabled {
-                    let cwdInfo = rule.currentWorkingDirectory.map { " [cwd: \($0)]" } ?? ""
-                    os_log("   Rule: %{public}@ %{public}@ (%{public}@)%{public}@",
-                           log: self.log, type: .default,
-                           rule.action.rawValue.uppercased(),
-                           rule.target.displayValue,
-                           rule.target.typeString,
-                           cwdInfo)
-                }
+    /// Replaces the enforced tables (from the initial query or a daemon push)
+    /// and acknowledges them. Tables this build cannot apply leave the filter
+    /// with none, so leashed flows are denied, and the refusal is reported.
+    func applyTables(_ payload: [String: Any]) {
+        let version = payload["version"] as? String ?? ""
+        do {
+            let tables = try LeashPolicyTables.decode(from: payload)
+            let matcher = try LeashPolicyMatcher(tables: tables)
+            var previous: String?
+            syncQueue.sync {
+                previous = self.policyTables?.version
+                self.policyTables = matcher
+                self.tablesRefusal = nil
             }
-
-            self.networkRules = loaded
+            if previous != matcher.version {
+                os_log("Applied network policy tables %{public}@: %{public}d rules, default %{public}@",
+                       log: log, type: .default, matcher.version,
+                       tables.network.rules.count, tables.network.defaultAllow ? "allow" : "deny")
+            }
+            daemon.sendPolicyApplied(version: matcher.version)
+        } catch {
+            syncQueue.sync {
+                self.policyTables = nil
+                self.tablesRefusal = "policy tables refused: \(error)"
+            }
+            os_log("REFUSED policy tables %{public}@: %{public}@", log: log, type: .fault, version, String(describing: error))
+            daemon.sendPolicyApplied(version: version, error: String(describing: error))
         }
     }
 

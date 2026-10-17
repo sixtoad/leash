@@ -14,57 +14,54 @@ extension FilterDataProvider {
 //
 // Scope is deliberately narrow: only flows that reach evaluateFlow — tracked
 // PIDs, or every process when system-wide enforcement is on — are affected.
-// With system-wide enforcement off and no tracked PIDs the filter has nothing
-// in scope, so this changes nothing. Local-scope destinations stay exempt so
-// the control plane (extension → daemon websocket, proxy → local MITM listener)
-// can always reconnect and lift the condition.
+// Leash's own processes (the extensions' websocket to darwind, the proxy's
+// relay to the local MITM listener) are never leashed, so they always
+// reconnect and lift the condition. Processes the filter merely inferred keep
+// loopback and link-local while policy is unavailable; a leashed process does
+// not.
 
-    enum PolicyAvailability {
-        case available
-        case unavailable(reason: String)
-    }
-
-    /// Whether the filter currently holds a policy it can enforce.
+    /// The tables to decide with, or why there are none.
     ///
-    /// Two grace windows keep transients from cutting traffic: `policyStartupGrace`
-    /// covers the gap between the provider starting and its first rule delivery,
-    /// and `policyDisconnectGrace` covers websocket reconnect churn (the daemon
-    /// re-pushes network rules on every hello, so a quick reconnect refreshes the
-    /// policy on its own).
-    func policyAvailability(now: Date = Date()) -> PolicyAvailability {
+    /// `strictScope` is true for a leashed process: no tables means deny at
+    /// once, because `leash --darwin exec` only starts a workload after this
+    /// filter applied the daemon's current tables, so a missing table set is
+    /// a real failure, not a startup race. Processes the filter only inferred
+    /// (system-wide enforcement) get the old startup grace.
+    ///
+    /// A daemon gone for longer than `policyDisconnectGrace` also leaves the
+    /// filter without usable tables: the policy may have changed since.
+    func policyMatcher(strictScope: Bool, now: Date = Date()) -> (LeashPolicyMatcher?, String) {
         let connected = daemon.isConnected
         let disconnectedSince = daemon.disconnectedSince
 
-        var result: PolicyAvailability = .available
+        var matcher: LeashPolicyMatcher?
+        var reason = ""
         var transition: (engaged: Bool, reason: String)?
 
         syncQueue.sync {
-            if !rulesAreAuthoritative {
-                if now.timeIntervalSince(filterStartTime) > policyStartupGrace {
-                    result = .unavailable(reason: "no network policy received from the leash daemon")
+            matcher = policyTables
+            if matcher == nil {
+                if strictScope || now.timeIntervalSince(filterStartTime) > policyStartupGrace {
+                    reason = tablesRefusal ?? "no network policy received from the leash daemon"
+                } else {
+                    reason = "starting"
                 }
             } else if !connected, let since = disconnectedSince,
                       now.timeIntervalSince(since) > policyDisconnectGrace {
-                result = .unavailable(reason: "leash daemon connection lost; network policy is stale")
+                matcher = nil
+                reason = "leash daemon connection lost; network policy is stale"
             }
 
-            switch result {
-            case .available:
-                if failClosedEngaged {
-                    failClosedEngaged = false
-                    transition = (false, "")
-                }
-            case .unavailable(let reason):
-                if !failClosedEngaged {
-                    failClosedEngaged = true
-                    transition = (true, reason)
-                }
+            let unavailable = matcher == nil && reason != "starting"
+            if unavailable != failClosedEngaged {
+                failClosedEngaged = unavailable
+                transition = (unavailable, reason)
             }
         }
 
         if let transition {
             if transition.engaged {
-                os_log("FAIL-CLOSED: %{public}@. In-scope flows will be denied until policy is restored (local-scope destinations stay allowed).",
+                os_log("FAIL-CLOSED: %{public}@. Flows of leashed processes are denied until policy is restored.",
                        log: log, type: .fault, transition.reason)
             } else {
                 os_log("Fail-closed lifted: network policy is authoritative again.",
@@ -72,23 +69,12 @@ extension FilterDataProvider {
             }
         }
 
-        return result
-    }
-
-    /// Record that the current rule set came from the daemon, so the filter can
-    /// tell "policy says allow" apart from "policy never arrived".
-    func markRulesAuthoritative() {
-        var engaged = false
-        syncQueue.sync {
-            rulesAreAuthoritative = true
-            engaged = failClosedEngaged
+        if matcher == nil && reason == "starting" {
+            // Inferred processes during startup: no decision yet; the caller
+            // applies its local-scope exemption and otherwise denies.
+            return (nil, "network policy not received yet")
         }
-        if engaged {
-            // Availability (and the lift log) is recomputed on the next flow;
-            // note the delivery here so the daemon log shows the recovery point.
-            os_log("Network policy delivered while fail-closed was engaged.",
-                   log: log, type: .default)
-        }
+        return (matcher, reason)
     }
 
     /// Destinations that stay allowed even when policy is unavailable.

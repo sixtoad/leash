@@ -43,6 +43,7 @@ type MITMProxy struct {
 	certCacheMux   sync.RWMutex
 	port           string
 	listenHost     string // "" listens on every interface (the Linux netns case)
+	connFilter     func(net.Conn) bool
 	headerRewriter *HeaderRewriter
 	logMutex       sync.Mutex
 	sharedLogger   *lsm.SharedLogger // Shared event logger
@@ -276,6 +277,10 @@ func (p *MITMProxy) Run() error {
 			log.Printf("Error accepting connection: %v", err)
 			continue
 		}
+		if p.connFilter != nil && !p.connFilter(conn) {
+			_ = conn.Close()
+			continue
+		}
 
 		if p.useProxyProtocol {
 			go p.handleProxyProtocolConnection(conn)
@@ -292,6 +297,14 @@ func (p *MITMProxy) Run() error {
 // to loopback.
 func (p *MITMProxy) SetListenHost(host string) {
 	p.listenHost = host
+}
+
+// SetConnFilter installs a check every accepted connection must pass before
+// it is served; a refused connection is closed. The macOS daemon uses it to
+// refuse leashed processes, which the content filter cannot stop on
+// loopback.
+func (p *MITMProxy) SetConnFilter(allow func(net.Conn) bool) {
+	p.connFilter = allow
 }
 
 // SetProxyProtocolIngestion selects how the original destination is obtained for

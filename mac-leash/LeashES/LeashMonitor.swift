@@ -57,6 +57,14 @@ final class LeashMonitor {
     weak var commService: LeashCommunicationService?
     let pidSyncQueue = DispatchQueue(label: LeashIdentifiers.namespaced("pid-sync"), qos: .utility)
 
+    /// Always-on events: leash process discovery (exec), lineage (fork) and
+    /// teardown (exit). AUTH events are added while a leashed process lives.
+    static let notifyEventTypes: [es_event_type_t] = [
+        ES_EVENT_TYPE_NOTIFY_EXEC,
+        ES_EVENT_TYPE_NOTIFY_FORK,
+        ES_EVENT_TYPE_NOTIFY_EXIT
+    ]
+
     init(commService: LeashCommunicationService) {
         self.commService = commService
     }
@@ -122,10 +130,7 @@ final class LeashMonitor {
             throw LeashMonitorError.cacheClearFailed
         }
 
-        var events: [es_event_type_t] = [
-            ES_EVENT_TYPE_NOTIFY_EXEC,
-            ES_EVENT_TYPE_NOTIFY_EXIT
-        ]
+        var events = Self.notifyEventTypes
         let subscribeResult = es_subscribe(establishedClient, &events, UInt32(events.count))
         guard subscribeResult == ES_RETURN_SUCCESS else {
             throw LeashMonitorError.subscriptionFailed(subscribeResult)
@@ -142,10 +147,7 @@ final class LeashMonitor {
             disableAuthEvents()
         }
 
-        var events: [es_event_type_t] = [
-            ES_EVENT_TYPE_NOTIFY_EXEC,
-            ES_EVENT_TYPE_NOTIFY_EXIT
-        ]
+        var events = Self.notifyEventTypes
         if es_unsubscribe(client, &events, UInt32(events.count)) != ES_RETURN_SUCCESS {
             os_log("Failed to unsubscribe from EndpointSecurity events", log: log, type: .error)
         }
@@ -156,55 +158,4 @@ final class LeashMonitor {
         trackedLeashProcesses.removeAll()
     }
 
-    func enforceDeniedProcesses(rules: [LeashPolicyRule]) {
-        guard !rules.isEmpty else { return }
-
-        callbackQueue.async { [weak self] in
-            guard let self else { return }
-
-            let denyExecRules = rules.filter { $0.action == .deny && $0.kind == .processExec }
-            guard !denyExecRules.isEmpty else { return }
-
-            var terminated: [pid_t] = []
-
-            for (pid, tracked) in self.trackedLeashProcesses {
-                let event = LeashPolicyEvent(
-                    id: UUID(),
-                    timestamp: Date(),
-                    kind: .processExec,
-                    processPath: tracked.executablePath,
-                    processArguments: tracked.arguments,
-                    currentWorkingDirectory: tracked.currentWorkingDirectory,
-                    filePath: nil,
-                    fileOperation: nil,
-                    parentProcessPath: tracked.leashExecutablePath,
-                    ttyPath: tracked.ttyPath,
-                    leashProcessPath: tracked.leashExecutablePath,
-                    leashPid: tracked.leashPID,
-                    leashArguments: tracked.leashArguments,
-                    leashTTYPath: tracked.leashTTYPath,
-                    pid: pid,
-                    parentPid: tracked.leashPID ?? 0
-                )
-
-                if denyExecRules.contains(where: { $0.matches(event) }) {
-                    if kill(pid, SIGKILL) == 0 {
-                        terminated.append(pid)
-                        os_log("Enforced deny rule, terminated pid=%{public}d (%{public}@)", log: self.log, type: .info, pid, tracked.executablePath)
-                    } else {
-                        let errorCode = errno
-                        let message = String(cString: strerror(errorCode))
-                        os_log("Failed to terminate pid=%{public}d (%{public}@): %{public}@", log: self.log, type: .error, pid, tracked.executablePath, message)
-                    }
-                }
-            }
-
-            if !terminated.isEmpty {
-                for pid in terminated {
-                    self.trackedLeashProcesses.removeValue(forKey: pid)
-                }
-                self.syncTrackedPIDsToNetwork()
-            }
-        }
-    }
 }
