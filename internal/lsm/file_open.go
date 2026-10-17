@@ -283,11 +283,10 @@ func populateOpenTailCall(coll *ebpf.Collection) error {
 }
 
 func (l *OpenLsm) requiredProgramNames() []string {
-	programs := []string{"lsm_open", "lsm_mkdir", "lsm_unlink", "lsm_rmdir", "lsm_rename_source", "lsm_rename_destination"}
-	if l.containerOverlay {
-		return append(programs, "lsm_mark_overlay_write")
-	}
-	return programs
+	// Container mode adds no file_open program: the overlay copy-up correlation
+	// is installed by the deciding program itself, so enforcement never depends
+	// on the order the kernel runs links on one hook (#186/#125).
+	return []string{"lsm_open", "lsm_mkdir", "lsm_unlink", "lsm_rmdir", "lsm_rename_source", "lsm_rename_destination"}
 }
 
 func (l *OpenLsm) attachCopyUpExitTracepoint(coll *ebpf.Collection) error {

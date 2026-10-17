@@ -434,8 +434,11 @@ func TestKernelLoadAllModulesWithExecRule(t *testing.T) {
 
 	longPaths := newLongPathTrees()
 	longPaths.prepare(t)
+	overlayRoot := newOverlayRootCases()
+	overlayRoot.prepare(t)
 	loopback := newLoopbackTargets(t)
-	policies := kernelLoadPolicySet(t, append(longPaths.policy(), loopback.policy()...)...)
+	extra := append(longPaths.policy(), loopback.policy()...)
+	policies := kernelLoadPolicySet(t, append(extra, overlayRoot.policy()...)...)
 	eventLog := filepath.Join(t.TempDir(), "events.log")
 	logger, err := NewSharedLogger(eventLog)
 	if err != nil {
@@ -446,6 +449,9 @@ func TestKernelLoadAllModulesWithExecRule(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Container mode, as leashd runs it for a container workload: the overlay
+	// copy-up correlation and its syscall-exit cleanup are installed (#186/#125).
+	openLsm.containerOverlay = true
 	if err := openLsm.LoadPolicies(ConvertToFileOpenRules(policies.Open)); err != nil {
 		t.Fatal(err)
 	}
@@ -559,6 +565,8 @@ collect:
 	// Long policy paths must be enforced byte-for-byte by the attached
 	// file-open and directory-mutation hooks (issues #108/#109).
 	longPaths.verify(t, int(cgroupDir.Fd()))
+	// Overlay-rootfs writes obey the policy like any other path (#186/#125).
+	overlayRoot.verify(t, int(cgroupDir.Fd()))
 	longPaths.verifyReload(t, openLsm, int(cgroupDir.Fd()))
 
 	// The audit trail must carry the complete long paths with the operation
@@ -573,6 +581,7 @@ collect:
 		`event=net.send .*protocol=tcp addr="` + regexp.QuoteMeta(loopback.deniedAddr()) + `" decision=denied`,
 		`event=net.send .*protocol=udp addr="` + regexp.QuoteMeta(loopback.deniedAddr()) + `" decision=denied`,
 	}
+	required = append(required, overlayRoot.auditPatterns()...)
 	var events []byte
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(250 * time.Millisecond) {
 		events, _ = os.ReadFile(eventLog)
