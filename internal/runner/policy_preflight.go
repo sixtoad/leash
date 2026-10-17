@@ -33,9 +33,8 @@ func (r *runner) validateSourcePolicy() error {
 
 // validateStagedPolicy compiles the policy leashd will load (cfgDir/leash.cedar)
 // before anything is provisioned, so a policy that does not parse, compile or
-// fit the kernel's limits aborts the run with its reason, for every runtime and
-// regardless of --allow-proxy-only: a bad policy is not an LSM-availability
-// problem, and no posture permits running the workload without one. When no
+// fit the kernel's limits aborts the run with its reason, for every runtime:
+// nothing permits running the workload without a valid policy. When no
 // policy is staged (none configured), leashd writes its default; nothing to check.
 func (r *runner) validateStagedPolicy() error {
 	staged := filepath.Join(r.cfg.cfgDir, "leash.cedar")

@@ -89,127 +89,51 @@ func TestDecideBPFLSM(t *testing.T) {
 
 	active := []string{"lockdown", "apparmor"}
 
-	// Active: no warning, no error, regardless of requireLSM.
-	if w, err := decideBPFLSM(bpfLSMActive, active, true); w != "" || err != nil {
-		t.Fatalf("active: got (%q, %v), want empty/nil", w, err)
+	if err := decideBPFLSM(bpfLSMActive, active); err != nil {
+		t.Fatalf("active: got %v, want nil", err)
 	}
 
-	// Default (not requiring): warn and continue, no error.
-	w, err := decideBPFLSM(bpfLSMInactiveCompiled, active, false)
-	if err != nil {
-		t.Fatalf("default degrade should not error, got: %v", err)
+	// bpf inactive (or unknown): always a hard error, never a warning.
+	for _, status := range []bpfLSMStatus{bpfLSMInactiveCompiled, bpfLSMUnknown} {
+		err := decideBPFLSM(status, active)
+		if err == nil {
+			t.Fatalf("status %v: an unavailable LSM must refuse to start", status)
+		}
+		if !strings.Contains(err.Error(), "fail-closed") || strings.Contains(err.Error(), "allow-proxy-only") {
+			t.Fatalf("status %v: unexpected error: %v", status, err)
+		}
 	}
-	if !strings.Contains(w, "WARNING") || !strings.Contains(w, "proxy-only") || !strings.Contains(w, "CONFIG_BPF_LSM=y") {
-		t.Fatalf("degrade warning not informative: %q", w)
-	}
-
-	// require-lsm: hard error, no warning string.
-	w, err = decideBPFLSM(bpfLSMInactiveCompiled, active, true)
-	if err == nil {
-		t.Fatal("require-lsm should error when LSM unavailable")
-	}
-	if w != "" {
-		t.Fatalf("require-lsm should not also emit a warning, got: %q", w)
-	}
-	if !strings.Contains(err.Error(), "--require-lsm") {
-		t.Fatalf("require-lsm error should mention the flag: %v", err)
+	if err := decideBPFLSM(bpfLSMInactiveCompiled, active); !strings.Contains(err.Error(), "CONFIG_BPF_LSM=y") {
+		t.Fatalf("error should carry the advice: %v", err)
 	}
 }
 
-func TestParseArgsRequireLSM(t *testing.T) {
+// --require-lsm stays accepted as a no-op (Walk passes it); there is no
+// proxy-only flag, so --allow-proxy-only is an unknown flag.
+func TestParseArgsPostureFlags(t *testing.T) {
 	t.Parallel()
 
-	opts, err := parseArgs([]string{"--require-lsm", "claude"})
-	if err != nil {
-		t.Fatalf("parseArgs error: %v", err)
+	if _, err := parseArgs([]string{"--require-lsm", "claude"}); err != nil {
+		t.Fatalf("--require-lsm must stay accepted: %v", err)
 	}
-	if !opts.requireLSM {
-		t.Fatal("--require-lsm should set requireLSM")
-	}
-
 	if _, err := parseArgs([]string{"--require-lsm=true"}); err == nil {
 		t.Fatal("--require-lsm= should be rejected (takes no value)")
 	}
-
-	off, err := parseArgs([]string{"claude"})
-	if err != nil {
-		t.Fatalf("parseArgs error: %v", err)
-	}
-	if off.requireLSM || off.allowProxyOnly {
-		t.Fatal("no flag should record neither explicit choice (the fail-closed default is applied in loadConfig)")
+	if _, err := parseArgs([]string{"--allow-proxy-only", "claude"}); err == nil || !strings.Contains(err.Error(), "unknown flag") {
+		t.Fatalf("--allow-proxy-only must be an unknown flag, got %v", err)
 	}
 }
-
-func TestParseArgsAllowProxyOnly(t *testing.T) {
-	t.Parallel()
-
-	opts, err := parseArgs([]string{"--allow-proxy-only", "claude"})
-	if err != nil {
-		t.Fatalf("parseArgs error: %v", err)
-	}
-	if !opts.allowProxyOnly || opts.requireLSM {
-		t.Fatalf("--allow-proxy-only should set only allowProxyOnly: %+v", opts)
-	}
-	if _, err := parseArgs([]string{"--allow-proxy-only=1"}); err == nil {
-		t.Fatal("--allow-proxy-only= should be rejected (takes no value)")
-	}
-}
-
-// Issue #117: fail closed by default; proxy-only only by explicit opt-out.
-func TestLoadConfigResolvesFailClosedDefault(t *testing.T) {
-	cases := []struct {
-		name    string
-		opts    options
-		env     map[string]string
-		want    bool
-		wantErr bool
-	}{
-		{name: "default fails closed", want: true},
-		{name: "--require-lsm is redundant", opts: options{requireLSM: true}, want: true},
-		{name: "--allow-proxy-only opts out", opts: options{allowProxyOnly: true}, want: false},
-		{name: "LEASH_ALLOW_PROXY_ONLY opts out", env: map[string]string{"LEASH_ALLOW_PROXY_ONLY": "1"}, want: false},
-		{name: "falsy LEASH_REQUIRE_LSM does not opt out", env: map[string]string{"LEASH_REQUIRE_LSM": "0"}, want: true},
-		{name: "flag beats env", opts: options{allowProxyOnly: true}, env: map[string]string{"LEASH_REQUIRE_LSM": "1"}, want: false},
-		{name: "both flags conflict", opts: options{requireLSM: true, allowProxyOnly: true}, wantErr: true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Setenv("LEASH_REQUIRE_LSM", "")
-			t.Setenv("LEASH_ALLOW_PROXY_ONLY", "")
-			t.Setenv("LEASH_WORK_DIR", t.TempDir())
-			t.Setenv("LEASH_HOME", t.TempDir())
-			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-			for k, v := range tc.env {
-				t.Setenv(k, v)
-			}
-			cfg, _, err := loadConfig(t.TempDir(), tc.opts)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("want an error for conflicting flags")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("loadConfig: %v", err)
-			}
-			if cfg.requireLSM != tc.want {
-				t.Fatalf("requireLSM = %v, want %v", cfg.requireLSM, tc.want)
-			}
-		})
-	}
-}
-
 func TestEnforcementMarkerReport(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "enforcement.ready")
-	if err := os.WriteFile(path, []byte(`{"enforcement":"proxy-only","layer1":"unavailable","layer2":"active","requireLSM":false,"allowProxyOnly":true}`+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(`{"enforcement":"lsm","layer1":"active","layer2":"disabled","requireLSM":true}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	st, ok := readEnforcementStatus(path)
 	if !ok {
 		t.Fatal("JSON marker should decode")
 	}
-	if got, want := formatEnforcementLine(st), "leash: enforcement=proxy-only layer1=unavailable layer2=active"; got != want {
+	if got, want := formatEnforcementLine(st), "leash: enforcement=lsm layer1=active layer2=disabled"; got != want {
 		t.Fatalf("line = %q, want %q", got, want)
 	}
 	// An older leashd writes a bare "ready" line: no status, nothing reported.
@@ -294,15 +218,8 @@ func TestBPFLSMAdviceNeverEmitsAnEmptyLSMList(t *testing.T) {
 			}
 		}
 		// The same guard has to hold on the run path's own decision.
-		warn, err := decideBPFLSM(bpfLSMInactiveCompiled, active, false)
-		if err != nil {
-			t.Fatalf("default degrade should not error: %v", err)
-		}
-		if strings.Contains(warn, "lsm=") {
-			t.Errorf("run-path warning proposes lsm= from an empty list:\n%s", warn)
-		}
-		if _, err := decideBPFLSM(bpfLSMInactiveCompiled, active, true); err == nil {
-			t.Error("require-lsm should still fail")
+		if err := decideBPFLSM(bpfLSMInactiveCompiled, active); err == nil {
+			t.Error("an inactive bpf LSM must fail")
 		} else if strings.Contains(err.Error(), "lsm=") {
 			t.Errorf("run-path error proposes lsm= from an empty list:\n%v", err)
 		}

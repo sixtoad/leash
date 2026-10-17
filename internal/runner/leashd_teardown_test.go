@@ -158,11 +158,7 @@ func TestNativeLeashdReapedOnEveryTeardownPath(t *testing.T) {
 		s := spawnFakeLeashd(t, false)
 		s.r.cfg.shareDir = t.TempDir() // never gets the enforcement-ready marker
 		s.r.cfg.bootstrapTimeout = 2 * caCertWaitDelay
-		// The fail-closed default: notReady reads cfg.requireLSM (resolved
-		// from the flags by enforcement.ResolveRequireLSM), not opts. Setting
-		// opts left the verdict on the --allow-proxy-only path, so as root
-		// (Layer 2 active) WaitReady degraded and returned nil (#180).
-		s.r.cfg.requireLSM = true
+		// Always fail-closed, also as root with Layer 2 active (#180).
 		err := (nativeLauncher{r: s.r}).WaitReady(context.Background())
 		if err == nil {
 			t.Fatal("WaitReady should fail closed when enforcement never confirms")

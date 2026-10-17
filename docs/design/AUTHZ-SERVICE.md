@@ -277,9 +277,8 @@ every probed connection (hosts, IPv4, v4-mapped and IPv6 addresses, ports).
 ICMP datagram sockets (`SOCK_DGRAM`, `IPPROTO_ICMP`/`ICMPV6`, which iputils
 `ping` opens first) are ordinary addressed sockets: `sendto()` is decided by
 the connect rules, with port 0 (`Host::"10.0.0.1"` permits ping to it,
-`Host::"10.0.0.1:443"` does not). A container run that may continue
-proxy-only also starts the target with `--cap-drop NET_RAW`
-(SECURITY-MODEL.md).
+`Host::"10.0.0.1:443"` does not). A run never starts without this kernel
+gate (SECURITY-MODEL.md).
 
 **Inherent divergence (documented, unchanged):** the kernel matches connects
 by IP. Hostname rules are resolved to IPs when the policy loads and wildcards

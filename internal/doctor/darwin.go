@@ -128,13 +128,13 @@ func (d DarwinReport) Ready() bool { return d.Status == StatusReady }
 // degraded state actually costs. Named once so the text and the JSON issues
 // cannot describe the same state differently.
 const (
-	darwinESConsequence     = "file and exec policy is NOT enforced: the Endpoint Security extension is what gates them on macOS, and there is no fallback layer (unlike Linux, `leash --darwin` has no proxy-only mode)."
+	darwinESConsequence     = "file and exec policy is NOT enforced: the Endpoint Security extension is what gates them on macOS, and there is no fallback layer."
 	darwinFilterConsequence = "socket-level network policy is NOT enforced: the content filter is what gates connections on macOS."
 	darwinProxyConsequence  = "HTTPS is NOT inspected or rewritten: the transparent-proxy extension is what feeds flows to leash's MITM proxy, so URL/header policy and MCP rewriting do not apply."
 	darwinDaemonConsequence = "the extensions are blind: they receive no tracked PIDs and no rules over the websocket, so whatever is activated is enforcing nothing."
 
 	// The one-line summary for a degraded macOS verdict. It is deliberately not
-	// the Linux sentence: macOS has no eBPF LSM and no proxy-only fallback, so
+	// the Linux sentence: macOS has no eBPF LSM, so
 	// "Layer 1 is off, Layer 2 still applies" describes nothing that is true here.
 	darwinDegradedConsequence = "macOS enforcement is partial: some of the file/exec, socket and HTTPS-inspection layers are not active, or could not be verified. The issues above say which."
 )

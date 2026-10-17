@@ -93,7 +93,7 @@ func main() {
 			os.Exit(policycli.Main(args[2:], os.Stdout, os.Stderr))
 		case "daemon": // `daemon install|uninstall|status|run`: the rootless enforcer daemon.
 			os.Exit(enforcerd.Main(args[2:], version, os.Stdout, os.Stderr))
-		case "doctor": // node readiness self-check; exit 0 enforces, 3 runs proxy-only, 1 cannot run at all.
+		case "doctor": // node readiness self-check; exit 0 enforces, 3 runtime usable but a layer is off (leash run refuses), 1 cannot run at all.
 			os.Exit(doctor.Main(args[2:], os.Stdout, os.Stderr))
 		case "--native-holder": // internal: the native box holder, bound to the owning leash's lifetime (#158).
 			os.Exit(runner.NativeHolderMain(args[2:]))

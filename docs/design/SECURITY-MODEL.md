@@ -41,12 +41,10 @@ Leash closes this at three points:
   custom `--cap-add`). Each decision is logged as `event=net.socket`.
 - **Native mode:** the workload has no `CAP_NET_RAW` (cleared bounding set,
   drop-user).
-- **Container mode:** a run that may continue proxy-only
-  (`--allow-proxy-only`) starts the target with `--cap-drop NET_RAW`, because
-  the kernel gate may then be absent and a packet socket also bypasses the
-  proxy's redirect. A fail-closed run (the default) never starts without the
-  kernel gate and keeps the runtime's capability set: dropping `NET_RAW`
-  there would add nothing the gate does not already refuse, and it breaks
+- **Container mode:** a run never starts without the kernel gate (leash
+  always fails closed when the eBPF LSM is unavailable), so the target keeps
+  the runtime's capability set: dropping `NET_RAW` would add nothing the
+  gate does not already refuse, and it breaks
   `ping` in Debian and Ubuntu images, whose iputils `ping` carries the
   `cap_net_raw+ep` file capability and cannot even be executed without
   `NET_RAW` in the bounding set (measured on #188).

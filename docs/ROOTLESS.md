@@ -14,10 +14,9 @@ capabilities and attaches the same eBPF LSM programs, compiled from the same
 policy, to the rootless workload's cgroup. A rootless run then reports
 `enforcement=lsm`, with the same guarantees as a rootful run.
 
-There is no weaker automatic mode. Without a usable daemon a rootless run is
-**refused before anything starts**. The only alternative is the existing,
-explicit `--allow-proxy-only` opt-out, which is reported honestly as
-`enforcement=proxy-only`.
+There is no weaker mode. Without a usable daemon a rootless run is
+**refused before anything starts**: leash never runs a workload with only the
+L7 proxy enforcing.
 
 ## Setup
 
@@ -64,7 +63,6 @@ Requirements: Linux with systemd, cgroup v2 with systemd user delegation
    Kernel enforcement for rootless runs comes from the leash enforcer daemon, which is not usable: dial unix /run/leash/enforcerd.sock: connect: no such file or directory.
    Install it once with:  sudo leash daemon install
    Check it with:         leash daemon status
-   Or pass --allow-proxy-only to run with only the L7 proxy (filesystem, exec and socket policies are then NOT enforced).
    ```
 
 2. The leash container gets the socket's directory mounted at
@@ -201,9 +199,9 @@ kernel enforcement.
   only feed rules that cover the caller's own workload.
 - SELinux hosts (Fedora, RHEL): the leash container connecting to a socket in
   `/run` may need a policy module; not verified.
-- Rootless Docker is not supported yet. Its containers cannot keep the
-  caller's `leash` group, so a rootless Docker run is refused unless
-  `--allow-proxy-only` is passed.
+- Rootless Docker is not supported yet
+  ([#207](https://github.com/sixtoad/leash/issues/207)). Its containers cannot
+  keep the caller's `leash` group, so a rootless Docker run is refused.
 
 ## Machine-readable surface
 

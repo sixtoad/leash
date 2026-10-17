@@ -14,6 +14,8 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+
+	"github.com/strongdm/leash/internal/enforcement"
 )
 
 // MaxPolicyPathLength is the longest path that fits in the userspace/BPF rule
@@ -42,31 +44,16 @@ func notifyEnforcementSettled() {
 // slower file-open one, which would otherwise release the workload early).
 var onLSMAttached func()
 
-// requireLSM, when true, makes a failed LSM attach fatal (fail-closed) rather
-// than degrading to proxy-only. leashd sets it once at startup, before any
-// attach, from ResolveRequireLSM: fail-closed is the default and proxy-only
-// requires --allow-proxy-only / LEASH_ALLOW_PROXY_ONLY (issue #117). The
-// package-level zero value stays false so library callers and kernel tests
-// that drive LoadAndAttach directly get an error back instead of os.Exit;
-// leashd always sets it explicitly before the first attach.
+// requireLSM, when true, makes a failed LSM attach exit the process
+// (fail-closed) before the attempt is reported settled. leashd sets it once at
+// startup, before any attach. When false the failure is only recorded
+// (Layer1Degraded) and the caller refuses the run itself: the enforcer
+// daemon's worker reports it to its client, and library callers and kernel
+// tests that drive LoadAndAttach directly get an error back instead of
+// os.Exit. Neither mode ever continues with the workload unenforced.
 var requireLSM bool
 
-// failClosedRemedy is appended to fatal attach messages. leashd replaces it
-// with enforcement.FailClosedRemedy for the session's real state (e.g. the
-// proxy being off, where --allow-proxy-only cannot help).
-var failClosedRemedy = "pass --allow-proxy-only to continue with only the L7 proxy"
-
-// SetFailClosedRemedy sets the remediation text for fatal attach failures.
-func SetFailClosedRemedy(s string) {
-	if s != "" {
-		failClosedRemedy = s
-	}
-}
-
-// FailClosedRemedy returns the current remediation text.
-func FailClosedRemedy() string { return failClosedRemedy }
-
-// SetRequireLSM selects fail-closed (true) vs degrade-to-proxy (false) behavior
+// SetRequireLSM selects exit-on-failure (true) vs record-and-report (false)
 // for LSM attach failures. Call once at startup before enforcement begins.
 func SetRequireLSM(v bool) { requireLSM = v }
 
@@ -515,7 +502,7 @@ func validateEventArrays(arrays ...[]byte) bool {
 
 // BPFConfig holds configuration for BPF program attachment
 type BPFConfig struct {
-	ProgramNames         []string                     // Programs to attach; a failure fails enforcement (caller decides degrade vs --require-lsm)
+	ProgramNames         []string                     // Programs to attach; a failure fails enforcement (the run is refused)
 	OptionalProgramNames []string                     // Best-effort programs: a failure degrades only that hook, not the whole enforcement
 	OptionalStageNames   []string                     // Tail-called stages of optional programs: stripped with them, never attached
 	AfterRequiredAttach  func(*ebpf.Collection) error // Required setup after ordered core attachments, before optional hooks
@@ -561,17 +548,16 @@ func LoadAndAttachBPFWithSetup(
 			return
 		}
 		settled = true
-		// Fail-closed (the default): if this attach failed and proxy-only was
-		// not explicitly allowed, exit BEFORE notifying the settle watcher —
-		// otherwise the host launcher would be released to run the workload
-		// with file/exec/connect enforcement silently degraded to proxy-only.
-		// Exiting here (not after notify) closes the release race.
+		// Fail-closed: if this attach failed, exit BEFORE notifying the settle
+		// watcher — otherwise the host launcher would be released to run the
+		// workload without file/exec/connect enforcement. Exiting here (not
+		// after notify) closes the release race.
 		if retErr != nil && requireLSM {
-			fmt.Fprintf(os.Stderr, "FATAL: eBPF LSM enforcement is unavailable (%v); refusing to run unenforced (%s)\n", retErr, failClosedRemedy)
+			fmt.Fprintf(os.Stderr, "FATAL: eBPF LSM enforcement is unavailable (%v); refusing to run unenforced (%s)\n", retErr, enforcement.FailClosedRemedy)
 			os.Exit(1)
 		}
-		// Record the degrade before reporting the attempt settled, so the
-		// enforcement-ready marker states the effective level correctly.
+		// Record the failure before reporting the attempt settled, so the
+		// settle hook refuses the run (no marker is published).
 		if retErr != nil {
 			markLayer1Degraded()
 		} else {
@@ -668,10 +654,10 @@ func LoadAndAttachBPFWithSetup(
 			Program: coll.Programs[programName],
 		})
 		if err != nil {
-			// Return the error rather than exiting so the caller can decide
-			// whether to degrade to proxy-only (the default) or fail hard
-			// (--require-lsm). The deferred loop above closes any links that
-			// already attached. The most common cause is the kernel not having
+			// Return the error; the deferred settle exits (leashd) or records
+			// the failure for the caller to refuse the run (enforcer daemon
+			// worker). The deferred loop above closes any links that already
+			// attached. The most common cause is the kernel not having
 			// "bpf" as an active LSM (see the client-side preflight).
 			return fmt.Errorf("attach %s LSM program (kernel may lack an active bpf LSM): %w", programName, err)
 		}
@@ -687,7 +673,7 @@ func LoadAndAttachBPFWithSetup(
 	// Optional hooks attach best-effort: a failure (e.g. the kernel lacks
 	// CONFIG_SECURITY_PATH, or the program is incompatible) degrades only that
 	// hook, NOT the whole enforcement — so an added/experimental hook can never
-	// take the sandbox down to proxy-only.
+	// make the whole run refuse to start.
 	for _, programName := range config.OptionalProgramNames {
 		prog := coll.Programs[programName]
 		if prog == nil {

@@ -80,8 +80,8 @@ permit (principal, action == Action::"ProcessExec", resource in Dir::"/opt/") wh
 	}
 }
 
-// Without a scopable cgroup (degraded proxy-only) the kernel is not
-// programmed, so its limits do not gate updates.
+// Without a local cgroup (the enforcer daemon holds the programs) the local
+// kernel is not programmed, so its limits do not gate updates.
 func TestManagerSkipsKernelLimitsWithoutCgroup(t *testing.T) {
 	m := NewManager(lsm.NewLSMManager("", nil, false), nil)
 	if err := m.UpdateFileRules(tooManyOpenRules(lsm.MaxPolicyRules+1), nil); err != nil {

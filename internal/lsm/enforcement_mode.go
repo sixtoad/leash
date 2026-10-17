@@ -2,9 +2,9 @@ package lsm
 
 import "sync/atomic"
 
-// layer1Degraded records that at least one eBPF LSM program failed to attach
-// and leash continued without it (only possible with proxy-only explicitly
-// allowed and the L7 proxy active, issue #117).
+// layer1Degraded records that at least one eBPF LSM program failed to attach.
+// The process did not exit on the failure (record-and-report mode, see
+// SetRequireLSM), so the caller must refuse the run.
 var layer1Degraded atomic.Bool
 
 // layer1Attached counts eBPF LSM programs that attached successfully.
