@@ -205,11 +205,13 @@ jobs:
         run: go build ./...
 
       # releasecontract runs the release shell scripts, which need GNU
-      # timeout(1); macOS ships none.
-      - name: GNU coreutils
+      # timeout(1) and bash >= 4 (empty arrays under set -u); macOS ships
+      # neither (/bin/bash is 3.2).
+      - name: GNU coreutils and bash
         run: |
-          brew list coreutils >/dev/null 2>&1 || brew install coreutils
+          brew install bash coreutils
           echo "$(brew --prefix coreutils)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
 
       # The default TMPDIR (/var/folders/...) is a symlink into /private, and
       # releasecontract compares script-printed physical paths against
