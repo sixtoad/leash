@@ -102,3 +102,26 @@ func TestRenameHalvesNeverSkipOnOverlayCorrelation(t *testing.T) {
 		}
 	}
 }
+
+// The correlation lets through only opens overlayfs makes on its own behalf
+// (under its mounter's credentials). Without the cred check, a second open the
+// task issued in the same syscall, such as a second inline io_uring openat
+// after an allowed overlay write, skipped policy.
+func TestOverlayCorrelationSkipsOnlyOverlayfsCredentialOpens(t *testing.T) {
+	text := copyUpBPFSource(t)
+	start := strings.Index(text, "int BPF_PROG(lsm_open, struct file *file)")
+	if start < 0 {
+		t.Fatal("lsm_open not found")
+	}
+	body := text[start:]
+	body = body[:strings.Index(body, "\n}\n")]
+	if !strings.Contains(body, "} else if (active && current_creds_overridden()) {\n        return 0;") {
+		t.Fatal("lsm_open skips on the overlay correlation without requiring overlayfs's overridden credentials")
+	}
+	if strings.Contains(body, "} else if (active) {") {
+		t.Fatal("lsm_open still skips on the bare overlay correlation")
+	}
+	if !strings.Contains(text, "return BPF_CORE_READ(task, cred) != BPF_CORE_READ(task, real_cred);") {
+		t.Fatal("credential-override check is not a cred/real_cred comparison")
+	}
+}

@@ -563,6 +563,8 @@ static __noinline int emit_current_mutation(u32 operation, int allowed)
 
 struct task_struct___leash {
     unsigned int flags;
+    const struct cred *cred;
+    const struct cred *real_cred;
 } __attribute__((preserve_access_index));
 
 static __always_inline bool current_is_io_worker()
@@ -570,6 +572,17 @@ static __always_inline bool current_is_io_worker()
     struct task_struct___leash *task = (void *)bpf_get_current_task_btf();
     unsigned int flags = BPF_CORE_READ(task, flags);
     return (flags & PF_IO_WORKER) != 0;
+}
+
+// overlayfs performs its nested backing-store opens (real-file open, copy-up)
+// with its mounter's credentials installed over the task's own, so the
+// subjective cred differs from real_cred exactly while overlayfs acts. An
+// open the task makes itself in the same syscall (a second inline io_uring
+// openat, say) runs on its own cred and must not ride the correlation.
+static __always_inline bool current_creds_overridden()
+{
+    struct task_struct___leash *task = (void *)bpf_get_current_task_btf();
+    return BPF_CORE_READ(task, cred) != BPF_CORE_READ(task, real_cred);
 }
 
 static __always_inline int mark_allowed_overlay_mutation(const struct path *dir)
@@ -935,7 +948,7 @@ int BPF_PROG(lsm_open, struct file *file)
     u8 *active = bpf_map_lookup_elem(&overlay_write_context, &context_key);
     if (current_is_io_worker()) {
         bpf_map_delete_elem(&overlay_write_context, &context_key);
-    } else if (active) {
+    } else if (active && current_creds_overridden()) {
         return 0;
     }
 

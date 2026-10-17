@@ -36,6 +36,8 @@ type overlayRootCases struct {
 	renameTarget    string
 	renameOKFrom    string // rename inside the permitted rw dir (control)
 	renameOKTo      string
+	uringPermitted  string // overlay file in the permitted rw dir, opened first
+	uringHelper     string // copy of this test binary where the box may exec it
 }
 
 func newOverlayRootCases() overlayRootCases {
@@ -50,6 +52,8 @@ func newOverlayRootCases() overlayRootCases {
 		renameTarget:    "/tmp/leash-ovl-moved-profile",
 		renameOKFrom:    "/tmp/leash-ovl-from",
 		renameOKTo:      "/tmp/leash-ovl-to",
+		uringPermitted:  "/tmp/leash-ovl-uring-ok",
+		uringHelper:     "/usr/local/bin/leash-ovl-uring-helper",
 	}
 }
 
@@ -78,9 +82,19 @@ func (o overlayRootCases) prepare(t *testing.T) {
 	for _, path := range []string{o.renameTarget, o.renameOKTo, o.defaultDenyDir + "/leash-ovl-new", o.permittedDir + "/leash-ovl-new"} {
 		_ = os.Remove(path)
 	}
-	if err := os.WriteFile(o.renameOKFrom, []byte("x"), 0o666); err != nil {
+	for _, file := range []string{o.renameOKFrom, o.uringPermitted} {
+		if err := os.WriteFile(file, []byte("x"), 0o666); err != nil {
+			t.Fatal(err)
+		}
+	}
+	self, err := os.ReadFile("/proc/self/exe")
+	if err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(o.uringHelper, self, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(o.uringHelper) })
 }
 
 func (o overlayRootCases) verify(t *testing.T, cgroupFD int) {
@@ -98,6 +112,7 @@ func (o overlayRootCases) verify(t *testing.T, cgroupFD int) {
 		{"overlay: rename default-deny image file into permitted rw dir", `mv "$1" "$2"`, []string{o.renameSource, o.renameTarget}, false, ""},
 		{"overlay: rename inside permitted rw dir", `mv "$1" "$2"`, []string{o.renameOKFrom, o.renameOKTo}, true, ""},
 	})
+	o.verifyURing(t, cgroupFD)
 	if _, err := os.Stat(o.renameTarget); err == nil {
 		t.Errorf("FAIL overlay: denied rename still moved %s to %s", o.renameSource, o.renameTarget)
 	}
