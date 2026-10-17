@@ -149,6 +149,12 @@ type PolicySet struct {
 	ConnectDefaultAllow    bool
 	ConnectDefaultExplicit bool
 
+	// ProxyRestricted is set by the kernel compiler when the policy forbids
+	// something only the L7 proxy enforces (an McpCall forbid). Packet, raw
+	// and SCTP sockets can bypass the proxy, so the kernel keeps them denied
+	// for such a policy even when every destination is allowed (#188).
+	ProxyRestricted bool
+
 	// Source is the Cedar the rules were compiled from (nil for rules built
 	// in code, which are legacy IR by definition). policy.Manager merges
 	// layers by their sources and compiles the merged Cedar once: compiled
@@ -176,6 +182,7 @@ func (ps *PolicySet) Clone() *PolicySet {
 		MCP:                    append([]MCPPolicyRule(nil), ps.MCP...),
 		ConnectDefaultAllow:    ps.ConnectDefaultAllow,
 		ConnectDefaultExplicit: ps.ConnectDefaultExplicit,
+		ProxyRestricted:        ps.ProxyRestricted,
 		Source:                 ps.Source,
 	}
 }

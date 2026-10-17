@@ -133,6 +133,13 @@ const (
 	// usable daemon such a run is refused before anything starts unless
 	// --allow-proxy-only is passed.
 	CapabilityRootlessDaemon = "rootless-daemon"
+	// CapabilityRawSocketGate means packet, raw IP and SCTP sockets, whose
+	// traffic no address rule can see, are refused at creation by the eBPF
+	// LSM unless the policy restricts no destination (logged as
+	// event=net.socket), and a container run that may continue proxy-only
+	// starts its target without CAP_NET_RAW (issue #188). ICMP datagram
+	// sockets (ping) are decided by the connect rules.
+	CapabilityRawSocketGate = "raw-socket-gate"
 )
 
 // Enforced policy path limits, in bytes of the resolved path (a directory
@@ -176,6 +183,7 @@ var capabilities = []string{
 	CapabilityAuthzSocket,
 	CapabilityAllowProxyOnly,
 	CapabilityRootlessDaemon,
+	CapabilityRawSocketGate,
 }
 
 // Capabilities returns the surface names this build advertises. The slice is a

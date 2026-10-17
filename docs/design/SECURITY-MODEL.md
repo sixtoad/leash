@@ -17,10 +17,49 @@ Policies aim for deny‑by‑default with explicit, explainable allows. Start in
 - Kernel (eBPF LSM):
   - `file_open` decisions including read vs. write
   - `bprm_check_security` for `proc.exec`
-  - `socket_connect` for outbound `net.send`
+  - `socket_connect` / `socket_sendmsg` for outbound `net.send`
+  - `socket_create` for packet, raw IP and SCTP sockets, whose traffic no
+    address rule can see: denied unless the policy restricts no destination
+    (see below)
 - Proxy (HTTP[S]):
   - Allow/Deny per host
   - Header injection at the boundary (secrets never enter the agent)
+
+### Packet, raw and SCTP sockets
+
+A packet socket bound with `bind()`, or a raw IP socket with `IP_HDRINCL`,
+emits frames or IP packets with `send()` and no destination address, and
+SCTP adds peers through `sctp_connectx()`, the `sendmsg()` address list and
+the peer's own address list, none of which pass `socket_connect` (#188).
+Leash closes this at three points:
+
+- **Kernel:** `lsm_socket_create` refuses `AF_PACKET`, `AF_XDP`, `SOCK_RAW` on
+  `AF_INET`/`AF_INET6`, `SOCK_SEQPACKET` on an IP family and `IPPROTO_SCTP`
+  in the governed cgroup with `EPERM`, unless the policy restricts no
+  destination (connect default allow, no deny connect rule, no MCP forbid).
+  This holds whatever capabilities the workload has (rootless podman,
+  custom `--cap-add`). Each decision is logged as `event=net.socket`.
+- **Native mode:** the workload has no `CAP_NET_RAW` (cleared bounding set,
+  drop-user).
+- **Container mode:** a run that may continue proxy-only
+  (`--allow-proxy-only`) starts the target with `--cap-drop NET_RAW`, because
+  the kernel gate may then be absent and a packet socket also bypasses the
+  proxy's redirect. A fail-closed run (the default) never starts without the
+  kernel gate and keeps the runtime's capability set: dropping `NET_RAW`
+  there would add nothing the gate does not already refuse, and it breaks
+  `ping` in Debian and Ubuntu images, whose iputils `ping` carries the
+  `cap_net_raw+ep` file capability and cannot even be executed without
+  `NET_RAW` in the bounding set (measured on #188).
+
+`ping`: iputils `ping` opens an ICMP datagram socket
+(`SOCK_DGRAM`/`IPPROTO_ICMP`) first. That is an ordinary addressed socket,
+decided by the connect rules with port 0 (`Host::"10.0.0.1"` permits pinging
+it, `Host::"10.0.0.1:443"` does not), and it needs the workload's group
+inside `net.ipv4.ping_group_range`: Docker opens the range to every group;
+a fresh network namespace (native mode) and Podman's default (`0 0`) do not,
+so `ping` already failed there without `CAP_NET_RAW`. BusyBox `ping` uses
+only a raw socket and is refused under a restricting policy, as are tools
+that need raw sockets (`tcpdump`, `nmap -sS`, `mtr`, `arping`).
 
 ### Proxy Certificate Management
 

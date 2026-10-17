@@ -176,7 +176,65 @@ func checkKernelParity(t *testing.T, rng *rand.Rand, text string, eng *engine.En
 			t.Fatalf("connect %s:%d: kernel=%v cedar=%v\npolicy:\n%s\nrules: %v default=%v", ip, port, got, want, text, ruleStrings(ir.Connect), ir.ConnectDefaultAllow)
 		}
 	}
+	// Packet/raw/SCTP sockets (#188) have no destination for Cedar to decide;
+	// the kernel allows them only where Cedar allows every connection, so it
+	// is never looser than Cedar for any destination they could reach.
+	if k.UnaddressedSockets() {
+		for _, host := range kpProbeHosts {
+			for _, ip := range kpProbeIPs {
+				for _, port := range []uint16{0, 22, 25, 80, 443} {
+					n++
+					if !eng.DecideConnect(host, ip, port).Allow {
+						t.Fatalf("unaddressed sockets allowed by the kernel but cedar denies %q %s:%d\npolicy:\n%s\nrules: %v", host, ip, port, text, ruleStrings(ir.Connect))
+					}
+				}
+			}
+		}
+	}
 	return n
+}
+
+var (
+	kpProbeHosts = []string{"", "api.example.com", "x.example.com", "other.test"}
+	kpProbeIPs   = []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "192.0.2.1", "::ffff:10.0.0.1", "2001:db8::1", "2001:db8::2", "2001:db8::9"}
+)
+
+// TestKernelCompileUnaddressedSockets: the lsm_socket_create verdict a
+// Cedar policy compiles to (#188).
+func TestKernelCompileUnaddressedSockets(t *testing.T) {
+	const s = "@leash_semantics(\"cedar\")\n"
+	for _, tc := range []struct {
+		name, text string
+		allow      bool
+	}{
+		{"permit everything", s + `permit (principal, action, resource);`, true},
+		{"permit every host", s + `permit (principal, action == Action::"NetworkConnect", resource);`, true},
+		{"permit Host::\"*\"", s + `permit (principal, action == Action::"NetworkConnect", resource in Host::"*");`, true},
+		{"no network policy", s + `permit (principal, action == Action::"ProcessExec", resource in Dir::"/");`, false},
+		{"default deny with a host permit", s + `permit (principal, action == Action::"NetworkConnect", resource in Host::"10.0.0.1:443");`, false},
+		{"forbid Host::\"*\"", s + `permit (principal, action, resource);` + "\n" + s + `forbid (principal, action == Action::"NetworkConnect", resource in Host::"*");`, false},
+		{"permit everything, forbid one address", s + `permit (principal, action, resource);` + "\n" + s + `forbid (principal, action == Action::"NetworkConnect", resource in Host::"169.254.169.254");`, false},
+		{"permit everything, forbid one port", s + `permit (principal, action, resource);` + "\n" + s + `forbid (principal, action == Action::"NetworkConnect", resource in Host::"*:25");`, false},
+		{"permit everything, forbid a zone", s + `permit (principal, action, resource);` + "\n" + s + `forbid (principal, action == Action::"NetworkConnect", resource in Host::"*.example.com");`, false},
+		{"permit everything, forbid an MCP server", s + `permit (principal, action, resource);` + "\n" + s + `forbid (principal, action == Action::"McpCall", resource in MCP::Server::"mcp.example.com");`, false},
+		{"permit everything, forbid any MCP tool", s + `permit (principal, action, resource);` + "\n" + s + `forbid (principal, action == Action::"McpCall", resource is MCP::Tool);`, false},
+		{"permit everything, forbid every action on a directory", s + `permit (principal, action, resource);` + "\n" + s + `forbid (principal, action, resource in Dir::"/secret/");`, true},
+		{"permit everything, forbid reads of a file", s + `permit (principal, action, resource);` + "\n" + s + `forbid (principal, action in Action::"FileOpen", resource == File::"/etc/shadow");`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ir, _, err := compileStrict(t, tc.text)
+			if err != nil {
+				t.Fatalf("compile: %v\n%s", err, tc.text)
+			}
+			k, err := lsm.NewKernelForTest(ir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := k.UnaddressedSockets(); got != tc.allow {
+				t.Fatalf("unaddressed sockets allowed = %v, want %v\npolicy:\n%s\nrules: %v default=%v mcp=%v", got, tc.allow, tc.text, ruleStrings(ir.Connect), ir.ConnectDefaultAllow, ir.MCP)
+			}
+		})
+	}
 }
 
 var filePrefixLiteral = regexp.MustCompile(`FilePrefix::"([^"]*)"`)
