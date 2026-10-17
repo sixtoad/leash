@@ -135,6 +135,15 @@ func runExec(args []string) error {
 		return fmt.Errorf("leashcli not found at %q: %w", cliPath, err)
 	}
 
+	// The daemon checks its policy path too, but it runs detached with its
+	// output in the log file; refuse an unsafe LEASH_POLICY here so the reason
+	// reaches the terminal (#12).
+	if p := strings.TrimSpace(os.Getenv("LEASH_POLICY")); p != "" {
+		if err := checkPolicyPathSafe(p); err != nil {
+			return err
+		}
+	}
+
 	handle, err := acquireExecServer()
 	if err != nil {
 		return err
