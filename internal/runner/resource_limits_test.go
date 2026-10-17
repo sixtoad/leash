@@ -316,8 +316,8 @@ func TestLaunchTargetContainerPassesResourceLimits(t *testing.T) {
 	if strings.Contains(leash, "--memory") || strings.Contains(leash, "--pids-limit") || strings.Contains(leash, "--cpus") {
 		t.Fatalf("leash sidecar must not get the target limits: %s", leash)
 	}
-	// #188: the target never holds CAP_NET_RAW (packet/raw sockets bypass
-	// the address-based connect policy); the sidecar keeps its own caps.
+	// #188: a run that may continue proxy-only (requireLSM false here) drops
+	// NET_RAW from the target; the sidecar keeps its own caps.
 	if !strings.Contains(target, "--cap-drop NET_RAW") || strings.Index(target, "--cap-drop") > strings.Index(target, "example/target:latest") {
 		t.Fatalf("target run args must drop NET_RAW before the image: %s", target)
 	}
@@ -327,5 +327,19 @@ func TestLaunchTargetContainerPassesResourceLimits(t *testing.T) {
 	// Flags must precede the image (the image and its args come last).
 	if strings.Index(target, "--pids-limit") > strings.Index(target, "example/target:latest") {
 		t.Fatalf("limits must come before the image: %s", target)
+	}
+}
+
+// #188: NET_RAW is dropped from the target exactly when the run may continue
+// without the eBPF LSM (proxy-only allowed); a fail-closed run keeps it (the
+// LSM refuses packet/raw sockets itself, and ping's file capability needs it).
+func TestTargetCapArgs(t *testing.T) {
+	failClosed := &runner{cfg: config{requireLSM: true}}
+	if got := failClosed.targetCapArgs(); len(got) != 0 {
+		t.Fatalf("fail-closed run: cap args = %q, want none", got)
+	}
+	proxyOnly := &runner{cfg: config{requireLSM: false}}
+	if got := proxyOnly.targetCapArgs(); strings.Join(got, " ") != "--cap-drop NET_RAW" {
+		t.Fatalf("proxy-only-allowed run: cap args = %q, want --cap-drop NET_RAW", got)
 	}
 }

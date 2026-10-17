@@ -263,8 +263,7 @@ addresses in INIT-ACK and ASCONF. A per-address `lsm/sctp_bind_connect`
 program would therefore still miss destinations, so these sockets are
 decided once, at creation (`lsm_socket_create` on `socket_create`, in the
 connect object): **denied with `EPERM`** (the error a missing `CAP_NET_RAW`
-gives, so `ping` implementations fall back to an ICMP datagram socket)
-**unless the policy restricts no destination**: the compiled connect default
+gives) **unless the policy restricts no destination**: the compiled connect default
 is allow, there is no deny connect rule of any kind (address, port, hostname
 or `*.zone`), and no `McpCall` forbid can apply (`PolicySet.ProxyRestricted`,
 set by the compiler for a forbid that reaches `McpCall` with a resource
@@ -275,11 +274,12 @@ the policy forbids is already expressible. `TestKernelCompileUnaddressedSockets`
 pins the verdict per policy shape, and `checkKernelParity` asserts on every
 random set that the kernel allows them only where `cedar.Authorize` allows
 every probed connection (hosts, IPv4, v4-mapped and IPv6 addresses, ports).
-ICMP datagram sockets (`SOCK_DGRAM`, `IPPROTO_ICMP`/`ICMPV6`, what `ping`
-uses without `CAP_NET_RAW`) are ordinary addressed sockets: `sendto()` is
-decided by the connect rules, with port 0 (`Host::"10.0.0.1"` permits ping to
-it, `Host::"10.0.0.1:443"` does not). Container mode also starts the target
-with `--cap-drop NET_RAW`.
+ICMP datagram sockets (`SOCK_DGRAM`, `IPPROTO_ICMP`/`ICMPV6`, which iputils
+`ping` opens first) are ordinary addressed sockets: `sendto()` is decided by
+the connect rules, with port 0 (`Host::"10.0.0.1"` permits ping to it,
+`Host::"10.0.0.1:443"` does not). A container run that may continue
+proxy-only also starts the target with `--cap-drop NET_RAW`
+(SECURITY-MODEL.md).
 
 **Inherent divergence (documented, unchanged):** the kernel matches connects
 by IP. Hostname rules are resolved to IPs when the policy loads and wildcards

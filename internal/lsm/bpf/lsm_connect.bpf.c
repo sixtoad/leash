@@ -613,7 +613,8 @@ int BPF_PROG(lsm_socket_create, int family, int type, int protocol, int kern)
         bpf_ringbuf_submit(event, 0);
     }
 
-    // -EPERM, the error a missing CAP_NET_RAW gives: ping implementations
-    // that fall back from a raw to an ICMP datagram socket do so on EPERM.
+    // -EPERM, the error a missing CAP_NET_RAW gives, so tools report it as
+    // one. iputils ping opens an ICMP datagram socket first, which this hook
+    // does not gate (the connect rules decide its sendto).
     return allow ? 0 : -1;
 }

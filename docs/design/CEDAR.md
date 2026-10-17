@@ -386,8 +386,8 @@ Persistence is similarly performed through `/api/policies/persist` or via the
   connect hook. The kernel refuses to create them (`EPERM`) unless the policy
   restricts no destination at all (connect default allow, no `forbid` on
   `NetworkConnect`, no `forbid` on `McpCall`). There is no action to permit
-  them otherwise. Container mode also drops `NET_RAW` from the target.
-  `ping` uses an ICMP datagram socket where the container's
-  `net.ipv4.ping_group_range` admits the workload's group; it is decided by
-  the connect rules with port 0, so `Host::"1.1.1.1"` permits pinging it and
-  `Host::"1.1.1.1:443"` does not.
+  them otherwise. iputils `ping` uses an ICMP datagram socket where
+  `net.ipv4.ping_group_range` admits the workload's group (Docker containers
+  do); it is decided by the connect rules with port 0, so `Host::"1.1.1.1"`
+  permits pinging it and `Host::"1.1.1.1:443"` does not. BusyBox `ping`
+  needs a raw socket. See `docs/design/SECURITY-MODEL.md`.
