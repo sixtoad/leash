@@ -40,3 +40,7 @@ apm_modules/
 
 # Local-only native-runtime PoC box repro (dev scratch, not shipped)
 scratch-native-poc/
+
+# SwiftPM build output (swift test --package-path mac-leash)
+/mac-leash/.build/
+/mac-leash/.swiftpm/

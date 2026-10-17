@@ -285,12 +285,33 @@ by IP. Hostname rules are resolved to IPs when the policy loads and wildcards
 are not loaded at all; the proxy (the engine) matches the name. A forbidden
 host that shares an IP with a permitted one blocks that IP in the kernel.
 
-**macOS** consumes the same compiled tables through macsync. The ES
-extension orders file rules before directory rules and deny before allow
-rather than longest prefix, so a permit nested under a forbid (a legacy
-exception) is not equivalent on macOS. This predates #142 (audit item 9 of
-the first version) and stays a follow-up: a macsync model plus a Swift change
-to longest-prefix matching.
+**macOS** enforces the same tables. `lsm.MacTablesFor` runs the kernel
+loaders' own compilation (the file-open index with its exact and prefix
+entries per open mode, specificity and order; the mutation index; the exec
+rules in precedence order; the connect rules with hostnames resolved at load
+and the explicit default) and `macsync.CompileTables` sends it to the
+extensions as `mac.policy.tables`, with leash's protected paths and ports.
+The Swift matcher (`mac-leash/Shared/PolicyCore`) implements the four BPF
+lookups over those tables and nothing else. `macsync`'s parity test compiles
+random strict policies, decides them with a Go model of the Swift matcher and
+compares with `cedar.Authorize` (2500 sets, ~800,000 decisions); the same
+vectors are replayed against the Swift code by `swift test --package-path
+mac-leash`. Differences that are macOS's own:
+
+- Endpoint Security reports `/tmp`, `/etc` and `/var` as `/private/...`; the
+  matcher maps them back to the short form, and a policy naming a path only
+  reachable in the `/private` form fails to compile for macOS.
+- Creating a regular file is decided as a write open of it (Linux sees the
+  created file in `file_open`); creating any other object (directory, symlink,
+  fifo) as a mutation; truncate, clonefile, copyfile and exchangedata as write
+  opens. Linux does not gate symlink or fifo creation: macOS is stricter there.
+- The content filter never sees loopback flows, so loopback connections are
+  not decided by the connect table on macOS. Leash's own listeners refuse
+  leashed clients instead (peer PID check).
+- A flow that names its destination but not its address is allowed only when
+  the table allows every address on its port.
+- Packet, raw and SCTP sockets: the content filter sees TCP and UDP flows
+  only; an unprivileged workload cannot open packet or raw sockets on macOS.
 
 ### 3.4 Tests
 
@@ -416,7 +437,7 @@ that constrains the principal of a built-in policy fails the load.
 | 24 | Kernel connect quirks: an address-less allow rule or `allow *:443` set the kernel default to allow everything; `forbid *:22` was dropped by the kernel (DNS) | the kernel compiler writes an explicit default and `*:p` as a port rule | the kernel now matches Cedar (stricter) |
 | 25 | Plugin actions already had Cedar semantics | kept as written | namespace rule |
 | 26 | Kernel matches connects by IP, the proxy by name | unchanged | inherent |
-| 27 | macOS ES rule order (file before directory, deny first) | not equivalent for exceptions | pre-existing; follow-up |
+| 27 | macOS ES rule order (file before directory, deny first), open mode ignored, network rules without ports and with suffix-matched names | the extensions enforce the kernel tables (§3.3) | fixed: macOS == kernel, parity-tested |
 | 28 | Layer merge: a raw-IR runtime layer with an *explicit* default allow overrode a file `forbid Host::"*"` | union: a forbid default wins | Cedar layers cannot express an explicit allow default; only IR built in code could |
 | 29 | Directory mutations were allowed only by read-write directory allow rules (generic `FileOpen` allows did not count), denied by any covering generic forbid, deny first | Cedar: `FileOpenReadWrite` on the path and on a new entry of its directory, compiled into the mutation table | the table is now longest-prefix (one BPF function); generic `FileOpen` permits now allow mutations; a permit nested in a forbid now allows mutations below it |
 | 30 | Packet, raw IP and SCTP sockets got the connect default per address-bearing call; a bound packet or raw socket and SCTP `connectx` passed unchecked (#188) | no Cedar form: denied at `socket_create` unless the policy restricts no destination (§3.3) | the kernel is stricter: allowed only where Cedar allows every connection |
@@ -425,7 +446,6 @@ that constrains the principal of a built-in policy fails the load.
 
 - **#20 and #21** are deliberately not reproduced (bugs).
 - **#26**: the kernel cannot match names; documented.
-- **#27**: macOS needs a Swift change.
 - **#28**: only reachable from IR built in code, not from Cedar.
 - **#30**: packet, raw and SCTP sockets have no destination to decide; the
   kernel allows them only where Cedar allows every connection.
@@ -686,6 +706,5 @@ if d.Allowed() { ... }               // false on any error
 3. **Socket service:** `internal/authz` server on the engine, `pkg/authz`
    client, leashd wiring, the runner `authz=` key, the capability.
 
-Follow-ups: Walk emits strict policies; the macOS ES longest-prefix change and
-a macsync parity model; the approval flow; #18 manifest ingestion; a
+Follow-ups: Walk emits strict policies; the approval flow; #18 manifest ingestion; a
 real-kernel run of the parity cases.

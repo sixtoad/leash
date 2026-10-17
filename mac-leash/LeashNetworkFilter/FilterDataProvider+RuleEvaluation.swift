@@ -10,130 +10,6 @@ extension FilterDataProvider {
     enum FlowDecision {
         case allow
         case deny(reason: String)
-        case needsInspection
-    }
-
-    internal enum TLSInspectionOutcome {
-        case needMoreData
-        case success(hostname: String?)
-        case notTLS
-        case malformed
-    }
-
-    func parseClientHelloSNI(from data: Data) -> TLSInspectionOutcome {
-        let recordHeaderLength = 5
-        guard data.count >= recordHeaderLength else {
-            return .needMoreData
-        }
-
-        let recordType = data[0]
-        guard recordType == 0x16 else {
-            return .notTLS
-        }
-
-        let recordLength = (Int(data[3]) << 8) | Int(data[4])
-        let recordTotalLength = recordHeaderLength + recordLength
-        if data.count < recordTotalLength {
-            return .needMoreData
-        }
-
-        let cursor = recordHeaderLength
-        guard cursor + 4 <= data.count else {
-            return .malformed
-        }
-
-        let handshakeType = data[cursor]
-        guard handshakeType == 0x01 else {
-            return .notTLS
-        }
-
-        let handshakeLength = (Int(data[cursor + 1]) << 16) |
-                              (Int(data[cursor + 2]) << 8) |
-                               Int(data[cursor + 3])
-        let handshakeEnd = cursor + 4 + handshakeLength
-        if data.count < handshakeEnd {
-            return .needMoreData
-        }
-
-        var position = cursor + 4
-
-        guard position + 2 <= handshakeEnd else { return .malformed }
-        position += 2 // legacy version
-
-        guard position + 32 <= handshakeEnd else { return .malformed }
-        position += 32 // random
-
-        guard position + 1 <= handshakeEnd else { return .malformed }
-        let sessionIDLength = Int(data[position])
-        position += 1
-        guard position + sessionIDLength <= handshakeEnd else { return .malformed }
-        position += sessionIDLength
-
-        guard position + 2 <= handshakeEnd else { return .malformed }
-        let cipherSuitesLength = (Int(data[position]) << 8) | Int(data[position + 1])
-        position += 2
-        guard position + cipherSuitesLength <= handshakeEnd else { return .malformed }
-        position += cipherSuitesLength
-
-        guard position + 1 <= handshakeEnd else { return .malformed }
-        let compressionMethodsLength = Int(data[position])
-        position += 1
-        guard position + compressionMethodsLength <= handshakeEnd else { return .malformed }
-        position += compressionMethodsLength
-
-        if position == handshakeEnd {
-            return .success(hostname: nil)
-        }
-
-        guard position + 2 <= handshakeEnd else { return .malformed }
-        let extensionsLength = (Int(data[position]) << 8) | Int(data[position + 1])
-        position += 2
-
-        let extensionsEnd = position + extensionsLength
-        guard extensionsEnd <= handshakeEnd else { return .malformed }
-
-        var extCursor = position
-        while extCursor + 4 <= extensionsEnd {
-            let extensionType = (Int(data[extCursor]) << 8) | Int(data[extCursor + 1])
-            let extensionLength = (Int(data[extCursor + 2]) << 8) | Int(data[extCursor + 3])
-            extCursor += 4
-
-            guard extCursor + extensionLength <= extensionsEnd else { return .malformed }
-
-            if extensionType == 0 {
-                if extensionLength < 2 { return .malformed }
-                let listLength = (Int(data[extCursor]) << 8) | Int(data[extCursor + 1])
-                var nameCursor = extCursor + 2
-                let namesEnd = nameCursor + listLength
-                guard namesEnd <= extCursor + extensionLength else { return .malformed }
-
-                while nameCursor + 3 <= namesEnd {
-                    let nameType = data[nameCursor]
-                    let nameLength = (Int(data[nameCursor + 1]) << 8) | Int(data[nameCursor + 2])
-                    nameCursor += 3
-                    guard nameCursor + nameLength <= namesEnd else { return .malformed }
-
-                    if nameType == 0 {
-                        let nameData = data.subdata(in: nameCursor ..< nameCursor + nameLength)
-                        if let host = String(data: nameData, encoding: .utf8) {
-                            return .success(hostname: host)
-                        }
-                        if let asciiHost = String(bytes: nameData, encoding: .ascii) {
-                            return .success(hostname: asciiHost)
-                        }
-                        return .success(hostname: nil)
-                    }
-
-                    nameCursor += nameLength
-                }
-
-                return .success(hostname: nil)
-            }
-
-            extCursor += extensionLength
-        }
-
-        return .success(hostname: nil)
     }
 
     func handleDNSOutbound(flow: NEFilterFlow, flowKey: ObjectIdentifier, readBytes: Data) -> NEFilterDataVerdict? {
@@ -249,129 +125,47 @@ extension FilterDataProvider {
         }
     }
 
+    /// Decides a flow of a leashed process from the daemon's policy tables,
+    /// as the Linux kernel decides connect/sendmsg: by destination address and
+    /// port (hostname rules were resolved by the daemon when the policy
+    /// loaded; names are the transparent proxy's job). DNS is an ordinary
+    /// flow to the resolver, decided like any other.
+    ///
+    /// `exemptLocalScope` is only for flows of processes the filter merely
+    /// inferred (system-wide enforcement): loopback and link-local stay open
+    /// for them while policy is unavailable, so the machine's own plumbing
+    /// keeps working. A leashed process gets no exemption.
     func evaluateFlow(
         hostname: String,
         port: String,
-        pidInfo: TrackedPIDInfo,
-        pid: pid_t,
-        socketProtocol: Int32,
-        allowInspection: Bool = true,
-        isDNSQuery: Bool = false,
-        direction: NETrafficDirection = .outbound
+        direction: NETrafficDirection = .outbound,
+        exemptLocalScope: Bool = false
     ) -> FlowDecision {
-        // Fail closed: a flow in the filter's enforcement scope is denied while
-        // the policy that governs it is missing or stale, rather than falling
-        // through to the default-allow below (#62).
-        //
-        // Explicitly-outbound flows only. Leash enforces egress; a filter that
-        // lost its daemon must not become a host firewall that refuses new
-        // connections to the machine — that would cut the remote access you'd
-        // use to fix it. Requiring `.outbound` rather than merely excluding
-        // `.inbound` costs no enforcement (outbound socket flows do report
-        // `.outbound`) and keeps anything the system reports ambiguously on the
-        // safe side of that line.
-        if direction == .outbound,
-           case .unavailable(let reason) = policyAvailability(),
-           !isFailClosedExempt(hostname: hostname) {
-            return .deny(reason: "Policy unavailable: \(reason)")
+        if direction != .outbound {
+            // Leash enforces egress. Inbound flows to a leashed process are
+            // the machine's to decide.
+            return .allow
         }
-
-        var rules: [NetworkRule] = []
-        syncQueue.sync {
-            rules = networkRules
+        let (matcher, unavailable) = policyMatcher(strictScope: !exemptLocalScope)
+        guard let matcher else {
+            if exemptLocalScope && isFailClosedExempt(hostname: hostname) {
+                return .allow
+            }
+            return .deny(reason: "Policy unavailable: \(unavailable)")
         }
-
-        for rule in rules where rule.enabled {
-            if let ruleCWD = rule.currentWorkingDirectory, let actualCWD = pidInfo.cwd {
-                if ruleCWD != actualCWD {
-                    continue
-                }
-            }
-
-            switch rule.target {
-            case .domain(let domain):
-                if isDNSQuery {
-                    continue
-                }
-
-                if let ipHost = normalizedIPAddress(from: hostname) {
-                    let normalizedDomain = normalizeDomain(domain)
-                    if allowInspection,
-                       socketProtocol == IPPROTO_TCP,
-                       (port == "443" || port == "8443"),
-                       !normalizedDomain.isEmpty,
-                       !domainContainsIP(domain: normalizedDomain, ip: ipHost) {
-                        return .needsInspection
-                    }
-                }
-
-                if hostMatchesDomain(hostname, domain: domain, pidInfo: pidInfo, pid: pid) {
-                    switch rule.action {
-                    case .allow:
-                        return .allow
-                    case .deny:
-                        return .deny(reason: "Blocked by rule: \(domain)")
-                    }
-                }
-
-            case .ipAddress(let ip):
-                if hostname == ip {
-                    switch rule.action {
-                    case .allow:
-                        return .allow
-                    case .deny:
-                        return .deny(reason: "Blocked by rule: \(ip)")
-                    }
-                }
-
-            case .ipRange(let cidr):
-                if isIPInRange(hostname, cidr: cidr) {
-                    switch rule.action {
-                    case .allow:
-                        return .allow
-                    case .deny:
-                        return .deny(reason: "Blocked by rule: \(cidr)")
-                    }
-                }
-            }
+        guard let portNumber = UInt16(port) else {
+            return .deny(reason: "unparseable destination port \(port)")
         }
-
-        // No matching rule - default allow
-        return .allow
-    }
-
-    func hostMatchesDomain(_ hostname: String, domain: String, pidInfo: TrackedPIDInfo, pid: pid_t) -> Bool {
-        let trimmed = domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let hasWildcard = trimmed.hasPrefix("*.")
-        let domainBody = hasWildcard ? String(trimmed.dropFirst(2)) : trimmed
-        let normalizedDomain = normalizeDomain(domainBody)
-        guard !normalizedDomain.isEmpty else { return false }
-
-        let normalizedHost = normalizeHostname(hostname)
-        if hasWildcard {
-            if normalizedHost.hasSuffix("." + normalizedDomain) {
-                return true
-            }
+        let allowed: Bool
+        if normalizedIPAddress(from: hostname) != nil {
+            allowed = matcher.allowsConnect(ip: hostname, port: portNumber)
         } else {
-            if normalizedHost == normalizedDomain {
-                return true
-            }
-
-            if normalizedHost.hasSuffix("." + normalizedDomain) {
-                return true
-            }
+            // The flow names its destination but not its address. Allow it only
+            // if the tables allow every address on this port: never looser
+            // than deciding by the address the name resolves to.
+            allowed = matcher.allowsConnectToAnyAddress(port: portNumber)
         }
-
-        guard let ipAddress = normalizedIPAddress(from: normalizedHost) else {
-            return false
-        }
-
-        if domainContainsIP(domain: normalizedDomain, ip: ipAddress) {
-            return true
-        }
-
-        addResolvedIP(ipAddress, to: normalizedDomain, pid: pid, info: pidInfo)
-        return true
+        return allowed ? .allow : .deny(reason: "Blocked by policy (\(matcher.version))")
     }
 
     func normalizeDomain(_ domain: String) -> String {
@@ -586,9 +380,6 @@ extension FilterDataProvider {
             severity = "warning"
             decisionValue = "deny"
             details["reason"] = reason
-        case .needsInspection:
-            severity = "info"
-            decisionValue = "inspect"
         }
         details["decision"] = decisionValue
 
@@ -820,58 +611,6 @@ extension FilterDataProvider {
         }
 
         return ips
-    }
-
-    func isIPInRange(_ ip: String, cidr: String) -> Bool {
-        // cidr is "network/prefix", e.g. "192.168.1.0/24" or "2001:db8::/32".
-        let parts = cidr.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
-        guard parts.count == 2, let prefixLen = Int(parts[1]), prefixLen >= 0 else {
-            return false
-        }
-        let network = String(parts[0])
-
-        // The address and the network must be the same family. Try IPv4, then IPv6.
-        if let ipBytes = inetBytes(ip, family: AF_INET, length: 4),
-           let netBytes = inetBytes(network, family: AF_INET, length: 4) {
-            guard prefixLen <= 32 else { return false }
-            return prefixMatches(ipBytes, netBytes, bits: prefixLen)
-        }
-        if let ipBytes = inetBytes(ip, family: AF_INET6, length: 16),
-           let netBytes = inetBytes(network, family: AF_INET6, length: 16) {
-            guard prefixLen <= 128 else { return false }
-            return prefixMatches(ipBytes, netBytes, bits: prefixLen)
-        }
-        return false
-    }
-
-    /// Parse a numeric IP string into its raw bytes for the given address family
-    /// (4 bytes for AF_INET, 16 for AF_INET6). Returns nil if it doesn't parse.
-    private func inetBytes(_ s: String, family: Int32, length: Int) -> [UInt8]? {
-        var buffer = [UInt8](repeating: 0, count: length)
-        let ok = s.withCString { cstr in
-            buffer.withUnsafeMutableBytes { raw -> Int32 in
-                guard let baseAddress = raw.baseAddress else { return 0 }
-                return inet_pton(family, cstr, baseAddress)
-            }
-        }
-        return ok == 1 ? buffer : nil
-    }
-
-    /// True if the first `bits` bits of `a` and `b` are equal.
-    private func prefixMatches(_ a: [UInt8], _ b: [UInt8], bits: Int) -> Bool {
-        guard a.count == b.count, bits >= 0, bits <= a.count * 8 else { return false }
-        let fullBytes = bits / 8
-        let remainderBits = bits % 8
-        for i in 0..<fullBytes where a[i] != b[i] {
-            return false
-        }
-        if remainderBits > 0 {
-            let mask = UInt8(truncatingIfNeeded: 0xFF << (8 - remainderBits))
-            if (a[fullBytes] & mask) != (b[fullBytes] & mask) {
-                return false
-            }
-        }
-        return true
     }
 
     func describeSocketProtocol(_ number: Int32) -> String {

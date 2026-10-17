@@ -1,5 +1,8 @@
 import Foundation
 
+/// An Endpoint Security decision, as reported to the daemon for the event log
+/// and the Control UI. Decisions themselves are made by `LeashPolicyMatcher`
+/// over the daemon's policy tables.
 struct LeashPolicyEvent: Codable, Identifiable {
     enum Kind: String, Codable {
         case processExec
@@ -7,9 +10,24 @@ struct LeashPolicyEvent: Codable, Identifiable {
     }
 
     enum FileOperation: String, Codable {
+        /// open without FWRITE
         case open
+        /// open of an existing file with O_CREAT and FWRITE
         case create
+        /// open with FWRITE
         case write
+        /// truncate(2): decided as a write open
+        case truncate
+        /// mkdir, and the creation of any non-regular file
+        case mkdir
+        /// unlink and rmdir
+        case unlink
+        /// either side of a rename or an exchangedata
+        case rename
+        /// a hard link (new name; the source must be readable)
+        case link
+        /// clonefile / copyfile (the new file)
+        case clone
     }
 
     let id: UUID
@@ -30,104 +48,9 @@ struct LeashPolicyEvent: Codable, Identifiable {
     let parentPid: Int32
 }
 
-struct LeashPolicyDecision: Codable {
+struct LeashPolicyDecision {
     enum Action: String, Codable {
         case allow
         case deny
-    }
-
-    enum Scope: Codable {
-        case once
-        case always
-        case directory(String)
-    }
-
-    let eventID: UUID
-    let action: Action
-    let scope: Scope
-}
-
-struct LeashPolicyRule: Codable, Identifiable, Equatable {
-    let id: UUID
-    let kind: LeashPolicyEvent.Kind
-    let action: LeashPolicyDecision.Action
-    let executablePath: String
-    let directory: String?
-    let filePath: String?
-    let coversCreates: Bool
-
-    init(id: UUID = UUID(), kind: LeashPolicyEvent.Kind, action: LeashPolicyDecision.Action, executablePath: String, directory: String? = nil, filePath: String? = nil, coversCreates: Bool = false) {
-        self.id = id
-        self.kind = kind
-        self.action = action
-        self.executablePath = executablePath
-        self.directory = directory
-        self.filePath = filePath
-        if filePath != nil {
-            self.coversCreates = true
-        } else {
-            self.coversCreates = coversCreates
-        }
-    }
-
-    func matches(_ event: LeashPolicyEvent) -> Bool {
-        guard kind == event.kind else { return false }
-        if !executablePath.isEmpty && executablePath != "*" {
-            guard event.processPath == executablePath else { return false }
-        }
-        if let directory {
-            let normalizedDirectory = normalizeDirectoryPath(directory)
-            let directoryExact = String(normalizedDirectory.dropLast())
-            if kind == .fileAccess {
-                guard let rawPath = event.filePath else { return false }
-                let normalizedPath = normalizeFilePath(rawPath)
-                if normalizedPath != directoryExact && !normalizedPath.hasPrefix(normalizedDirectory) {
-                    return false
-                }
-            } else {
-                // processExec: a directory rule (e.g. "/") matches by executable path
-                // prefix, so "allow /" covers every binary. (Exact File:: exec rules use
-                // executablePath above, not this branch.)
-                let normalizedPath = normalizeFilePath(event.processPath)
-                if normalizedPath != directoryExact && !normalizedPath.hasPrefix(normalizedDirectory) {
-                    return false
-                }
-            }
-        }
-        if let filePath {
-            guard let eventFilePath = event.filePath, eventFilePath == filePath else { return false }
-        }
-
-        if event.fileOperation == .create && !coversCreates {
-            return false
-        }
-
-        return true
-    }
-
-    private func normalizeDirectoryPath(_ path: String) -> String {
-        var normalized = normalizeFilePath(path)
-        if !normalized.hasSuffix("/") {
-            normalized += "/"
-        }
-        return normalized
-    }
-
-    private func normalizeFilePath(_ path: String) -> String {
-        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return trimmed }
-        var normalized = URL(fileURLWithPath: trimmed).standardized.path
-        // macOS firmlinks: Endpoint Security reports canonical /private/{etc,tmp,var}
-        // paths, but policies are written as /etc, /tmp, /var. Map the private form
-        // back so a rule like "/tmp/" matches an event path like "/private/tmp/x".
-        for firmlink in ["/etc", "/tmp", "/var"] {
-            let privatePrefix = "/private" + firmlink
-            if normalized == privatePrefix {
-                normalized = firmlink
-            } else if normalized.hasPrefix(privatePrefix + "/") {
-                normalized = firmlink + String(normalized.dropFirst(privatePrefix.count))
-            }
-        }
-        return normalized
     }
 }

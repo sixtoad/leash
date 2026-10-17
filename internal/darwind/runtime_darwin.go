@@ -164,12 +164,18 @@ func runExec(args []string) error {
 		}
 	}()
 
+	// Activation is not enforcement: wait until the extensions are connected
+	// to this daemon and enforce its current policy (launch_gate.go).
+	if err := waitForEnforcement(enforcementReadyTimeout); err != nil {
+		return err
+	}
+
 	cmd := exec.Command(cliPath, passthrough...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
 	cmd.Env = execEnvWithCACert(os.Environ())
-	return cmd.Run()
+	return runLeashcli(cmd)
 }
 
 // execEnvWithCACert augments the leashcli environment so it can locate the leash
@@ -554,6 +560,10 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 	// protocol v1 header the transparent proxy provider prepends to each flow.
 	mitmProxy.SetProxyProtocolIngestion(true)
 	mitmProxy.SetListenHost(darwinLoopback)
+	// The transparent proxy provider relays here; a leashed process
+	// connecting directly would skip the network filter (it never sees
+	// loopback).
+	mitmProxy.SetConnFilter(func(c net.Conn) bool { return allowControlConn("proxy", c, macSync.TrackedPIDList) })
 	logPolicyEvent("proxy.mode", map[string]any{
 		"status":    "enabled",
 		"port":      cfg.ProxyPort,
@@ -572,9 +582,14 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 		macSync:        macSync,
 	}
 
-	policyManager := policy.NewManager(lsmManager, func(active *cedarutil.Compilation) {
+	// The extensions are this platform's kernel: every active policy is
+	// compiled to their tables, and one they cannot take is rejected like a
+	// kernel refusal (the previous policy stays active everywhere).
+	kernel := &macKernel{rt: state, protection: darwinProtection(cfg)}
+	policyManager := policy.NewManagerWithKernel(kernel, func(active *cedarutil.Compilation) error {
 		state.headerRewriter.SetRules(active.HTTPRules)
 		state.decisions.Publish(active.Engine, state.mitmProxy.SetEngine)
+		return nil
 	})
 
 	if err := policyManager.UpdateFileRules(initialPolicy.LSMPolicies, initialPolicy.HTTPRewrites); err != nil {
@@ -583,8 +598,6 @@ func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 	}
 	headerRewriter.SetRules(initialPolicy.HTTPRewrites)
 	state.policyManager = policyManager
-
-	state.syncMacPoliciesFrom(initialPolicy.LSMPolicies)
 
 	logPolicyEvent("policy.restore", map[string]any{
 		"source":        "file",
@@ -711,10 +724,16 @@ func (rt *runtimeState) startFrontend() error {
 	api.register(mux)
 
 	server := httpserver.NewWebServer(rt.cfg.WebBind, mux)
+	ln, err := net.Listen("tcp", rt.cfg.WebBind)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", rt.cfg.WebBind, err)
+	}
+	// A leashed process may not talk to the daemon (peer_guard_darwin.go).
+	guarded := &guardedListener{Listener: ln, name: "control", tracked: rt.trackedPIDList}
 
 	go func(addr string, srv *http.Server) {
 		logPolicyEvent("frontend.start", map[string]any{"addr": addr})
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(guarded); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("web server failed: %v", err)
 		}
 	}(rt.cfg.WebBind, server)
@@ -762,7 +781,6 @@ func (rt *runtimeState) startPolicyWatcher() error {
 			"lsm_connect":   len(newCfg.LSMPolicies.Connect),
 			"http_rewrites": len(newCfg.HTTPRewrites),
 		})
-		rt.syncMacPoliciesFrom(newCfg.LSMPolicies)
 		rt.policyReady.Store(true)
 	}, func(detail *cedarutil.ErrorDetail) {
 		if detail == nil {
@@ -868,6 +886,14 @@ func (rt *runtimeState) dispatchClientEnvelope(clientID string, env *messages.En
 			rt.sendAck(clientID, env, "error", "invalid pid payload")
 			return
 		}
+		if rt.macSync != nil && !rt.macSync.AcceptsPIDSync(clientID) {
+			// The network filter and the transparent proxy enforce for exactly
+			// this set; only the ES extension, which sees process lineage, may
+			// replace it.
+			logPolicyEvent("mac.pid.sync.refused", map[string]any{"client": clientID})
+			rt.sendAck(clientID, env, "error", "only the Endpoint Security extension reports tracked PIDs")
+			return
+		}
 		if rt.macSync != nil {
 			tracked := rt.macSync.UpdateTrackedPIDs(clientID, &pidPayload)
 			logPolicyEvent("mac.pid.sync", map[string]any{
@@ -940,21 +966,36 @@ func (rt *runtimeState) dispatchClientEnvelope(clientID string, env *messages.En
 		}
 		rt.sendResponse(clientID, env, "ok", "policy event stored", map[string]any{"success": true})
 
-	case messages.TypeMacRuleQuery:
-		if rt.macSync == nil {
-			rt.sendResponse(clientID, env, "error", "macsync not available", nil)
-			return
-		}
-		rules := rt.macSync.GetPolicyRules()
-		rt.sendResponse(clientID, env, "ok", "rules retrieved", map[string]any{"rules": rules})
+	case messages.TypeMacRuleQuery, messages.TypeMacNetworkRuleQuery:
+		// The pre-tables rule lists. Extensions that still ask for them predate
+		// mac.policy.tables and cannot enforce the policy's semantics.
+		rt.sendResponse(clientID, env, "error", "superseded by mac.policy.tables; update Leash.app", nil)
 
-	case messages.TypeMacNetworkRuleQuery:
-		if rt.macSync == nil {
-			rt.sendResponse(clientID, env, "error", "macsync not available", nil)
+	case messages.TypeMacPolicyTablesQuery:
+		var tables *macsync.MacPolicyTables
+		if rt.macSync != nil {
+			tables = rt.macSync.CurrentTables()
+		}
+		if tables == nil {
+			rt.sendResponse(clientID, env, "error", "no policy compiled yet", nil)
 			return
 		}
-		rules := rt.macSync.GetNetworkRules()
-		rt.sendResponse(clientID, env, "ok", "network rules retrieved", map[string]any{"rules": rules})
+		payload, err := tablesPayload(tables)
+		if err != nil {
+			rt.sendResponse(clientID, env, "error", err.Error(), nil)
+			return
+		}
+		rt.sendResponse(clientID, env, "ok", "policy tables", map[string]any{"tables": payload})
+
+	case messages.TypeMacPolicyApplied:
+		var applied messages.MacPolicyAppliedPayload
+		if err := messages.UnmarshalPayload(env, &applied); err != nil {
+			log.Printf("macsync: invalid policy applied from %s: %v", clientID, err)
+			return
+		}
+		if rt.macSync != nil {
+			rt.macSync.RecordApplied(clientID, applied.Version, applied.Error)
+		}
 
 	case messages.TypeMacClientQuery:
 		if rt.macSync == nil {
@@ -1118,70 +1159,6 @@ func (rt *runtimeState) sendResponse(clientID string, env *messages.Envelope, st
 	if err := rt.wsHub.SendToClient(clientID, data); err != nil {
 		log.Printf("macsync: failed to send response to %s: %v", clientID, err)
 	}
-}
-
-// broadcastRuleUpdate notifies all clients that policy rules have changed.
-func (rt *runtimeState) broadcastRuleUpdate() {
-	if rt.wsHub == nil || rt.macSync == nil {
-		return
-	}
-
-	rules := rt.macSync.GetPolicyRules()
-	payload := map[string]any{"rules": rules}
-
-	env, err := messages.WrapPayload("", "", "mac.rule.snapshot", 1, payload)
-	if err != nil {
-		log.Printf("macsync: failed to create rule update broadcast: %v", err)
-		return
-	}
-
-	data, err := json.Marshal(env)
-	if err != nil {
-		log.Printf("macsync: failed to marshal rule update broadcast: %v", err)
-		return
-	}
-
-	// Broadcast to all clients
-	if rt.wsHub != nil {
-		for _, client := range rt.snapshotMacClients() {
-			if err := rt.wsHub.SendToClient(client.ID, data); err != nil {
-				log.Printf("macsync: failed to broadcast rule update to %s: %v", client.ID, err)
-			}
-		}
-	}
-
-	log.Printf("macsync: broadcasted rule update (%d rules) to %d clients", len(rules), len(rt.snapshotMacClients()))
-}
-
-// broadcastNetworkRuleUpdate notifies all clients that network rules have changed.
-func (rt *runtimeState) broadcastNetworkRuleUpdate() {
-	if rt.wsHub == nil || rt.macSync == nil {
-		return
-	}
-
-	rules := rt.macSync.GetNetworkRules()
-	payload := map[string]any{"rules": rules}
-
-	env, err := messages.WrapPayload("", "", messages.TypeMacNetworkRuleUpdate, 1, payload)
-	if err != nil {
-		log.Printf("macsync: failed to create network rule update broadcast: %v", err)
-		return
-	}
-
-	data, err := json.Marshal(env)
-	if err != nil {
-		log.Printf("macsync: failed to marshal network rule update broadcast: %v", err)
-		return
-	}
-
-	// Broadcast to all clients
-	for _, client := range rt.snapshotMacClients() {
-		if err := rt.wsHub.SendToClient(client.ID, data); err != nil {
-			log.Printf("macsync: failed to broadcast network rule update to %s: %v", client.ID, err)
-		}
-	}
-
-	log.Printf("macsync: broadcasted network rule update (%d rules) to %d clients", len(rules), len(rt.snapshotMacClients()))
 }
 
 // broadcastMITMConfig pushes the latest MITM configuration to all mac clients.
@@ -1350,27 +1327,6 @@ func (rt *runtimeState) broadcastPIDUpdate(pids []messages.MacTrackedPID) {
 	log.Printf("macsync: broadcasted PID update (%d PIDs) to %d clients", len(pids), len(rt.snapshotMacClients()))
 }
 
-func (rt *runtimeState) syncMacPoliciesFrom(policies *lsm.PolicySet) {
-	if rt.macSync == nil {
-		return
-	}
-
-	rules, networkRules := macsync.ConvertPolicyToMacRules(policies)
-
-	rt.macSync.ClearPolicyRules()
-	if len(rules) > 0 {
-		rt.macSync.AddPolicyRules(rules)
-	}
-	rt.broadcastRuleUpdate()
-
-	rt.macSync.UpdateNetworkRules(networkRules)
-	rt.broadcastNetworkRuleUpdate()
-
-	for _, rule := range networkRules {
-		log.Printf("macsync: network rule %s %s=%s", rule.Action, rule.TargetType, rule.TargetValue)
-	}
-}
-
 // macDebugEnabled reports whether verbose macOS debug logging is on, from the
 // LEASH_MAC_DEBUG environment variable ("1"/"true"/"yes"/"on", case-insensitive).
 func macDebugEnabled() bool {
@@ -1414,22 +1370,12 @@ func (rt *runtimeState) pushMacStateToClient(clientID string) {
 		}
 	}
 
-	rules := rt.macSync.GetPolicyRules()
-	rulePayload := map[string]any{"rules": rules}
-	if env, err := messages.WrapPayload("", "", "mac.rule.snapshot", 1, rulePayload); err == nil {
-		if data, err := json.Marshal(env); err == nil {
+	// The policy tables, unless this client already applied the current
+	// version (hellos repeat on the same connection).
+	if tables := rt.macSync.CurrentTables(); tables != nil && !rt.macSync.HasApplied(clientID, tables.Version) {
+		if data, err := tablesEnvelope(tables); err == nil {
 			if err := rt.wsHub.SendToClient(clientID, data); err != nil {
-				log.Printf("macsync: failed to push rule snapshot to %s: %v", clientID, err)
-			}
-		}
-	}
-
-	netRules := rt.macSync.GetNetworkRules()
-	netPayload := map[string]any{"rules": netRules}
-	if netEnv, err := messages.WrapPayload("", "", messages.TypeMacNetworkRuleUpdate, 1, netPayload); err == nil {
-		if data, err := json.Marshal(netEnv); err == nil {
-			if err := rt.wsHub.SendToClient(clientID, data); err != nil {
-				log.Printf("macsync: failed to push network rules to %s: %v", clientID, err)
+				log.Printf("macsync: failed to push policy tables to %s: %v", clientID, err)
 			}
 		}
 	}
@@ -1543,4 +1489,13 @@ func findIptables() (string, error) {
 		}
 	}
 	return "", fmt.Errorf("iptables not found (checked PATH, /usr/sbin, /sbin)")
+}
+
+// trackedPIDList is the leashed PID set the Endpoint Security extension
+// reports.
+func (rt *runtimeState) trackedPIDList() []int {
+	if rt.macSync == nil {
+		return nil
+	}
+	return rt.macSync.TrackedPIDList()
 }

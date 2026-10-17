@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/macsync"
 	"github.com/strongdm/leash/internal/messages"
 )
@@ -33,9 +34,11 @@ func TestControlUIBindsLoopbackByDefault(t *testing.T) {
 // enforce: they are compiled from the Cedar policy only.
 func TestClientRuleMutationsAreRefused(t *testing.T) {
 	rt := &runtimeState{macSync: macsync.NewManager(nil)}
-	seed := messages.MacPolicyRule{ID: "policy-rule", Kind: "fileAccess", Action: "deny", ExecutablePath: "*", Directory: "/secret/"}
-	rt.macSync.AddPolicyRules([]messages.MacPolicyRule{seed})
-	rt.macSync.UpdateNetworkRules([]messages.MacNetworkRule{{ID: "net-rule", TargetType: "domain", TargetValue: "evil.test", Action: "deny", Enabled: true}})
+	seed, err := macsync.CompileTables(&lsm.PolicySet{ConnectDefaultExplicit: true}, macsync.Protection{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt.macSync.SetTables(seed)
 	rt.macSync.StorePolicyEvent(&messages.MacPolicyEventPayload{ID: "0123456789", Kind: "fileAccess", ProcessPath: "/bin/cat", FilePath: "/secret/x"})
 
 	payloads := map[string]any{
@@ -53,12 +56,28 @@ func TestClientRuleMutationsAreRefused(t *testing.T) {
 		rt.dispatchClientEnvelope("workload", &messages.Envelope{Type: typ, Payload: raw})
 	}
 
-	rules := rt.macSync.GetPolicyRules()
-	if len(rules) != 1 || rules[0].ID != "policy-rule" || rules[0].Action != "deny" {
-		t.Fatalf("file/exec rules changed by a client: %+v", rules)
+	if got := rt.macSync.CurrentTables(); got != seed {
+		t.Fatalf("the enforced tables were changed by a client: %+v", got)
 	}
-	net := rt.macSync.GetNetworkRules()
-	if len(net) != 1 || net[0].ID != "net-rule" {
-		t.Fatalf("network rules changed by a client: %+v", net)
+}
+
+// Only the ES extension may replace the tracked PID set the network filter
+// and the transparent proxy enforce for.
+func TestPIDSyncOnlyFromEndpointSecurity(t *testing.T) {
+	rt := &runtimeState{macSync: macsync.NewManager(nil)}
+	rt.macSync.RegisterClient("es", &messages.ClientHelloPayload{Component: macsync.ComponentEndpointSecurity})
+	rt.macSync.RegisterClient("other", &messages.ClientHelloPayload{Component: "leash.cli"})
+	send := func(client string, pids ...int) {
+		var entries []messages.MacTrackedPID
+		for _, p := range pids {
+			entries = append(entries, messages.MacTrackedPID{PID: p, LeashPID: 1, Executable: "/bin/sh"})
+		}
+		raw, _ := json.Marshal(messages.MacPIDSyncPayload{Entries: entries})
+		rt.dispatchClientEnvelope(client, &messages.Envelope{Type: messages.TypeMacPIDSync, Payload: raw})
+	}
+	send("es", 10, 11)
+	send("other") // an empty set would stop enforcement for 10 and 11
+	if got := rt.macSync.CurrentTrackedPIDs(); len(got) != 2 {
+		t.Fatalf("tracked PIDs = %+v, want the ES extension's two", got)
 	}
 }

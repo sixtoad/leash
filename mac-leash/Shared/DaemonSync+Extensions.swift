@@ -4,8 +4,11 @@ import os.log
 extension DaemonSync {
     // MARK: - Public API
 
+    /// Sends the complete tracked set, including an empty one: the daemon
+    /// replaces its set with this, and a set that never empties would keep
+    /// the network filter and the proxy enforcing on PIDs the OS has since
+    /// reused for unrelated processes.
     func sendTrackedPIDs(_ pids: [PIDEntry]) {
-        guard !pids.isEmpty else { return }
         queue.async { [weak self] in
             guard let self else { return }
             self.ensureConnection()
@@ -27,57 +30,6 @@ extension DaemonSync {
                 payload: ["entries": entriesPayload],
                 requestID: nil
             )
-        }
-    }
-
-    func sendRuleSnapshot(ruleSet: RuleSet) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.ensureConnection()
-
-            let fileRules = ruleSet.fileRules.map { rule -> [String: Any] in
-                var dict: [String: Any] = [
-                    "id": rule.id,
-                    "action": rule.action,
-                    "executable": rule.executable
-                ]
-                if let directory = rule.directory { dict["directory"] = directory }
-                if let file = rule.file { dict["file"] = file }
-                if let kind = rule.kind { dict["kind"] = kind }
-                return dict
-            }
-
-            let execRules = ruleSet.execRules.map { rule -> [String: Any] in
-                var dict: [String: Any] = [
-                    "id": rule.id,
-                    "action": rule.action,
-                    "executable": rule.executable
-                ]
-                if let argsHash = rule.argsHash { dict["args_hash"] = argsHash }
-                return dict
-            }
-
-            let networkRules = ruleSet.networkRules.map { rule -> [String: Any] in
-                var dict: [String: Any] = [
-                    "id": rule.id,
-                    "action": rule.action,
-                    "target_type": rule.targetType,
-                    "target_value": rule.targetValue,
-                    "enabled": rule.enabled
-                ]
-                if let name = rule.name { dict["name"] = name }
-                if let cwd = rule.cwd { dict["cwd"] = cwd }
-                return dict
-            }
-
-            let payload: [String: Any] = [
-                "file_rules": fileRules,
-                "exec_rules": execRules,
-                "network_rules": networkRules,
-                "version": ruleSet.version
-            ]
-
-            self.sendEnvelope(type: "mac.rule.sync", payload: payload, requestID: nil)
         }
     }
 
@@ -137,76 +89,26 @@ extension DaemonSync {
         }
     }
 
-    func sendPolicyDecision(_ decision: LeashPolicyDecision, completion: ((Error?) -> Void)? = nil) {
+    // MARK: - Policy tables
+
+    /// Asks the daemon for the policy tables the extensions must enforce
+    /// (`mac.policy.tables.query`). The daemon also pushes them unsolicited
+    /// on every hello and every policy change (`mac.policy.tables`).
+    func queryPolicyTables(completion: @escaping (Result<[String: Any], Error>) -> Void) {
         queue.async { [weak self] in
             guard let self else { return }
             self.ensureConnection()
-
-            var scopeDict: [String: Any] = [:]
-            switch decision.scope {
-            case .once:
-                scopeDict = ["type": "once"]
-            case .always:
-                scopeDict = ["type": "always"]
-            case .directory(let path):
-                scopeDict = ["type": "directory", "path": path]
-            }
-
-            let payload: [String: Any] = [
-                "event_id": decision.eventID.uuidString,
-                "action": decision.action.rawValue,
-                "scope": scopeDict
-            ]
-
-            self.sendRequest(type: "mac.policy.decision", payload: payload) { result in
-                switch result {
-                case .success:
-                    completion?(nil)
-                case .failure(let error):
-                    completion?(error)
-                }
-            }
-        }
-    }
-
-    // MARK: - Rules Management
-
-    func queryRules(completion: @escaping (Result<[LeashPolicyRule], Error>) -> Void) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.ensureConnection()
-
-            self.sendRequest(type: "mac.rule.query", payload: [:]) { result in
+            self.sendRequest(type: "mac.policy.tables.query", payload: [:]) { result in
                 switch result {
                 case .success(let payload):
-                    guard let rulesData = payload["rules"] as? [[String: Any]] else {
-                        completion(.success([]))
+                    guard let tables = payload["tables"] as? [String: Any] else {
+                        completion(.failure(NSError(
+                            domain: LeashIdentifiers.namespaced("daemon-sync"),
+                            code: -4,
+                            userInfo: [NSLocalizedDescriptionKey: "daemon sent no policy tables"])))
                         return
                     }
-
-                    let rules = rulesData.compactMap { ruleDict -> LeashPolicyRule? in
-                        guard let idString = ruleDict["id"] as? String,
-                              let id = UUID(uuidString: idString),
-                              let kindString = ruleDict["kind"] as? String,
-                              let kind = LeashPolicyEvent.Kind(rawValue: kindString),
-                              let actionString = ruleDict["action"] as? String,
-                              let action = LeashPolicyDecision.Action(rawValue: actionString),
-                              let executablePath = ruleDict["executable_path"] as? String else {
-                            return nil
-                        }
-
-                        return LeashPolicyRule(
-                            id: id,
-                            kind: kind,
-                            action: action,
-                            executablePath: executablePath,
-                            directory: ruleDict["directory"] as? String,
-                            filePath: ruleDict["file_path"] as? String,
-                            coversCreates: (ruleDict["covers_creates"] as? Bool) ?? false
-                        )
-                    }
-
-                    completion(.success(rules))
+                    completion(.success(tables))
                 case .failure(let error):
                     completion(.failure(error))
                 }
@@ -214,141 +116,16 @@ extension DaemonSync {
         }
     }
 
-    func addRules(_ rules: [LeashPolicyRule], completion: ((Error?) -> Void)? = nil) {
+    /// Reports that this component now enforces `version` (error == nil) or
+    /// refused it. `leash --darwin exec` starts a workload only once the ES and
+    /// NE extensions have applied the daemon's current version.
+    func sendPolicyApplied(version: String, error: String? = nil) {
         queue.async { [weak self] in
             guard let self else { return }
             self.ensureConnection()
-
-            let rulesPayload = rules.map { rule -> [String: Any] in
-                var dict: [String: Any] = [
-                    "id": rule.id.uuidString,
-                    "kind": rule.kind.rawValue,
-                    "action": rule.action.rawValue,
-                    "executable_path": rule.executablePath
-                ]
-                if let directory = rule.directory {
-                    dict["directory"] = directory
-                }
-                if let filePath = rule.filePath {
-                    dict["file_path"] = filePath
-                }
-                if rule.coversCreates {
-                    dict["covers_creates"] = true
-                }
-                return dict
-            }
-
-            self.sendRequest(type: "mac.rule.add", payload: ["rules": rulesPayload]) { result in
-                switch result {
-                case .success:
-                    completion?(nil)
-                case .failure(let error):
-                    completion?(error)
-                }
-            }
-        }
-    }
-
-    func removeRules(ids: [UUID], completion: ((Error?) -> Void)? = nil) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.ensureConnection()
-
-            let payload = ["ids": ids.map { $0.uuidString }]
-
-            self.sendRequest(type: "mac.rule.remove", payload: payload) { result in
-                switch result {
-                case .success:
-                    completion?(nil)
-                case .failure(let error):
-                    completion?(error)
-                }
-            }
-        }
-    }
-
-    func clearAllRules(completion: ((Error?) -> Void)? = nil) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.ensureConnection()
-
-            self.sendRequest(type: "mac.rule.clear", payload: [:]) { result in
-                switch result {
-                case .success:
-                    completion?(nil)
-                case .failure(let error):
-                    completion?(error)
-                }
-            }
-        }
-    }
-
-    // MARK: - Network Rules Management
-
-    func updateNetworkRules(_ rules: [NetworkRule], completion: ((Error?) -> Void)? = nil) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.ensureConnection()
-
-            let rulesPayload = rules.map { rule -> [String: Any] in
-                var dict: [String: Any] = [
-                    "id": rule.id.uuidString,
-                    "name": rule.name,
-                    "action": rule.action.rawValue,
-                    "enabled": rule.enabled,
-                    "created_at": ISO8601DateFormatter().string(from: rule.createdAt)
-                ]
-
-                switch rule.target {
-                case .domain(let domain):
-                    dict["target_type"] = "domain"
-                    dict["target_value"] = domain
-                case .ipAddress(let ip):
-                    dict["target_type"] = "ipAddress"
-                    dict["target_value"] = ip
-                case .ipRange(let cidr):
-                    dict["target_type"] = "ipRange"
-                    dict["target_value"] = cidr
-                }
-
-                if let cwd = rule.currentWorkingDirectory {
-                    dict["cwd"] = cwd
-                }
-
-                return dict
-            }
-
-            self.sendRequest(type: "mac.network_rule.update", payload: ["rules": rulesPayload]) { result in
-                switch result {
-                case .success:
-                    completion?(nil)
-                case .failure(let error):
-                    completion?(error)
-                }
-            }
-        }
-    }
-
-    func queryNetworkRules(completion: @escaping (Result<[NetworkRule], Error>) -> Void) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.ensureConnection()
-
-            self.sendRequest(type: "mac.network_rule.query", payload: [:]) { result in
-                switch result {
-                case .success(let payload):
-                    guard let rulesData = payload["rules"] as? [[String: Any]] else {
-                        completion(.success([]))
-                        return
-                    }
-
-                    let rules = rulesData.compactMap { NetworkRule.fromDictionary($0) }
-
-                    completion(.success(rules))
-                case .failure(let error):
-                    completion(.failure(error))
-                }
-            }
+            var payload: [String: Any] = ["version": version]
+            if let error { payload["error"] = error }
+            self.sendEnvelope(type: "mac.policy.applied", payload: payload, requestID: nil)
         }
     }
 

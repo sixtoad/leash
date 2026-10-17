@@ -61,9 +61,13 @@ type Manager struct {
 	clients      map[string]*ClientState
 	trackedPIDs  map[int]messages.MacTrackedPID
 	rules        RuleSnapshot
-	policyRules  map[string]messages.MacPolicyRule         // keyed by rule ID
-	networkRules map[string]messages.MacNetworkRule        // keyed by rule ID
 	policyEvents map[string]messages.MacPolicyEventPayload // keyed by event ID
+
+	// tables is the policy the extensions must enforce (nil until the first
+	// policy compiles); applied is the tables version each client last
+	// acknowledged applying (TypeMacPolicyApplied), by client ID.
+	tables       *MacPolicyTables
+	applied      map[string]string
 	mitmConfig   *messages.MacMITMConfigPayload
 	mitmSessions map[string]messages.MacMITMSessionPayload
 	mitmVersion  int
@@ -81,8 +85,7 @@ func NewManager(logger *lsm.SharedLogger) *Manager {
 		logger:       logger,
 		clients:      make(map[string]*ClientState),
 		trackedPIDs:  make(map[int]messages.MacTrackedPID),
-		policyRules:  make(map[string]messages.MacPolicyRule),
-		networkRules: make(map[string]messages.MacNetworkRule),
+		applied:      make(map[string]string),
 		policyEvents: make(map[string]messages.MacPolicyEventPayload),
 		mitmSessions: make(map[string]messages.MacMITMSessionPayload),
 	}
@@ -128,6 +131,7 @@ func (m *Manager) UnregisterClient(clientID string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	delete(m.applied, clientID)
 	if client, ok := m.clients[clientID]; ok {
 		delete(m.clients, clientID)
 		log.Printf("macsync: unregistered client %s component=%s (%d remaining: %s)",
@@ -470,88 +474,6 @@ func (m *Manager) StorePolicyEvent(event *messages.MacPolicyEventPayload) {
 	defer m.mu.Unlock()
 	m.policyEvents[event.ID] = *event
 	log.Printf("macsync: stored policy event %s kind=%s process=%s", event.ID, event.Kind, event.ProcessPath)
-}
-
-// MARK: - Policy Rules
-
-// GetPolicyRules returns all current policy rules.
-func (m *Manager) GetPolicyRules() []messages.MacPolicyRule {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	rules := make([]messages.MacPolicyRule, 0, len(m.policyRules))
-	for _, rule := range m.policyRules {
-		rules = append(rules, rule)
-	}
-	return rules
-}
-
-// AddPolicyRules adds new policy rules.
-func (m *Manager) AddPolicyRules(rules []messages.MacPolicyRule) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, rule := range rules {
-		m.policyRules[rule.ID] = rule
-		log.Printf("macsync: added policy rule %s: %s %s", rule.ID, rule.Action, rule.ExecutablePath)
-	}
-}
-
-// RemovePolicyRules removes rules by ID.
-func (m *Manager) RemovePolicyRules(ids []string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, id := range ids {
-		if _, exists := m.policyRules[id]; exists {
-			delete(m.policyRules, id)
-			log.Printf("macsync: removed policy rule %s", id)
-		}
-	}
-}
-
-// ClearPolicyRules removes all policy rules.
-func (m *Manager) ClearPolicyRules() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	count := len(m.policyRules)
-	m.policyRules = make(map[string]messages.MacPolicyRule)
-	log.Printf("macsync: cleared %d policy rules", count)
-}
-
-// MARK: - Network Rules
-
-// GetNetworkRules returns all current network rules.
-func (m *Manager) GetNetworkRules() []messages.MacNetworkRule {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	rules := make([]messages.MacNetworkRule, 0, len(m.networkRules))
-	for _, rule := range m.networkRules {
-		rules = append(rules, rule)
-	}
-	return rules
-}
-
-// UpdateNetworkRules replaces all network rules.
-func (m *Manager) UpdateNetworkRules(rules []messages.MacNetworkRule) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.networkRules = make(map[string]messages.MacNetworkRule, len(rules))
-	for _, rule := range rules {
-		m.networkRules[rule.ID] = rule
-	}
-
-	enabledCount := 0
-	for _, rule := range rules {
-		if rule.Enabled {
-			enabledCount++
-		}
-	}
-
-	log.Printf("macsync: updated network rules: %d total, %d enabled", len(rules), enabledCount)
 }
 
 // MARK: - MITM State
