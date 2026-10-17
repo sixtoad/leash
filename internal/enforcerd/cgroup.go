@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // CgroupRoot is the cgroup v2 mount.
@@ -123,6 +124,63 @@ func CgroupPopulated(path string) (bool, error) {
 		}
 	}
 	return false, fmt.Errorf("%s/cgroup.events has no populated field", path)
+}
+
+// KillCgroup stops every process in the cgroup at path and its descendants:
+// cgroup.kill (Linux 5.14+), else SIGKILL to each pid in every cgroup.procs,
+// repeated so a process forked meanwhile is caught too. It is the fail-closed
+// backstop when kernel enforcement can no longer be trusted (#193).
+func KillCgroup(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return errors.New("no cgroup to stop")
+	}
+	killErr := writeExisting(filepath.Join(path, "cgroup.kill"), "1")
+	if killErr == nil {
+		return nil
+	}
+	for pass := 0; pass < 10; pass++ {
+		alive := 0
+		walkErr := filepath.WalkDir(path, func(p string, d os.DirEntry, err error) error {
+			if err != nil || !d.IsDir() {
+				return err
+			}
+			data, err := os.ReadFile(filepath.Join(p, "cgroup.procs"))
+			if err != nil {
+				return err
+			}
+			for _, f := range strings.Fields(string(data)) {
+				pid, err := strconv.Atoi(f)
+				if err != nil || pid <= 0 {
+					continue // 0: a process outside this pid namespace
+				}
+				alive++
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+			return nil
+		})
+		if walkErr != nil {
+			return fmt.Errorf("stop cgroup %s: cgroup.kill: %v; walking cgroup.procs: %w", path, killErr, walkErr)
+		}
+		if alive == 0 {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("stop cgroup %s: cgroup.kill: %v; processes still present after SIGKILL", path, killErr)
+}
+
+// writeExisting writes data to an existing file (a cgroup interface file is
+// never created).
+func writeExisting(path, data string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	_, werr := f.WriteString(data)
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	return werr
 }
 
 // CgroupID returns a cgroup directory's id (its inode number).

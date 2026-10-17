@@ -658,14 +658,17 @@ func TestValidateKernelPolicyLimitsChecksEveryModuleBeforeUpdate(t *testing.T) {
 	if err := ValidateKernelPolicyLimits(&PolicySet{Open: []PolicyRule{openRule}, Exec: []PolicyRule{execRule(MaxExecPolicyPathLength + 1)}}); err == nil {
 		t.Fatal("over-limit exec rule passed pre-update validation")
 	}
-	manager, err := os.ReadFile("manager.go")
-	if err != nil {
-		t.Fatal(err)
+	// UpdateRuntimeRules validates every module before updating any: the
+	// over-limit exec rule must stop the update before the open module runs.
+	touched := 0
+	m := NewLSMManager("/cg", nil, true)
+	step := func(*PolicySet) error { touched++; return nil }
+	m.steps = []kernelStep{{"file-open", step}, {"exec", step}, {"connect", step}}
+	if err := m.UpdateRuntimeRules(&PolicySet{Open: []PolicyRule{openRule}, Exec: []PolicyRule{execRule(MaxExecPolicyPathLength + 1)}}); err == nil {
+		t.Fatal("over-limit exec rule accepted by UpdateRuntimeRules")
 	}
-	body := string(manager)
-	validate, open := strings.Index(body, "ValidateKernelPolicyLimits(policies)"), strings.Index(body, "m.updateOpenLSM(policies); err != nil")
-	if validate < 0 || open < 0 || validate > open {
-		t.Fatal("UpdateRuntimeRules must validate every module before updating any")
+	if touched != 0 {
+		t.Fatalf("UpdateRuntimeRules must validate every module before updating any (%d modules updated)", touched)
 	}
 }
 

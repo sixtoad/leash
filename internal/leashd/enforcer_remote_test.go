@@ -22,6 +22,14 @@ type scriptedDaemon struct {
 	mu   sync.Mutex
 	reqs []enforcerd.Request
 	conn net.Conn
+	// refuse, when set, returns a non-empty error for a request to refuse.
+	refuse func(enforcerd.Request) string
+}
+
+func (d *scriptedDaemon) setRefuse(f func(enforcerd.Request) string) {
+	d.mu.Lock()
+	d.refuse = f
+	d.mu.Unlock()
 }
 
 func (d *scriptedDaemon) serve(conn net.Conn) {
@@ -33,10 +41,16 @@ func (d *scriptedDaemon) serve(conn net.Conn) {
 		_ = json.Unmarshal(sc.Bytes(), &r)
 		d.mu.Lock()
 		d.reqs = append(d.reqs, r)
+		refuse := d.refuse
 		d.mu.Unlock()
 		m := enforcerd.Message{V: 1, Type: enforcerd.TypeResult, OK: true}
 		if r.Op == enforcerd.OpAttach {
 			m.Session, m.Programs = "s1", 3
+		}
+		if refuse != nil {
+			if msg := refuse(r); msg != "" {
+				m = enforcerd.Message{V: 1, Type: enforcerd.TypeResult, Error: msg}
+			}
 		}
 		data, _ := json.Marshal(m)
 		_, _ = conn.Write(append(data, '\n'))

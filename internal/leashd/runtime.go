@@ -530,6 +530,10 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 	}
 	headerRewriter.SetRules(initialPolicy.HTTPRewrites)
 	state.policyManager = policyManager
+	// A failed initial load is returned above (leashd exits FATAL and every
+	// launcher fails closed). From here on, a change that cannot be applied
+	// or rolled back stops the workload (#193).
+	policyManager.SetFailClosedHandler(state.policyFailedClosed)
 
 	if err := state.startAuthz(); err != nil {
 		state.Close()
@@ -855,34 +859,28 @@ func (rt *runtimeState) startFrontend() error {
 }
 
 // applyFileReload applies a reloaded policy file, keeping the previous policy
-// when it cannot be applied. The manager already refuses a set the kernel would
-// reject before changing anything; if applying still fails (e.g. a BPF map
-// update error after some modules took the new rules), restore and re-apply the
-// previous file layer so a bad reload never leaves the workload on a partial or
-// empty policy.
+// when it cannot be applied. The manager refuses a set that does not compile
+// or that the kernel would reject before changing anything, and rolls every
+// component (kernel modules, enforcer daemon, proxy) back to the previous
+// policy when applying fails partway (#193); if that rollback fails it fails
+// closed and stops the workload. So a bad reload never leaves the workload on
+// a partial, empty or more permissive policy, and there is nothing to restore
+// here.
 func applyFileReload(mgr *policy.Manager, newCfg *policy.Config) error {
 	if mgr == nil || newCfg == nil {
 		return fmt.Errorf("policy reload: no policy manager or config")
 	}
-	prevLSM, prevHTTP, _, _ := mgr.Snapshot()
-	err := mgr.UpdateFileRules(newCfg.LSMPolicies, newCfg.HTTPRewrites)
-	if err == nil {
-		return nil
-	}
-	// Refused before commit (does not compile, or the kernel would reject it):
-	// the manager never switched, so there is nothing to restore.
-	if errors.Is(err, policy.ErrCompile) || errors.Is(err, policy.ErrRejected) {
-		return err
-	}
-	if rbErr := mgr.UpdateFileRules(prevLSM, prevHTTP); rbErr != nil {
-		return fmt.Errorf("%w (restoring the previous policy also failed: %v)", err, rbErr)
-	}
-	return err
+	return mgr.UpdateFileRules(newCfg.LSMPolicies, newCfg.HTTPRewrites)
 }
 
 func (rt *runtimeState) startPolicyWatcher() error {
 	cancel, err := policy.WatchCedar(rt.cfg.PolicyPath, time.Second, func(newCfg *policy.Config) {
 		if err := applyFileReload(rt.policyManager, newCfg); err != nil {
+			if errors.Is(err, policy.ErrFailedClosed) {
+				logPolicyEvent("policy.update", map[string]any{"source": "file", "error": err.Error(), "kept": "deny-all"})
+				log.Printf("leash: policy reload failed and enforcement failed closed: %v", err)
+				return
+			}
 			logPolicyEvent("policy.update", map[string]any{"source": "file", "error": err.Error(), "kept": "previous"})
 			log.Printf("leash: policy reload rejected, keeping the previous policy: %v", err)
 			return
