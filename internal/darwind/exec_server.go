@@ -32,7 +32,6 @@ const (
 	execLogFilename         = "leash.log"
 	execServerReadyTimeout  = 10 * time.Second
 	execServerShutdownGrace = 5 * time.Second
-	execDefaultPolicyPath   = "/tmp/tmp.leash.policy"
 )
 
 var execHTTPClient = &http.Client{Timeout: 250 * time.Millisecond}
@@ -266,23 +265,46 @@ func (s *execServerState) removeClient(pid int) {
 }
 
 func execStateDir() (string, error) {
-	if override := strings.TrimSpace(os.Getenv("LEASH_DARWIN_STATE_DIR")); override != "" {
-		if err := os.MkdirAll(override, 0o700); err != nil {
-			return "", err
+	base := strings.TrimSpace(os.Getenv("LEASH_DARWIN_STATE_DIR"))
+	if base == "" {
+		config, err := os.UserConfigDir()
+		if err != nil || strings.TrimSpace(config) == "" {
+			base = filepath.Join(os.TempDir(), "leash")
+		} else {
+			base = filepath.Join(config, "leash")
 		}
-		return override, nil
-	}
-
-	base, err := os.UserConfigDir()
-	if err != nil || strings.TrimSpace(base) == "" {
-		base = filepath.Join(os.TempDir(), "leash")
-	} else {
-		base = filepath.Join(base, "leash")
 	}
 	if err := os.MkdirAll(base, 0o700); err != nil {
 		return "", err
 	}
+	if err := secureStateDir(base); err != nil {
+		return "", err
+	}
 	return base, nil
+}
+
+// secureStateDir makes sure the state directory (default policy, server state,
+// log) is a real directory owned by this user and closed to everyone else:
+// mode 0700, repaired if it is ours and looser, refused if it is not ours.
+func secureStateDir(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("leash state directory %q is not a directory (symlinks are refused)", dir)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st.Uid != uint32(os.Geteuid()) {
+		return fmt.Errorf("leash state directory %q is not owned by you; refusing to keep the policy there", dir)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("restrict leash state directory %q: %w", dir, err)
+		}
+		log.Printf("event=darwin.state-dir.permissions.adjust path=%q previous=%04o new=0700", dir, perm)
+	}
+	return nil
 }
 
 func lockExecState(path string) (*os.File, error) {
@@ -507,10 +529,15 @@ func startManagedServer(stateDir, logPath string) (int, error) {
 	cmd := exec.Command(executable, "--darwin")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	policyPath := execDefaultPolicyPath
-	env := os.Environ()
-	env = append(env, "LEASH_POLICY="+policyPath)
-	env = append(env, "LEASH_LOG="+logPath)
+	// An explicit LEASH_POLICY wins (it used to be silently overridden);
+	// otherwise the policy lives in the private state directory (#12). The
+	// daemon checks either path before it reads it.
+	policyPath := strings.TrimSpace(os.Getenv("LEASH_POLICY"))
+	if policyPath == "" {
+		policyPath = filepath.Join(stateDir, policyFilename)
+	}
+	env := withEnv(os.Environ(), "LEASH_POLICY", policyPath)
+	env = withEnv(env, "LEASH_LOG", logPath)
 	cmd.Env = env
 
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
@@ -529,6 +556,18 @@ func startManagedServer(stateDir, logPath string) (int, error) {
 		log.Printf("failed to release leash --darwin runtime process handle: %v", err)
 	}
 	return pid, nil
+}
+
+// withEnv returns env with key set to value, replacing any existing entry.
+func withEnv(env []string, key, value string) []string {
+	out := make([]string, 0, len(env)+1)
+	for _, kv := range env {
+		if strings.HasPrefix(kv, key+"=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, key+"="+value)
 }
 
 func terminateProcess(pid int) error {

@@ -135,6 +135,15 @@ func runExec(args []string) error {
 		return fmt.Errorf("leashcli not found at %q: %w", cliPath, err)
 	}
 
+	// The daemon checks its policy path too, but it runs detached with its
+	// output in the log file; refuse an unsafe LEASH_POLICY here so the reason
+	// reaches the terminal (#12).
+	if p := strings.TrimSpace(os.Getenv("LEASH_POLICY")); p != "" {
+		if err := checkPolicyPathSafe(p); err != nil {
+			return err
+		}
+	}
+
 	handle, err := acquireExecServer()
 	if err != nil {
 		return err
@@ -249,7 +258,12 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 
 	defaultPolicyPath := strings.TrimSpace(os.Getenv("LEASH_POLICY"))
 	if defaultPolicyPath == "" {
-		defaultPolicyPath = "/tmp/tmp.leash.policy"
+		// Not /tmp (#12): the per-user state directory, mode 0700.
+		p, err := defaultDarwinPolicyPath()
+		if err != nil {
+			return nil, err
+		}
+		defaultPolicyPath = p
 	}
 	policyPath := fs.String("policy", defaultPolicyPath, "Policy file path")
 
@@ -329,7 +343,9 @@ func preFlight(cfg *runtimeConfig) error {
 	if policyPath == "" {
 		return fmt.Errorf("policy file path required")
 	}
-	if err := policy.EnsureDefaultCedarFile(policyPath); err != nil {
+	// Refuse a policy file another local user could have planted or could
+	// replace, and create a missing one without following a symlink (#12).
+	if err := ensurePolicyFile(policyPath); err != nil {
 		return err
 	}
 	if _, err := policy.Parse(policyPath); err != nil {
@@ -468,6 +484,9 @@ func preFlight(cfg *runtimeConfig) error {
 func initRuntime(cfg *runtimeConfig) (*runtimeState, error) {
 	if _, err := os.Stat(cfg.PolicyPath); err != nil {
 		return nil, fmt.Errorf("policy file required: %w", err)
+	}
+	if err := checkPolicyPathSafe(cfg.PolicyPath); err != nil {
+		return nil, err
 	}
 
 	logger, err := lsm.NewSharedLogger(cfg.LogPath)
@@ -713,6 +732,13 @@ func (rt *runtimeState) openControlUI() {
 
 func (rt *runtimeState) startPolicyWatcher() error {
 	cancel, err := policy.WatchCedar(rt.cfg.PolicyPath, time.Second, func(newCfg *policy.Config) {
+		// The file was safe at startup; refuse a reload if it has since been
+		// swapped for a symlink or a file another user owns or can write.
+		// The previous policy stays active.
+		if err := checkPolicyPathSafe(rt.cfg.PolicyPath); err != nil {
+			logPolicyEvent("policy.update", map[string]any{"source": "file", "error": err.Error()})
+			return
+		}
 		if err := rt.policyManager.UpdateFileRules(newCfg.LSMPolicies, newCfg.HTTPRewrites); err != nil {
 			logPolicyEvent("policy.update", map[string]any{"source": "file", "error": err.Error()})
 			return

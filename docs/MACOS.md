@@ -97,6 +97,26 @@ leash --darwin stop
 
 Stops the running server.
 
+### Policy file
+
+The daemon enforces the Cedar policy at `LEASH_POLICY` (or `--policy`), by
+default `~/Library/Application Support/leash/policy.cedar` (the state directory,
+`LEASH_DARWIN_STATE_DIR` if set, kept at mode `0700`). It is created with the
+permissive default policy, mode `0600`, if missing. It used to default to
+`/tmp/tmp.leash.policy`, which any local user could create first (#12).
+
+Every policy path is checked before it is created or read, and again on each
+reload: the file must be a regular file (not a symlink) owned by you or root
+and not writable by group or others, and every directory above it must be
+owned by you or root and not writable by others unless it is sticky (a sticky
+directory such as `/private/tmp` is accepted only because the file in it must
+pass the same checks). An unsafe path stops the daemon; an unsafe reload is
+refused and the previous policy stays active. `LEASH_POLICY` set when `leash
+--darwin exec` starts the daemon is now honoured (it used to be overridden).
+
+These checks keep other local users out. The workload runs as your user, so
+keeping it away from the policy file is the Endpoint Security extension's job.
+
 ## Remove / Uninstall
 
 Deleting `Leash.app` should delete the system extensions, but you can also use the the app UI (each section has a “Remove” button). You can also remove from the terminal:
