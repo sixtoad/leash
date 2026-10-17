@@ -35,9 +35,13 @@ import (
 //   - Host::"name" (case-insensitive, trailing dot ignored), Host::"*.zone"
 //     for every proper label suffix of the name (label boundary: *.example.com
 //     covers a.example.com, not example.com or evilexample.com), Host::"<ip>",
-//     and Host::"*" (any host).
+//     and Host::"*" (any host, IPv4 or IPv6).
+//   - <ip> is the canonical form of the destination address (CanonicalIP):
+//     dotted IPv4, also for an IPv4-mapped IPv6 address (::ffff:a.b.c.d is
+//     the IPv4 host it carries), or RFC 5952 IPv6 ("2001:db8::1").
 //   - With a known port, each of those also as Host::"<x>:<port>", plus
-//     Host::"*:<port>" (any host on that port).
+//     Host::"*:<port>" (any host on that port); an IPv6 address is bracketed
+//     before its port (Host::"[2001:db8::1]:443").
 //
 // MCP (request resource MCP::Tool::"<tool>", lowercased):
 //
@@ -76,7 +80,7 @@ func NormalizeHost(host string) string {
 }
 
 // CanonicalIPv4 returns the dotted IPv4 form of ip, or "" when ip is not an
-// IPv4 (or IPv4-mapped) address. IPv6 is not supported in policies.
+// IPv4 (or IPv4-mapped) address.
 func CanonicalIPv4(ip string) string {
 	parsed := net.ParseIP(strings.TrimSpace(ip))
 	if parsed == nil {
@@ -89,19 +93,44 @@ func CanonicalIPv4(ip string) string {
 	return v4.String()
 }
 
+// CanonicalIP returns the canonical policy form of an IP address: dotted
+// IPv4 for an IPv4 or IPv4-mapped IPv6 address, RFC 5952 text (lowercase,
+// zeros compressed) for any other IPv6 address, "" when ip is not an IP
+// address. A bracketed IPv6 literal ("[2001:db8::1]") is accepted.
+func CanonicalIP(ip string) string {
+	s := strings.TrimSpace(ip)
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		s = s[1 : len(s)-1]
+	}
+	parsed := net.ParseIP(s)
+	if parsed == nil {
+		return ""
+	}
+	return parsed.String()
+}
+
+// HostWithPort renders the Host entity ID of x on port: "x:port", with an
+// IPv6 address bracketed ("[2001:db8::1]:443").
+func HostWithPort(x string, port uint16) string {
+	if strings.Contains(x, ":") {
+		return "[" + x + "]:" + strconv.Itoa(int(port))
+	}
+	return x + ":" + strconv.Itoa(int(port))
+}
+
 // connectResource builds the resource UID and parents of a connect request.
 // hostname is the name the workload asked for (SNI/Host; may be empty), ip
-// the destination IPv4 (may be empty), port the destination port (0 =
-// unknown). An IP literal is never matched as a hostname.
+// the destination IPv4 or IPv6 address (may be empty), port the destination
+// port (0 = unknown). An IP literal is never matched as a hostname.
 func connectResource(hostname, ip string, port uint16) (types.EntityUID, []types.EntityUID, bool) {
 	host := NormalizeHost(hostname)
-	if lit := CanonicalIPv4(host); lit != "" || net.ParseIP(host) != nil {
+	if lit := CanonicalIP(host); lit != "" {
 		if ip == "" {
-			ip = host
+			ip = lit
 		}
 		host = ""
 	}
-	ip = CanonicalIPv4(ip)
+	ip = CanonicalIP(ip)
 	if host == "" && ip == "" {
 		return types.EntityUID{}, nil, false
 	}
@@ -124,7 +153,7 @@ func connectResource(hostname, ip string, port uint16) (types.EntityUID, []types
 	for _, n := range names {
 		parents = append(parents, types.NewEntityUID(TypeHost, types.String(n)))
 		if port != 0 {
-			parents = append(parents, types.NewEntityUID(TypeHost, types.String(n+":"+strconv.Itoa(int(port)))))
+			parents = append(parents, types.NewEntityUID(TypeHost, types.String(HostWithPort(n, port))))
 		}
 	}
 	id := host

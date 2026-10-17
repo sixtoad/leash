@@ -471,7 +471,7 @@ func (e *Engine) DecideConnect(hostname, ip string, port uint16) Decision {
 	}
 	res, parents, ok := connectResource(hostname, ip, port)
 	if !ok {
-		return invalidRequest("connect needs a hostname or an IPv4 address")
+		return invalidRequest("connect needs a hostname or an IP address")
 	}
 	return e.builtinRequest(ActionNetworkConnect, res, parents, types.Record{})
 }

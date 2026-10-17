@@ -19,6 +19,7 @@ type ConnectPolicyRule struct {
 	Action      int32     // 0 = deny, 1 = allow
 	Operation   int32     // Always OP_CONNECT (4) for this program
 	DestIP      uint32    // Canonical IPv4 value a<<24|b<<16|c<<8|d (0 = any IP)
+	DestIP6     [16]byte  // IPv6 address, network byte order (all zero = not an IPv6 rule)
 	DestPort    uint16    // Host-order destination port (0 = any port)
 	Hostname    [128]byte // Hostname pattern (empty for IP-only rules)
 	HostnameLen int32     // Length of hostname for efficient matching
@@ -40,10 +41,10 @@ func (rule *ConnectPolicyRule) String() string {
 	parts = append(parts, fmt.Sprintf("operation=%d", rule.Operation))
 
 	// Destination IP
-	if rule.DestIP == 0 {
+	if ip := ConnectRuleAddr(rule.DestIP, rule.DestIP6); ip == "" {
 		parts = append(parts, "dest_ip=any")
 	} else {
-		parts = append(parts, fmt.Sprintf("dest_ip=%s", canonicalIPv4String(rule.DestIP)))
+		parts = append(parts, fmt.Sprintf("dest_ip=%s", ip))
 	}
 
 	// Destination Port
@@ -73,38 +74,72 @@ func (rule *ConnectPolicyRule) String() string {
 	return fmt.Sprintf("ConnectPolicyRule{%s}", strings.Join(parts, ", "))
 }
 
-// ConnectPolicyRuleBPF matches struct connect_policy_rule in BPF exactly (152 bytes)
+// Address families of the connect ABI (linux/socket.h).
+const (
+	afInet  = 2
+	afInet6 = 10
+)
+
+// ConnectPolicyRuleBPF is the value of the connect_policy_rules map; it
+// matches struct connect_policy_rule in lsm_connect.bpf.c byte for byte
+// (36 bytes, every padding byte explicit).
+//
+// Family selects the address match: 0 matches every destination (IPv4 and
+// IPv6), AF_INET compares DestIP, AF_INET6 compares DestIP6. The kernel
+// classifies an IPv4-mapped IPv6 destination (::ffff:a.b.c.d) as AF_INET, so
+// IPv4 rules govern it. Hostnames never reach the kernel: hostname rules are
+// resolved to address rules at load time.
 type ConnectPolicyRuleBPF struct {
-	Action      uint32
-	Operation   uint32
-	DestIP      uint32
-	DestPort    uint16
-	_pad0       [2]byte
-	Hostname    [128]byte
-	HostnameLen uint32
-	IsWildcard  uint32
+	Action    uint32   // offset 0: 0 = deny, 1 = allow
+	Operation uint32   // offset 4: always OpConnect
+	Family    uint32   // offset 8: 0 = any address, AF_INET, AF_INET6
+	DestIP    uint32   // offset 12: canonical IPv4 value (Family == AF_INET)
+	DestIP6   [16]byte // offset 16: IPv6 address, network byte order (Family == AF_INET6)
+	DestPort  uint16   // offset 32: host-order destination port (0 = any port)
+	_         [2]byte  // offset 34: explicit padding
 }
 
-// Connect event structure - must match BPF code
+// ConnectEvent is a connect_events ring-buffer record; it matches struct
+// connect_event in lsm_connect.bpf.c byte for byte (208 bytes, every padding
+// byte explicit, so binary.Read decodes it field by field).
 type ConnectEvent struct {
-	PID          uint32
-	TGID         uint32
-	Timestamp    uint64
-	CgroupID     uint64
-	Comm         [16]byte
-	Family       uint32    // AF_INET, AF_INET6
-	Protocol     uint32    // IPPROTO_TCP, IPPROTO_UDP
-	DestIP       uint32    // Canonical IPv4 value a<<24|b<<16|c<<8|d
-	DestPort     uint16    // Host-order destination port
-	_            [2]byte   // C alignment padding; binary.Read adds none implicitly
-	Result       int32     // Result of the connect operation (0 = allowed, -EACCES = denied)
-	DestHostname [128]byte // Resolved hostname if available
+	PID          uint32    // offset 0
+	TGID         uint32    // offset 4
+	Timestamp    uint64    // offset 8
+	CgroupID     uint64    // offset 16
+	Comm         [16]byte  // offset 24
+	Family       uint32    // offset 40: AF_INET (including IPv4-mapped IPv6) or AF_INET6
+	Protocol     uint32    // offset 44: IPPROTO_TCP, IPPROTO_UDP
+	DestIP       uint32    // offset 48: canonical IPv4 value a<<24|b<<16|c<<8|d (AF_INET)
+	DestPort     uint16    // offset 52: host-order destination port
+	_            [2]byte   // offset 54: explicit padding
+	Result       int32     // offset 56: 0 = allowed, -EACCES = denied
+	DestHostname [128]byte // offset 60: resolved hostname if available
+	DestIP6      [16]byte  // offset 188: IPv6 address, network byte order (AF_INET6)
+	_            [4]byte   // offset 204: explicit tail padding (8-byte alignment)
+}
+
+// connectBPFRuleFor converts one address-or-any connect rule to its map
+// value.
+func connectBPFRuleFor(action, operation int32, v4 uint32, v6 [16]byte, port uint16) ConnectPolicyRuleBPF {
+	r := ConnectPolicyRuleBPF{Action: uint32(action), Operation: uint32(operation), DestPort: port}
+	switch {
+	case v6 != [16]byte{}:
+		r.Family, r.DestIP6 = afInet6, v6
+	case v4 != 0:
+		r.Family, r.DestIP = afInet, v4
+	}
+	return r
 }
 
 const (
 	MaxConnectPolicyRules = 256
 	// Note: OpConnect is defined in common.go
 )
+
+// lookupConnectHost resolves a hostname rule's A and AAAA records; tests
+// substitute a fixed resolver.
+var lookupConnectHost = net.LookupIP
 
 type ConnectLsmLoader func() (*ebpf.CollectionSpec, error)
 
@@ -171,32 +206,16 @@ func (l *ConnectLsm) LoadPolicies(policies []ConnectPolicyRule, defaultOverride 
 		l.defaultPolicyResult = false
 	}
 	for _, rule := range policies {
-		// If rule already has an IP (non-zero), keep as-is
-		if rule.DestIP != 0 {
-			expanded = append(expanded, ConnectPolicyRuleBPF{
-				Action:      uint32(rule.Action),
-				Operation:   uint32(rule.Operation),
-				DestIP:      rule.DestIP,
-				DestPort:    rule.DestPort,
-				Hostname:    [128]byte{},
-				HostnameLen: 0,
-				IsWildcard:  0,
-			})
+		// If rule already has an IP (IPv4 or IPv6), keep as-is
+		if rule.DestIP != 0 || rule.DestIP6 != ([16]byte{}) {
+			expanded = append(expanded, connectBPFRuleFor(rule.Action, rule.Operation, rule.DestIP, rule.DestIP6, rule.DestPort))
 			continue
 		}
 
 		// Hostname-based rule
 		if rule.HostnameLen == 0 {
-			// No IP and no hostname means "any"; keep as-is
-			expanded = append(expanded, ConnectPolicyRuleBPF{
-				Action:      uint32(rule.Action),
-				Operation:   uint32(rule.Operation),
-				DestIP:      0,
-				DestPort:    rule.DestPort,
-				Hostname:    [128]byte{},
-				HostnameLen: 0,
-				IsWildcard:  0,
-			})
+			// No IP and no hostname means "any" (IPv4 and IPv6); keep as-is
+			expanded = append(expanded, connectBPFRuleFor(rule.Action, rule.Operation, 0, [16]byte{}, rule.DestPort))
 			continue
 		}
 
@@ -219,33 +238,31 @@ func (l *ConnectLsm) LoadPolicies(policies []ConnectPolicyRule, defaultOverride 
 		if isConnectDefault(rule.DestIP, rule.DestPort, rule.Hostname[:], rule.HostnameLen) {
 			continue
 		}
-		ips, err := net.LookupIP(hostname)
+		ips, err := lookupConnectHost(hostname)
 		if err != nil {
 			failedResolves++
 			continue
 		}
 
-		// Create IP rules for each resolved IPv4
+		// Create an address rule for each resolved A and AAAA record, so a
+		// hostname rule covers the name over IPv4 and IPv6 alike.
 		for _, ip := range ips {
-			v4 := ip.To4()
-			if v4 == nil {
+			if ipNum, ok := canonicalIPv4(ip); ok {
+				expanded = append(expanded, connectBPFRuleFor(rule.Action, rule.Operation, ipNum, [16]byte{}, rule.DestPort))
+
+				// Populate DNS cache for logging/BPF map
+				l.dnsCacheMux.Lock()
+				l.dnsCache[ipNum] = hostname
+				l.dnsCacheMux.Unlock()
 				continue
 			}
-			ipNum, _ := canonicalIPv4(v4)
-			var newRule ConnectPolicyRuleBPF
-			newRule.Action = uint32(rule.Action)
-			newRule.Operation = uint32(rule.Operation)
-			newRule.DestIP = ipNum
-			newRule.DestPort = rule.DestPort
-			newRule.Hostname = [128]byte{}
-			newRule.HostnameLen = 0
-			newRule.IsWildcard = 0
-			expanded = append(expanded, newRule)
-
-			// Populate DNS cache for logging/BPF map
-			l.dnsCacheMux.Lock()
-			l.dnsCache[ipNum] = hostname
-			l.dnsCacheMux.Unlock()
+			ip16 := ip.To16()
+			if ip16 == nil || ip16.IsUnspecified() {
+				continue
+			}
+			var v6 [16]byte
+			copy(v6[:], ip16)
+			expanded = append(expanded, connectBPFRuleFor(rule.Action, rule.Operation, 0, v6, rule.DestPort))
 		}
 	}
 
@@ -305,7 +322,7 @@ func (l *ConnectLsm) checkRootConnectPolicy() {
 
 	// For connect policies, we consider a rule that allows all IPs/hostnames as permissive
 	for _, rule := range l.policyRules {
-		if rule.Action == PolicyAllow && rule.DestIP == 0 && rule.HostnameLen == 0 {
+		if rule.Action == PolicyAllow && rule.Family == 0 {
 			l.defaultPolicyResult = true
 			break
 		}
@@ -439,6 +456,9 @@ func (l *ConnectLsm) handleEvent(data []byte) {
 	}
 
 	destIP := canonicalIPv4String(event.DestIP)
+	if event.Family == afInet6 {
+		destIP = net.IP(event.DestIP6[:]).String()
+	}
 	destPort := event.DestPort
 
 	// Use current time for ISO 8601 format (BPF timestamp is kernel boot time, not Unix time)
@@ -460,9 +480,11 @@ func (l *ConnectLsm) handleEvent(data []byte) {
 	}
 
 	// Create destination string
-	destStr := destIP
-	if destPort != 0 {
-		destStr = fmt.Sprintf("%s:%d", destStr, destPort)
+	destStr := JoinConnectTarget(destIP, destPort)
+	if event.Family != afInet && event.Family != afInet6 && event.Family != 0 {
+		// A non-IP socket family (packet, vsock, ...) decided by the connect
+		// default: there is no address to show.
+		destStr = fmt.Sprintf("family=%d", event.Family)
 	}
 
 	// Add hostname if available
@@ -487,7 +509,7 @@ func (l *ConnectLsm) handleEvent(data []byte) {
 	// Unique connect logging removed
 
 	// Update DNS cache if hostname is provided
-	if len(hostname) > 0 {
+	if len(hostname) > 0 && event.Family != afInet6 {
 		l.dnsCacheMux.Lock()
 		l.dnsCache[event.DestIP] = hostname
 		l.dnsCacheMux.Unlock()
@@ -511,52 +533,6 @@ func (l *ConnectLsm) GetDNSCache() map[uint32]string {
 		cache[ip] = hostname
 	}
 	return cache
-}
-
-// resolveHostnamesFromPolicies proactively resolves hostnames from connect policies
-func (l *ConnectLsm) resolveHostnamesFromPolicies() error {
-	var resolveErrors []string
-	resolvedCount := 0
-
-	for _, rule := range l.policyRules {
-		if rule.HostnameLen == 0 {
-			continue // IP-only rule, skip
-		}
-
-		hostname := string(bytes.TrimRight(rule.Hostname[:], "\x00"))
-
-		// Skip wildcard hostnames - we can't resolve *.example.com
-		if rule.IsWildcard == 1 {
-			continue
-		}
-
-		// Resolve hostname to IP addresses
-		ips, err := net.LookupIP(hostname)
-		if err != nil {
-			resolveErrors = append(resolveErrors, fmt.Sprintf("%s: %v", hostname, err))
-			continue
-		}
-
-		// Add all resolved IPs to our DNS cache
-		l.dnsCacheMux.Lock()
-		for _, ip := range ips {
-			if ipNum, ok := canonicalIPv4(ip); ok {
-				l.dnsCache[ipNum] = hostname
-				resolvedCount++
-			}
-		}
-		l.dnsCacheMux.Unlock()
-	}
-
-	if resolvedCount > 0 {
-		fmt.Printf("Resolved %d hostname entries for connect policies\n", resolvedCount)
-	}
-
-	if len(resolveErrors) > 0 {
-		return fmt.Errorf("failed to resolve %d hostnames: %s", len(resolveErrors), strings.Join(resolveErrors, "; "))
-	}
-
-	return nil
 }
 
 // updateDNSCacheInBPF updates the BPF DNS cache map with current hostname mappings

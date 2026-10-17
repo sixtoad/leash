@@ -92,6 +92,7 @@ type PolicyRule struct {
 
 	// Network connection matching (only used for connect operations)
 	DestIP      uint32    // Canonical IPv4 value a<<24|b<<16|c<<8|d (0 = any IP)
+	DestIP6     [16]byte  // IPv6 address in network byte order (all zero = not an IPv6 rule)
 	DestPort    uint16    // Host-order destination port (0 = any port)
 	Hostname    [128]byte // Hostname pattern (empty for IP-only rules)
 	HostnameLen int32     // Length of hostname for efficient matching
@@ -212,13 +213,8 @@ func (pr *PolicyRule) String() string {
 			} else {
 				target = hostname
 			}
-		} else if pr.DestIP > 0 {
-			ip := canonicalIPv4String(pr.DestIP)
-			if pr.DestPort > 0 {
-				target = fmt.Sprintf("%s:%d", ip, pr.DestPort)
-			} else {
-				target = ip
-			}
+		} else if ip := ConnectRuleAddr(pr.DestIP, pr.DestIP6); ip != "" {
+			target = JoinConnectTarget(ip, pr.DestPort)
 		}
 	} else {
 		// Use path
@@ -301,21 +297,10 @@ func parsePolicyLine(line string, lineNum int) (PolicyRule, error) {
 		// For connect operations, "path" is actually hostname/IP
 		target := path
 
-		// Parse hostname:port or IP:port
-		var hostname string
-		var port uint16
-
-		if strings.Contains(target, ":") {
-			parts := strings.SplitN(target, ":", 2)
-			hostname = parts[0]
-			if portNum, err := parsePort(parts[1]); err != nil {
-				return PolicyRule{}, fmt.Errorf("invalid port '%s': %v", parts[1], err)
-			} else {
-				port = portNum
-			}
-		} else {
-			hostname = target
-			port = 0 // Any port
+		// Parse hostname[:port], IPv4[:port], IPv6 or [IPv6][:port]
+		hostname, port, err := SplitConnectTarget(target)
+		if err != nil {
+			return PolicyRule{}, err
 		}
 
 		// Validate hostname length
@@ -326,11 +311,12 @@ func parsePolicyLine(line string, lineNum int) (PolicyRule, error) {
 		// Check if it's an IP address or hostname
 		if isIPAddress(hostname) {
 			// Parse IP address
-			ip, err := parseIPAddress(hostname)
+			v4, v6, err := ParseConnectIP(hostname)
 			if err != nil {
 				return PolicyRule{}, fmt.Errorf("invalid IP address '%s': %v", hostname, err)
 			}
-			rule.DestIP = ip
+			rule.DestIP = v4
+			rule.DestIP6 = v6
 			rule.DestPort = port
 			// Leave hostname empty for IP-only rules
 		} else {
@@ -462,6 +448,7 @@ func ConvertToConnectRules(rules []PolicyRule) []ConnectPolicyRule {
 			Action:      rule.Action,
 			Operation:   rule.Operation,
 			DestIP:      rule.DestIP,
+			DestIP6:     rule.DestIP6,
 			DestPort:    rule.DestPort,
 			Hostname:    rule.Hostname,
 			HostnameLen: rule.HostnameLen,
@@ -803,17 +790,90 @@ func canonicalIPv4String(addr uint32) string {
 	return ip.String()
 }
 
-func parseIPAddress(s string) (uint32, error) {
+// ParseConnectIP parses an IP literal of a connect rule. An IPv4 (or
+// IPv4-mapped IPv6, ::ffff:a.b.c.d) address returns its canonical IPv4 value
+// and a zero v6; any other IPv6 address returns v4 == 0 and its 16 bytes.
+// The unspecified addresses (0.0.0.0, ::) are rejected for IPv6: an all-zero
+// address means "no address" in the rule ABI. 0.0.0.0 keeps its legacy
+// meaning (DestIP 0, any destination).
+func ParseConnectIP(s string) (v4 uint32, v6 [16]byte, err error) {
 	ip := net.ParseIP(s)
 	if ip == nil {
-		return 0, fmt.Errorf("invalid IP address")
+		return 0, v6, fmt.Errorf("invalid IP address")
 	}
+	if addr, ok := canonicalIPv4(ip); ok {
+		return addr, v6, nil
+	}
+	if ip.IsUnspecified() {
+		return 0, v6, fmt.Errorf("the unspecified IPv6 address :: is not a destination")
+	}
+	copy(v6[:], ip.To16())
+	return 0, v6, nil
+}
 
-	addr, ok := canonicalIPv4(ip)
-	if !ok {
-		return 0, fmt.Errorf("IPv6 not supported")
+// ConnectRuleAddr renders the address of a connect rule (IPv4 dotted, IPv6
+// in RFC 5952 form), or "" for a rule without an address.
+func ConnectRuleAddr(v4 uint32, v6 [16]byte) string {
+	if v6 != ([16]byte{}) {
+		return net.IP(v6[:]).String()
 	}
-	return addr, nil
+	if v4 != 0 {
+		return canonicalIPv4String(v4)
+	}
+	return ""
+}
+
+// JoinConnectTarget renders host with an optional port; an IPv6 literal is
+// bracketed when a port follows ("[2001:db8::1]:443").
+func JoinConnectTarget(host string, port uint16) string {
+	if port == 0 {
+		return host
+	}
+	if strings.Contains(host, ":") {
+		return "[" + host + "]:" + strconv.Itoa(int(port))
+	}
+	return host + ":" + strconv.Itoa(int(port))
+}
+
+// SplitConnectTarget splits a connect target into host and port (0 = any).
+// Forms: name, name:port, IPv4, IPv4:port, a bare IPv6 literal (no port, as
+// its colons are ambiguous), [IPv6] and [IPv6]:port.
+func SplitConnectTarget(target string) (string, uint16, error) {
+	if strings.HasPrefix(target, "[") {
+		end := strings.Index(target, "]")
+		if end < 0 {
+			return "", 0, fmt.Errorf("unterminated '[' in %q", target)
+		}
+		host, rest := target[1:end], target[end+1:]
+		if ip := net.ParseIP(host); ip == nil || ip.To4() != nil && !strings.Contains(host, ":") {
+			return "", 0, fmt.Errorf("brackets only enclose an IPv6 address: %q", target)
+		}
+		if rest == "" {
+			return host, 0, nil
+		}
+		if !strings.HasPrefix(rest, ":") {
+			return "", 0, fmt.Errorf("expected ':port' after ']' in %q", target)
+		}
+		port, err := parsePort(rest[1:])
+		if err != nil {
+			return "", 0, fmt.Errorf("invalid port '%s': %v", rest[1:], err)
+		}
+		return host, port, nil
+	}
+	if strings.Count(target, ":") > 1 {
+		if net.ParseIP(target) != nil {
+			return target, 0, nil
+		}
+		return "", 0, fmt.Errorf("%q: write an IPv6 address with a port as [address]:port", target)
+	}
+	if host, p, ok := strings.Cut(target, ":"); ok {
+		port, err := parsePort(p)
+		if err != nil {
+			return "", 0, fmt.Errorf("invalid port '%s': %v", p, err)
+		}
+		return host, port, nil
+	}
+	return target, 0, nil
 }
 
 func parsePort(s string) (uint16, error) {

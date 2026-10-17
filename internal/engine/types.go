@@ -116,7 +116,7 @@ func invalidRequest(format string, args ...any) Decision {
 //	FileOpenReadOnly / FileOpenReadWrite  resource File::"<absolute path>"
 //	FileOpen                              allowed only when both of the above are
 //	ProcessExec                           resource File::"<absolute path>"
-//	NetworkConnect                        resource Host::"<hostname or IPv4>", context.port (long, optional), context.ip (string, optional)
+//	NetworkConnect                        resource Host::"<hostname or IP>", context.port (long, optional), context.ip (string, optional)
 //	McpCall                               resource MCP::Tool::"<tool>", context.server (string)
 //
 // The built-in principal is always WorkloadPrincipal. Any other action must

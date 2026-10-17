@@ -220,9 +220,6 @@ func lintPolicySet(ps *CedarPolicySet) []LintIssue {
 						if strings.Contains(host, "*") && !strings.HasPrefix(host, "*.") && host != "*" {
 							issues = append(issues, LintIssue{PolicyID: p.ID, Severity: LintError, Code: "unsupported_wildcard", Message: fmt.Sprintf("Unsupported wildcard pattern %q; only prefix '*.domain' is supported.", host), Suggestion: "Use '*.example.com' style or enumerate explicit hosts."})
 						}
-						if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
-							issues = append(issues, LintIssue{PolicyID: p.ID, Severity: LintError, Code: "ipv6_unsupported", Message: fmt.Sprintf("IPv6 literal %q is not supported in connect rules.", host), Suggestion: "Use IPv4 or hostname."})
-						}
 						if port != "" {
 							if _, err := strconv.ParseUint(port, 10, 16); err != nil {
 								issues = append(issues, LintIssue{PolicyID: p.ID, Severity: LintError, Code: "invalid_port", Message: fmt.Sprintf("Invalid port %q (must be 1-65535).", port)})
@@ -337,6 +334,14 @@ func extractResourcesForLint(p CedarPolicy) []Resource {
 func splitHostPortLoose(value string) (host string, port string) {
 	if strings.Count(value, ":") == 0 {
 		return value, ""
+	}
+	if strings.HasPrefix(value, "[") {
+		if end := strings.Index(value, "]"); end > 0 {
+			return value[1:end], strings.TrimPrefix(value[end+1:], ":")
+		}
+	}
+	if strings.Count(value, ":") > 1 {
+		return value, "" // a bare IPv6 address
 	}
 	parts := strings.SplitN(value, ":", 2)
 	return parts[0], parts[1]
