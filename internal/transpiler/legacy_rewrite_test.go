@@ -25,11 +25,12 @@ func rewriteText(t *testing.T, text string) *Rewrite {
 
 func TestDetectSemantics(t *testing.T) {
 	for text, want := range map[string]Semantics{
-		``:                                      SemanticsLegacy,
-		`permit (principal, action, resource);`: SemanticsLegacy,
-		`@leash_semantics("cedar") permit (principal, action, resource);`:                                          SemanticsCedar,
-		"permit (principal, action, resource);\n@leash_semantics(\"cedar\") forbid (principal, action, resource);": SemanticsCedar,
-		`@leash_semantics("legacy") permit (principal, action, resource);`:                                         SemanticsLegacy,
+		``:                                      SemanticsCedar,
+		`permit (principal, action, resource);`: SemanticsCedar,
+		`@leash_semantics("cedar") permit (principal, action, resource);`:                                           SemanticsCedar,
+		"permit (principal, action, resource);\n@leash_semantics(\"cedar\") forbid (principal, action, resource);":  SemanticsCedar,
+		`@leash_semantics("legacy") permit (principal, action, resource);`:                                          SemanticsLegacy,
+		"permit (principal, action, resource);\n@leash_semantics(\"legacy\") forbid (principal, action, resource);": SemanticsLegacy,
 	} {
 		ps, err := cedarlib.NewPolicySetFromBytes("x", []byte(text))
 		if err != nil {
@@ -77,8 +78,9 @@ permit (principal, action == Action::"FileOpen", resource) when { resource in [D
 			t.Errorf("%s: %v, want %v", path, got, want)
 		}
 	}
-	if !strings.Contains(rw.Text, `@leash_semantics("cedar")`) || !strings.Contains(rw.Text, `@leash_source("leash.cedar:2")`) {
-		t.Errorf("markers missing:\n%s", rw.Text)
+	// Strict is the default: the rewrite carries no @leash_semantics marker.
+	if strings.Contains(rw.Text, `@leash_semantics`) || !strings.Contains(rw.Text, `@leash_source("leash.cedar:2")`) {
+		t.Errorf("want provenance and no semantics marker:\n%s", rw.Text)
 	}
 }
 
@@ -194,5 +196,87 @@ permit (principal, action == Action::"FileOpen", resource) when { resource in [D
 	// The output is strict and migrates to itself.
 	if _, _, already, err := MigrateText("leash.cedar", out); err != nil || !already {
 		t.Fatalf("migrated file must be strict: %v %v", already, err)
+	}
+}
+
+// legacyMarker opts a test fixture into the legacy dialect: strict Cedar is
+// the default, so a fixture written for legacy semantics must say so.
+const legacyMarker = "@leash_semantics(\"legacy\")\n"
+
+func TestMigrateTextInputs(t *testing.T) {
+	const legacyText = `forbid (principal, action == Action::"FileOpen", resource) when { resource in [Dir::"/a/"] };
+permit (principal, action == Action::"FileOpen", resource) when { resource in [Dir::"/a/b/"] };`
+	// Unmarked and legacy-marked input migrate the same way, without marker.
+	unmarked, _, _, err := MigrateText("leash.cedar", legacyText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marked, _, _, err := MigrateText("leash.cedar", legacyMarker+legacyText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unmarked != marked || strings.Contains(marked, "@leash_semantics") {
+		t.Fatalf("unmarked:\n%s\nmarked:\n%s", unmarked, marked)
+	}
+	// An explicit strict file has nothing to migrate.
+	if _, _, already, err := MigrateText("leash.cedar", `@leash_semantics("cedar") permit (principal, action, resource);`); err != nil || !already {
+		t.Fatalf("explicit strict: %v %v", already, err)
+	}
+}
+
+func TestLintWarnsWhenAnUnmarkedFileReliesOnLegacy(t *testing.T) {
+	codes := func(text string) []string {
+		rep, err := LintFromString(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, is := range rep.Issues {
+			if is.Code == LintLegacySemantics {
+				if !strings.Contains(is.Suggestion, "leash policy migrate") {
+					t.Errorf("no migrate hint: %+v", is)
+				}
+				out = append(out, is.Message)
+			}
+		}
+		return out
+	}
+	for _, text := range []string{
+		// File:: as a prefix: legacy covered /bin/rmdir.
+		`permit (principal, action == Action::"ProcessExec", resource in File::"/bin/rm");
+permit (principal, action == Action::"ProcessExec", resource in File::"/usr/bin/rmdir");`,
+		// A longer permit beat a shorter forbid.
+		`permit (principal, action in Action::"FileOpen", resource in Dir::"/");
+forbid (principal, action in Action::"FileOpen", resource in Dir::"/a/");
+permit (principal, action in Action::"FileOpen", resource in Dir::"/a/b/");`,
+		// unless read as when.
+		`forbid (principal, action == Action::"ProcessExec", resource in Dir::"/bin/") unless { resource in [File::"/bin/ls"] };`,
+		// MCP forbids that relied on the MCP default allow.
+		`forbid (principal, action == Action::"McpCall", resource) when { resource in [MCP::Server::"evil.example.com"] };`,
+	} {
+		if got := codes(text); len(got) == 0 {
+			t.Errorf("no %s warning for:\n%s", LintLegacySemantics, text)
+		}
+		// Marked, the file states its dialect: no hint.
+		if got := codes(`@leash_semantics("cedar")` + "\n" + text); len(got) != 0 {
+			t.Errorf("explicit strict file warned: %v", got)
+		}
+	}
+	// migrate's own output, and strict-only syntax, are strict by intent.
+	migrated, _, _, err := MigrateText("leash.cedar", `forbid (principal, action == Action::"FileOpen", resource) when { resource in [Dir::"/a/"] };
+permit (principal, action == Action::"FileOpen", resource) when { resource in [Dir::"/a/b/"] };
+forbid (principal, action == Action::"McpCall", resource) when { resource in [MCP::Server::"x.example.com"] };`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{migrated, `permit (principal, action == Action::"ProcessExec", resource in Dir::"/");
+forbid (principal, action == Action::"ProcessExec", resource) when { resource in FilePrefix::"/bin/rm" };`} {
+		if got := codes(text); len(got) != 0 {
+			t.Errorf("warned on a strict file: %v\n%s", got, text)
+		}
+	}
+	// A plain strict file that decides the same either way.
+	if got := codes(`permit (principal, action == Action::"ProcessExec", resource in Dir::"/usr/bin/");`); len(got) != 0 {
+		t.Errorf("warned on a file that decides the same: %v", got)
 	}
 }

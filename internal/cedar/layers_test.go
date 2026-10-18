@@ -11,7 +11,7 @@ import (
 )
 
 func TestCompileStringReadsSemantics(t *testing.T) {
-	legacy, err := CompileString("leash.cedar", `
+	legacy, err := CompileString("leash.cedar", `@leash_semantics("legacy")
 forbid (principal, action == Action::"FileOpen", resource) when { resource in [Dir::"/a/"] };
 permit (principal, action == Action::"FileOpen", resource) when { resource in [Dir::"/a/b/"] };`)
 	if err != nil {
@@ -38,6 +38,38 @@ permit (principal, action in Action::"FileOpen", resource in Dir::"/a/b/");`)
 	}
 	if strict.Engine.DecideOpen("/a/b/x", engine.ActionFileOpenReadOnly).Allow || strict.Engine.DecideMCP("s", "t").Allow {
 		t.Fatal("strict: forbid overrides permit, MCP default deny")
+	}
+
+	// Strict Cedar is the default: an unmarked file is read like the
+	// explicitly marked one.
+	unmarked, err := CompileString("leash.cedar", `
+forbid (principal, action in Action::"FileOpen", resource in Dir::"/a/");
+permit (principal, action in Action::"FileOpen", resource in Dir::"/a/b/");`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unmarked.Semantics != transpiler.SemanticsCedar || unmarked.Rewrite != nil {
+		t.Fatal("an unmarked file is strict and must not be rewritten")
+	}
+	if unmarked.Engine.DecideOpen("/a/b/x", engine.ActionFileOpenReadOnly).Allow || unmarked.Engine.DecideMCP("s", "t").Allow {
+		t.Fatal("unmarked: forbid overrides permit, MCP default deny")
+	}
+}
+
+// A legacy-only construct in an unmarked file fails the load, and the error
+// points at the two ways out: migrate, or mark the file legacy.
+func TestCompileStringHintsMigrateForUnmarkedLegacyFile(t *testing.T) {
+	_, err := CompileString("leash.cedar", `permit (principal, action == Action::"FileOpen", resource in Dir::"/a/");`)
+	var detail *ErrorDetail
+	if !errors.As(err, &detail) {
+		t.Fatalf("want an ErrorDetail, got %v", err)
+	}
+	if !strings.Contains(detail.Suggestion, "leash policy migrate") || !strings.Contains(detail.Suggestion, `@leash_semantics("legacy")`) {
+		t.Fatalf("suggestion %q", detail.Suggestion)
+	}
+	if _, err := CompileString("leash.cedar", `@leash_semantics("legacy")
+permit (principal, action == Action::"FileOpen", resource in Dir::"/a/");`); err != nil {
+		t.Fatalf("marked legacy: %v", err)
 	}
 }
 
@@ -78,11 +110,12 @@ func TestCompileStringRejectsUnenforceablePermits(t *testing.T) {
 		name, text, want string
 		line             int
 	}{
-		{"legacy", `permit (principal, action == Action::"FileOpen", resource in Dir::"/a/");
+		{"legacy", `@leash_semantics("legacy")
+permit (principal, action == Action::"FileOpen", resource in Dir::"/a/");
 
 @id("tty-only")
-permit (principal, action == Action::"ProcessExec", resource in Dir::"/usr/bin/") when { context.tty == true };`, "tty-only", 3},
-		{"legacy-principal", `permit (principal == User::"alice", action == Action::"NetworkConnect", resource == Host::"api.example.com");`, "policy0", 1},
+permit (principal, action == Action::"ProcessExec", resource in Dir::"/usr/bin/") when { context.tty == true };`, "tty-only", 4},
+		{"legacy-principal", `@leash_semantics("legacy") permit (principal == User::"alice", action == Action::"NetworkConnect", resource == Host::"api.example.com");`, "policy0", 1},
 		{"strict-mcp", `@leash_semantics("cedar")
 permit (principal, action == Action::"McpCall", resource in MCP::Server::"s");
 @leash_semantics("cedar")
@@ -104,7 +137,8 @@ permit (principal, action == Action::"McpCall", resource) when { context.args ==
 
 // A forbid enforced without its condition is stricter and still loads.
 func TestCompileStringKeepsForbidWithDroppedCondition(t *testing.T) {
-	comp, err := CompileString("leash.cedar", `permit (principal, action == Action::"ProcessExec", resource in Dir::"/");
+	comp, err := CompileString("leash.cedar", `@leash_semantics("legacy")
+permit (principal, action == Action::"ProcessExec", resource in Dir::"/");
 forbid (principal, action == Action::"ProcessExec", resource in Dir::"/opt/") when { context.tty == true };`)
 	if err != nil {
 		t.Fatal(err)

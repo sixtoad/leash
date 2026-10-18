@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1643,23 +1644,57 @@ func describeAction(ac transpiler.ActionConstraint) string {
 	return strings.Join(uniqueStrings(parts), ", ")
 }
 
+// conditionResourceRe finds `resource in E` / `resource in [E, ...]` in a
+// condition the parser did not type as a resource list (strict Cedar, the
+// default dialect, writes a single entity without brackets, and
+// `leash policy migrate` writes `a && b` for MCP).
+var (
+	conditionResourceRe = regexp.MustCompile(`resource in (\[[^\]]*\]|[A-Za-z_:]+::"[^"]*")`)
+	conditionEntityRe   = regexp.MustCompile(`([A-Za-z_:]+)::"([^"]*)"`)
+	conditionBodyRe     = regexp.MustCompile(`(?s)\b(when|unless)\s*\{(.*?)\}`)
+)
+
 func describeResource(policy transpiler.CedarPolicy) string {
 	resources := make([]string, 0)
 	resources = append(resources, entityConstraintResources(policy.Resource)...)
-	for _, cond := range policy.Conditions {
-		if cond.Type == transpiler.ConditionResourceIn {
-			for _, lit := range cond.ResourceSet {
-				if typ, val, ok := splitResourceLiteral(lit); ok {
-					resources = append(resources, humanizeResource(typ, val))
+	var except []string
+	if policy.NativePolicy != nil {
+		// Read the conditions from the policy itself: the parser types
+		// only bracketed resource lists.
+		for _, c := range conditionBodyRe.FindAllStringSubmatch(string(policy.NativePolicy.MarshalCedar()), -1) {
+			var found []string
+			for _, m := range conditionResourceRe.FindAllStringSubmatch(c[2], -1) {
+				for _, e := range conditionEntityRe.FindAllStringSubmatch(m[1], -1) {
+					found = append(found, humanizeResource(e[1], e[2]))
+				}
+			}
+			// In strict Cedar an `unless` clause is an exception.
+			if c[1] == "unless" {
+				except = append(except, found...)
+			} else {
+				resources = append(resources, found...)
+			}
+		}
+	} else {
+		for _, cond := range policy.Conditions {
+			if cond.Type == transpiler.ConditionResourceIn {
+				for _, lit := range cond.ResourceSet {
+					if typ, val, ok := splitResourceLiteral(lit); ok {
+						resources = append(resources, humanizeResource(typ, val))
+					}
 				}
 			}
 		}
 	}
 	resources = uniqueStrings(resources)
-	if len(resources) == 0 {
-		return "any resource"
+	out := "any resource"
+	if len(resources) > 0 {
+		out = strings.Join(resources, ", ")
 	}
-	return strings.Join(resources, ", ")
+	if except = uniqueStrings(except); len(except) > 0 {
+		out += " except " + strings.Join(except, ", ")
+	}
+	return out
 }
 
 func describePrincipal(ec transpiler.EntityConstraint) string {
@@ -2011,8 +2046,18 @@ func buildCedarFromActionRequest(req addPolicyFromActionRequest) (string, error)
 	}
 }
 
+// buildHeadEqualityPolicy builds one policy in strict Cedar, the default
+// dialect, in a form that reads the same in a layer marked
+// @leash_semantics("legacy"): the generic FileOpen action is a group
+// (`action in`), and the resource is matched with `resource in` (strict
+// `File::"p"` is exactly p, `Dir::"d/"` the tree, `Host::"h:443"` host h on
+// port 443; `==` would match no request for a Dir or a host with a port).
 func buildHeadEqualityPolicy(effect, action, resource string) string {
-	return fmt.Sprintf(`%s (principal, action == %s, resource == %s);`, effect, action, resource)
+	actionOp := "=="
+	if action == `Action::"FileOpen"` {
+		actionOp = "in"
+	}
+	return fmt.Sprintf(`%s (principal, action %s %s, resource in %s);`, effect, actionOp, action, resource)
 }
 
 func buildFileEntityFromName(name string) (string, string) {

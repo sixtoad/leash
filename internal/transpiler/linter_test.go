@@ -12,7 +12,7 @@ func TestLint_MissingAction(t *testing.T) {
 	cedar := `
 permit (principal, action, resource)
 when { resource in [ Host::"api.example.com" ] };`
-	rep, err := LintFromString(cedar)
+	rep, err := LintFromString(legacyMarker + cedar)
 	if err != nil {
 		t.Fatalf("lint parse failed: %v", err)
 	}
@@ -29,7 +29,7 @@ when { resource in [ Host::"api.example.com" ] };`
 
 func TestLint_NoResources(t *testing.T) {
 	cedar := `permit (principal, action == Action::"NetworkConnect", resource);`
-	rep, err := LintFromString(cedar)
+	rep, err := LintFromString(legacyMarker + cedar)
 	if err != nil {
 		t.Fatalf("lint parse failed: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestLint_ResourceMismatch_FileOpOnHost(t *testing.T) {
 	cedar := `
 permit (principal, action == Action::"FileOpen", resource)
 when { resource in [ Host::"api.example.com" ] };`
-	rep, err := LintFromString(cedar)
+	rep, err := LintFromString(legacyMarker + cedar)
 	if err != nil {
 		t.Fatalf("lint parse failed: %v", err)
 	}
@@ -70,7 +70,7 @@ permit (
   action == Action::"NetworkConnect",
   resource == Host::"api.example.com"
 );`
-	rep, err := LintFromString(cedar)
+	rep, err := LintFromString(legacyMarker + cedar)
 	if err != nil {
 		t.Fatalf("lint parse failed: %v", err)
 	}
@@ -83,7 +83,7 @@ permit (
 
 func TestLint_UnsupportedAction(t *testing.T) {
 	cedar := `permit (principal, action == Action::"Delete", resource == File::"/tmp/x");`
-	rep, err := LintFromString(cedar)
+	rep, err := LintFromString(legacyMarker + cedar)
 	if err != nil {
 		t.Fatalf("lint parse failed: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestLint_UnsupportedAction(t *testing.T) {
 
 func TestLint_UnsupportedWildcard(t *testing.T) {
 	cedar := `permit (principal, action == Action::"NetworkConnect", resource) when { resource in [ Host::"foo*bar.com" ] };`
-	rep, err := LintFromString(cedar)
+	rep, err := LintFromString(legacyMarker + cedar)
 	if err != nil {
 		t.Fatalf("lint parse failed: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestLint_MCPResourcesAllowedWithMCPCall(t *testing.T) {
 	cedar := `
 forbid (principal, action == Action::"McpCall", resource == MCP::Tool::"resolve-library-id")
 when { resource in [ MCP::Server::"mcp.context7.com" ] };`
-	rep, err := LintFromString(cedar)
+	rep, err := LintFromString(legacyMarker + cedar)
 	if err != nil {
 		t.Fatalf("lint parse failed: %v", err)
 	}
@@ -133,7 +133,7 @@ when { resource in [ MCP::Server::"mcp.context7.com" ] };`
 func TestLint_DirectoryLengthIncludesNormalizedSlash(t *testing.T) {
 	path := "/" + strings.Repeat("d", lsm.MaxPolicyPathLength-1)
 	cedar := fmt.Sprintf(`permit (principal, action == Action::"FileOpen", resource == Dir::%q);`, path)
-	report, err := LintFromString(cedar)
+	report, err := LintFromString(legacyMarker + cedar)
 	if err != nil {
 		t.Fatalf("lint parse failed: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestLint_DirectoryLengthIncludesNormalizedSlash(t *testing.T) {
 func TestLint_ExecPathBeyondKernelExecLimit(t *testing.T) {
 	lint := func(length int) bool {
 		path := "/" + strings.Repeat("e", length-1)
-		report, err := LintFromString(fmt.Sprintf(`permit (principal, action == Action::"ProcessExec", resource == File::%q);`, path))
+		report, err := LintFromString(legacyMarker + fmt.Sprintf(`permit (principal, action == Action::"ProcessExec", resource == File::%q);`, path))
 		if err != nil {
 			t.Fatalf("lint parse failed: %v", err)
 		}

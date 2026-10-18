@@ -21,7 +21,8 @@ import (
 func TestSessionPolicyCompilesToLeashdKernelTables(t *testing.T) {
 	policies := map[string]string{
 		"default": policy.DefaultCedar(),
-		"legacy": `permit (principal, action == Action::"ProcessExec", resource) when { resource in [ Dir::"/" ] };
+		"legacy": `@leash_semantics("legacy")
+permit (principal, action == Action::"ProcessExec", resource) when { resource in [ Dir::"/" ] };
 forbid (principal, action == Action::"ProcessExec", resource == File::"/bin/rm");
 permit (principal, action == Action::"ProcessExec", resource == File::"/bin/rm/x");
 permit (principal, action in [Action::"FileOpen", Action::"FileOpenReadOnly"], resource) when { resource in [ Dir::"/" ] };
@@ -42,6 +43,11 @@ permit (principal, action == Action::"NetworkConnect", resource) when { resource
 forbid (principal, action == Action::"NetworkConnect", resource in Host::"fd00:6::2");
 @leash_semantics("cedar")
 permit (principal, action == Action::"McpCall", resource);`,
+		// Strict Cedar is the default: no marker.
+		"unmarked": `permit (principal, action in Action::"FileOpen", resource in Dir::"/");
+forbid (principal, action == Action::"FileOpenReadWrite", resource in Dir::"/etc/");
+permit (principal, action == Action::"ProcessExec", resource in Dir::"/usr/bin/");
+permit (principal, action == Action::"NetworkConnect", resource in Host::"example.com:443");`,
 		"empty-strict": `@leash_semantics("cedar")
 permit (principal, action == Action::"McpCall", resource);`,
 	}

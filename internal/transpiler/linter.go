@@ -43,12 +43,18 @@ func LintFromString(cedar string) (*LintReport, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse Cedar: %w", err)
 	}
-	sem, err := DetectSemantics(ps.NativePolicySet)
+	marker, err := SemanticsMarker(ps.NativePolicySet)
 	if err != nil {
 		return &LintReport{Issues: []LintIssue{{Severity: LintError, Code: "invalid_semantics_marker", Message: err.Error()}}}, nil
 	}
-	if sem == SemanticsCedar {
-		return &LintReport{Issues: lintStrict(ps.NativePolicySet)}, nil
+	if marker != MarkerLegacy {
+		// Strict Cedar, the default. An unmarked file may have been
+		// written for the legacy dialect: say so where it shows.
+		issues := lintStrict(ps.NativePolicySet)
+		if marker == MarkerNone {
+			issues = append(issues, legacyRelianceIssues(cedar, ps)...)
+		}
+		return &LintReport{Issues: dedupeIssues(issues)}, nil
 	}
 	issues := lintPolicySet(ps)
 	// The load rewrites a legacy file to strict Cedar and compiles it for
@@ -73,7 +79,7 @@ func lintStrict(ps *cedarlib.PolicySet) []LintIssue {
 	if err != nil {
 		return []LintIssue{{Severity: LintError, Code: "invalid_policy", Message: err.Error()}}
 	}
-	_, warnings, err := CompileKernelReport(ps, eng)
+	ir, warnings, err := CompileKernelReport(ps, eng)
 	var ue *UnenforceableError
 	if errors.As(err, &ue) {
 		return ue.Issues()
@@ -82,6 +88,11 @@ func lintStrict(ps *cedarlib.PolicySet) []LintIssue {
 		return []LintIssue{{Severity: LintError, Code: "not_enforceable", Message: err.Error(), Suggestion: "Policies on file, exec and connect actions may only test resource membership (`resource in ...`) and the action; see docs/design/AUTHZ-SERVICE.md."}}
 	}
 	var issues []LintIssue
+	// The load also refuses tables beyond the kernel's limits (path
+	// length, rule count).
+	if err := lsm.ValidateKernelPolicyLimits(ir); err != nil {
+		issues = append(issues, LintIssue{Severity: LintError, Code: "kernel_limits", Message: err.Error(), Suggestion: "Shorten the path or target a higher-level directory, or use fewer rules; see `leash version --json` policyLimits."})
+	}
 	for _, w := range warnings {
 		issues = append(issues, LintIssue{PolicyID: w.Policy, Severity: LintWarning, Code: "kernel_stricter", Message: w.Path + ": " + w.Message})
 	}

@@ -157,7 +157,7 @@ func TestLegacyRejectsNarrowedForbids(t *testing.T) {
 }
 
 func TestLintReportsUnenforceablePermit(t *testing.T) {
-	rep, err := LintFromString(`@id("tty-only")
+	rep, err := LintFromString(legacyMarker + `@id("tty-only")
 permit (principal, action == Action::"ProcessExec", resource in Dir::"/a/") when { context.tty == true };`)
 	if err != nil {
 		t.Fatal(err)
@@ -177,7 +177,7 @@ permit (principal, action == Action::"ProcessExec", resource in Dir::"/a/") when
 }
 
 func TestMigrateRefusesUnenforceablePermit(t *testing.T) {
-	_, _, _, err := MigrateText("leash.cedar", `permit (principal == User::"x", action == Action::"ProcessExec", resource in Dir::"/a/");`)
+	_, _, _, err := MigrateText("leash.cedar", legacyMarker+`permit (principal == User::"x", action == Action::"ProcessExec", resource in Dir::"/a/");`)
 	var ue *UnenforceableError
 	if !errors.As(err, &ue) {
 		t.Fatalf("migrate must refuse an unenforceable permit, got %v", err)

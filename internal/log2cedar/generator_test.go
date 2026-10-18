@@ -59,7 +59,7 @@ when {
 permit(
     principal,
     action == Action::"ProcessExec",
-    resource == File::"/usr/bin/date"
+    resource in File::"/usr/bin/date"
 );
 `
 

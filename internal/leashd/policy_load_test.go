@@ -18,7 +18,7 @@ import (
 func TestPreFlightRejectsUnknownEntity(t *testing.T) {
 	_, _ = provisionLeashEnv(t)
 	cfg := &runtimeConfig{
-		PolicyPath: writePolicyFile(t, `forbid (principal, action == Action::"FileOpen", resource in Dirr::"/etc/");`),
+		PolicyPath: writePolicyFile(t, `forbid (principal, action in Action::"FileOpen", resource in Dirr::"/etc/");`),
 		ProxyPort:  "18000",
 		CgroupPath: createCgroupStub(t, true),
 	}
@@ -44,7 +44,7 @@ func TestFatalLine(t *testing.T) {
 // A reload that fails to parse, names an unknown entity, or cannot be applied
 // keeps the previous policy; a later valid reload still applies.
 func TestPolicyReloadKeepsPreviousOnBadUpdate(t *testing.T) {
-	path := writePolicyFile(t, `permit (principal, action == Action::"FileOpen", resource in Dir::"/tmp/");`)
+	path := writePolicyFile(t, `permit (principal, action in Action::"FileOpen", resource in Dir::"/tmp/");`)
 	initial, err := policy.Parse(path)
 	if err != nil {
 		t.Fatal(err)
@@ -92,8 +92,8 @@ func TestPolicyReloadKeepsPreviousOnBadUpdate(t *testing.T) {
 	}
 
 	for _, bad := range []string{
-		`permit (principal, action == Action::"FileOpen", resource in Dir::"/")`, // missing ';'
-		`permit (principal, action == Action::"FileOpen", resource in Bogus::"/");`,
+		`permit (principal, action in Action::"FileOpen", resource in Dir::"/")`, // missing ';'
+		`permit (principal, action in Action::"FileOpen", resource in Bogus::"/");`,
 	} {
 		write(bad)
 		time.Sleep(2500 * time.Millisecond) // the watcher polls every second
@@ -105,7 +105,7 @@ func TestPolicyReloadKeepsPreviousOnBadUpdate(t *testing.T) {
 		}
 	}
 
-	write(`permit (principal, action == Action::"FileOpen", resource in Dir::"/var/");`)
+	write(`permit (principal, action in Action::"FileOpen", resource in Dir::"/var/");`)
 	deadline := time.Now().Add(5 * time.Second)
 	for openPaths() != "/var/" {
 		if time.Now().After(deadline) {

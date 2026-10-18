@@ -20,8 +20,8 @@ func TestWatchCedarHandlesUpdatesAndErrors(t *testing.T) {
 
 	initial := `permit (
     principal,
-    action == Action::"FileOpen",
-    resource == Dir::"/tmp"
+    action in Action::"FileOpen",
+    resource in Dir::"/tmp"
 );`
 	writeCedar(t, path, initial)
 
@@ -40,8 +40,8 @@ func TestWatchCedarHandlesUpdatesAndErrors(t *testing.T) {
 
 	validUpdate := `permit (
     principal,
-    action == Action::"FileOpen",
-    resource == Dir::"/var"
+    action in Action::"FileOpen",
+    resource in Dir::"/var"
 );`
 	writeCedar(t, path, validUpdate)
 
@@ -60,8 +60,8 @@ func TestWatchCedarHandlesUpdatesAndErrors(t *testing.T) {
 
 	recovery := `permit (
     principal,
-    action == Action::"FileOpen",
-    resource == Dir::"/home"
+    action in Action::"FileOpen",
+    resource in Dir::"/home"
 );`
 	writeCedar(t, path, recovery)
 

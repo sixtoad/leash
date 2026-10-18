@@ -728,7 +728,7 @@ func TestPoliciesCompleteUsesPolicyHints(t *testing.T) {
 
 	api := newPolicyAPI(mgr, "", nil, nil, nil)
 
-	src := `permit (principal, action == Action::"FileOpen", resource) when { resource in [ <caret> ] };`
+	src := `permit (principal, action in Action::"FileOpen", resource) when { resource in [ <caret> ] };`
 	cedar, line, col := extractCaretCoords(t, src)
 	reqBody := completionRequest{
 		Cedar:  cedar,

@@ -8,6 +8,38 @@ Claude Code handling on top.
 
 ## [Unreleased]
 
+### Breaking — unmarked policy files are strict Cedar
+- A policy file without a `@leash_semantics` marker is now read as **strict
+  Cedar**: any matching `forbid` denies (a longer `permit` no longer beats a
+  shorter `forbid`), otherwise a matching `permit` allows, otherwise deny —
+  MCP calls included (they were allowed unless forbidden). `File::"/p"` is
+  exactly the path `/p` (it was a byte prefix; the prefix is
+  `FilePrefix::"/p"`), `action == Action::"FileOpen"` is rejected (write
+  `action in Action::"FileOpen"`), and `unless` is an exception (legacy read
+  it as `when`). Before, an unmarked file was read in the legacy dialect and
+  only `@leash_semantics("cedar")` made it strict.
+- **Migrate** a legacy policy with `leash policy migrate <file> --write`
+  (same decisions, plain strict Cedar, no marker needed), or keep its old
+  meaning by marking it `@leash_semantics("legacy")`. `@leash_semantics("cedar")`
+  stays accepted as an explicit strict marker.
+- New `leash policy lint [--json] <file>`: reports what would fail the load
+  and warns (`legacy_semantics_suspected`, also in the Control UI's
+  validation) when an unmarked file decides differently than its legacy
+  reading, naming an example request. A load error on an unmarked file
+  carries the migrate / mark-legacy hint.
+- Every built-in policy was migrated with `leash policy migrate` and is
+  checked to decide like its legacy original: the bootstrap policy (now with
+  an explicit MCP permit), the release-gate Walk policy
+  (`e2e/testdata/walk33-combined.cedar`) and the CEDAR.md examples. The
+  policy API and Control UI generate statements that read the same in both
+  dialects; `log2cedar` and the policy suggestions emit strict Cedar.
+- `contractVersion` is now `3` (contract 3 = strict Cedar by default),
+  `minCompatibleContract` stays `0` (nothing was removed: the legacy dialect
+  is one marker away), and `capabilities` gains `cedar-strict-default`.
+  Provisioners that generate unmarked legacy-style policies (Walk) must emit
+  strict Cedar or mark their output `@leash_semantics("legacy")` against a
+  leash that advertises it.
+
 ### Security — macOS enforces the Linux kernel tables
 - The macOS extensions now enforce exactly the tables the eBPF LSM enforces,
   compiled from the Cedar policy by the same code (`lsm.MacTablesFor`) and

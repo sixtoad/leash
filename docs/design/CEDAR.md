@@ -5,11 +5,11 @@
 
 
 > [!NOTE]
-> Every userspace decision (the proxy's connect check, MCP tools/call, the plugin authorization socket) is made by Cedar's own evaluator (cedar-go) over strict Cedar, and the kernel enforces tables compiled from the same policies (#142). A file without `@leash_semantics("cedar")` keeps the legacy semantics this page describes: it is rewritten at load to equivalent strict Cedar, and the daemon logs every `forbid` that gained an exception. `leash policy migrate <file>` prints the rewritten file. See `docs/design/AUTHZ-SERVICE.md`.
+> **Policy files are strict Cedar by default** (contract 3, capability `cedar-strict-default`): any applicable `forbid` denies, otherwise any applicable `permit` allows, otherwise the request is denied. Every userspace decision (the proxy's connect check, MCP tools/call, the plugin authorization socket) is made by Cedar's own evaluator (cedar-go), and the kernel enforces tables compiled from the same policies (#142). Leash's older **legacy dialect** (the most specific file rule wins, MCP allowed by default, `File::` as a path prefix) is an explicit opt-in: mark the file `@leash_semantics("legacy")` and it is rewritten at load to equivalent strict Cedar. `leash policy migrate <file>` converts a legacy file for good, and `leash policy lint <file>` warns when an unmarked file looks written for the legacy dialect. See [Dialects](#dialects-strict-cedar-default-and-legacy) and `docs/design/AUTHZ-SERVICE.md`.
 
 Leash loads the initial access‑control policy from `/cfg/leash.cedar`. At startup
-the daemon validates Cedar, transpiles it to Leash IR in memory, and loads the
-resulting rules into the eBPF LSM programs and the HTTP MITM proxy.
+the daemon validates Cedar, compiles it to kernel tables in memory, and loads them
+into the eBPF LSM programs; the HTTP MITM proxy evaluates the same policies with Cedar.
 
 This is the single, authoritative reference for authoring Cedar policies in Leash.
 All examples use Cedar’s standard Action entity with PascalCase identifiers. No
@@ -85,27 +85,28 @@ conditions.
 ```cedar
 permit (
     principal,
-    action == Action::"FileOpen",
+    action in Action::"FileOpen",
     resource
 ) when {
-    resource in [ Dir::"/workspace" ]
+    resource in [ Dir::"/workspace/" ]
 };
 ```
 
 Key elements:
 
 - **effect** – `permit` or `forbid`.
-- **action** – a Cedar `Action::"PascalCase"` identifier such as `FileOpen`, `ProcessExec`, `NetworkConnect`, or `HttpRewrite`.
-- **resource** – entity describing what is touched (e.g. `Dir::"/path"`, `File::"/file"`,
-  `Host::"example.com"`).
+- **action** – a Cedar `Action::"PascalCase"` identifier such as `FileOpen`, `ProcessExec`, `NetworkConnect`, or `HttpRewrite`. `Action::"FileOpen"` is the group of the two open modes: write `action in Action::"FileOpen"` (`action == Action::"FileOpen"` matches no request and is rejected).
+- **resource** – entity describing what is touched (e.g. `Dir::"/path/"`, `File::"/file"`,
+  `FilePrefix::"/bin/rm"`, `Host::"example.com"`). Match files and directories with
+  `resource in ...`: `File::"/p"` is exactly the path `/p`, `Dir::"/d/"` the tree below `/d`
+  (and `/d` itself for opens), `FilePrefix::"/q"` every path those bytes prefix.
 - **conditions** – optional `when { ... }` block that constrains matches. Leash
   uses it primarily for HTTP rewrite header/value matching.
 
-Statement order does not matter. In a legacy file (the semantics this page
-describes) the most specific file or exec rule wins and a `forbid` wins a
-tie; connect and MCP rules are forbid-overrides-permit. In a strict file
-(`@leash_semantics("cedar")`) every action is plain Cedar: any applicable
-`forbid` denies, otherwise any applicable `permit` allows, otherwise deny.
+Statement order does not matter. Every action is plain Cedar: any applicable
+`forbid` denies, otherwise any applicable `permit` allows, otherwise deny. A
+`forbid` is not overridden by a more specific `permit`; write the exception
+on the `forbid` (`unless { resource in [ ... ] }`).
 
 ### Supported Actions and Resources
 
@@ -115,15 +116,24 @@ tie; connect and MCP rules are forbid-overrides-permit. In a strict file
 | `Action::"ProcessExec"`          | `Dir::"/path/"`, `File::"/path"`                    | Path‑only matching; argument filtering not yet available. |
 | `Action::"NetworkConnect"`       | `Host::"example.com"`, `Host::"*.domain"`, `Host::"ip:port"` | Wildcard hosts support a leading `*.` only. Ports optional. |
 | `Action::"HttpRewrite"`          | `Host::"example.com"`                               | Requires `context.header` and `context.value`. |
-| `Action::"McpCall"`              | `MCP::Server::"host"`, `MCP::Tool::"tool-name"`     | V1: `forbid` enforced; `permit` informational only. |
+| `Action::"McpCall"`              | `MCP::Server::"host"`, `MCP::Tool::"tool-name"`     | Default deny: MCP calls need a `permit`. |
 
 ### Plugin Actions
 
 Actions outside the root `Action::` namespace (for example `Secret::Action::"Read"`) belong to injected plugins, which ask Leash for decisions over the authorization socket. They are evaluated by cedar-go itself, with Cedar semantics (forbid overrides permit, default deny) and the full Cedar language, against only the policies whose action scope names their namespace: a policy with an unconstrained `action` never decides a plugin action. `@id` names a policy in decisions; `@expires("<RFC 3339>")` makes it stop applying at that instant. See `docs/design/AUTHZ-SERVICE.md`.
 
-### Strict Cedar Semantics and `leash policy migrate`
+### Dialects: strict Cedar (default) and legacy
 
-A file whose policies carry `@leash_semantics("cedar")` is read as plain Cedar over Leash's entity hierarchy (see `docs/design/AUTHZ-SERVICE.md` §3): `File::"/p"` is exactly one path, `Dir::"/d/"` a tree (and the directory itself for opens), `FilePrefix::"/q"` every path those bytes prefix. `leash policy migrate <file> [--write]` rewrites a file in the semantics described on this page into that form, with the same decisions: a `forbid` that a more specific `permit` used to override gains an `unless { resource in ... }` exception, a `File::` rule (a byte prefix on this page) becomes `FilePrefix::`, and the MCP and connect defaults become explicit policies.
+A policy file without a `@leash_semantics` marker is plain Cedar over Leash's entity hierarchy (see `docs/design/AUTHZ-SERVICE.md` §3): `File::"/p"` is exactly one path, `Dir::"/d/"` a tree (and the directory itself for opens), `FilePrefix::"/q"` every path those bytes prefix, `Host::"*.zone"` every name in the zone, `Host::"*"` every host. `@leash_semantics("cedar")` marks the same thing explicitly.
+
+`@leash_semantics("legacy")` (on any policy of the file) selects Leash's older dialect, where the most specific file or exec rule wins (a longer `permit` beat a shorter `forbid`), `File::"/p"` is a byte prefix, MCP calls are allowed unless forbidden (MCP permits are no-ops), `Host::"*"` is the connect default, and `unless` was read as `when`. A legacy file is rewritten to equivalent strict Cedar at load, and the daemon logs every `forbid` that gained an exception. Mixing both markers in one file is an error. A policy added through the policy API or the Control UI joins the layer it is added to and is read in that layer's dialect; the generated statements read the same in both.
+
+**Migrating.** Until contract 3, an unmarked file was read as legacy. Such a file now means something else, and may fail to load (strict Cedar rejects `action == Action::"FileOpen"`, a principal constraint on a built-in action, or a `resource ==` on a directory). Either:
+
+- `leash policy migrate <file> [--write]`: reads the file in the legacy dialect (unless it is marked `@leash_semantics("cedar")`) and prints plain strict Cedar with the same decisions, without a marker: a `forbid` that a more specific `permit` used to override gains an `unless { resource in ... }` exception, a `File::` rule becomes `FilePrefix::`, and the MCP and connect defaults become explicit policies. The output starts with a `// Migrated from legacy ...` header, so migrating it again is a no-op.
+- or keep the old meaning by marking the file `@leash_semantics("legacy")`.
+
+`leash policy lint <file>` (and the Control UI's validation) warns with `legacy_semantics_suspected` when an unmarked file decides differently than it would in the legacy dialect (for example a `File::` rule that relied on prefix matching, a `permit` nested under a `forbid`, an `unless`, or MCP forbids without any MCP permit), with an example request. Mark the file `@leash_semantics("cedar")` once you have checked it is meant as strict Cedar.
 
 ### Action→IR Mapping
 
@@ -139,12 +149,12 @@ Leash IR and logs use stable operation strings. Actions map as follows:
 
 Notes:
 - Directory resources must end with `/`. The transpiler normalises this; the linter warns when missing.
-- `FileOpen` file and directory resource paths may contain at most 255 bytes (a directory's trailing `/` counts); parsers and loaders reject a longer individual rule. The kernel compares every byte of every accepted rule: a rule matches each path it is a byte prefix of (a directory rule also matches the directory itself), the longest matching rule wins, and at equal length a forbid beats a permit regardless of rule order. The hard-link guard (judged as a read of the source) and the directory-mutation hooks (`mkdir`, `unlink`, `rmdir`, `rename`) use the same full-length rules. A runtime path longer than 255 bytes cannot be matched and is denied.
+- `FileOpen` file and directory resource paths may contain at most 255 bytes (a directory's trailing `/` counts); parsers and loaders reject a longer individual rule. The kernel compares every byte of every accepted rule of the tables compiled from the strict policy (the compiler adds the entries that make longest-match equal Cedar's forbid-overrides-permit; see AUTHZ-SERVICE.md §3.3). The hard-link guard (judged as a read of the source) and the directory-mutation hooks (`mkdir`, `unlink`, `rmdir`, `rename`) use the same full-length rules. A runtime path longer than 255 bytes cannot be matched and is denied.
 - `ProcessExec` resource paths are still matched by the legacy 64-byte kernel matcher (at most 64 exec rules); the exec loader rejects a longer rule or a larger rule set instead of skipping it.
 - `leash version --json` advertises both limits as `policyLimits.filePathBytes` / `policyLimits.execPathBytes` (capability `policy-path-limits`).
-- IPv6 literals and CIDR are not supported in v1 policies.
+- CIDR ranges are not supported in policies (IPv6 literals are, #182).
 - Hostname rules require the Leash proxy for hostname enforcement (kernel enforces IP only).
-- `NetworkConnect` and `McpCall` have no specificity order: any matching `forbid` wins over every matching `permit`, regardless of rule order. The bare `Host::"*"` resource is the connect default (`permit` = default allow, `forbid` = default deny), not a rule, so `forbid Host::"*"` plus `permit Host::"api.example.com"` allows only that host.
+- `NetworkConnect` and `McpCall`, like every action, have no specificity order: any matching `forbid` wins over every matching `permit`. Connections are denied unless permitted, so a policy that only permits `Host::"api.example.com"` allows only that host; `Host::"*"` is every host (`forbid ... Host::"*"` denies every connection, whatever is permitted).
 - The kernel enforces hostname rules on the IPs they resolve to. If a forbidden host and a permitted host share an IP (common behind a CDN), the kernel denies that IP, so the permitted host is blocked too. Use the proxy's hostname rules, not a hostname `forbid`, for hosts that share an IP with permitted ones.
 
 ## File Access Examples
@@ -264,11 +274,11 @@ Each matching request to `api.example.com` receives the specified header and val
 Leash monitors and enforces policies on MCP tool calls made by AI agents. MCP
 policies use `Action::"McpCall"` with `MCP::Server` and `MCP::Tool` resources.
 
-### V1 Enforcement Limitations
+### Enforcement
 
-- **Deny-only enforcement**: `forbid` statements are enforced at runtime; `permit` statements are informational and generate linter warnings.
-- **Server-level denies**: Denying an `MCP::Server` blocks all network connectivity to that host (transpiles to `net.send` deny).
-- **Tool-specific denies**: Denying a specific `MCP::Tool` on an `MCP::Server` requires both resources; the proxy enforces tool-level access control.
+- **Default deny**: an MCP call is allowed only by a `permit`, and any matching `forbid` denies it. To allow MCP in general and block a few tools, add `permit (principal, action == Action::"McpCall", resource);` next to the forbids.
+- **Server-level denies**: a `forbid` on an `MCP::Server` denies its tool calls in the proxy. To block all network traffic to that host as well, also forbid `NetworkConnect` on `Host::"<server>"` (the legacy dialect did that implicitly).
+- **Tool-specific denies**: the proxy enforces tool-level access control on `MCP::Tool` (with or without an `MCP::Server`).
 
 ### Block All Access to an MCP Server
 
@@ -284,14 +294,15 @@ forbid (
 };
 ```
 
-This transpiles to a network deny rule (`net.send mcp.untrusted.com`) and an MCP
-policy rule blocking all tools on that server.
+The proxy denies every tool call to that server. (Calls to other servers still need a `permit`.)
 
 ### Block a Specific Tool on a Server
 
 Deny access to a specific MCP tool while allowing others:
 
 ```cedar
+permit (principal, action == Action::"McpCall", resource);
+
 forbid (
     principal,
     action == Action::"McpCall",
@@ -303,9 +314,9 @@ forbid (
 
 The proxy will allow other tools on `mcp.context7.com` but deny calls to `resolve-library-id`.
 
-### Informational Permit (V1)
+### Permit a Tool
 
-In v1, `permit` on `McpCall` is recorded but not enforced:
+Allow one tool on one server (every other MCP call stays denied):
 
 ```cedar
 permit (
@@ -317,8 +328,7 @@ permit (
 };
 ```
 
-This generates a linter warning (`mcp_allow_noop`) to indicate that allow rules are
-not yet enforced. Use permit statements for documentation and future compatibility.
+In the legacy dialect MCP permits were no-ops (MCP was allowed by default); in strict Cedar they are the only way to allow a call.
 
 ## Example Policy File
 
@@ -326,27 +336,30 @@ A small end-to-end policy might look like:
 
 ```cedar
 // Allow basic file access while protecting secrets
-permit (principal, action in [Action::"FileOpen", Action::"FileOpenReadOnly", Action::"FileOpenReadWrite"], resource)
+permit (principal, action in Action::"FileOpen", resource)
 when { resource in [ Dir::"/workspace/" ] };
 
 forbid (principal, action == Action::"FileOpenReadWrite", resource)
 when { resource in [ Dir::"/workspace/secrets/" ] };
 
-// Allow execution of trusted tools
+// Allow execution of trusted tools, but not rm (nor rmdir: a byte prefix)
 permit (principal, action == Action::"ProcessExec", resource)
 when { resource in [ Dir::"/bin/", Dir::"/usr/bin/" ] };
 
 forbid (principal, action == Action::"ProcessExec", resource)
-when { resource in [ File::"/bin/rm" ] };
+when { resource in [ FilePrefix::"/bin/rm" ] };
 
 // Network policy
 permit (principal, action == Action::"NetworkConnect", resource)
-when { resource in [ Host::"api.internal" , Host::"db.internal:5432" ] };
+when { resource in [ Host::"api.internal", Host::"db.internal:5432" ] };
 
 forbid (principal, action == Action::"NetworkConnect", resource)
-when { resource in [ Host::"*.facebook.com" ] };
+when { resource in [ Host::"*.facebook.com", Host::"mcp.example.com" ] };
 
-// MCP tool access control
+// MCP tool access control: every call is allowed except execute-shell on
+// mcp.example.com (strict Cedar denies MCP calls no policy permits)
+permit (principal, action == Action::"McpCall", resource);
+
 forbid (principal, action == Action::"McpCall", resource == MCP::Tool::"execute-shell")
 when { resource in [ MCP::Server::"mcp.example.com" ] };
 
@@ -366,11 +379,10 @@ return structured errors with file, line, column, snippet, and a suggested fix. 
 ```bash
 curl -fsS -X POST localhost:18080/api/policies/validate \
   -H 'Content-Type: application/json' \
-  --data '{"cedar": "permit (principal, action == Action::\"FileOpen\", resource);"}'
+  --data '{"cedar": "permit (principal, action in Action::\"FileOpen\", resource in Dir::\"/workspace/\");"}'
 ```
 
-Persistence is similarly performed through `/api/policies/persist` or via the
-`leash` CLI (`leash policy apply ...`).
+Persistence is similarly performed through `/api/policies/persist`. Offline, `leash policy lint <file>` reports the same issues (exit 1 on an error) and `leash policy migrate <file>` converts a legacy file.
 
 ## Runtime Behavior Notes
 

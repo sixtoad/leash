@@ -66,13 +66,22 @@ import (
 // `--require-lsm` stays accepted as a no-op, so nothing a contract-0/1 caller
 // drives was removed.
 //
-// MinCompatibleContract is 0 today because neither contract 1 (which only added
-// the document) nor contract 2 took away anything an older caller drives. That also makes the
+// Contract 3 changed the meaning of the `--policy` file: a policy file without
+// a @leash_semantics marker is strict Cedar (forbid overrides permit, default
+// deny, `File::"/p"` is exactly one path, MCP calls need a permit). Before, an
+// unmarked file was read in the legacy Leash dialect. The legacy dialect is
+// still available, as an explicit opt-in (@leash_semantics("legacy")), so
+// nothing a contract-0/1/2 caller drives was removed; a caller that writes
+// unmarked legacy policies must mark them, or emit strict Cedar, against a
+// leash that advertises CapabilityCedarStrictDefault.
+//
+// MinCompatibleContract is 0 today because none of contracts 1 (which only added
+// the document), 2 and 3 took away anything an older caller drives. That also makes the
 // field's absence safe to read as 0 — "nothing has been removed". The integer is
 // deliberately coarse, and raising the floor over-refuses; Capabilities exists so
 // a caller can ask about the one surface element it actually drives instead.
 const (
-	ContractVersion       = 2
+	ContractVersion       = 3
 	MinCompatibleContract = 0
 )
 
@@ -133,6 +142,12 @@ const (
 	// event=net.socket; issue #188). ICMP datagram sockets (ping) are decided
 	// by the connect rules.
 	CapabilityRawSocketGate = "raw-socket-gate"
+	// CapabilityCedarStrictDefault means a policy file without a
+	// @leash_semantics marker is strict Cedar (contract 3); the legacy Leash
+	// dialect is read only from a file marked @leash_semantics("legacy").
+	// `leash policy migrate` converts a legacy file, `leash policy lint`
+	// warns on an unmarked file that looks written for the legacy dialect.
+	CapabilityCedarStrictDefault = "cedar-strict-default"
 )
 
 // Enforced policy path limits, in bytes of the resolved path (a directory
@@ -176,6 +191,7 @@ var capabilities = []string{
 	CapabilityAuthzSocket,
 	CapabilityRootlessDaemon,
 	CapabilityRawSocketGate,
+	CapabilityCedarStrictDefault,
 }
 
 // Capabilities returns the surface names this build advertises. The slice is a

@@ -53,7 +53,8 @@ import (
 //   - Plugin-action policies already had Cedar semantics and are kept as
 //     written.
 //
-// Every emitted policy carries @leash_semantics("cedar").
+// The emitted policies carry no @leash_semantics marker: strict Cedar is
+// the default (an input marker is dropped).
 
 // LegacyLayer is one legacy policy source: a parsed file, or a raw IR layer
 // (whose rules are legacy by definition).
@@ -525,7 +526,6 @@ func (w *strictWriter) policy(annots []xast.AnnotationType, source, effect strin
 	if w.b.Len() > 0 {
 		w.b.WriteString("\n")
 	}
-	fmt.Fprintf(&w.b, "@%s(\"cedar\")\n", AnnotationSemantics)
 	for _, a := range annots {
 		fmt.Fprintf(&w.b, "@%s(%s)\n", a.Key, a.Value.MarshalCedar())
 	}
@@ -541,8 +541,7 @@ func (w *strictWriter) policy(annots []xast.AnnotationType, source, effect strin
 
 func (w *strictWriter) ast(p *xast.Policy, source string) {
 	cp := *p
-	cp.Annotations = []xast.AnnotationType{{Key: AnnotationSemantics, Value: "cedar"}}
-	cp.Annotations = append(cp.Annotations, keptAnnotations(p)...)
+	cp.Annotations = keptAnnotations(p)
 	if w.opts.Provenance && source != "" {
 		cp.Annotations = append(cp.Annotations, xast.AnnotationType{Key: annotationSource, Value: types.String(source)})
 	}

@@ -265,7 +265,7 @@ func legacyUnenforceable(p CedarPolicy, pa *xast.Policy, u *legacyUnit, isMCP bo
 		}
 		hint := " Remove the constraint to grant unconditionally, or narrow the policy's resources instead."
 		if len(lc.unless) > 0 {
-			hint = " Express the exception as a forbid, or mark the file strict (@leash_semantics(\"cedar\"), see `leash policy migrate`), where `unless { resource in [...] }` is enforced as written."
+			hint = " Express the exception as a forbid, or migrate the file to strict Cedar, the default dialect (`leash policy migrate`), where `unless { resource in [...] }` is enforced as written."
 		}
 		return "permit cannot be enforced as written: " + strings.Join(why, "; ") +
 			". Legacy semantics would grant it without that constraint, allowing more than the policy says, so the load is refused." + hint

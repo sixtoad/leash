@@ -15,15 +15,17 @@ func TestRenderPolicyLinesHumanization(t *testing.T) {
 	if err != nil {
 		t.Fatalf("renderPolicyLines failed: %v", err)
 	}
-	if len(lines) != 4 {
-		t.Fatalf("expected 4 lines, got %d", len(lines))
+	if len(lines) != 6 {
+		t.Fatalf("expected 6 lines, got %d", len(lines))
 	}
 
 	expected := []string{
 		"Allow read files /etc/inputrc",
-		"Allow open files, read files, write files directory /",
+		"Allow read files, write files directory /",
 		"Allow run processes directory /",
-		"Allow network connect any host",
+		"Allow network connect any resource",
+		"Allow read files, write files any resource",
+		"Allow call MCP tool any resource",
 	}
 
 	for i, line := range lines {
@@ -36,6 +38,18 @@ func TestRenderPolicyLinesHumanization(t *testing.T) {
 		if line.Humanized != expected[i] {
 			t.Errorf("humanized mismatch at %d: got %q want %q", i, line.Humanized, expected[i])
 		}
+	}
+}
+
+// Strict Cedar (the default) writes a single entity without brackets and an
+// exception as `unless`; the humanized line must show both.
+func TestRenderPolicyLinesStrictConditions(t *testing.T) {
+	lines, err := renderPolicyLines(`forbid (principal, action in Action::"FileOpen", resource) when { resource in Dir::"/a/" } unless { resource in [Dir::"/a/b/"] };` + "\n")
+	if err != nil || len(lines) != 1 {
+		t.Fatalf("%v %v", lines, err)
+	}
+	if got := lines[0].Humanized; !strings.Contains(got, "/a/") || !strings.Contains(got, "except") || !strings.Contains(got, "/a/b/") {
+		t.Fatalf("humanized %q", got)
 	}
 }
 
