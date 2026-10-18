@@ -39,7 +39,8 @@ images must advertise a compatible manager-contract range and OCI revision;
 unlabeled or incompatible privileged managers fail closed.
 `leash manager inspect --json` reports the same verdict without starting a
 run, plus the image leash's own contract range and capabilities
-(`io.leash.manager.cli.contract.*`, `io.leash.manager.capabilities`; see
+(`io.leash.manager.cli.contract.*`, `io.leash.manager.capabilities`,
+`io.leash.manager.policy-limits`; see
 docs/api-contracts-leash-core.md).
 
 Run the complete path without registry or GitHub publication:

@@ -86,6 +86,7 @@ func fullLabels(revision string) map[string]string {
 		managercontract.LabelCLIContractVersion:       "3",
 		managercontract.LabelCLIMinCompatibleContract: "0",
 		managercontract.LabelCapabilities:             "policy,runtime,manager-inspect",
+		managercontract.LabelPolicyLimits:             "filePathBytes=255,execPathBytes=64,fileRules=256,execRules=64",
 	}
 }
 
@@ -153,6 +154,9 @@ func TestManagerInspectDefaultImageCompatible(t *testing.T) {
 	}
 	if strings.Join(doc.Capabilities, ",") != "policy,runtime,manager-inspect" || !doc.CapabilitiesLabeled {
 		t.Fatalf("capabilities = %v labeled=%t", doc.Capabilities, doc.CapabilitiesLabeled)
+	}
+	if doc.PolicyLimits == nil || doc.PolicyLimits.FilePathBytes != 255 || doc.PolicyLimits.ExecRules != 64 {
+		t.Fatalf("policy limits = %+v", doc.PolicyLimits)
 	}
 	if !doc.CompatibleWithThisCLI || !strings.Contains(doc.Reason, "revision matches") {
 		t.Fatalf("verdict = %t %q", doc.CompatibleWithThisCLI, doc.Reason)
@@ -251,7 +255,7 @@ func TestManagerInspectUnlabeledImage(t *testing.T) {
 		doc.ContractVersion != nil || doc.CapabilitiesLabeled || len(doc.Capabilities) != 0 {
 		t.Fatalf("doc=%+v", doc)
 	}
-	for _, want := range []string{`"managerContract": null`, `"contractVersion": null`, `"capabilities": []`, `"repoDigests": []`} {
+	for _, want := range []string{`"managerContract": null`, `"contractVersion": null`, `"policyLimits": null`, `"capabilities": []`, `"repoDigests": []`} {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("stdout missing %s:\n%s", want, stdout)
 		}

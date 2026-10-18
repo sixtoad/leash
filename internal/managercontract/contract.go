@@ -24,7 +24,18 @@ const (
 	LabelCLIContractVersion       = "io.leash.manager.cli.contract.version"
 	LabelCLIMinCompatibleContract = "io.leash.manager.cli.contract.min-compatible"
 	LabelCapabilities             = "io.leash.manager.capabilities"
+	// LabelPolicyLimits carries the document's policyLimits as
+	// filePathBytes=N,execPathBytes=N,fileRules=N,execRules=N.
+	LabelPolicyLimits = "io.leash.manager.policy-limits"
 )
+
+// PolicyLimits mirrors the `policyLimits` object of `leash version --json`.
+type PolicyLimits struct {
+	FilePathBytes int `json:"filePathBytes"`
+	ExecPathBytes int `json:"execPathBytes"`
+	FileRules     int `json:"fileRules"`
+	ExecRules     int `json:"execRules"`
+}
 
 // CLIMetadata is what the image advertises about the leash binary it carries.
 // Each field is nil (or Capabilities empty with CapabilitiesPresent false)
@@ -35,6 +46,33 @@ type CLIMetadata struct {
 	MinCompatibleContract *int
 	Capabilities          []string
 	CapabilitiesPresent   bool
+	PolicyLimits          *PolicyLimits
+}
+
+func parsePolicyLimits(raw string) (*PolicyLimits, error) {
+	var out PolicyLimits
+	fields := map[string]*int{
+		"filePathBytes": &out.FilePathBytes, "execPathBytes": &out.ExecPathBytes,
+		"fileRules": &out.FileRules, "execRules": &out.ExecRules,
+	}
+	seen := map[string]bool{}
+	for _, pair := range strings.Split(raw, ",") {
+		key, value, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		dst, known := fields[key]
+		if !ok || !known || seen[key] {
+			return nil, fmt.Errorf("manager image OCI label %q: bad entry %q", LabelPolicyLimits, pair)
+		}
+		n, err := strconv.Atoi(value)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("manager image OCI label %q: %s must be a positive integer, got %q", LabelPolicyLimits, key, value)
+		}
+		seen[key] = true
+		*dst = n
+	}
+	if len(seen) != len(fields) {
+		return nil, fmt.Errorf("manager image OCI label %q must set filePathBytes, execPathBytes, fileRules and execRules", LabelPolicyLimits)
+	}
+	return &out, nil
 }
 
 // ParseCLI reads the optional CLI-description labels. A label that is present
@@ -77,6 +115,13 @@ func ParseCLI(labels map[string]string) (CLIMetadata, error) {
 			seen[name] = true
 			out.Capabilities = append(out.Capabilities, name)
 		}
+	}
+	if raw, ok := labels[LabelPolicyLimits]; ok && strings.TrimSpace(raw) != "" {
+		limits, err := parsePolicyLimits(raw)
+		if err != nil {
+			return CLIMetadata{}, err
+		}
+		out.PolicyLimits = limits
 	}
 	return out, nil
 }

@@ -62,6 +62,8 @@ type ManagerInspectDocument struct {
 	MinCompatibleContract *int     `json:"minCompatibleContract"`
 	Capabilities          []string `json:"capabilities"`
 	CapabilitiesLabeled   bool     `json:"capabilitiesLabeled"`
+	// PolicyLimits is the image leash's `policyLimits`; null when unlabeled.
+	PolicyLimits *managercontract.PolicyLimits `json:"policyLimits"`
 	// CompatibleWithThisCLI is the verdict a run of this CLI would reach
 	// before provisioning; Reason explains it either way.
 	CompatibleWithThisCLI bool   `json:"compatibleWithThisCli"`
@@ -294,6 +296,7 @@ func buildManagerInspectDocument(ref, source, engine string, facts managerImageF
 		doc.MinCompatibleContract = cli.MinCompatibleContract
 		doc.Capabilities = cli.Capabilities
 		doc.CapabilitiesLabeled = cli.CapabilitiesPresent
+		doc.PolicyLimits = cli.PolicyLimits
 	}
 
 	metadata, err := managercontract.Parse(facts.Labels)

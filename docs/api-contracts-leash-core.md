@@ -390,6 +390,7 @@ own registry credentials.
   "minCompatibleContract": 0,       //   null when the image predates the label
   "capabilities": ["policy", "…", "manager-inspect"], // same vocabulary and order
   "capabilitiesLabeled": true,      // false: the image predates the label ([] means unknown)
+  "policyLimits": {"filePathBytes": 255, "execPathBytes": 64, "fileRules": 256, "execRules": 64}, // null when unlabeled
   "compatibleWithThisCli": true,    // the verdict this CLI's run would reach before provisioning
   "reason": "manager contract 1 is within the image's range 1..1 and the revision matches this release"
 }
@@ -405,6 +406,11 @@ are pinned to `internal/version` by tests):
 | `io.leash.manager.contract.version` / `.min-compatible` | manager contract range (CLI ↔ manager) |
 | `io.leash.manager.cli.contract.version` / `.min-compatible` | the image leash's `contractVersion` / `minCompatibleContract` |
 | `io.leash.manager.capabilities` | the image leash's `capabilities`, comma-separated, in document order |
+| `io.leash.manager.policy-limits` | the image leash's `policyLimits`, as `filePathBytes=N,execPathBytes=N,fileRules=N,execRules=N` |
+
+The image's leashd loads a container run's policy, so a policy generator sizes
+container policies by this `policyLimits` (and checks its dialect by
+`cedar-strict-default` in `capabilities`), not by the host CLI's document.
 
 Exit `0` whenever the image was resolved and inspected, compatible or not —
 read `compatibleWithThisCli` and `reason`. Exit `1` (nothing on stdout) when

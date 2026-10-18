@@ -66,9 +66,13 @@ func TestParseCLI(t *testing.T) {
 	labels[LabelCLIContractVersion] = "3"
 	labels[LabelCLIMinCompatibleContract] = "0"
 	labels[LabelCapabilities] = "policy, runtime,policy,manager-inspect"
+	labels[LabelPolicyLimits] = "filePathBytes=255,execPathBytes=64,fileRules=256,execRules=64"
 	cli, err := ParseCLI(labels)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cli.PolicyLimits == nil || *cli.PolicyLimits != (PolicyLimits{FilePathBytes: 255, ExecPathBytes: 64, FileRules: 256, ExecRules: 64}) {
+		t.Fatalf("policy limits = %+v", cli.PolicyLimits)
 	}
 	if cli.Version != "native-v0.4.0" || cli.ContractVersion == nil || *cli.ContractVersion != 3 ||
 		cli.MinCompatibleContract == nil || *cli.MinCompatibleContract != 0 || !cli.CapabilitiesPresent {
@@ -88,6 +92,10 @@ func TestParseCLI(t *testing.T) {
 		"text":       {LabelCLIMinCompatibleContract: "x"},
 		"inverted":   {LabelCLIContractVersion: "1", LabelCLIMinCompatibleContract: "2"},
 		"empty name": {LabelCapabilities: "policy,,runtime"},
+		"limits key": {LabelPolicyLimits: "filePathBytes=255,execPathBytes=64,fileRules=256,bogus=1"},
+		"limits dup": {LabelPolicyLimits: "filePathBytes=255,filePathBytes=255,fileRules=256,execRules=64"},
+		"limits few": {LabelPolicyLimits: "filePathBytes=255"},
+		"limits neg": {LabelPolicyLimits: "filePathBytes=0,execPathBytes=64,fileRules=256,execRules=64"},
 	} {
 		if _, err := ParseCLI(bad); err == nil {
 			t.Errorf("%s: ParseCLI accepted %v", name, bad)

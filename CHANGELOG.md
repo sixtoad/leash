@@ -89,8 +89,9 @@ fails closed everywhere. Upgrade notes are under **Breaking**.
   capabilities, and whether this CLI would accept it (capability
   `manager-inspect`). The manager image gains the OCI labels
   `io.leash.manager.cli.contract.version`,
-  `io.leash.manager.cli.contract.min-compatible` and
-  `io.leash.manager.capabilities`; the `final` build stage now also sets the
+  `io.leash.manager.cli.contract.min-compatible`,
+  `io.leash.manager.capabilities` and `io.leash.manager.policy-limits`
+  (reported as `policyLimits`); the `final` build stage now also sets the
   manager-contract labels, which were empty in images built from it.
 
 ### Fixed

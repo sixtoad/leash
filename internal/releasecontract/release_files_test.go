@@ -27,6 +27,8 @@ func TestManagerImageAdvertisesItsLeashBuildContract(t *testing.T) {
 		"LEASH_CLI_CONTRACT_VERSION":        strconv.Itoa(version.ContractVersion),
 		"LEASH_CLI_MIN_COMPATIBLE_CONTRACT": strconv.Itoa(version.MinCompatibleContract),
 		"LEASH_CAPABILITIES":                strings.Join(version.Capabilities(), ","),
+		"LEASH_POLICY_LIMITS": fmt.Sprintf("filePathBytes=%d,execPathBytes=%d,fileRules=%d,execRules=%d",
+			version.FilePolicyPathBytes, version.ExecPolicyPathBytes, version.FilePolicyRules, version.ExecPolicyRules),
 	}
 	labels := map[string]string{
 		managercontract.LabelContractVersion:          "MANAGER_CONTRACT_VERSION",
@@ -34,6 +36,7 @@ func TestManagerImageAdvertisesItsLeashBuildContract(t *testing.T) {
 		managercontract.LabelCLIContractVersion:       "LEASH_CLI_CONTRACT_VERSION",
 		managercontract.LabelCLIMinCompatibleContract: "LEASH_CLI_MIN_COMPATIBLE_CONTRACT",
 		managercontract.LabelCapabilities:             "LEASH_CAPABILITIES",
+		managercontract.LabelPolicyLimits:             "LEASH_POLICY_LIMITS",
 		managercontract.LabelVersion:                  "VERSION",
 		managercontract.LabelRevision:                 "COMMIT",
 	}
