@@ -69,6 +69,46 @@ scripts/release.sh --dry-run native-vX.Y.Z   # rehearse, no credentials
 scripts/release.sh native-vX.Y.Z             # publish
 ```
 
+### CI release (`.github/workflows/native-release.yml`)
+
+Pushing a `native-vX.Y.Z` tag runs `scripts/release.sh --from-pushed-tag` on
+an `ubuntu-latest` runner with Buildx/QEMU, using only the workflow
+`GITHUB_TOKEN` (`packages: write` for GHCR, `contents: write` for the
+release). `--from-pushed-tag` replaces the "Git tag absent" checks with "the Git
+tag resolves to exactly the release commit"; the GitHub release must still be
+absent. Rehearse first, from any ref:
+
+```bash
+gh workflow run native-release.yml --ref <branch> -f tag=native-vX.Y.Z -f dry_run=true
+```
+
+A dispatch with `dry_run=false` releases an already-pushed tag (it checks out
+`refs/tags/<tag>`), e.g. to retry after a failure that published nothing.
+
+The runner kernel has `CONFIG_BPF_LSM=y` but no `bpf` in the active LSM list,
+so the kernel-dependent gates run in a nested KVM guest:
+`scripts/release-gate-vm.sh` boots the Ubuntu noble cloud image directly from
+its own checksummed `vmlinuz`/`initrd` with
+`lsm=lockdown,capability,landlock,yama,apparmor,bpf`, a NoCloud seed holding a
+client key and host key generated in the job (the host key is pinned), and
+user-mode networking forwarding SSH to `127.0.0.1`. `release.sh` then runs its
+gates there through:
+
+- `LEASH_RELEASE_GATE_SSH=[user@]host[:port]` — the gate host;
+- `LEASH_RELEASE_GATE_SSH_CONFIG=<file>` — optional `ssh -F` config.
+
+With the gate host set, the build host still generates, builds and publishes
+everything. The gate host receives a `git archive` of the release commit's
+`scripts/` and `e2e/testdata/`, the kernel-load test binary built from the
+pinned LSM objects (checked to embed each object byte-for-byte), the exact CLI
+binaries, and (for local-only managers) the manager image, whose image ID must
+be unchanged; registry managers are pulled there by digest. Every copied file
+is re-checked by sha256 on the gate host. The gate host must have `bpf` active
+and match the build host's architecture; there is no inert escape. With a gate
+host, `--dry-run` also runs the kernel-load gate. Unset, every gate runs
+locally exactly as before. If the GHCR push is refused, grant the repository
+write access in the package settings (Manage Actions access) and re-run.
+
 ### Resume a stranded manager publication
 
 If the immutable manager tag was pushed but a later package-visibility gate

@@ -89,6 +89,7 @@ func TestNativeReleaseRemoteModes(t *testing.T) {
 		{name: "package 404 registry tag exists", scenario: "package-404-existing", resume: "1", want: "resume\n"},
 		{name: "package 404 registry tag absent", scenario: "package-404-missing", resume: "0", want: "fresh\n"},
 		{name: "package 404 registry access denied", scenario: "package-404-denied", resume: "0", wantErr: "could not prove"},
+		{name: "workflow token package 403 falls back to registry", scenario: "package-403-missing", resume: "0", want: "fresh\n"},
 	}
 
 	for _, tc := range tests {
@@ -141,6 +142,8 @@ func TestNativeReleaseVisibility(t *testing.T) {
 		{name: "already public", scenario: "public"},
 		{name: "private requires UI and resume", scenario: "private", wantErr: "https://github.com/users/sixtoad/packages/container/leash-manager/settings"},
 		{name: "visibility read failure is diagnosed", scenario: "visibility-fail", wantErr: "could not read manager package visibility via GET /user/packages/container/leash-manager"},
+		{name: "workflow token proves public anonymously", scenario: "anonymous-public"},
+		{name: "workflow token anonymous refusal is private", scenario: "anonymous-private", wantErr: "https://github.com/users/sixtoad/packages/container/leash-manager/settings"},
 	}
 
 	for _, tc := range tests {
@@ -369,7 +372,14 @@ printf '%s\n' "$*" >> "$GH_LOG"
 case "$*" in
   *'/git/ref/tags/'*)
     if [ "$GH_SCENARIO" = git-tag ]; then printf '%s\n' '{}'; exit 0; fi
+    case "$GH_SCENARIO" in
+      pushed-annotated) printf '%s\n' 'tag 1111111111111111111111111111111111111111'; exit 0 ;;
+      pushed-lightweight) printf '%s\n' 'commit 2222222222222222222222222222222222222222'; exit 0 ;;
+      pushed-elsewhere) printf '%s\n' 'commit 3333333333333333333333333333333333333333'; exit 0 ;;
+    esac
     printf '%s\n' 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
+  *'/git/tags/1111111111111111111111111111111111111111'*)
+    printf '%s\n' 'commit 2222222222222222222222222222222222222222'; exit 0 ;;
   *'/releases/tags/'*)
     if [ "$GH_SCENARIO" = release ]; then printf '%s\n' '{}'; exit 0; fi
     printf '%s\n' 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
@@ -377,13 +387,16 @@ case "$*" in
 	if [ "$GH_SCENARIO" = package-404-existing ] || [ "$GH_SCENARIO" = package-404-missing ] || [ "$GH_SCENARIO" = package-404-denied ]; then
 	  printf '%s\n' 'gh: Not Found (HTTP 404)' >&2; exit 1
 	fi
+	if [ "$GH_SCENARIO" = package-403-missing ]; then
+	  printf '%s\n' 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1
+	fi
     if [ "$GH_SCENARIO" = manager-present ]; then printf '%s\n' 'native-v0.3.4'; fi
     exit 0 ;;
   *'/user/packages/container/leash-manager --jq .visibility'*)
     case "$GH_SCENARIO" in
       public) printf '%s\n' public ;;
 	  private) printf '%s\n' private ;;
-	  visibility-fail) printf '%s\n' 'gh: Forbidden (HTTP 403)' >&2; exit 1 ;;
+	  visibility-fail|anonymous-public|anonymous-private) printf '%s\n' 'gh: Forbidden (HTTP 403)' >&2; exit 1 ;;
       *) printf '%s\n' private ;;
     esac
     exit 0 ;;
@@ -404,8 +417,13 @@ case "$GH_SCENARIO" in
     printf '%s\n' '{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' ;;
   digest-drift)
     printf '%s\n' '{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' ;;
-  package-404-missing)
+  package-404-missing|package-403-missing)
     printf '%s\n' 'manifest unknown' >&2; exit 1 ;;
+  anonymous-public)
+    [ -n "$DOCKER_CONFIG" ] || { printf '%s\n' 'anonymous probe must not use stored credentials' >&2; exit 2; }
+    printf '%s\n' '{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}' ;;
+  anonymous-private)
+    printf '%s\n' 'ERROR: unexpected status from HEAD request: 401 Unauthorized' >&2; exit 1 ;;
   package-404-denied)
     printf '%s\n' 'denied: permission_denied' >&2; exit 1 ;;
   *)
@@ -416,4 +434,102 @@ esac
 		t.Fatal(err)
 	}
 	return dir, logPath
+}
+
+func TestNativeReleasePushedTag(t *testing.T) {
+	commit := "2222222222222222222222222222222222222222"
+	for _, tc := range []struct {
+		name     string
+		scenario string
+		wantErr  string
+	}{
+		{name: "annotated tag at release commit", scenario: "pushed-annotated"},
+		{name: "lightweight tag at release commit", scenario: "pushed-lightweight"},
+		{name: "tag at another commit", scenario: "pushed-elsewhere", wantErr: "not release commit " + commit},
+		{name: "missing tag", scenario: "fresh", wantErr: "requires existing Git tag"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeBin, _ := fakeGitHubCLI(t)
+			command := exec.Command("bash", "-c", `
+source "$1"
+NATIVE_PUSHED_TAG_COMMIT="$3"
+native_require_release_names_absent "$2" sixtoad/leash native-v0.3.4
+`, "bash", filepath.Join(repositoryRoot(t), "scripts", "native-release-remote.sh"), t.TempDir(), commit)
+			command.Env = append(os.Environ(), "PATH="+fakeBin+":"+os.Getenv("PATH"),
+				"GH_SCENARIO="+tc.scenario, "GH_LOG="+filepath.Join(t.TempDir(), "gh.log"))
+			output, err := command.CombinedOutput()
+			if tc.wantErr == "" && err != nil {
+				t.Fatalf("pushed tag: %v\n%s", err, output)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(string(output), tc.wantErr)) {
+				t.Fatalf("pushed tag output = %q, want failure containing %q", output, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestReleaseGateSSHSpec(t *testing.T) {
+	for _, tc := range []struct {
+		spec, want, wantErr string
+	}{
+		{spec: "ubuntu@127.0.0.1:2222", want: "ubuntu@127.0.0.1 2222"},
+		{spec: "leash-release-gate", want: "leash-release-gate "},
+		{spec: "ubuntu@host;rm -rf /", wantErr: "must be [user@]host[:port]"},
+		{spec: "-oProxyCommand", wantErr: "must be [user@]host[:port]"},
+	} {
+		t.Run(tc.spec, func(t *testing.T) {
+			command := exec.Command("bash", "-c", `
+source "$1"
+release_gate_configure "$2" || exit 1
+printf '%s %s' "$RELEASE_GATE_DEST" "$RELEASE_GATE_PORT"
+`, "bash", filepath.Join(repositoryRoot(t), "scripts", "release-gate-remote.sh"), tc.spec)
+			output, err := command.CombinedOutput()
+			if tc.wantErr == "" {
+				if err != nil || string(output) != tc.want {
+					t.Fatalf("gate spec: %v, output %q, want %q", err, output, tc.want)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(string(output), tc.wantErr) {
+				t.Fatalf("gate spec output = %q, want failure containing %q", output, tc.wantErr)
+			}
+		})
+	}
+}
+
+// The remote kernel gates must run the same scripts with no inert escape and
+// re-check every copied artifact; local gates stay the default.
+func TestReleaseRemoteGatePreservesGates(t *testing.T) {
+	release := readRepositoryFile(t, "scripts/release.sh")
+	for _, required := range []string{
+		`RELEASE_GATE_SSH="${LEASH_RELEASE_GATE_SSH:-}"`,
+		`timeout 10m env -u LEASH_KERNEL_LOAD_ALLOW_INERT "$RELEASE_ROOT/scripts/verify-lsm-kernel-load.sh"`,
+		`release_gate_kernel_load "$RELEASE_ROOT/scripts/verify-lsm-kernel-load.sh" "$TEMP" "${LSM_OBJECTS[@]}"`,
+		`"$RELEASE_ROOT/scripts/verify-native-release.sh" "$TEMP/leash" "$MANAGER_REF" "$COMMIT"`,
+		`release_gate_native_release "$TEMP/leash" "$MANAGER_REF" "$COMMIT"`,
+	} {
+		if !strings.Contains(release, required) {
+			t.Errorf("release.sh missing %q", required)
+		}
+	}
+	gate := readRepositoryFile(t, "scripts/release-gate-remote.sh")
+	for _, required := range []string{
+		"env -u LEASH_KERNEL_LOAD_ALLOW_INERT",
+		"scripts/verify-lsm-kernel-load.sh --test-binary",
+		"scripts/verify-native-release.sh",
+		"sha256sum -c --quiet -",
+		"obj not in binary",
+		`archive --format=tar "$commit"`,
+		"*,bpf,*",
+	} {
+		if !strings.Contains(gate, required) {
+			t.Errorf("release-gate-remote.sh missing %q", required)
+		}
+	}
+	vm := readRepositoryFile(t, "scripts/release-gate-vm.sh")
+	for _, forbidden := range []string{"LEASH_KERNEL_LOAD_ALLOW_INERT=1", "StrictHostKeyChecking=no", "StrictHostKeyChecking no"} {
+		if strings.Contains(gate, forbidden) || strings.Contains(vm, forbidden) {
+			t.Errorf("remote gate must not contain %q", forbidden)
+		}
+	}
 }

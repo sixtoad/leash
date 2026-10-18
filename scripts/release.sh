@@ -5,11 +5,16 @@ set -euo pipefail
 
 DRY_RUN=0
 RESUME_EXISTING_MANAGER=0
+FROM_PUSHED_TAG=0
 RELEASE_SOURCE_OVERRIDE=""
+# Optional remote host for the gates that need an active BPF LSM; see
+# scripts/release-gate-remote.sh. Unset, every gate runs on this host.
+RELEASE_GATE_SSH="${LEASH_RELEASE_GATE_SSH:-}"
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
     --resume-existing-manager) RESUME_EXISTING_MANAGER=1 ;;
+    --from-pushed-tag) FROM_PUSHED_TAG=1 ;;
     --release-source-root)
       [ "$#" -ge 2 ] || { printf '%s\n' "release: --release-source-root requires a path" >&2; exit 1; }
       RELEASE_SOURCE_OVERRIDE="$2"
@@ -20,9 +25,9 @@ while [[ "${1:-}" == --* ]]; do
   shift
 done
 
-TAG="${1:?usage: scripts/release.sh [--dry-run] [--resume-existing-manager --release-source-root <path>] <native-vX.Y.Z>}"
+TAG="${1:?usage: scripts/release.sh [--dry-run] [--from-pushed-tag] [--resume-existing-manager --release-source-root <path>] <native-vX.Y.Z>}"
 if [ "$#" -ne 1 ]; then
-  printf '%s\n' "release: usage: scripts/release.sh [--dry-run] [--resume-existing-manager --release-source-root <path>] <native-vX.Y.Z>" >&2
+  printf '%s\n' "release: usage: scripts/release.sh [--dry-run] [--from-pushed-tag] [--resume-existing-manager --release-source-root <path>] <native-vX.Y.Z>" >&2
   exit 1
 fi
 if [[ ! "$TAG" =~ ^native-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -37,12 +42,20 @@ MANAGER_OWNER="${MANAGER_OWNER%%/*}"
 MANAGER_PACKAGE="${MANAGER_REPO##*/}"
 TOOL_ROOT="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
 source "$TOOL_ROOT/scripts/native-release-remote.sh"
+source "$TOOL_ROOT/scripts/release-gate-remote.sh"
+if [ -n "$RELEASE_GATE_SSH" ]; then
+  release_gate_configure "$RELEASE_GATE_SSH" || exit 1
+fi
 MANAGER_VERSION="$(native_manager_version "$TAG")" || exit 1
 RELEASE_ROOT="$(native_release_source_root "$TOOL_ROOT" "$RELEASE_SOURCE_OVERRIDE" "$RESUME_EXISTING_MANAGER")" || exit 1
 cd "$RELEASE_ROOT"
 
 if ((DRY_RUN && RESUME_EXISTING_MANAGER)); then
   printf '%s\n' "release: --resume-existing-manager cannot be combined with --dry-run" >&2
+  exit 1
+fi
+if ((DRY_RUN && FROM_PUSHED_TAG)); then
+  printf '%s\n' "release: --from-pushed-tag cannot be combined with --dry-run" >&2
   exit 1
 fi
 
@@ -52,11 +65,17 @@ if [ -n "$(git -C "$TOOL_ROOT" status --porcelain --untracked-files=all)" ]; the
 fi
 
 COMMIT="$(git -C "$RELEASE_ROOT" rev-parse HEAD)"
+if ((FROM_PUSHED_TAG)); then
+  # The Git tag was pushed first (CI release); every later "names absent"
+  # check instead requires it to resolve to exactly this commit.
+  NATIVE_PUSHED_TAG_COMMIT="$COMMIT"
+fi
 DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 MANAGER_TAG="$MANAGER_REPO:$TAG"
 TEMP="$(mktemp -d /tmp/leash-native-release.XXXXXX)"
 LOCAL_LOAD_MANAGER=""
 cleanup() {
+  release_gate_cleanup
   if [ -n "$LOCAL_LOAD_MANAGER" ] && command -v docker >/dev/null 2>&1; then
     docker image rm -f "$LOCAL_LOAD_MANAGER" >/dev/null 2>&1 || true
   fi
@@ -114,9 +133,26 @@ LSM_OBJECTS=(internal/lsm/lsmopen_bpfel.o internal/lsm/lsmopen_bpfeb.o
   internal/lsm/lsmexec_bpfel.o internal/lsm/lsmexec_bpfeb.o
   internal/lsm/lsmconnect_bpfel.o internal/lsm/lsmconnect_bpfeb.o)
 LSM_OBJECT_SUMS="$(sha256sum "${LSM_OBJECTS[@]}")"
-if (( !DRY_RUN )) && [ "$REMOTE_MODE" != resume ]; then
+
+case "$(uname -m)" in
+  x86_64) HOST_ARCH=amd64 ;;
+  aarch64|arm64) HOST_ARCH=arm64 ;;
+  *) printf '%s\n' "release: unsupported E2E host architecture $(uname -m)" >&2; exit 1 ;;
+esac
+
+if [ -n "$RELEASE_GATE_SSH" ]; then
+  release_gate_init "$RELEASE_ROOT" "$COMMIT" "$HOST_ARCH"
+fi
+
+# With a remote gate host the dry run also exercises this gate, so the remote
+# path is rehearsed end to end before a real release depends on it.
+if [ "$REMOTE_MODE" != resume ] && { (( !DRY_RUN )) || [ -n "$RELEASE_GATE_SSH" ]; }; then
   printf '%s\n' "release: verifying real host-kernel load of the CLI-embedded LSM objects..." >&2
-  timeout 10m "$RELEASE_ROOT/scripts/verify-lsm-kernel-load.sh"
+  if [ -n "$RELEASE_GATE_SSH" ]; then
+    release_gate_kernel_load "$RELEASE_ROOT/scripts/verify-lsm-kernel-load.sh" "$TEMP" "${LSM_OBJECTS[@]}"
+  else
+    timeout 10m env -u LEASH_KERNEL_LOAD_ALLOW_INERT "$RELEASE_ROOT/scripts/verify-lsm-kernel-load.sh"
+  fi
 fi
 
 MANAGER_BUILD_ARGS=(
@@ -130,12 +166,6 @@ MANAGER_BUILD_ARGS=(
   --build-arg CHANNEL=release
   --build-arg GIT_REMOTE_URL="$(git config --get remote.origin.url 2>/dev/null || echo unknown)"
 )
-
-case "$(uname -m)" in
-  x86_64) HOST_ARCH=amd64 ;;
-  aarch64|arm64) HOST_ARCH=arm64 ;;
-  *) printf '%s\n' "release: unsupported E2E host architecture $(uname -m)" >&2; exit 1 ;;
-esac
 
 # Validate the exact multi-platform graph, child architectures, labels, and
 # digests before a fresh immutable registry name exists. A recovery instead
@@ -182,8 +212,12 @@ if (( !DRY_RUN )) && [ "$REMOTE_MODE" = fresh ]; then
     -buildvcs=false -trimpath \
     -ldflags "-X main.version=$TAG -X main.commit=$COMMIT -X main.buildDate=$DATE -X main.managerImage=$LOCAL_LOAD_MANAGER -X main.managerRevision=$COMMIT -X main.managerContract=1" \
     -o "$LOCAL_LOAD_CLI" ./cmd/leash
-  timeout 4m "$RELEASE_ROOT/scripts/verify-native-release.sh" \
-    "$LOCAL_LOAD_CLI" "$LOCAL_LOAD_MANAGER" "$COMMIT"
+  if [ -n "$RELEASE_GATE_SSH" ]; then
+    release_gate_native_release "$LOCAL_LOAD_CLI" "$LOCAL_LOAD_MANAGER" "$COMMIT" "$LOCAL_LOAD_MANAGER" 6m
+  else
+    timeout 4m "$RELEASE_ROOT/scripts/verify-native-release.sh" \
+      "$LOCAL_LOAD_CLI" "$LOCAL_LOAD_MANAGER" "$COMMIT"
+  fi
 fi
 
 publish_fresh_manager() {
@@ -305,7 +339,12 @@ done
 
 tar -C "$TEMP" -xzf "$DIST/leash_linux_${HOST_ARCH}.tar.gz"
 chmod +x "$TEMP/leash"
-"$RELEASE_ROOT/scripts/verify-native-release.sh" "$TEMP/leash" "$MANAGER_REF" "$COMMIT"
+if [ -n "$RELEASE_GATE_SSH" ]; then
+  # A dry run's manager exists only locally; a real one is pulled by digest.
+  release_gate_native_release "$TEMP/leash" "$MANAGER_REF" "$COMMIT" "${LOCAL_MANAGER:-}" 15m
+else
+  "$RELEASE_ROOT/scripts/verify-native-release.sh" "$TEMP/leash" "$MANAGER_REF" "$COMMIT"
+fi
 
 if ((DRY_RUN)); then
   printf '%s\n' "release: dry-run verified manager $MANAGER_TAG ($MANAGER_REF) and all CLI archives; no release was published" >&2
