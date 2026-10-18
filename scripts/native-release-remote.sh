@@ -85,9 +85,51 @@ native_require_github_absent() {
   fi
 }
 
+# A CI release starts from a pushed tag, so release.sh --from-pushed-tag sets
+# NATIVE_PUSHED_TAG_COMMIT to the release commit: the Git tag must then exist
+# and resolve to exactly that commit. Unset, the tag must be absent.
+native_require_tag_at_commit() {
+  local temp="$1" repo="$2" tag="$3" commit="$4"
+  local error_file="$temp/github-pushed-tag.err" object type sha depth=0
+  if ! object="$(timeout 2m gh api "/repos/$repo/git/ref/tags/$tag" \
+    --jq '.object.type + " " + .object.sha' 2>"$error_file")"; then
+    cat "$error_file" >&2
+    printf '%s\n' "release: --from-pushed-tag requires existing Git tag $tag" >&2
+    return 1
+  fi
+  while :; do
+    type="${object%% *}"
+    sha="${object#* }"
+    case "$type" in
+      commit) break ;;
+      tag)
+        depth=$((depth + 1))
+        if [ "$depth" -gt 4 ] || ! object="$(timeout 2m gh api "/repos/$repo/git/tags/$sha" \
+          --jq '.object.type + " " + .object.sha' 2>"$error_file")"; then
+          cat "$error_file" >&2
+          printf '%s\n' "release: could not peel Git tag $tag" >&2
+          return 1
+        fi
+        ;;
+      *)
+        printf '%s\n' "release: Git tag $tag points at unsupported object '$object'" >&2
+        return 1
+        ;;
+    esac
+  done
+  if [ "$sha" != "$commit" ]; then
+    printf '%s\n' "release: Git tag $tag resolves to $sha, not release commit $commit" >&2
+    return 1
+  fi
+}
+
 native_require_release_names_absent() {
   local temp="$1" repo="$2" tag="$3"
-  native_require_github_absent "$temp" "Git tag" "/repos/$repo/git/ref/tags/$tag" "$tag" || return 1
+  if [ -n "${NATIVE_PUSHED_TAG_COMMIT:-}" ]; then
+    native_require_tag_at_commit "$temp" "$repo" "$tag" "$NATIVE_PUSHED_TAG_COMMIT" || return 1
+  else
+    native_require_github_absent "$temp" "Git tag" "/repos/$repo/git/ref/tags/$tag" "$tag" || return 1
+  fi
   native_require_github_absent "$temp" "GitHub release" "/repos/$repo/releases/tags/$tag" "$tag" || return 1
 }
 
@@ -105,7 +147,10 @@ native_manager_tag_state() {
     fi
     return 0
   fi
-  if grep -qi 'HTTP 404' "$error_file"; then
+  # 404: no package yet, or the token cannot see user packages. 401/403: a
+  # workflow GITHUB_TOKEN may not call the user packages API at all. Either way
+  # the registry itself is the authority for whether the tag exists.
+  if grep -Eqi 'HTTP 40[134]|Resource not accessible by integration' "$error_file"; then
     local manager_tag="ghcr.io/$owner/$package:$tag"
     local registry_error="$temp/ghcr-registry-check.err"
     if timeout 2m docker buildx imagetools inspect \
@@ -119,7 +164,7 @@ native_manager_tag_state() {
       return 0
     fi
     cat "$registry_error" >&2
-    printf '%s\n' "release: package API returned 404 and registry could not prove $manager_tag absent" >&2
+    printf '%s\n' "release: package API unavailable and registry could not prove $manager_tag absent" >&2
     return 1
   fi
   cat "$error_file" >&2
@@ -198,6 +243,28 @@ native_assert_manager_digest() {
   fi
 }
 
+# Prints "public" when an anonymous client can resolve the manager tag and
+# "private" when the registry refuses it without credentials. Any other outcome
+# (network failure, missing tag) fails closed.
+native_probe_anonymous_manager() {
+  local temp="$1" owner="$2" package="$3" tag="$4"
+  local manager_tag="ghcr.io/$owner/$package:$tag"
+  local anonymous="$temp/anonymous-probe-docker" error_file="$temp/anonymous-probe.err"
+  mkdir -p "$anonymous"
+  if DOCKER_CONFIG="$anonymous" timeout 2m docker buildx imagetools inspect \
+    --format '{{json .Manifest}}' "$manager_tag" >"$temp/anonymous-probe.json" 2>"$error_file"; then
+    printf '%s\n' public
+    return 0
+  fi
+  if grep -Eqi 'unauthorized|denied|forbidden|HTTP 401|HTTP 403' "$error_file"; then
+    printf '%s\n' private
+    return 0
+  fi
+  cat "$error_file" >&2
+  printf '%s\n' "release: anonymous registry probe could not resolve $manager_tag" >&2
+  return 1
+}
+
 native_require_manager_public() {
   local temp="$1" owner="$2" package="$3" tag="$4" source_root="$5"
   local endpoint="/user/packages/container/$package"
@@ -205,7 +272,10 @@ native_require_manager_public() {
   if ! visibility="$(timeout 2m gh api "$endpoint" --jq .visibility 2>"$error_file")"; then
     cat "$error_file" >&2
     printf '%s\n' "release: could not read manager package visibility via GET $endpoint" >&2
-    return 1
+    # A workflow GITHUB_TOKEN cannot read user package settings. The package is
+    # public exactly when the registry serves the tag without credentials.
+    visibility="$(native_probe_anonymous_manager "$temp" "$owner" "$package" "$tag")" || return 1
+    printf '%s\n' "release: manager package visibility from anonymous registry probe: $visibility" >&2
   fi
   case "$visibility" in
     public)

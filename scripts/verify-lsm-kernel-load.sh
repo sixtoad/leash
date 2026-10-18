@@ -11,7 +11,26 @@
 #
 # The compiled test binary runs inside a privileged, --cgroupns=host container
 # so no host sudo is needed; rootful Docker supplies CAP_BPF/CAP_SYS_ADMIN.
+#
+# Usage:
+#   verify-lsm-kernel-load.sh                      build the test binary, then load
+#   verify-lsm-kernel-load.sh --build-only <out>   only build the test binary
+#   verify-lsm-kernel-load.sh --test-binary <bin>  only load a binary built by
+#                                                  --build-only (release gate on
+#                                                  a remote kernel host)
 set -euo pipefail
+
+MODE=all
+BINARY_ARG=""
+case "${1:-}" in
+  "") ;;
+  --build-only|--test-binary)
+    [ "$#" -eq 2 ] && [ -n "$2" ] || { printf '%s\n' "verify-lsm-kernel-load: $1 requires a path" >&2; exit 1; }
+    MODE="${1#--}"
+    BINARY_ARG="$2"
+    ;;
+  *) printf '%s\n' "verify-lsm-kernel-load: unknown argument $1" >&2; exit 1 ;;
+esac
 
 ROOT="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
 IMAGE="${LEASH_KERNEL_LOAD_IMAGE:-debian:bookworm-slim}"
@@ -30,22 +49,36 @@ case "$(uname -m)" in
   *) printf '%s\n' "verify-lsm-kernel-load: unsupported architecture $(uname -m)" >&2; exit 1 ;;
 esac
 
-for file in lsmopen lsmexec lsmconnect; do
-  for endian in bpfel bpfeb; do
-    for ext in go o; do
-      [ -s "$ROOT/internal/lsm/${file}_${endian}.${ext}" ] || {
-        printf '%s\n' "verify-lsm-kernel-load: internal/lsm/${file}_${endian}.${ext} missing; run make lsm-generate" >&2
-        exit 1
-      }
+TEST_BINARY="$WORKDIR/lsm.test"
+if [ "$MODE" = test-binary ]; then
+  [ -f "$BINARY_ARG" ] && [ -s "$BINARY_ARG" ] || {
+    printf '%s\n' "verify-lsm-kernel-load: test binary $BINARY_ARG missing" >&2
+    exit 1
+  }
+  cp "$BINARY_ARG" "$TEST_BINARY"
+  chmod 0755 "$TEST_BINARY"
+else
+  for file in lsmopen lsmexec lsmconnect; do
+    for endian in bpfel bpfeb; do
+      for ext in go o; do
+        [ -s "$ROOT/internal/lsm/${file}_${endian}.${ext}" ] || {
+          printf '%s\n' "verify-lsm-kernel-load: internal/lsm/${file}_${endian}.${ext} missing; run make lsm-generate" >&2
+          exit 1
+        }
+      done
     done
   done
-done
 
-(
-  cd "$ROOT"
-  CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go test -buildvcs=false -c \
-    -o "$WORKDIR/lsm.test" ./internal/lsm
-)
+  (
+    cd "$ROOT"
+    CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" go test -buildvcs=false -c \
+      -o "$TEST_BINARY" ./internal/lsm
+  )
+  if [ "$MODE" = build-only ]; then
+    cp "$TEST_BINARY" "$BINARY_ARG"
+    exit 0
+  fi
+fi
 
 # Expose tracefs so the exec argv tracepoint attaches as it does in a real run.
 TRACEFS=()
@@ -62,7 +95,7 @@ printf '%s\n' "verify-lsm-kernel-load: loading lsm_open/lsm_exec/lsm_connect on 
 docker run --rm --name "$CONTAINER" \
   --privileged --cgroupns=host "${TRACEFS[@]}" \
   -e LEASH_LSM_KERNEL_LOAD_VALIDATION=1 \
-  -v "$WORKDIR/lsm.test:/lsm.test:ro" \
+  -v "$TEST_BINARY:/lsm.test:ro" \
   "$IMAGE" /lsm.test -test.v -test.count=1 \
   -test.run '^TestKernelLoadAllModulesWithExecRule$' | tee "$WORKDIR/output"
 

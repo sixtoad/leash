@@ -1,0 +1,154 @@
+name: Native release
+
+# Runs scripts/release.sh for fork-native tags (native-vX.Y.Z). The upstream
+# release.yml triggers on v*.*.* and never matches these tags.
+#
+# Credentials: only the workflow GITHUB_TOKEN (packages: write to push
+# ghcr.io/sixtoad/leash-manager, contents: write to create the release), and
+# only on a real release. A dry run logs in nowhere and publishes nothing.
+#
+# Kernel gates: runners have CONFIG_BPF_LSM=y but bpf is not an active LSM, so
+# the gates that need it (host-kernel load of the CLI-embedded LSM objects and
+# the archived-CLI fail-closed E2E) run in a nested KVM guest booted with
+# lsm=...,bpf (scripts/release-gate-vm.sh) through LEASH_RELEASE_GATE_SSH.
+
+on:
+  push:
+    tags:
+      - 'native-v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (native-vX.Y.Z). A real release requires the tag to exist already.
+        required: true
+        type: string
+      dry_run:
+        description: Rehearse the whole release (including the nested-VM gates) without publishing
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # Matches ci.yml and Dockerfile.leash.
+  GO_VERSION: '1.25.3'
+  BPF2GO_VERSION: v0.19.0
+  PNPM_VERSION: 10.18.0
+  GOIMPORTS_VERSION: v0.38.0
+  # Publishing happens only for a pushed native tag or a dispatch with
+  # dry_run=false; every other event is a dry run.
+  TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'native-v0.0.0' }}
+  DRY_RUN: ${{ ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/native-v')) || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)) && '0' || '1' }}
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Validate tag
+        run: |
+          if [[ ! "$TAG" =~ ^native-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag must match native-vX.Y.Z, got '$TAG'"
+            exit 1
+          fi
+          echo "tag=$TAG dry_run=$DRY_RUN event=${{ github.event_name }} ref=${{ github.ref }}"
+
+      # A real release builds exactly the pushed tag; a dry run builds the
+      # dispatched ref and uses the tag only as a label.
+      - uses: actions/checkout@v6.1.0
+        with:
+          ref: ${{ env.DRY_RUN == '1' && github.sha || format('refs/tags/{0}', env.TAG) }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Enable KVM
+        run: |
+          ls -l /dev/kvm
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+
+      - name: Install toolchain and QEMU
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            clang llvm libbpf-dev pkg-config \
+            qemu-system-x86 qemu-utils cloud-image-utils
+          clang --version | head -1
+          qemu-system-x86_64 --version | head -1
+
+      # Boot first: cloud-init installs Docker in the guest while the build runs.
+      - name: Boot BPF-LSM gate VM
+        run: scripts/release-gate-vm.sh start "$RUNNER_TEMP/gate-vm"
+
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      # `make build-ui` runs `make fmt`, which would otherwise install
+      # goimports@latest (it can need a newer Go than GO_VERSION).
+      - name: Install bpf2go and goimports
+        run: |
+          go install "github.com/cilium/ebpf/cmd/bpf2go@${BPF2GO_VERSION}"
+          go install "golang.org/x/tools/cmd/goimports@${GOIMPORTS_VERSION}"
+
+      - uses: docker/setup-qemu-action@v4.4.0
+
+      - uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Docker
+        run: |
+          docker version
+          docker info --format 'storage driver: {{.Driver}}'
+          docker run --rm --platform linux/arm64 alpine uname -m
+
+      - name: Control UI
+        run: |
+          corepack enable
+          corepack prepare "pnpm@${PNPM_VERSION}" --activate
+          pnpm --version
+          CI=true make build-ui
+          git status --porcelain --untracked-files=all | tee "$RUNNER_TEMP/dirty"
+          test ! -s "$RUNNER_TEMP/dirty"
+
+      - name: Wait for gate VM
+        run: |
+          scripts/release-gate-vm.sh wait "$RUNNER_TEMP/gate-vm"
+          cat "$RUNNER_TEMP/gate-vm/env" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        if: env.DRY_RUN != '1'
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release (dry run)
+        if: env.DRY_RUN == '1'
+        run: scripts/release.sh --dry-run "$TAG"
+
+      - name: Release
+        if: env.DRY_RUN != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LEASH_REPO: ${{ github.repository }}
+        run: scripts/release.sh --from-pushed-tag "$TAG"
+
+      - name: Gate VM console
+        if: always()
+        run: |
+          scripts/release-gate-vm.sh stop "$RUNNER_TEMP/gate-vm" || true
+          tail -n 200 "$RUNNER_TEMP/gate-vm/console.log" 2>/dev/null || true
