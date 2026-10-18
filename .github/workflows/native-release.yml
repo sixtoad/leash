@@ -16,8 +16,6 @@ on:
   push:
     tags:
       - 'native-v*.*.*'
-    branches:
-      - feat/native-release-workflow
   workflow_dispatch:
     inputs:
       tag:
@@ -42,6 +40,7 @@ env:
   GO_VERSION: '1.25.3'
   BPF2GO_VERSION: v0.19.0
   PNPM_VERSION: 10.18.0
+  GOIMPORTS_VERSION: v0.38.0
   # Publishing happens only for a pushed native tag or a dispatch with
   # dry_run=false; every other event is a dry run.
   TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || 'native-v0.0.0' }}
@@ -98,8 +97,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Install bpf2go
-        run: go install "github.com/cilium/ebpf/cmd/bpf2go@${BPF2GO_VERSION}"
+      # `make build-ui` runs `make fmt`, which would otherwise install
+      # goimports@latest (it can need a newer Go than GO_VERSION).
+      - name: Install bpf2go and goimports
+        run: |
+          go install "github.com/cilium/ebpf/cmd/bpf2go@${BPF2GO_VERSION}"
+          go install "golang.org/x/tools/cmd/goimports@${GOIMPORTS_VERSION}"
 
       - uses: docker/setup-qemu-action@v4.4.0
 
@@ -117,7 +120,8 @@ jobs:
           corepack prepare "pnpm@${PNPM_VERSION}" --activate
           pnpm --version
           CI=true make build-ui
-          git status --porcelain --untracked-files=all
+          git status --porcelain --untracked-files=all | tee "$RUNNER_TEMP/dirty"
+          test ! -s "$RUNNER_TEMP/dirty"
 
       - name: Wait for gate VM
         run: |
