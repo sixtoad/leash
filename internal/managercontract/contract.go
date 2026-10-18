@@ -14,7 +14,72 @@ const (
 	LabelContractVersion       = "io.leash.manager.contract.version"
 	LabelMinCompatibleContract = "io.leash.manager.contract.min-compatible"
 	LabelRevision              = "org.opencontainers.image.revision"
+	LabelVersion               = "org.opencontainers.image.version"
+
+	// The leash binary inside the manager image describes its own CLI build
+	// contract with the same vocabulary as `leash version --json`
+	// (contractVersion, minCompatibleContract, capabilities), so a provisioner
+	// can check the image without starting it. Capabilities are a
+	// comma-separated list in the order `leash version --json` emits them.
+	LabelCLIContractVersion       = "io.leash.manager.cli.contract.version"
+	LabelCLIMinCompatibleContract = "io.leash.manager.cli.contract.min-compatible"
+	LabelCapabilities             = "io.leash.manager.capabilities"
 )
+
+// CLIMetadata is what the image advertises about the leash binary it carries.
+// Each field is nil (or Capabilities empty with CapabilitiesPresent false)
+// when the image predates the label, so absence never reads as a real value.
+type CLIMetadata struct {
+	Version               string
+	ContractVersion       *int
+	MinCompatibleContract *int
+	Capabilities          []string
+	CapabilitiesPresent   bool
+}
+
+// ParseCLI reads the optional CLI-description labels. A label that is present
+// but malformed is an error: an image that claims a surface it cannot spell
+// must not be read as advertising nothing.
+func ParseCLI(labels map[string]string) (CLIMetadata, error) {
+	out := CLIMetadata{Version: strings.TrimSpace(labels[LabelVersion]), Capabilities: []string{}}
+	for _, field := range []struct {
+		name string
+		dst  **int
+	}{
+		{LabelCLIContractVersion, &out.ContractVersion},
+		{LabelCLIMinCompatibleContract, &out.MinCompatibleContract},
+	} {
+		raw, ok := labels[field.name]
+		if !ok || strings.TrimSpace(raw) == "" {
+			continue
+		}
+		value, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || value < 0 {
+			return CLIMetadata{}, fmt.Errorf("manager image OCI label %q must be a non-negative integer, got %q", field.name, raw)
+		}
+		v := value
+		*field.dst = &v
+	}
+	if out.ContractVersion != nil && out.MinCompatibleContract != nil && *out.MinCompatibleContract > *out.ContractVersion {
+		return CLIMetadata{}, fmt.Errorf("manager image CLI contract range is invalid: minimum %d exceeds version %d", *out.MinCompatibleContract, *out.ContractVersion)
+	}
+	if raw, ok := labels[LabelCapabilities]; ok && strings.TrimSpace(raw) != "" {
+		out.CapabilitiesPresent = true
+		seen := map[string]bool{}
+		for _, name := range strings.Split(raw, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				return CLIMetadata{}, fmt.Errorf("manager image OCI label %q has an empty capability name", LabelCapabilities)
+			}
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			out.Capabilities = append(out.Capabilities, name)
+		}
+	}
+	return out, nil
+}
 
 // Metadata is the compatibility and provenance advertised by a manager image.
 type Metadata struct {

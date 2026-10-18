@@ -169,13 +169,24 @@ ARG COMMIT=dev
 ARG BUILD_DATE=unknown
 ARG CHANNEL=main
 ARG GIT_REMOTE_URL=unknown
+ARG MANAGER_CONTRACT_VERSION=1
+ARG MANAGER_MIN_COMPATIBLE_CONTRACT=1
+# The leash binary's own `leash version --json` contract and capabilities, in
+# the order that document emits them. Pinned to internal/version by
+# internal/releasecontract tests; update them together.
+ARG LEASH_CLI_CONTRACT_VERSION=3
+ARG LEASH_CLI_MIN_COMPATIBLE_CONTRACT=0
+ARG LEASH_CAPABILITIES=policy,inject-service,runtime,user,require-lsm,machine-output,version-json,resolver-contract-json,idmap-volume,policy-path-limits,container-resource-limits,authz-socket,rootless-daemon,raw-socket-gate,cedar-strict-default,manager-inspect
 LABEL org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.source="${GIT_REMOTE_URL}" \
       org.opencontainers.image.ref.name="${CHANNEL}" \
       io.leash.manager.contract.version="${MANAGER_CONTRACT_VERSION}" \
-      io.leash.manager.contract.min-compatible="${MANAGER_MIN_COMPATIBLE_CONTRACT}"
+      io.leash.manager.contract.min-compatible="${MANAGER_MIN_COMPATIBLE_CONTRACT}" \
+      io.leash.manager.cli.contract.version="${LEASH_CLI_CONTRACT_VERSION}" \
+      io.leash.manager.cli.contract.min-compatible="${LEASH_CLI_MIN_COMPATIBLE_CONTRACT}" \
+      io.leash.manager.capabilities="${LEASH_CAPABILITIES}"
 COPY --from=build /out/leash /usr/local/bin/leash
 COPY --from=build /out/leash-entry /usr/local/bin/leash-entry
 
@@ -187,13 +198,22 @@ ARG CHANNEL=main
 ARG GIT_REMOTE_URL=unknown
 ARG MANAGER_CONTRACT_VERSION=1
 ARG MANAGER_MIN_COMPATIBLE_CONTRACT=1
+# The leash binary's own `leash version --json` contract and capabilities, in
+# the order that document emits them. Pinned to internal/version by
+# internal/releasecontract tests; update them together.
+ARG LEASH_CLI_CONTRACT_VERSION=3
+ARG LEASH_CLI_MIN_COMPATIBLE_CONTRACT=0
+ARG LEASH_CAPABILITIES=policy,inject-service,runtime,user,require-lsm,machine-output,version-json,resolver-contract-json,idmap-volume,policy-path-limits,container-resource-limits,authz-socket,rootless-daemon,raw-socket-gate,cedar-strict-default,manager-inspect
 LABEL org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${COMMIT}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.source="${GIT_REMOTE_URL}" \
       org.opencontainers.image.ref.name="${CHANNEL}" \
       io.leash.manager.contract.version="${MANAGER_CONTRACT_VERSION}" \
-      io.leash.manager.contract.min-compatible="${MANAGER_MIN_COMPATIBLE_CONTRACT}"
+      io.leash.manager.contract.min-compatible="${MANAGER_MIN_COMPATIBLE_CONTRACT}" \
+      io.leash.manager.cli.contract.version="${LEASH_CLI_CONTRACT_VERSION}" \
+      io.leash.manager.cli.contract.min-compatible="${LEASH_CLI_MIN_COMPATIBLE_CONTRACT}" \
+      io.leash.manager.capabilities="${LEASH_CAPABILITIES}"
 COPY --from=build /out/leash /usr/local/bin/leash
 COPY --from=build /out/leash-entry /usr/local/bin/leash-entry
 

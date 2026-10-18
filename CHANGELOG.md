@@ -82,6 +82,16 @@ fails closed everywhere. Upgrade notes are under **Breaking**.
 - **macOS parity** with the Linux kernel tables (#215), and the darwin
   hardening above.
 - `leash policy migrate` and `leash policy lint` (#216).
+- **`leash manager inspect --json`** reports the manager image a container
+  run would use (same `--leash-image` / `LEASH_IMAGE` / embedded-default
+  precedence), read from the local engine: ref, digest, version, revision,
+  manager-contract range, the image leash's `contractVersion` range and
+  capabilities, and whether this CLI would accept it (capability
+  `manager-inspect`). The manager image gains the OCI labels
+  `io.leash.manager.cli.contract.version`,
+  `io.leash.manager.cli.contract.min-compatible` and
+  `io.leash.manager.capabilities`; the `final` build stage now also sets the
+  manager-contract labels, which were empty in images built from it.
 
 ### Fixed
 - Rootless podman with `userns = "keep-id"` (#121, #184); Dir rules cover the
