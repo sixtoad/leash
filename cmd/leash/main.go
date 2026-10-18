@@ -101,6 +101,8 @@ func main() {
 			os.Exit(runner.NativeHolderMain(args[2:]))
 		case "--native-reap-box": // internal: reap one native box whose owning leash died (#158).
 			os.Exit(runner.NativeReapBoxMain(args[2:]))
+		case "--container-watch": // internal: removes a container run's containers once the leash that owns them is gone (#201).
+			os.Exit(runner.ContainerWatchMain(args[2:]))
 		case "--harden-exec": // internal: seccomp-harden this process, then exec the workload.
 			if err := hardenExec(args[2:]); err != nil {
 				log.Fatal(err)
