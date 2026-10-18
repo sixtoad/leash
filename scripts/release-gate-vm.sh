@@ -67,9 +67,12 @@ start() {
     printf '%s\n' '#cloud-config' 'ssh_pwauth: false' 'disable_root: true'
     printf '%s\n' 'users:' '  - name: ubuntu' '    sudo: ALL=(ALL) NOPASSWD:ALL' '    shell: /bin/bash' '    ssh_authorized_keys:'
     printf '      - %s\n' "$(cat "$DIR/id_ed25519.pub")"
-    printf '%s\n' 'ssh_deletekeys: true' 'ssh_genkeytypes: []' 'ssh_keys:' '  ed25519_private: |'
+    printf '%s\n' 'ssh_deletekeys: true' 'ssh_keys:' '  ed25519_private: |'
     sed 's/^/    /' "$DIR/host_ed25519"
     printf '  ed25519_public: %s\n' "$(cat "$DIR/host_ed25519.pub")"
+    # Classic image store, like the runner's Docker: a dry run's manager is
+    # addressed by its local image ID, which must survive docker save/load.
+    printf '%s\n' 'write_files:' '  - path: /etc/docker/daemon.json' '    content: |' '      {"features": {"containerd-snapshotter": false}}'
     printf '%s\n' 'package_update: true' 'packages:' '  - docker.io' '  - git' '  - python3' '  - ca-certificates'
     printf '%s\n' 'runcmd:' '  - [usermod, -aG, docker, ubuntu]' '  - [systemctl, enable, --now, docker]'
   } >"$DIR/user-data"
@@ -120,12 +123,21 @@ wait_ready() {
     sleep 5
   done
   log "waiting for cloud-init..."
-  gate_ssh 'cloud-init status --wait >/dev/null; cloud-init status --long' || {
-    gate_ssh 'sudo tail -80 /var/log/cloud-init-output.log' >&2 || true
-    die "cloud-init failed"
-  }
+  # Exit 2 is "done with recoverable errors" (e.g. schema warnings); the
+  # Docker and LSM checks below decide whether the guest is usable.
+  local rc=0
+  gate_ssh 'cloud-init status --wait >/dev/null' || rc=$?
+  gate_ssh 'cloud-init status --long' >&2 || true
+  case "$rc" in
+    0) ;;
+    2) gate_ssh 'sudo cloud-init schema --system' >&2 || true ;;
+    *)
+      gate_ssh 'sudo tail -80 /var/log/cloud-init-output.log' >&2 || true
+      die "cloud-init failed (status $rc)"
+      ;;
+  esac
   # A fresh session picks up the docker group added by cloud-init.
-  until gate_ssh 'docker info --format "{{.ServerVersion}} {{.Driver}}"' >&2; do
+  until gate_ssh 'docker info --format "docker {{.ServerVersion}} storage {{.Driver}}"' >&2; do
     [ "$SECONDS" -lt "$deadline" ] || die "timed out waiting for Docker"
     sleep 5
   done
