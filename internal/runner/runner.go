@@ -1412,12 +1412,6 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 		cfg.leashContainerBase = name + "-leash"
 	}
 
-	if envLeash := strings.TrimSpace(os.Getenv("LEASH_IMAGE")); envLeash != "" {
-		cfg.leashImage = envLeash
-		cfg.leashImageSource = imageSourceEnv
-		cfg.leashImageDevFile = ""
-	}
-
 	cfg.logDir = envOrDefault("LEASH_LOG_DIR", filepath.Join(workDir, "log"))
 	cfg.cfgDir = envOrDefault("LEASH_CFG_DIR", filepath.Join(workDir, "cfg"))
 	cfg.workspaceDir = envOrDefault("LEASH_WORKSPACE_DIR", filepath.Join(workDir, "workspace"))
@@ -1484,11 +1478,11 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 		cfg.targetImageDevFile = ""
 	}
 
-	if trimmed := strings.TrimSpace(opts.leashImage); trimmed != "" {
-		cfg.leashImage = trimmed
-		cfg.leashImageSource = imageSourceFlag
-		cfg.leashImageDevFile = ""
+	leashImage, leashSource, leashDevFile, err := resolveManagerImage(callerDir, opts.leashImage)
+	if err != nil {
+		return config{}, nil, err
 	}
+	cfg.leashImage, cfg.leashImageSource, cfg.leashImageDevFile = leashImage, leashSource, leashDevFile
 
 	if cfg.targetImageSource == imageSourceDefault {
 		targetID, targetPath, err := readDevImageID(callerDir, devDockerCoderFile)
@@ -1499,18 +1493,6 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 			cfg.targetImage = targetID
 			cfg.targetImageSource = imageSourceDevFile
 			cfg.targetImageDevFile = targetPath
-		}
-	}
-
-	if cfg.leashImageSource == imageSourceDefault {
-		leashID, leashPath, err := readDevImageID(callerDir, devDockerLeashFile)
-		if err != nil {
-			return config{}, nil, err
-		}
-		if leashID != "" {
-			cfg.leashImage = leashID
-			cfg.leashImageSource = imageSourceDevFile
-			cfg.leashImageDevFile = leashPath
 		}
 	}
 
@@ -1607,6 +1589,27 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 
 	cleanupTemp = false
 	return cfg, resolvedEnv, nil
+}
+
+// resolveManagerImage selects the manager image exactly as a container run
+// does: --leash-image, then LEASH_IMAGE, then the dev image-id file in the
+// caller's directory, then the embedded default. `leash manager inspect` uses
+// the same function so it reports the image a run would start.
+func resolveManagerImage(callerDir, flagImage string) (image, source, devFile string, err error) {
+	if trimmed := strings.TrimSpace(flagImage); trimmed != "" {
+		return trimmed, imageSourceFlag, "", nil
+	}
+	if envLeash := strings.TrimSpace(os.Getenv("LEASH_IMAGE")); envLeash != "" {
+		return envLeash, imageSourceEnv, "", nil
+	}
+	leashID, leashPath, err := readDevImageID(callerDir, devDockerLeashFile)
+	if err != nil {
+		return "", "", "", err
+	}
+	if leashID != "" {
+		return leashID, imageSourceDevFile, leashPath, nil
+	}
+	return defaultLeashImage, imageSourceDefault, "", nil
 }
 
 func readDevImageID(baseDir, filename string) (string, string, error) {

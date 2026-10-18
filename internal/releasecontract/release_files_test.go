@@ -8,9 +8,59 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/strongdm/leash/internal/managercontract"
+	"github.com/strongdm/leash/internal/version"
 )
+
+// TestManagerImageAdvertisesItsLeashBuildContract pins the Dockerfile's
+// CLI-description label defaults to what the binary inside the image reports
+// in `leash version --json`, in both manager stages.
+func TestManagerImageAdvertisesItsLeashBuildContract(t *testing.T) {
+	dockerfile := readRepositoryFile(t, "Dockerfile.leash")
+	want := map[string]string{
+		"MANAGER_CONTRACT_VERSION":          strconv.Itoa(managercontract.Current),
+		"MANAGER_MIN_COMPATIBLE_CONTRACT":   "1",
+		"LEASH_CLI_CONTRACT_VERSION":        strconv.Itoa(version.ContractVersion),
+		"LEASH_CLI_MIN_COMPATIBLE_CONTRACT": strconv.Itoa(version.MinCompatibleContract),
+		"LEASH_CAPABILITIES":                strings.Join(version.Capabilities(), ","),
+		"LEASH_POLICY_LIMITS": fmt.Sprintf("filePathBytes=%d,execPathBytes=%d,fileRules=%d,execRules=%d",
+			version.FilePolicyPathBytes, version.ExecPolicyPathBytes, version.FilePolicyRules, version.ExecPolicyRules),
+	}
+	labels := map[string]string{
+		managercontract.LabelContractVersion:          "MANAGER_CONTRACT_VERSION",
+		managercontract.LabelMinCompatibleContract:    "MANAGER_MIN_COMPATIBLE_CONTRACT",
+		managercontract.LabelCLIContractVersion:       "LEASH_CLI_CONTRACT_VERSION",
+		managercontract.LabelCLIMinCompatibleContract: "LEASH_CLI_MIN_COMPATIBLE_CONTRACT",
+		managercontract.LabelCapabilities:             "LEASH_CAPABILITIES",
+		managercontract.LabelPolicyLimits:             "LEASH_POLICY_LIMITS",
+		managercontract.LabelVersion:                  "VERSION",
+		managercontract.LabelRevision:                 "COMMIT",
+	}
+	for _, stage := range []string{"AS final\n", "AS final-prebuilt\n"} {
+		start := strings.Index(dockerfile, stage)
+		if start < 0 {
+			t.Fatalf("stage %q not found", stage)
+		}
+		body := dockerfile[start:]
+		if end := strings.Index(body[1:], "\nFROM "); end >= 0 {
+			body = body[:end+1]
+		}
+		for arg, value := range want {
+			if !strings.Contains(body, "\nARG "+arg+"="+value+"\n") {
+				t.Errorf("stage %q: want ARG %s=%s", strings.TrimSpace(stage), arg, value)
+			}
+		}
+		for label, arg := range labels {
+			if !strings.Contains(body, label+`="${`+arg+`}"`) {
+				t.Errorf("stage %q: label %s must carry ${%s}", strings.TrimSpace(stage), label, arg)
+			}
+		}
+	}
+}
 
 func repositoryRoot(t *testing.T) string {
 	t.Helper()

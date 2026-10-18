@@ -148,6 +148,11 @@ const (
 	// `leash policy migrate` converts a legacy file, `leash policy lint`
 	// warns on an unmarked file that looks written for the legacy dialect.
 	CapabilityCedarStrictDefault = "cedar-strict-default"
+	// CapabilityManagerInspect is `leash manager inspect --json`: it resolves
+	// the manager image a container run would use and reports the version,
+	// revision, contract ranges and capabilities that image's OCI labels
+	// advertise, plus whether this CLI would accept it.
+	CapabilityManagerInspect = "manager-inspect"
 )
 
 // Enforced policy path limits, in bytes of the resolved path (a directory
@@ -192,6 +197,7 @@ var capabilities = []string{
 	CapabilityRootlessDaemon,
 	CapabilityRawSocketGate,
 	CapabilityCedarStrictDefault,
+	CapabilityManagerInspect,
 }
 
 // Capabilities returns the surface names this build advertises. The slice is a

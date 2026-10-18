@@ -186,7 +186,7 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
   "contractVersion": 3,             // current CLI surface
   "minCompatibleContract": 0,       // oldest caller contract still served
   "capabilities": [                 // surface elements a provisioner can drive
-    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "rootless-daemon", "raw-socket-gate", "cedar-strict-default"
+    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "rootless-daemon", "raw-socket-gate", "cedar-strict-default", "manager-inspect"
   ],
   "policyLimits": {                 // enforced policy path lengths, in bytes
     "filePathBytes": 255,           // file.open rules: every byte matched; longer rules rejected at load
@@ -347,6 +347,80 @@ Unknown schema versions or strategies must fail closed. Invalid runtime,
 malformed/empty/over-limit native resolver state, encoding failure, or output
 failure returns non-zero. No validation or usage failure writes a partial
 success document to stdout.
+
+### Manager image — `leash manager inspect` JSON
+
+In container mode (`--runtime docker|podman`) the enforcement runs in the
+privileged manager image, not in the host CLI, so a provisioner that checked
+the host `leash version --json` has not yet checked the leash it will run. A
+caller that requires the `manager-inspect` capability asks the host CLI about
+the image instead:
+
+```sh
+leash manager inspect --runtime docker --json
+leash manager inspect --image ghcr.io/sixtoad/leash-manager@sha256:... --runtime podman --pull never --json
+```
+
+The image is resolved exactly as a run resolves it: `--image` (alias
+`--leash-image`), then `LEASH_IMAGE`, then the development image-id file in the
+working directory, then the manager digest embedded in this CLI. The engine is
+`--runtime`, then `LEASH_RUNTIME` (`native` there is ignored: it has no manager),
+then the first of docker, podman on `PATH`; `--runtime native` is a usage error.
+The labels are read from the engine's local store with `image inspect`, the
+same store and the same labels the run validates before provisioning. When the
+image is absent it is pulled (`--pull missing`, the default, like a run) or the
+command fails (`--pull never`); pull progress goes to stderr. Reading the local
+engine rather than the registry is deliberate: it is the copy the run will
+start, it works for locally built and loaded images, and it uses the engine's
+own registry credentials.
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "ref": "ghcr.io/sixtoad/leash-manager@sha256:4f…", // the resolved image reference
+  "source": "default",              // default | env | flag | dev-file
+  "runtime": "docker",
+  "imageId": "sha256:9a…",          // engine image id
+  "digest": "sha256:4f…",           // manifest digest of ref; "" for a locally built image
+  "repoDigests": ["ghcr.io/sixtoad/leash-manager@sha256:4f…"],
+  "version": "native-v0.4.0",       // org.opencontainers.image.version
+  "revision": "8a3a739…",           // org.opencontainers.image.revision
+  "managerContract": {"version": 1, "minCompatible": 1}, // null when unlabeled/malformed
+  "contractVersion": 3,             // the image's leash: same meaning as `leash version --json`
+  "minCompatibleContract": 0,       //   null when the image predates the label
+  "capabilities": ["policy", "…", "manager-inspect"], // same vocabulary and order
+  "capabilitiesLabeled": true,      // false: the image predates the label ([] means unknown)
+  "policyLimits": {"filePathBytes": 255, "execPathBytes": 64, "fileRules": 256, "execRules": 64}, // null when unlabeled
+  "compatibleWithThisCli": true,    // the verdict this CLI's run would reach before provisioning
+  "reason": "manager contract 1 is within the image's range 1..1 and the revision matches this release"
+}
+```
+
+The image carries these OCI labels, set in `Dockerfile.leash` (whose defaults
+are pinned to `internal/version` by tests):
+
+| Label | Meaning |
+|---|---|
+| `org.opencontainers.image.version` | release identifier (`native-vX.Y.Z`), or the dev version |
+| `org.opencontainers.image.revision` | full source commit |
+| `io.leash.manager.contract.version` / `.min-compatible` | manager contract range (CLI ↔ manager) |
+| `io.leash.manager.cli.contract.version` / `.min-compatible` | the image leash's `contractVersion` / `minCompatibleContract` |
+| `io.leash.manager.capabilities` | the image leash's `capabilities`, comma-separated, in document order |
+| `io.leash.manager.policy-limits` | the image leash's `policyLimits`, as `filePathBytes=N,execPathBytes=N,fileRules=N,execRules=N` |
+
+The image's leashd loads a container run's policy, so a policy generator sizes
+container policies by this `policyLimits` (and checks its dialect by
+`cedar-strict-default` in `capabilities`), not by the host CLI's document.
+
+Exit `0` whenever the image was resolved and inspected, compatible or not —
+read `compatibleWithThisCli` and `reason`. Exit `1` (nothing on stdout) when
+the image cannot be resolved: engine missing, pull failed or forbidden,
+unreadable inspect output. Exit `2` for usage errors. stdout is the document
+alone; every diagnostic is on stderr. A caller should treat an image whose
+`version` predates the release it needs, whose `contractVersion` range
+excludes its own contract, or whose `capabilities` lack what it drives as
+incompatible; `capabilitiesLabeled: false` (an image built before these
+labels) must be treated as not offering any capability.
 
 ### Machine-output fd ownership — `leash --machine-output`
 

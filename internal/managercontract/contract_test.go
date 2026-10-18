@@ -59,3 +59,46 @@ func TestValidateRejectsContractAndDefaultRevisionMismatch(t *testing.T) {
 		t.Fatalf("compatible override should allow a different revision: %v", err)
 	}
 }
+
+func TestParseCLI(t *testing.T) {
+	labels := validLabels()
+	labels[LabelVersion] = " native-v0.4.0 "
+	labels[LabelCLIContractVersion] = "3"
+	labels[LabelCLIMinCompatibleContract] = "0"
+	labels[LabelCapabilities] = "policy, runtime,policy,manager-inspect"
+	labels[LabelPolicyLimits] = "filePathBytes=255,execPathBytes=64,fileRules=256,execRules=64"
+	cli, err := ParseCLI(labels)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cli.PolicyLimits == nil || *cli.PolicyLimits != (PolicyLimits{FilePathBytes: 255, ExecPathBytes: 64, FileRules: 256, ExecRules: 64}) {
+		t.Fatalf("policy limits = %+v", cli.PolicyLimits)
+	}
+	if cli.Version != "native-v0.4.0" || cli.ContractVersion == nil || *cli.ContractVersion != 3 ||
+		cli.MinCompatibleContract == nil || *cli.MinCompatibleContract != 0 || !cli.CapabilitiesPresent {
+		t.Fatalf("cli = %+v", cli)
+	}
+	if strings.Join(cli.Capabilities, ",") != "policy,runtime,manager-inspect" {
+		t.Fatalf("capabilities = %v", cli.Capabilities)
+	}
+
+	old, err := ParseCLI(validLabels())
+	if err != nil || old.ContractVersion != nil || old.MinCompatibleContract != nil || old.CapabilitiesPresent || len(old.Capabilities) != 0 || old.Capabilities == nil {
+		t.Fatalf("unlabeled image = %+v, %v", old, err)
+	}
+
+	for name, bad := range map[string]map[string]string{
+		"negative":   {LabelCLIContractVersion: "-1"},
+		"text":       {LabelCLIMinCompatibleContract: "x"},
+		"inverted":   {LabelCLIContractVersion: "1", LabelCLIMinCompatibleContract: "2"},
+		"empty name": {LabelCapabilities: "policy,,runtime"},
+		"limits key": {LabelPolicyLimits: "filePathBytes=255,execPathBytes=64,fileRules=256,bogus=1"},
+		"limits dup": {LabelPolicyLimits: "filePathBytes=255,filePathBytes=255,fileRules=256,execRules=64"},
+		"limits few": {LabelPolicyLimits: "filePathBytes=255"},
+		"limits neg": {LabelPolicyLimits: "filePathBytes=0,execPathBytes=64,fileRules=256,execRules=64"},
+	} {
+		if _, err := ParseCLI(bad); err == nil {
+			t.Errorf("%s: ParseCLI accepted %v", name, bad)
+		}
+	}
+}
