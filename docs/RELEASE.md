@@ -45,7 +45,29 @@ scripts/release.sh --dry-run native-v0.0.0
 ```
 
 The dry run uses a local content-addressed manager image and still executes the
-same archived-binary/no-override E2E. It never creates a tag or release.
+same archived-binary/no-override E2E. It never creates a tag or release, and
+needs no registry or GitHub credentials.
+
+**Release host.** A real Linux host (amd64 or arm64), not a container, whose
+kernel has the BPF LSM **active** (`bpf` in `/sys/kernel/security/lsm`, e.g.
+booted with `lsm=...,bpf`): the release gate attaches the CLI-embedded LSM
+objects (`scripts/verify-lsm-kernel-load.sh`, skipped by `--dry-run`) and runs
+the archived CLI with fail-closed enforcement. It needs rootful Docker with
+Buildx and binfmt/QEMU for the other architecture (`docker run --rm --platform
+linux/arm64 alpine uname -m` works), `git`, `python3`, `sha256sum`, `tar`, Go
+(go.mod's version), clang/llvm 18 + libbpf headers + `bpf2go` v0.19.0 for
+`make lsm-generate` (else it falls back to Docker), and pnpm 10 for the Control
+UI: run `CI=true make build-ui` first (`corepack prepare pnpm@10.18.0
+--activate`; the release refuses the stub UI). A real release additionally
+needs `gh auth login` as the repository owner with `repo` and
+`read:packages`/`write:packages` scopes, and `docker login ghcr.io` with a
+token that can write `ghcr.io/sixtoad/leash-manager`. From a clean checkout of
+`main`:
+
+```bash
+scripts/release.sh --dry-run native-vX.Y.Z   # rehearse, no credentials
+scripts/release.sh native-vX.Y.Z             # publish
+```
 
 ### Resume a stranded manager publication
 
