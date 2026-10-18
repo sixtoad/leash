@@ -325,7 +325,7 @@ Leash native release from commit \`$COMMIT\`.
 - Manager contract: \`1\`
 - Linux binaries are fully enforcing; macOS binaries drive an installed Leash.app.
 
-The release gate executed the archived Linux CLI with no manager override, the exact Walk #33 combined policy, a named non-root target, and fail-closed LSM enforcement." \
+The release gate executed the archived Linux CLI with no manager override, the Walk #33 combined policy (migrated to strict Cedar), a named non-root target, and fail-closed LSM enforcement." \
   "$DIST"/*.tar.gz "$DIST/checksums.txt"
 
 printf '%s\n' "release: done → https://github.com/$REPO/releases/tag/$TAG" >&2

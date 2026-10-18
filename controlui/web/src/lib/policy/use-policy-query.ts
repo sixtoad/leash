@@ -26,15 +26,18 @@ export type PolicyQueryData = {
   enforcementMode: "enforce" | "permit-all";
 };
 
+// Strict Cedar (Leash's default dialect: default deny, so MCP calls need
+// their permit). Mirrors the daemon's built-in policy.DefaultCedarPolicy.
 const BASELINE_FALLBACK = `// Exploration baseline for interactive discovery
-permit (principal, action in [Action::"FileOpen", Action::"FileOpenReadOnly", Action::"FileOpenReadWrite"], resource)
+permit (principal, action in Action::"FileOpen", resource)
 when { resource in [ Dir::"/" ] };
 
 permit (principal, action == Action::"ProcessExec", resource)
 when { resource in [ Dir::"/" ] };
 
-permit (principal, action == Action::"NetworkConnect", resource)
-when { resource in [ Host::"*" ] };`;
+permit (principal, action == Action::"NetworkConnect", resource);
+
+permit (principal, action == Action::"McpCall", resource);`;
 
 // Query key factory for consistency
 export const policyKeys = {

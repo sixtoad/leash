@@ -39,7 +39,7 @@ permit (principal, action == Action::"ProcessExec", resource) when { context.tty
 	}
 }
 
-func TestFormatCedarErrorForCLINamesALegacyPolicyByItsSourceLine(t *testing.T) {
+func TestFormatCedarErrorForCLINamesAnInvalidPolicy(t *testing.T) {
 	out := cliError(t, `permit (principal, action in [Action::"FileOpen", Secret::Action::"Read"], resource);`)
 	if !strings.Contains(out, "error: invalid policy") || !strings.Contains(out, "mixes plugin actions") || !strings.Contains(out, "policy: policy0") || !strings.Contains(out, "leash.cedar:1:1") {
 		t.Errorf("got:\n%s", out)

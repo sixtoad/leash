@@ -34,7 +34,8 @@ func TestMigrateStdoutAndWrite(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, errOut.String())
 	}
 	data, _ := os.ReadFile(path)
-	if !strings.Contains(string(data), `@leash_semantics("cedar")`) || out.Len() != 0 {
+	// Strict Cedar is the default: the migrated file needs no marker.
+	if strings.Contains(string(data), `@leash_semantics`) || !strings.Contains(string(data), "unless {") || out.Len() != 0 {
 		t.Fatalf("--write: file:\n%s\nstdout: %q", data, out.String())
 	}
 	if info, _ := os.Stat(path); info.Mode().Perm() != 0o640 {
@@ -44,6 +45,41 @@ func TestMigrateStdoutAndWrite(t *testing.T) {
 	errOut.Reset()
 	if code := Main([]string{"migrate", "--write", path}, &out, &errOut); code != 0 || !strings.Contains(errOut.String(), "already uses strict") {
 		t.Fatalf("second migrate: %d %s", code, errOut.String())
+	}
+}
+
+func TestLint(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, text string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	var out, errOut bytes.Buffer
+	// An unmarked file written for the legacy dialect: a warning with the
+	// migrate hint, exit 0 (it loads, but means something else now).
+	nested := write("nested.cedar", `permit (principal, action in Action::"FileOpen", resource in Dir::"/");
+forbid (principal, action in Action::"FileOpen", resource in Dir::"/a/");
+permit (principal, action in Action::"FileOpen", resource in Dir::"/a/b/");`)
+	if code := Main([]string{"lint", nested}, &out, &errOut); code != 0 || !strings.Contains(out.String(), "legacy_semantics_suspected") || !strings.Contains(out.String(), "leash policy migrate") {
+		t.Fatalf("exit %d\n%s\n%s", code, out.String(), errOut.String())
+	}
+	// A legacy-only construct fails the strict load: exit 1.
+	out.Reset()
+	if code := Main([]string{"lint", write("legacy.cedar", legacy)}, &out, &errOut); code != 1 {
+		t.Fatalf("exit %d\n%s", code, out.String())
+	}
+	// The same file marked legacy is fine.
+	out.Reset()
+	if code := Main([]string{"lint", write("marked.cedar", "@leash_semantics(\"legacy\")\n"+legacy)}, &out, &errOut); code != 0 {
+		t.Fatalf("exit %d\n%s", code, out.String())
+	}
+	// --json
+	out.Reset()
+	if code := Main([]string{"lint", "--json", nested}, &out, &errOut); code != 0 || !strings.HasPrefix(strings.TrimSpace(out.String()), "{") {
+		t.Fatalf("exit %d\n%s", code, out.String())
 	}
 }
 

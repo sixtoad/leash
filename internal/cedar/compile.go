@@ -73,7 +73,7 @@ func (d *ErrorDetail) Error() string {
 var parseLocationRe = regexp.MustCompile(`at\s+(.+?):(\d+):(\d+)`)
 
 // policyRefRe extracts the policy ID of a compile error: "policy <id> at ...".
-var policyRefRe = regexp.MustCompile(`^policy (.+?) at \S+:\d+:\d+`)
+var policyRefRe = regexp.MustCompile(`^policy (.+?)(?: at \S+:\d+:\d+|: )`)
 
 // CompileFile reads Cedar from disk and converts it into LSM/proxy policies.
 // On parse errors, an *ErrorDetail is returned.
@@ -114,7 +114,16 @@ func CompileFile(path string) (*Compilation, error) {
 func CompileString(name, cedar string) (*Compilation, error) {
 	comp, err := CompileLayers([]Layer{{Source: &lsm.PolicySource{Name: name, Text: cedar}}})
 	if err != nil {
-		return nil, formatCedarError(err, name, cedar)
+		// A typo'd entity type or action is the more precise report, in
+		// either dialect (#162).
+		if detail := unknownEntityError(name, cedar, nil); detail != nil {
+			return nil, detail
+		}
+		detail := formatCedarError(err, name, cedar)
+		if detail != nil && unmarked(name, cedar) {
+			detail.Suggestion = strings.TrimSpace(detail.Suggestion + " " + unmarkedHint)
+		}
+		return nil, detail
 	}
 	comp.Cedar = cedar
 	comp.Policies.Source = &lsm.PolicySource{Name: name, Text: cedar}
@@ -122,6 +131,21 @@ func CompileString(name, cedar string) (*Compilation, error) {
 		return nil, detail
 	}
 	return comp, nil
+}
+
+// unmarkedHint follows a compile error of a file without @leash_semantics:
+// strict Cedar is the default, so a file written for the legacy dialect
+// fails on constructs only legacy accepted.
+const unmarkedHint = "Policy files without a @leash_semantics marker are strict Cedar. If this file was written for the legacy Leash dialect, run `leash policy migrate <file>` (same decisions, in strict Cedar) or mark it @leash_semantics(\"legacy\")."
+
+// unmarked reports a file that parses and carries no @leash_semantics marker.
+func unmarked(name, cedar string) bool {
+	ps, err := cedarlib.NewPolicySetFromBytes(name, []byte(cedar))
+	if err != nil {
+		return false
+	}
+	m, err := transpiler.SemanticsMarker(ps)
+	return err == nil && m == transpiler.MarkerNone
 }
 
 func formatCedarError(err error, filePath, cedar string) *ErrorDetail {

@@ -26,8 +26,9 @@ The script enforces this order:
 4. Build every CLI archive from that revision with
    `ghcr.io/sixtoad/leash-manager@sha256:...` embedded as its default.
 5. Verify manager OCI revision/contract labels and archive build metadata.
-6. Execute the archived Linux CLI with no manager override, the tracked exact
-   Walk #33 combined policy, a named non-root target, and fail-closed LSM.
+6. Execute the archived Linux CLI with no manager override, the tracked
+   Walk #33 combined policy (`e2e/testdata/walk33-combined.cedar`, migrated to
+   strict Cedar), a named non-root target, and fail-closed LSM.
 7. Only after every check succeeds, create the GitHub release with the manager
    tag, digest, revision, and contract in its notes.
 

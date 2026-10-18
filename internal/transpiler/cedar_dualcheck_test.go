@@ -26,7 +26,7 @@ func TestDual_CedarDnsZone_vs_IRWildcard_ApexDivergenceWarned(t *testing.T) {
 	cedarText := `permit (principal, action == Action::"NetworkConnect", resource in Net::DnsZone::"example.com");`
 
 	// Lint must warn that apex is excluded by IR mapping
-	rep, err := LintFromString(cedarText)
+	rep, err := LintFromString(legacyMarker + cedarText)
 	if err != nil {
 		t.Fatalf("lint failed: %v", err)
 	}

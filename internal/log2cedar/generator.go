@@ -103,11 +103,21 @@ func (g *Generator) Render() string {
 
 		builder.WriteString(fmt.Sprintf("%s(\n", g.policyEffect))
 		builder.WriteString("    principal,\n")
-		builder.WriteString(fmt.Sprintf("    action == Action::\"%s\",\n", actionToAction(action)))
+		// Strict Cedar (the default dialect): the generic FileOpen action
+		// is a group, and files and directories are matched with `in`.
+		actionOp := "=="
+		if actionToAction(action) == "FileOpen" {
+			actionOp = "in"
+		}
+		builder.WriteString(fmt.Sprintf("    action %s Action::\"%s\",\n", actionOp, actionToAction(action)))
 
 		if len(ordered) == 1 {
 			res := ordered[0]
-			builder.WriteString(fmt.Sprintf("    resource == %s::\"%s\"\n", res.Type, escapeCedarString(res.Value)))
+			resourceOp := "=="
+			if res.Type == "File" || res.Type == "Dir" {
+				resourceOp = "in"
+			}
+			builder.WriteString(fmt.Sprintf("    resource %s %s::\"%s\"\n", resourceOp, res.Type, escapeCedarString(res.Value)))
 			builder.WriteString(");\n")
 		} else {
 			builder.WriteString("    resource\n")

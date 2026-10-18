@@ -12,8 +12,8 @@ func TestCompileStringRejectsUnknownEntity(t *testing.T) {
 	cases := []struct {
 		name, cedar, want string
 	}{
-		{"resource type", `permit (principal, action == Action::"FileOpen", resource in Bogus::"/");`, `Resource type "Bogus"`},
-		{"forbid on unknown type", "permit (principal, action == Action::\"FileOpen\", resource in Dir::\"/\");\nforbid (principal, action == Action::\"FileOpen\", resource in Dirr::\"/etc/\");", `Resource type "Dirr"`},
+		{"resource type", `permit (principal, action in Action::"FileOpen", resource in Bogus::"/");`, `Resource type "Bogus"`},
+		{"forbid on unknown type", "permit (principal, action in Action::\"FileOpen\", resource in Dir::\"/\");\nforbid (principal, action in Action::\"FileOpen\", resource in Dirr::\"/etc/\");", `Resource type "Dirr"`},
 		{"action", `permit (principal, action == Action::"FileOpne", resource in Dir::"/");`, `Action "FileOpne"`},
 	}
 	for _, tc := range cases {
@@ -33,7 +33,7 @@ func TestCompileStringRejectsUnknownEntity(t *testing.T) {
 		}
 	}
 	for _, ok := range []string{
-		`permit (principal, action == Action::"FileOpen", resource in Dir::"/");`,
+		`permit (principal, action in Action::"FileOpen", resource in Dir::"/");`,
 		`permit (principal, action == Action::"NetworkConnect", resource == Host::"example.com");`,
 		`forbid (principal, action == Action::"McpCall", resource) when { resource in [ MCP::Server::"mcp.example.com" ] };`,
 	} {

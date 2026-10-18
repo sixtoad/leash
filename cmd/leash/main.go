@@ -89,7 +89,7 @@ func main() {
 				log.Fatal(err)
 			}
 			return
-		case "policy": // `policy migrate [--write] <file>`: legacy policy file -> strict Cedar (#142).
+		case "policy": // `policy migrate [--write] <file>` (legacy file -> strict Cedar, #142), `policy lint <file>`.
 			os.Exit(policycli.Main(args[2:], os.Stdout, os.Stderr))
 		case "daemon": // `daemon install|uninstall|status|run`: the rootless enforcer daemon.
 			os.Exit(enforcerd.Main(args[2:], version, os.Stdout, os.Stderr))

@@ -726,9 +726,14 @@ func buildDirectoryCedar(effect, dir string, ops []string) string {
 
 func buildActionClause(ops []string) string {
 	if len(ops) == 0 {
-		return "action == Action::\"FileOpen\""
+		return "action in Action::\"FileOpen\""
 	}
 	if len(ops) == 1 {
+		// FileOpen is the group of both open modes: strict Cedar matches it
+		// with `in` (`==` would match no request).
+		if a := operationToAction(ops[0]); a == "FileOpen" {
+			return "action in Action::\"FileOpen\""
+		}
 		return fmt.Sprintf("action == Action::\"%s\"", operationToAction(ops[0]))
 	}
 	parts := make([]string, 0, len(ops))

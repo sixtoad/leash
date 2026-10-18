@@ -48,7 +48,9 @@ func (e *PolicyError) Error() string { return e.Err.Error() }
 func (e *PolicyError) Unwrap() error { return e.Err }
 
 // Layer is one policy layer for CompileLayers: Cedar source text, or rules
-// built in code (Source nil), which are legacy IR by definition.
+// built in code (Source nil), which are legacy IR by definition. An empty IR
+// layer (no rules, no connect default: a cleared layer) holds no policy and
+// adds nothing, not even the legacy defaults.
 type Layer struct {
 	Source *lsm.PolicySource
 	IR     *lsm.PolicySet
@@ -65,9 +67,10 @@ func LayerOf(ps *lsm.PolicySet, http []proxy.HeaderRewriteRule) Layer {
 }
 
 // CompileLayers merges policy layers, in order, into one enforceable
-// policy (#142). Legacy layers (files without @leash_semantics("cedar"), and
-// IR layers) are rewritten to strict Cedar together, because legacy
-// most-specific-wins crosses layers; strict layers are added as written.
+// policy (#142). Legacy layers (files marked @leash_semantics("legacy"), and
+// IR layers built in code) are rewritten to strict Cedar together, because legacy
+// most-specific-wins crosses layers; strict layers (every other file: strict
+// Cedar is the default) are added as written.
 // One engine is built and one set of kernel tables compiled from the merged
 // strict set. Any failure fails the whole merge.
 func CompileLayers(layers []Layer) (*Compilation, error) {
@@ -80,7 +83,11 @@ func CompileLayers(layers []Layer) (*Compilation, error) {
 	}
 	var strict []strictLayer
 	http := []proxy.HeaderRewriteRule{}
+	policyLayers := 0
 	for _, l := range layers {
+		if l.Source != nil || l.IR != nil {
+			policyLayers++
+		}
 		switch {
 		case l.Source != nil:
 			parsed, err := transpiler.NewCedarParser().ParseFromNamedString(l.Source.Name, l.Source.Text)
@@ -97,6 +104,8 @@ func CompileLayers(layers []Layer) (*Compilation, error) {
 			} else {
 				legacy = append(legacy, transpiler.LegacyLayer{Name: l.Source.Name, Policies: parsed})
 			}
+		case l.IR != nil && emptyIR(l.IR):
+			http = append(http, l.HTTP...)
 		case l.IR != nil:
 			legacy = append(legacy, transpiler.LegacyLayer{Name: "rules", IR: l.IR})
 			http = append(http, l.HTTP...)
@@ -107,7 +116,7 @@ func CompileLayers(layers []Layer) (*Compilation, error) {
 
 	comp := &Compilation{Semantics: transpiler.SemanticsCedar, HTTPRules: http}
 	merged := cedarlib.NewPolicySet()
-	prefix := len(legacy)+len(strict) > 1
+	prefix := policyLayers > 1
 	add := func(layer string, ps *cedarlib.PolicySet) {
 		for id, p := range ps.All() {
 			if prefix {
@@ -147,4 +156,10 @@ func CompileLayers(layers []Layer) (*Compilation, error) {
 	comp.Engine = eng
 	comp.Policies = ir
 	return comp, nil
+}
+
+// emptyIR reports an IR layer without rules or an explicit connect default.
+func emptyIR(ps *lsm.PolicySet) bool {
+	return len(ps.Open) == 0 && len(ps.Exec) == 0 && len(ps.Connect) == 0 && len(ps.MCP) == 0 &&
+		!ps.ConnectDefaultAllow && !ps.ConnectDefaultExplicit
 }

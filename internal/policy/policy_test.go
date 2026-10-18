@@ -16,8 +16,8 @@ func TestParseValidCedar(t *testing.T) {
 	cedar := `
 permit (
     principal,
-    action == Action::"FileOpen",
-    resource == Dir::"/tmp"
+    action in Action::"FileOpen",
+    resource in Dir::"/tmp"
 );
 
 forbid (
@@ -62,7 +62,7 @@ func TestParseUnknownIdentifier(t *testing.T) {
 	cedar := `
 permit (
     principal,
-    action == Action::"FileOpen",
+    action in Action::"FileOpen",
     resource
 )
 when { missingVar == true };

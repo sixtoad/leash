@@ -118,6 +118,8 @@ leash -e MY_VAR=value codex bash
 
 Dive deeper with [CEDAR.md](docs/design/CEDAR.md) for ready-to-adapt snippets.
 
+Policy files are **strict Cedar** by default: any matching `forbid` denies, otherwise a matching `permit` allows, otherwise the request is denied (MCP calls included). A policy written for Leash's older legacy dialect (most specific rule wins, `File::` as a path prefix, MCP allowed unless forbidden) must be converted with `leash policy migrate <file> --write`, or marked `@leash_semantics("legacy")` to keep its old meaning. `leash policy lint <file>` warns when an unmarked file looks written for the legacy dialect.
+
 - Telemetry details live in [TELEMETRY.md](docs/TELEMETRY.md).
 
 ## Troubleshooting & Next Steps

@@ -16,7 +16,7 @@ import (
 
 const sampleCedarPolicy = `permit (
     principal,
-    action == Action::"FileOpen",
+    action in Action::"FileOpen",
     resource
 )
 when {

@@ -117,7 +117,7 @@ func TestBootstrapHappyPath(t *testing.T) {
 	mustWrite(t, filepath.Join(cgroupDir, "cgroup.controllers"), []byte("memory\n"))
 
 	policyPath := filepath.Join(t.TempDir(), "policy.cedar")
-	mustWrite(t, policyPath, []byte(`permit (principal, action == Action::"FileOpen", resource)
+	mustWrite(t, policyPath, []byte(`permit (principal, action in Action::"FileOpen", resource)
 when { resource in [ Dir::"/" ] };`))
 
 	uiPort := freePort(t)
@@ -166,7 +166,7 @@ func TestBootstrapIgnoresStaleMarker(t *testing.T) {
 	mustWrite(t, filepath.Join(cgroupDir, "cgroup.controllers"), []byte("memory\n"))
 
 	policyPath := filepath.Join(t.TempDir(), "policy.cedar")
-	mustWrite(t, policyPath, []byte(`permit (principal, action == Action::"FileOpen", resource)
+	mustWrite(t, policyPath, []byte(`permit (principal, action in Action::"FileOpen", resource)
 when { resource in [ Dir::"/" ] };`))
 
 	uiPort := freePort(t)
@@ -218,7 +218,7 @@ func TestBootstrapTimeout(t *testing.T) {
 	mustWrite(t, filepath.Join(cgroupDir, "cgroup.controllers"), []byte("memory\n"))
 
 	policyPath := filepath.Join(t.TempDir(), "policy.cedar")
-	mustWrite(t, policyPath, []byte(`permit (principal, action == Action::"FileOpen", resource)
+	mustWrite(t, policyPath, []byte(`permit (principal, action in Action::"FileOpen", resource)
 when { resource in [ Dir::"/" ] };`))
 
 	uiPort := freePort(t)
@@ -454,7 +454,7 @@ when { resource in [ File::%q ] };`, allowedPath),
 			mustWrite(t, hostBlocked, []byte("blocked-original"))
 
 			policyPath := filepath.Join(t.TempDir(), "long-path.cedar")
-			policy := fmt.Sprintf(`permit (principal, action == Action::"FileOpen", resource)
+			policy := fmt.Sprintf(`permit (principal, action in Action::"FileOpen", resource)
 when { resource in [ Dir::"/usr/", Dir::"/lib/", Dir::"/lib64/", Dir::"/bin/", Dir::"/sbin/", Dir::"/etc/", Dir::"/proc/", Dir::"/sys/", Dir::"/dev/", Dir::"/run/", Dir::"/tmp/", Dir::"/leash/" ] };
 permit (principal, action == Action::"FileOpenReadOnly", resource)
 when { resource in [ Dir::"/home/agent/", Dir::%q ] };
@@ -1040,7 +1040,7 @@ func TestDaemonFailsWhenPrivateDirIsNotDirectory(t *testing.T) {
 	mustWrite(t, filepath.Join(cgroupDir, "cgroup.controllers"), []byte("memory\n"))
 
 	policyPath := filepath.Join(t.TempDir(), "policy.cedar")
-	mustWrite(t, policyPath, []byte(`permit (principal, action == Action::"FileOpen", resource)
+	mustWrite(t, policyPath, []byte(`permit (principal, action in Action::"FileOpen", resource)
 when { resource in [ Dir::"/" ] };`))
 
 	cmd, stdout, stderr := startDaemon(t, bin, daemonConfig{

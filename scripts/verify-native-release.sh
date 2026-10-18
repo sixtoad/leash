@@ -19,9 +19,10 @@ trap cleanup EXIT
 test -x "$BIN"
 test -s "$POLICY"
 # The manager only loads an LSM module when the policy has rules for it, so the
-# gate policy must keep exec, file-open and connect rules (issue #110).
+# gate policy must keep exec, file-open and connect rules (issue #110). Strict
+# Cedar names the open modes (FileOpenReadOnly/FileOpenReadWrite).
 for action in ProcessExec FileOpen NetworkConnect; do
-  grep -q "Action::\"$action\"" "$POLICY" || {
+  grep -Eq "Action::\"$action(ReadOnly|ReadWrite)?\"" "$POLICY" || {
     printf '%s\n' "release gate policy $POLICY lacks a $action rule" >&2
     exit 1
   }
@@ -71,7 +72,7 @@ fi
   unset LEASH_IMAGE
   LEASH_HOME="$WORKDIR/home" \
   LEASH_WORK_DIR="$WORKDIR/work" \
-  LEASH_LISTEN= \
+  LEASH_LISTEN='' \
   timeout 180 "$BIN" --runtime docker --require-lsm --no-interactive \
     --image "$TARGET_IMAGE" --policy "$POLICY" --container-name "$CONTAINER" \
     sh -lc "printf 'LEASH84_USER='; id -un"

@@ -24,13 +24,15 @@ The owner's requirements:
   provably equivalent subset** of Cedar; anything else that would affect a
   kernel-enforced action fails the load.
 - Existing policies keep working: a **preparser** rewrites Leash's legacy
-  "most specific wins" policies into equivalent strict Cedar.
+  "most specific wins" policies into equivalent strict Cedar. Strict Cedar is
+  the **default** dialect (contract 3); the legacy dialect is an explicit
+  opt-in, `@leash_semantics("legacy")` (§4.1).
 
 ## 2. How Cedar policy flows
 
 ```
 leash.cedar ─► parse (cedar-go) ─► @leash_semantics?
-                                      │ legacy (no marker)          │ "cedar"
+                                      │ "legacy"                    │ none or "cedar"
                                       ▼                             │
                       transpiler.RewriteLegacy (preparser)          │
                       legacy IR per policy ─► strict Cedar          │
@@ -340,17 +342,42 @@ explicit connect default each makes these tests fail.
 
 ### 4.1 Mode selection
 
-A file is strict when any of its policies carries
-`@leash_semantics("cedar")`; otherwise it is legacy and is rewritten at load,
-with an info log listing every forbid that gained exceptions and every
-dropped construct. `@leash_semantics("legacy")` is accepted as explicit;
-mixing both values fails the load.
+**Strict Cedar is the default** (owner decision; contract 3, capability
+`cedar-strict-default`). A file is legacy only when one of its policies
+carries `@leash_semantics("legacy")`; it is then rewritten at load, with an
+info log listing every forbid that gained exceptions and every dropped
+construct. Every other file is strict: an unmarked one, or one marked
+`@leash_semantics("cedar")` (accepted as an explicit strict marker). Mixing
+both values fails the load. (Before contract 3 the default was the other way
+round: a file was strict only when marked `"cedar"`.)
 
 The marker is an **annotation**, not a comment: cedar-go keeps annotations in
 the AST and in `MarshalCedar`, so the marker survives every path that parses
 and re-emits policies (the policy API, the Control UI, runtime layers); the
-parser drops comments. `leash policy migrate` marks **every** policy, so
-deleting or reordering policies never turns a file back to legacy.
+parser drops comments. One marked policy makes the whole file legacy, so a
+statement the policy API prepends to a legacy runtime layer is read as legacy
+too; the statements it generates (`action in Action::"FileOpen"`,
+`resource in File::/Dir::`, `resource == Host::`, MCP tool and server) read
+the same in both dialects.
+
+Every place that reads a policy decides the dialect the same way, through
+`transpiler.DetectSemantics` in `cedar.CompileLayers`: the policy file and
+its reloads (leashd, darwind), the runtime layer of the policy API and the
+Control UI editor (Cedar text, `runtime.cedar`), the enforcer daemon's
+session policy, and `leash policy lint`. Rules built in code (an IR layer
+without Cedar source) are legacy by definition; an empty one (a cleared
+runtime layer) adds nothing, not even legacy defaults. The rewrite output,
+the policies `leash policy migrate` writes and the session text leashd sends
+the enforcer daemon (`Compilation.StrictText`) carry no marker: they are
+strict by default. macOS needs nothing of its own: the ES and NE extensions
+enforce the kernel tables compiled from the merged strict set (macsync).
+
+`leash policy lint` (and `POST /api/policies/validate`) warns with
+`legacy_semantics_suspected` when an **unmarked** file decides differently
+than its legacy reading: it compares the two on requests built from the
+file's own entities and names an example, and it flags `unless` clauses and
+MCP forbids without any MCP permit. A load that fails on an unmarked file
+adds the migrate / mark-legacy hint to the error.
 
 ### 4.2 Algorithm
 
@@ -462,23 +489,34 @@ that constrains the principal of a built-in policy fails the load.
 
 ## 5. Migration
 
-- **Nothing to do for a working legacy file**: it is rewritten at load, with
-  the info log describing every change. Decisions are unchanged except #20,
-  #21, #24 and #28. A file with a permit whose principal constraint,
-  condition or `unless` legacy semantics ignored (#8, #9, #10) no longer loads
-  (#164); `leash policy migrate` and the linter (`unenforceable_condition`)
-  report the same error.
-- `leash policy migrate <file>` prints the strict file (marked on every
-  policy, with a header listing the exceptions and dropped constructs);
-  `--write` replaces the file atomically. The output is checked like a load
-  (the engine builds, the kernel compiles) and migrates to itself.
+- **A legacy file must say so, or be migrated.** Since contract 3 an
+  unmarked file is strict Cedar. Mark a legacy file
+  `@leash_semantics("legacy")` and it is rewritten at load, with the info log
+  describing every change; decisions are unchanged except #20, #21, #24 and
+  #28. A file with a permit whose principal constraint, condition or
+  `unless` legacy semantics ignored (#8, #9, #10) no longer loads (#164);
+  `leash policy migrate` and the linter (`unenforceable_condition`) report
+  the same error.
+- `leash policy migrate <file>` reads the file as legacy (unless it is marked
+  `@leash_semantics("cedar")`: nothing to do) and prints plain strict Cedar
+  without a marker, with a header listing the exceptions and dropped
+  constructs; `--write` replaces the file atomically. The output is checked
+  like a load (the engine builds, the kernel compiles); its header makes a
+  second migrate a no-op.
+- Every policy Leash ships was migrated this way and is checked to decide
+  like its legacy original (`TestMigratedBuiltInPoliciesKeepTheirDecisions`:
+  the built-in bootstrap policy, the release-gate Walk policy
+  `e2e/testdata/walk33-combined.cedar`, the CEDAR.md example; the originals
+  are kept as `@leash_semantics("legacy")` fixtures in
+  `internal/lsm/testdata`).
 - After migrating, write strict Cedar: `resource == File::"/x"` for one file,
   `resource in Dir::"/x/"` for a tree, `FilePrefix::"..."` for a byte
   prefix (what a legacy `File` rule was), `forbid`
   overrides `permit` (add `unless` for an exception), MCP and connect need
   explicit permits, `action in Action::"FileOpen"` for both open modes.
-- **Follow-up:** Walk-generated policies will be emitted strict
-  (`@leash_semantics("cedar")`).
+- **Walk** (and any provisioner) that generates unmarked legacy-style
+  policies must, against a leash advertising `cedar-strict-default`, either
+  emit strict Cedar or mark its output `@leash_semantics("legacy")`.
 
 ## 6. Plugin actions in Cedar
 

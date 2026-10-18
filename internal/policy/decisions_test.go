@@ -76,8 +76,8 @@ func TestManagerPublishesOneEngine(t *testing.T) {
 // file forbid still wins, as the legacy rule merge did.
 func TestManagerRewritesLegacyLayersTogether(t *testing.T) {
 	m := NewManager(nil, nil)
-	file := mustCompile(t, "leash.cedar", `forbid (principal, action == Action::"FileOpen", resource) when { resource in [Dir::"/work/"] };`)
-	runtime := mustCompile(t, "runtime.cedar", `permit (principal, action == Action::"FileOpen", resource) when { resource in [Dir::"/work/ok/"] };`)
+	file := mustCompile(t, "leash.cedar", `@leash_semantics("legacy") forbid (principal, action == Action::"FileOpen", resource) when { resource in [Dir::"/work/"] };`)
+	runtime := mustCompile(t, "runtime.cedar", `@leash_semantics("legacy") permit (principal, action == Action::"FileOpen", resource) when { resource in [Dir::"/work/ok/"] };`)
 	if err := m.UpdateFileRules(file.Policies, file.HTTPRules); err != nil {
 		t.Fatal(err)
 	}

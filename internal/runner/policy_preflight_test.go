@@ -17,12 +17,12 @@ var badPolicies = []struct {
 }{
 	{
 		name:   "syntax error",
-		cedar:  `permit (principal, action == Action::"FileOpen", resource in Dir::"/")` + "\n", // missing ';'
+		cedar:  `permit (principal, action in Action::"FileOpen", resource in Dir::"/")` + "\n", // missing ';'
 		reason: "invalid Cedar policy",
 	},
 	{
 		name:   "unknown entity",
-		cedar:  `permit (principal, action == Action::"FileOpen", resource in Bogus::"/");` + "\n",
+		cedar:  `permit (principal, action in Action::"FileOpen", resource in Bogus::"/");` + "\n",
 		reason: "invalid Cedar policy",
 	},
 	{
@@ -140,7 +140,7 @@ func TestValidateStagedPolicyRejectsStaleBadPolicy(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "invalid Cedar policy") || !strings.Contains(err.Error(), staged) {
 		t.Fatalf("want the staged policy rejected with its reason: %v", err)
 	}
-	good := `permit (principal, action == Action::"FileOpen", resource in Dir::"/");` + "\n"
+	good := `permit (principal, action in Action::"FileOpen", resource in Dir::"/");` + "\n"
 	if err := os.WriteFile(staged, []byte(good), 0o644); err != nil {
 		t.Fatal(err)
 	}

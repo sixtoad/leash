@@ -1,5 +1,14 @@
 # Cedar to Leash Transpiler
 
+> [!NOTE]
+> Policy files are strict Cedar by default (`semantics.go`, contract 3): the
+> engine evaluates them as written and `kernel_compile.go` compiles the kernel
+> tables. The lowering this README describes is the **legacy dialect**, used
+> only for a file marked `@leash_semantics("legacy")`, which `legacy_rewrite.go`
+> rewrites to strict Cedar at load (and `leash policy migrate` writes out). The
+> example below is legacy: strict Cedar rejects a principal constraint on a
+> built-in action. See `docs/design/AUTHZ-SERVICE.md`.
+
 This package provides a transpiler that converts Cedar policies into Leash's IR (Intermediate Representation) policy configuration.
 
 ## Overview

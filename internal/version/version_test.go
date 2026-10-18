@@ -21,7 +21,7 @@ func testBuild() Build {
 // wantPolicyLimits pins the advertised enforced policy path limits.
 var wantPolicyLimits = &PolicyLimits{FilePathBytes: 255, ExecPathBytes: 64, FileRules: 256, ExecRules: 64}
 
-var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "rootless-daemon", "raw-socket-gate"}
+var wantCapabilities = []string{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "rootless-daemon", "raw-socket-gate", "cedar-strict-default"}
 
 // TestEnforcingIsDerivedPerPlatform pins the criterion: `enforcing` says whether
 // *this binary* carries an enforcement path. Linux ships the eBPF LSM programs
@@ -65,7 +65,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			goos:  "linux", goarch: "amd64",
 			want: Info{
 				Version: "v0.2.0", Commit: "c686025", SourceRevision: "c686025aa1b2c3", BuiltAt: "2026-07-21T10:11:12Z",
-				Enforcing: true, ContractVersion: 2, MinCompatibleContract: 0,
+				Enforcing: true, ContractVersion: 3, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "linux", Arch: "amd64",
 			},
 		},
@@ -75,7 +75,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			goos:  "darwin", goarch: "arm64",
 			want: Info{
 				Version: "v0.2.0", Commit: "c686025", SourceRevision: "c686025aa1b2c3", BuiltAt: "2026-07-21T10:11:12Z",
-				Enforcing: true, ContractVersion: 2, MinCompatibleContract: 0,
+				Enforcing: true, ContractVersion: 3, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "darwin", Arch: "arm64",
 			},
 		},
@@ -85,7 +85,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			goos:  "windows", goarch: "amd64",
 			want: Info{
 				Version: "v0.2.0", Commit: "c686025", SourceRevision: "c686025aa1b2c3", BuiltAt: "2026-07-21T10:11:12Z",
-				Enforcing: false, ContractVersion: 2, MinCompatibleContract: 0,
+				Enforcing: false, ContractVersion: 3, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "windows", Arch: "amd64",
 			},
 		},
@@ -95,7 +95,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			goos:  "linux", goarch: "amd64",
 			want: Info{
 				Version: "dev-c686025", Commit: "c686025-dirty", SourceRevision: "c686025aa1b2c3-dirty", BuiltAt: "2026-07-21T10:11:12Z",
-				Enforcing: true, ContractVersion: 2, MinCompatibleContract: 0,
+				Enforcing: true, ContractVersion: 3, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "linux", Arch: "amd64",
 			},
 		},
@@ -107,7 +107,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			goos:  "linux", goarch: "amd64",
 			want: Info{
 				Version: "dev", Commit: "abc-dirty", SourceRevision: "abc-dirty", BuiltAt: "unknown",
-				Enforcing: true, ContractVersion: 2, MinCompatibleContract: 0,
+				Enforcing: true, ContractVersion: 3, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "linux", Arch: "amd64",
 			},
 		},
@@ -119,7 +119,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			goos:  "linux", goarch: "amd64",
 			want: Info{
 				Version: "v1.2.3-4-gabc1234", Commit: "v1.2.3-4-gabc1234", SourceRevision: "v1.2.3-4-gabc1234", BuiltAt: "unknown",
-				Enforcing: true, ContractVersion: 2, MinCompatibleContract: 0,
+				Enforcing: true, ContractVersion: 3, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "linux", Arch: "amd64",
 			},
 		},
@@ -131,7 +131,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			goos:  "linux", goarch: "amd64",
 			want: Info{
 				Version: "dev", Commit: "unknown", SourceRevision: "unknown", BuiltAt: "unknown",
-				Enforcing: true, ContractVersion: 2, MinCompatibleContract: 0,
+				Enforcing: true, ContractVersion: 3, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "linux", Arch: "amd64",
 			},
 		},
@@ -141,7 +141,7 @@ func TestDescribeForPinsTheDocument(t *testing.T) {
 			goos:  "linux", goarch: "amd64",
 			want: Info{
 				Version: "unknown", Commit: "unknown", SourceRevision: "unknown", BuiltAt: "unknown",
-				Enforcing: true, ContractVersion: 2, MinCompatibleContract: 0,
+				Enforcing: true, ContractVersion: 3, MinCompatibleContract: 0,
 				Capabilities: wantCapabilities, PolicyLimits: wantPolicyLimits, OS: "linux", Arch: "amd64",
 			},
 		},
@@ -206,9 +206,9 @@ func TestJSONWireShape(t *testing.T) {
 		"sourceRevision":        "c686025aa1b2c3",
 		"builtAt":               "2026-07-21T10:11:12Z",
 		"enforcing":             true,
-		"contractVersion":       float64(2), // encoding/json decodes numbers as float64
+		"contractVersion":       float64(3), // encoding/json decodes numbers as float64
 		"minCompatibleContract": float64(0),
-		"capabilities":          []any{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "rootless-daemon", "raw-socket-gate"},
+		"capabilities":          []any{"policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "rootless-daemon", "raw-socket-gate", "cedar-strict-default"},
 		"policyLimits":          map[string]any{"filePathBytes": float64(255), "execPathBytes": float64(64), "fileRules": float64(256), "execRules": float64(64)},
 		"os":                    "linux",
 		"arch":                  "amd64",
@@ -338,8 +338,8 @@ func TestRunFormatSelection(t *testing.T) {
 			if decoded.Version != "v0.2.0" || decoded.Commit != "c686025" || decoded.SourceRevision != "c686025aa1b2c3" || decoded.BuiltAt != "2026-07-21T10:11:12Z" {
 				t.Fatalf("Run(%v) decoded to %+v, want the testBuild values", tt.args, decoded)
 			}
-			if decoded.ContractVersion != 2 || decoded.MinCompatibleContract != 0 {
-				t.Fatalf("Run(%v) decoded contract range [%d,%d], want [0,2]",
+			if decoded.ContractVersion != 3 || decoded.MinCompatibleContract != 0 {
+				t.Fatalf("Run(%v) decoded contract range [%d,%d], want [0,3]",
 					tt.args, decoded.MinCompatibleContract, decoded.ContractVersion)
 			}
 			if !reflect.DeepEqual(decoded.Capabilities, wantCapabilities) {
@@ -442,11 +442,11 @@ func TestRunHelp(t *testing.T) {
 func TestContractBoundsAreTheLiteralsTheDocsPublish(t *testing.T) {
 	t.Parallel()
 
-	if ContractVersion != 2 {
-		t.Fatalf("ContractVersion = %d, want 2 (the value the docs publish); bumping it is a contract change — update the docs and this test", ContractVersion)
+	if ContractVersion != 3 {
+		t.Fatalf("ContractVersion = %d, want 3 (the value the docs publish); bumping it is a contract change — update the docs and this test", ContractVersion)
 	}
 	if MinCompatibleContract != 0 {
-		t.Fatalf("MinCompatibleContract = %d, want 0 (contracts 1 and 2 removed nothing); raising it refuses every older caller — update the docs and this test", MinCompatibleContract)
+		t.Fatalf("MinCompatibleContract = %d, want 0 (contracts 1, 2 and 3 removed nothing); raising it refuses every older caller — update the docs and this test", MinCompatibleContract)
 	}
 }
 
@@ -514,7 +514,8 @@ func TestCheckCallerAgainstTheDocumentThisBuildEmits(t *testing.T) {
 		{callerContract: 0, want: "compatible"},
 		{callerContract: 1, want: "compatible"},
 		{callerContract: 2, want: "compatible"},
-		{callerContract: 3, want: "leash-too-old"},
+		{callerContract: 3, want: "compatible"},
+		{callerContract: 4, want: "leash-too-old"},
 	}
 	for _, tt := range tests {
 		if got := info.CheckCaller(tt.callerContract); got != tt.want {

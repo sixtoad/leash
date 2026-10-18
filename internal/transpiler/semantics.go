@@ -14,11 +14,12 @@ type Semantics int
 const (
 	// SemanticsLegacy is Leash's historical reading: file and exec rules are
 	// most-specific-wins, MCP is default-allow, Host::"*" is the connect
-	// default, principals and most conditions are ignored. A legacy file is
-	// rewritten to strict Cedar at load (RewriteLegacy).
+	// default, principals and most conditions are ignored. Only a file marked
+	// @leash_semantics("legacy") is read this way; it is rewritten to strict
+	// Cedar at load (RewriteLegacy).
 	SemanticsLegacy Semantics = iota
 	// SemanticsCedar is plain Cedar: forbid overrides permit, default deny,
-	// over Leash's entity hierarchy (see package engine).
+	// over Leash's entity hierarchy (see package engine). The default.
 	SemanticsCedar
 )
 
@@ -31,19 +32,30 @@ func (s Semantics) String() string {
 
 // AnnotationSemantics marks a policy file's semantics:
 //
-//	@leash_semantics("cedar")
+//	@leash_semantics("legacy")
 //	permit (...);
+//
+// Strict Cedar is the default: a file without the marker is plain Cedar.
+// The legacy dialect is an explicit opt-in, @leash_semantics("legacy");
+// @leash_semantics("cedar") is accepted as an explicit strict marker.
 //
 // An annotation, not a comment, because it is part of the policy: cedar-go
 // keeps it in the AST and in MarshalCedar, so it survives every path that
 // parses and re-emits policies (the policy API, the Control UI, runtime
 // layers). A comment is dropped by the parser.
 //
-// A file is strict when any of its policies carries @leash_semantics("cedar");
-// `leash policy migrate` marks every policy, so deleting or reordering
-// policies cannot silently turn a file back to legacy. "legacy" is accepted
-// as an explicit value; mixing the two values in one file is an error.
+// A file is legacy when any of its policies carries
+// @leash_semantics("legacy"), so a policy added to a legacy file (the policy
+// API prepends it to the layer's text) is read as legacy too. Mixing the two
+// values in one file is an error.
 const AnnotationSemantics = "leash_semantics"
+
+// The @leash_semantics values. MarkerNone is a file without the marker.
+const (
+	MarkerNone   = ""
+	MarkerCedar  = "cedar"
+	MarkerLegacy = "legacy"
+)
 
 // annotationRewrite marks a policy the legacy rewrite synthesized (e.g. the
 // MCP default allow); annotationSource records the legacy policy a
@@ -53,10 +65,12 @@ const (
 	annotationSource  = engine.AnnotationSource
 )
 
-// DetectSemantics reads the @leash_semantics marker of a parsed file.
-func DetectSemantics(ps *cedarlib.PolicySet) (Semantics, error) {
+// SemanticsMarker returns the @leash_semantics value a parsed file carries:
+// MarkerNone, MarkerCedar or MarkerLegacy. An unknown value, or both values
+// in one file, is an error.
+func SemanticsMarker(ps *cedarlib.PolicySet) (string, error) {
 	if ps == nil {
-		return SemanticsLegacy, nil
+		return MarkerNone, nil
 	}
 	seen := map[string]bool{}
 	for _, p := range ps.All() {
@@ -65,17 +79,32 @@ func DetectSemantics(ps *cedarlib.PolicySet) (Semantics, error) {
 			continue
 		}
 		switch string(v) {
-		case "cedar", "legacy":
+		case MarkerCedar, MarkerLegacy:
 			seen[string(v)] = true
 		default:
-			return SemanticsLegacy, fmt.Errorf("@%s(%q): want \"cedar\" or \"legacy\"", AnnotationSemantics, string(v))
+			return MarkerNone, fmt.Errorf("@%s(%q): want \"cedar\" or \"legacy\"", AnnotationSemantics, string(v))
 		}
 	}
-	if seen["cedar"] && seen["legacy"] {
-		return SemanticsLegacy, fmt.Errorf("policies disagree on @%s: use one value per file", AnnotationSemantics)
+	switch {
+	case seen[MarkerCedar] && seen[MarkerLegacy]:
+		return MarkerNone, fmt.Errorf("policies disagree on @%s: use one value per file", AnnotationSemantics)
+	case seen[MarkerLegacy]:
+		return MarkerLegacy, nil
+	case seen[MarkerCedar]:
+		return MarkerCedar, nil
 	}
-	if seen["cedar"] {
-		return SemanticsCedar, nil
+	return MarkerNone, nil
+}
+
+// DetectSemantics reads how a parsed file is to be read: legacy only when it
+// is marked @leash_semantics("legacy"), strict Cedar otherwise.
+func DetectSemantics(ps *cedarlib.PolicySet) (Semantics, error) {
+	m, err := SemanticsMarker(ps)
+	if err != nil {
+		return SemanticsCedar, err
 	}
-	return SemanticsLegacy, nil
+	if m == MarkerLegacy {
+		return SemanticsLegacy, nil
+	}
+	return SemanticsCedar, nil
 }
