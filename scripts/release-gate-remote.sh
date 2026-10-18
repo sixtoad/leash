@@ -127,9 +127,13 @@ release_gate_put_verified() {
 release_gate_kernel_load() {
   local verify_script="$1" temp="$2"
   shift 2
-  local binary="$temp/lsm-kernel-load.test" object
+  local binary="$temp/lsm-kernel-load.test" object checked=0
   "$verify_script" --build-only "$binary"
   for object in "$@"; do
+    # bpf2go embeds only the build target's endianness; every release
+    # architecture (amd64, arm64) is little-endian.
+    [[ "$object" == *_bpfel.o ]] || continue
+    checked=$((checked + 1))
     BINARY="$binary" OBJECT="$object" python3 - <<'PY'
 import os
 
@@ -141,6 +145,10 @@ if not obj or obj not in binary:
     raise SystemExit(f"release: kernel-load test binary does not embed {os.environ['OBJECT']} byte-for-byte")
 PY
   done
+  if [ "$checked" -ne 3 ]; then
+    printf '%s\n' "release: expected 3 little-endian LSM objects to check, got $checked" >&2
+    return 1
+  fi
   release_gate_put_verified "$binary" lsm-kernel-load.test
   release_gate_ssh_timeout 15m \
     "cd $(release_gate_quote "$RELEASE_GATE_DIR") && env -u LEASH_KERNEL_LOAD_ALLOW_INERT timeout 10m scripts/verify-lsm-kernel-load.sh --test-binary $(release_gate_quote "$RELEASE_GATE_DIR/lsm-kernel-load.test")"
