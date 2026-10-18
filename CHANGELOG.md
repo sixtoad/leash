@@ -1,14 +1,111 @@
 # Changelog
 
-All notable changes to the `walk-integration` (downstream) build of leash.
-Format loosely follows [Keep a Changelog](https://keepachangelog.com/). The
-container-free **native runtime** is developed on the upstream-eligible slice
-`feat/runtime-native-poc` and merged here; walk adds the native-by-default and
-Claude Code handling on top.
+All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
+(`scripts/release.sh`, docs/RELEASE.md). Format loosely follows
+[Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
-### Breaking — unmarked policy files are strict Cedar
+## [native-v0.4.0] — 2026-10-18
+
+Everything merged since `native-v0.3.15` (PRs #129–#216). The headline: one
+Cedar engine decides every request and the kernel enforces tables compiled
+from the same policy, strict Cedar is the default dialect, and enforcement
+fails closed everywhere. Upgrade notes are under **Breaking**.
+
+### Breaking
+- **Strict Cedar is the default policy dialect** (#216). An unmarked policy
+  file is plain Cedar: forbid overrides permit, default deny (MCP included),
+  `File::"/p"` is exactly one path, `action == Action::"FileOpen"` is
+  rejected. Convert a legacy policy with `leash policy migrate <file> --write`
+  or keep its old meaning with `@leash_semantics("legacy")`; `leash policy
+  lint` flags unmarked files that look written for the legacy dialect.
+  `contractVersion` 3, capability `cedar-strict-default`.
+- **Fail closed, always** (#137, #214). A run is refused when the eBPF LSM
+  cannot attach (or `bpf` is not an active LSM, or the workload has no
+  scopable cgroup); `--allow-proxy-only` / `LEASH_ALLOW_PROXY_ONLY` are gone
+  and `--require-lsm` is a no-op. `contractVersion` 2.
+- **Default deny in every kernel category** (#129, #140). The connect,
+  file-open and exec LSMs are always attached; a policy with no rules for a
+  category denies it (egress, opens and execs need explicit permits).
+- **A policy that does not load stops the run** (#163), and a bad reload
+  keeps the previous policy; policy changes apply transactionally across the
+  kernel, the enforcer daemon and the proxy and fail closed (deny-all, stop
+  the workload) if a rollback fails (#197).
+- **Permits Leash cannot enforce as written are rejected** (#164, #183): a
+  principal constraint or a condition on a file, exec or connect permit fails
+  the load instead of being enforced unconditionally.
+- **The workload is killed when leashd or the leash sidecar exits** mid-run
+  (#200).
+- **macOS refuses to start without its ES and NE extensions** (#211).
+
+### Security
+- **TCP and connected-UDP connects were not enforced by the kernel**: the
+  connect hook read the sockaddr as user memory (#145, #147); the connect map
+  and event ABI are now pinned field by field (#78, #192).
+- **IPv6 and IPv4-mapped egress** is enforced by the connect LSM (#182,
+  #185).
+- **Packet, raw IP and SCTP sockets** are refused at creation unless the
+  policy restricts no destination (#188, #202; capability `raw-socket-gate`).
+- **Writes through the container overlay rootfs** bypassed the file policy
+  (#186, #205); the hard-link guard's path reconstruction bounds were lifted
+  (#206).
+- **Policy load failures failed open** (the workload ran with the previous or
+  no policy) (#162, #163).
+- **Credential leak through Host/SNI mismatch**: request decisions (and
+  header rewrites) are bound to the connection's verified host (#149, #153);
+  the proxy dials only a destination the TLS connect policy permitted (#154,
+  #168); wildcard hosts need a label boundary (`*.example.com` no longer
+  matches `evilexample.com`) and names compare case-insensitively (#159).
+- **HTTP/2 clients bypassed header rewrite and MCP enforcement** (#57, #146,
+  #148).
+- **macOS**: the ES and NE extensions enforce exactly the Linux kernel tables
+  (open mode, nested permits, ports, connect default; #215); the daemon's
+  control plane is closed to other clients and the LAN (#212); the policy
+  file is kept out of `/tmp` and unsafe paths are refused (#12, #213).
+
+### Added
+- **Cedar decision engine** (#142: #150, #151, #152). Every userspace check
+  (proxy connect, MCP tools/call, plugin questions) is `cedar.Authorize` over
+  one strict policy set; the eBPF and macOS tables are compiled from the same
+  set by a compiler that accepts only constructs it can enforce exactly, and
+  parity tests prove the two agree. Deterministic rule precedence (#138).
+- **Plugin authorization socket**: `--inject-service ... authz=<Ns>` gives an
+  injected plugin a private Cedar authorization socket (protocol v1,
+  `pkg/authz`; capability `authz-socket`).
+- **Rootless podman with kernel enforcement** through the leash enforcer
+  daemon (`leash daemon install|status|uninstall`; #189, #190; capability
+  `rootless-daemon`).
+- **Full HTTP/2 MITM** for inspected hosts (#57, #148).
+- **Container resource limits**: `--cpus`, `--memory`, `--pids-limit`
+  (#116, #167; capability `container-resource-limits`).
+- **macOS parity** with the Linux kernel tables (#215), and the darwin
+  hardening above.
+- `leash policy migrate` and `leash policy lint` (#216).
+
+### Fixed
+- Rootless podman with `userns = "keep-id"` (#121, #184); Dir rules cover the
+  directory itself end to end (#119, #130); trailing-slash line-format rules
+  (#126, #166); cgroup v2 paths for control-plane rules (#123, #131);
+  `--inject-service` helpers reaped on every teardown (#128, #132); container
+  commands run in a non-login shell, preserving the image `PATH` (#120,
+  #134); target bootstrap failures surfaced before the sidecar netns error
+  (#81, #136); native leashd and boxes reaped on every teardown, including
+  boxes left by dead runs (#143, #156, #158, #198); the CA certificate and
+  key share one lifetime so `LEASH_SHARE_DIR` can be reused (#165, #199);
+  the CA is installed without `cp` and its trust verified before bootstrap
+  (#169, #181); local images are not pre-pulled and real pull failures are
+  reported (#170, #179).
+- CI on GitHub Actions: lint, Linux and darwin tests, kernel verifier load,
+  mac-leash build (#195); root and race fixes in tests (#144, #157, #180,
+  #194, #210).
+
+### Detailed notes
+The entries below accumulated on the development branch since
+`native-v0.1.0` (the `native-v0.2.x`/`native-v0.3.x` tags were not itemized
+in this file); the summary above is what is new since `native-v0.3.15`.
+
+#### Breaking — unmarked policy files are strict Cedar
 - A policy file without a `@leash_semantics` marker is now read as **strict
   Cedar**: any matching `forbid` denies (a longer `permit` no longer beats a
   shorter `forbid`), otherwise a matching `permit` allows, otherwise deny —
@@ -40,7 +137,7 @@ Claude Code handling on top.
   strict Cedar or mark their output `@leash_semantics("legacy")` against a
   leash that advertises it.
 
-### Security — macOS enforces the Linux kernel tables
+#### Security — macOS enforces the Linux kernel tables
 - The macOS extensions now enforce exactly the tables the eBPF LSM enforces,
   compiled from the Cedar policy by the same code (`lsm.MacTablesFor`) and
   sent as `mac.policy.tables`; the Swift matcher implements the kernel's
@@ -74,7 +171,7 @@ Claude Code handling on top.
 - leashcli reports a command killed by a signal (an exec ES denied) as
   128 + signal instead of exit 0.
 
-### Changed — native macOS refuses to start without its extensions
+#### Changed — native macOS refuses to start without its extensions
 - `leash --darwin exec` and the darwin daemon now **refuse to start** unless
   both the Endpoint Security and the Network Filter system extensions are
   activated. The previous default warned and ran the workload unenforced;
@@ -87,7 +184,7 @@ Claude Code handling on top.
   cannot make leash look enforced.
 - `--inject-service` (and its `authz=` socket) is refused in native macOS mode
   with an explanation: darwind serves no plugin authorization socket.
-### Security — macOS policy file out of /tmp (#12)
+#### Security — macOS policy file out of /tmp (#12)
 - The darwin daemon's default policy moves from `/tmp/tmp.leash.policy` (which
   any local user could create, or symlink, before leash first ran) to
   `policy.cedar` in the per-user state directory (mode `0700`, repaired if
@@ -101,7 +198,7 @@ Claude Code handling on top.
 - `LEASH_POLICY` given to `leash --darwin exec` is now passed to the daemon it
   starts instead of being overridden.
 
-### Added — build & compatibility document
+#### Added — build & compatibility document
 - **`leash version --json`** (also `--output json`): the build metadata as a
   machine-readable document — `version`, `commit`, `builtAt`, `enforcing`,
   `contractVersion`, `minCompatibleContract`, `capabilities`, `os`, `arch` — so
@@ -137,7 +234,7 @@ Claude Code handling on top.
   which `flag.FlagSet.Visit` cannot see because it reports a repeated flag once,
   with the last value.
 
-### Added — doctor probes BPF-LSM attachability instead of guessing
+#### Added — doctor probes BPF-LSM attachability instead of guessing
 - **`lsm_bpf_attachable` in `leash doctor --json`**: doctor now loads leash's
   *real* LSM programs, lets the kernel's verifier judge them, attaches one and
   detaches it immediately — `attachable` / `unattachable` / `unknown`. Reading
@@ -179,7 +276,7 @@ Claude Code handling on top.
   hanging, or taking the report down with it. Running it while leash is enforcing
   does not touch the live programs.
 
-### Added — node readiness self-check
+#### Added — node readiness self-check
 - **`leash doctor` / `leash doctor --json`**: one command answering the question
   a provisioner (`walk install leash`, a CI image) had been guessing at with its
   own coarse probes — *can this machine actually enforce?* — per runtime. It
@@ -216,7 +313,7 @@ Claude Code handling on top.
   read as unqualified good news. The document names the default and the human
   output warns when it is not the runtime the verdict is about.
 
-### Changed — permits with conditions Leash cannot enforce no longer load (#164)
+#### Changed — permits with conditions Leash cannot enforce no longer load (#164)
 - **Behavior change for legacy policy files.** Legacy semantics ignored
   principal constraints and every condition other than a whole
   `resource in [...]` or `context.hostname ==`/`like` clause, and read
@@ -250,7 +347,7 @@ Claude Code handling on top.
   resource in [...] }` is enforced as written. Design:
   [`docs/design/AUTHZ-SERVICE.md`](docs/design/AUTHZ-SERVICE.md) §4.3.
 
-### Changed — fail closed when the eBPF LSM can't attach (#117)
+#### Changed — fail closed when the eBPF LSM can't attach (#117)
 - **Behavior change.** When the eBPF LSM (Layer 1) cannot attach — kernel
   without an active `bpf` LSM, rootless podman without the enforcer daemon,
   rootless Docker, or no scopable cgroup — leash now **refuses to run the
@@ -290,7 +387,7 @@ Claude Code handling on top.
   can only narrow the reported level, and a native refusal now echoes leashd's
   FATAL reason instead of only pointing at the log.
 
-### Added — kernel enforcement for rootless podman: the leash enforcer daemon
+#### Added — kernel enforcement for rootless podman: the leash enforcer daemon
 - Rootless podman cannot load the eBPF LSM, so a rootless run used to fail
   closed. `sudo leash daemon
   install` now installs the **leash enforcer daemon**: a socket-activated
@@ -322,7 +419,7 @@ Claude Code handling on top.
   needs no change to accept these runs; it may want to surface `layer1Via`
   and drop its `userns=host` override (#121).
 
-### Fixed — rootless podman with `userns = "keep-id"` (#121)
+#### Fixed — rootless podman with `userns = "keep-id"` (#121)
 - With `userns = "keep-id"` in `containers.conf` (a common rootless podman
   setting) the target container gets its own user namespace. The leash
   container stayed in podman's default one, so it had no `CAP_NET_ADMIN` over
@@ -336,7 +433,7 @@ Claude Code handling on top.
   uid it runs as and what overrode leash's `--user 0`, instead of "must run as
   root or have sudo available".
 
-### Fixed — HTTP/2 clients bypassed header rewrite and MCP enforcement (#57)
+#### Fixed — HTTP/2 clients bypassed header rewrite and MCP enforcement (#57)
 - **Full HTTP/2 MITM.** The proxy used to offer `h2, http/1.1` to every client
   and tunnel any h2 connection opaquely, so header-rewrite rules, MCP
   `tools/call` policy and MCP observability never saw requests from h2 clients
@@ -366,7 +463,7 @@ Claude Code handling on top.
   `event=http.alpn` with `alpn_offered`, `alpn_advertised`, `alpn_negotiated`,
   `alpn_mode` (`inspect`/`tunnel`/`downgrade`/`refuse`) and `reasons`.
 
-### Fixed — remedy text that could break the host
+#### Fixed — remedy text that could break the host
 - **`leash doctor` could tell an operator to set `lsm=,bpf`** — a leading-comma
   kernel command line that *replaces* the host's LSM stack, silently disabling
   AppArmor/SELinux or leaving the machine unbootable. Two separate paths reached
@@ -386,7 +483,7 @@ Claude Code handling on top.
   document that said `ready`. Round-tripping is now identity, with the derived
   fields recomputed from the statuses rather than trusted from the document.
 
-### Changed
+#### Changed
 - **Behavior change — egress is denied when a policy has no `NetworkConnect`
   rules (#118).** The kernel connect LSM is now always created and attached.
   Previously a policy with file/exec rules but no network rules never attached
@@ -407,7 +504,8 @@ Claude Code handling on top.
 - **Known limitation: IPv6 egress is not enforced by the connect LSM.** Both
   hooks (`socket_connect`, `socket_sendmsg`) allow every non-`AF_INET` socket,
   so IPv6 connections from the target are not denied by the kernel layer,
-  with or without connect rules.
+  with or without connect rules. (Since lifted: IPv6 and IPv4-mapped egress are
+  enforced, #185.)
 - **Behavior change — file opens and execs are denied when a policy has no
   file / exec rules.** The kernel file-open LSM (which also carries the
   directory-mutation and link hooks) and the exec LSM are now always created
