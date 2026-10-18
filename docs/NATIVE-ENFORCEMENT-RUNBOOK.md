@@ -119,7 +119,12 @@ explicit, or `--runtime docker` to opt into the container path.
    --fork --mount-proc`) so it can't read host processes' `/proc/<pid>/environ` or
    share IPC; the private mount ns **masks** `/run/user/<uid>` (keyring/D-Bus) and
    `/tmp/.X11-unix` (X11); `DBUS_SESSION_BUS_ADDRESS`/`DISPLAY`/`XAUTHORITY` are
-   scrubbed. Finally **dropped to the invoking user** (`runuser -u $SUDO_USER`).
+   scrubbed. Finally **dropped to the invoking user** by `leash --harden-exec
+   --user $SUDO_USER`, which first empties the capability bounding set (only
+   possible as root), then switches user, clears every capability set, sets
+   `no_new_privs` and the seccomp filter: `CapBnd`/`CapEff`/... are `0` and
+   `NoNewPrivs: 1` in the box (#203, docs/design/SECURITY-MODEL.md § Workload
+   capabilities). `--allow-namespaces` uses `runuser -u $SUDO_USER` instead.
    Under Layer 2 it inherits the netns and `NODE_EXTRA_CA_CERTS` (the `/tmp` CA
    copy) so Node clients trust the proxy. The cgroup placement stays in the host
    PID ns (the LSM is cgroup-scoped, unaffected by the workload's PID ns). This
