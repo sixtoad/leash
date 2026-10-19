@@ -11,6 +11,9 @@ TARGET_CGROUP=${3:-}
 PROXY_MARK=${PROXY_MARK:-0x2000}
 
 RULE_ERRORS=0
+# Rules without which the MITM proxy (Layer 2) would see no traffic; any
+# failure is fatal (see apply-nftables.sh).
+REQUIRED_ERRORS=0
 
 iptables_cmd() {
     iptables -w "$@"
@@ -46,17 +49,17 @@ fi
 
 # Redirect HTTP to MITM proxy
 if ! ensure_rule -t nat -C OUTPUT -p tcp --dport 80 -j REDIRECT --to-ports "$MITM_PORT"; then
-    apply_rule "nat OUTPUT redirect HTTP" iptables_cmd -t nat -A OUTPUT -p tcp --dport 80 -j REDIRECT --to-ports "$MITM_PORT"
+    apply_rule "nat OUTPUT redirect HTTP" iptables_cmd -t nat -A OUTPUT -p tcp --dport 80 -j REDIRECT --to-ports "$MITM_PORT" || REQUIRED_ERRORS=$((REQUIRED_ERRORS + 1))
 fi
 
 # Redirect HTTPS to MITM proxy
 if ! ensure_rule -t nat -C OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports "$MITM_PORT"; then
-    apply_rule "nat OUTPUT redirect HTTPS" iptables_cmd -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports "$MITM_PORT"
+    apply_rule "nat OUTPUT redirect HTTPS" iptables_cmd -t nat -A OUTPUT -p tcp --dport 443 -j REDIRECT --to-ports "$MITM_PORT" || REQUIRED_ERRORS=$((REQUIRED_ERRORS + 1))
 fi
 
 # Drop QUIC to force TLS over TCP through the MITM
 if ! ensure_rule -t mangle -C OUTPUT -p udp --dport 443 -j DROP; then
-    apply_rule "mangle OUTPUT drop QUIC" iptables_cmd -t mangle -A OUTPUT -p udp --dport 443 -j DROP
+    apply_rule "mangle OUTPUT drop QUIC" iptables_cmd -t mangle -A OUTPUT -p udp --dport 443 -j DROP || REQUIRED_ERRORS=$((REQUIRED_ERRORS + 1))
 fi
 
 # Block target container from reaching leashd control plane on any interface.
@@ -104,7 +107,12 @@ if [ -z "$TARGET_CGROUP" ] && [ -n "$LEASH_PORT" ]; then
     fi
 fi
 
-# Report summary and exit successfully even if some rules failed
+if [ "$REQUIRED_ERRORS" -gt 0 ]; then
+    echo "leash: FATAL: $REQUIRED_ERRORS required iptables interception rule(s) (HTTP/HTTPS redirect, QUIC drop) failed to apply" >&2
+    exit 2
+fi
+
+# Report summary and exit successfully even if optional rules failed
 # (we log warnings above for failed rules)
 if [ "$RULE_ERRORS" -gt 0 ]; then
     echo "leash: WARNING: $RULE_ERRORS iptables rule(s) failed to apply (network interception may be incomplete)" >&2

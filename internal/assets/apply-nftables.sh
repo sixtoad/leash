@@ -21,6 +21,15 @@ PROXY_MARK=${PROXY_MARK:-0x2000}
 NFT=${NFT:-nft}
 
 RULE_ERRORS=0
+# Rules without which the MITM proxy (Layer 2) would silently see no traffic.
+# Any failure here is fatal, so the caller falls back to iptables or refuses to
+# start instead of reporting an intercepting proxy that intercepts nothing.
+REQUIRED_ERRORS=0
+
+# The redirect port set is passed to nft as ONE quoted word. Unquoted, a shell
+# that brace-expands (bash, which is /bin/sh on Fedora/RHEL/Arch) turns
+# {80,443} into "80 443" and nft rejects the rule.
+HTTP_PORTS='{ 80, 443 }'
 
 nft_cmd() {
     "$NFT" "$@"
@@ -68,22 +77,22 @@ ensure_rule() {
 
 # IPv4 NAT OUTPUT
 ensure_table ip leash
-ensure_chain ip leash out_nat { type nat hook output priority -100\; }
-ensure_rule ip leash out_nat "leash:return-mitm" tcp dport $MITM_PORT return
-ensure_rule ip leash out_nat "leash:return-mark" meta mark $PROXY_MARK return
-ensure_rule ip leash out_nat "leash:redir-80-443" tcp dport {80,443} redirect to :$MITM_PORT
+ensure_chain ip leash out_nat "{ type nat hook output priority -100; }"
+ensure_rule ip leash out_nat "leash:return-mitm" tcp dport "$MITM_PORT" return
+ensure_rule ip leash out_nat "leash:return-mark" meta mark "$PROXY_MARK" return
+ensure_rule ip leash out_nat "leash:redir-80-443" tcp dport "$HTTP_PORTS" redirect to :"$MITM_PORT" || REQUIRED_ERRORS=$((REQUIRED_ERRORS + 1))
 
 # IPv6 NAT OUTPUT
 ensure_table ip6 leash6
-ensure_chain ip6 leash6 out_nat { type nat hook output priority -100\; }
-ensure_rule ip6 leash6 out_nat "leash:return-mitm" tcp dport $MITM_PORT return
-ensure_rule ip6 leash6 out_nat "leash:return-mark" meta mark $PROXY_MARK return
-ensure_rule ip6 leash6 out_nat "leash:redir-80-443" tcp dport {80,443} redirect to :$MITM_PORT
+ensure_chain ip6 leash6 out_nat "{ type nat hook output priority -100; }"
+ensure_rule ip6 leash6 out_nat "leash:return-mitm" tcp dport "$MITM_PORT" return
+ensure_rule ip6 leash6 out_nat "leash:return-mark" meta mark "$PROXY_MARK" return
+ensure_rule ip6 leash6 out_nat "leash:redir-80-443" tcp dport "$HTTP_PORTS" redirect to :"$MITM_PORT" || REQUIRED_ERRORS=$((REQUIRED_ERRORS + 1))
 
 # inet route hook to drop QUIC for both families
 ensure_table inet leash
-ensure_chain inet leash out_route { type route hook output priority 0\; }
-ensure_rule inet leash out_route "leash:drop-quic" udp dport 443 drop
+ensure_chain inet leash out_route "{ type route hook output priority 0; }"
+ensure_rule inet leash out_route "leash:drop-quic" udp dport 443 drop || REQUIRED_ERRORS=$((REQUIRED_ERRORS + 1))
 
 # Block target cgroup from reaching leashd control plane on any interface.
 # This prevents a compromised agent from accessing the leashd API.
@@ -99,7 +108,7 @@ if [ -n "$TARGET_CGROUP" ] && [ -n "$LEASH_PORT" ]; then
     if [ -z "$TARGET_CGROUP_LEVEL" ]; then
         TARGET_CGROUP_LEVEL=$(printf '%s\n' "$TARGET_CGROUP" | awk -F/ '{print NF}')
     fi
-    ensure_chain inet leash out_filter { type filter hook output priority 0\; }
+    ensure_chain inet leash out_filter "{ type filter hook output priority 0; }"
     # Check if rule already exists
     if nft_cmd list chain inet leash out_filter 2>/dev/null | grep -F "leash:block-control-plane" >/dev/null; then
         : # Rule already exists, nothing to do
@@ -111,7 +120,7 @@ if [ -n "$TARGET_CGROUP" ] && [ -n "$LEASH_PORT" ]; then
         # the control plane port. This preserves the security boundary at the cost of disallowing
         # in-namespace clients.
         echo "leash: WARNING: cgroup-based control plane isolation unavailable (nftables); blocking all local access to control plane port $LEASH_PORT" >&2
-        if ensure_rule inet leash out_filter "leash:block-control-plane-fallback" tcp dport $LEASH_PORT reject with tcp reset; then
+        if ensure_rule inet leash out_filter "leash:block-control-plane-fallback" tcp dport "$LEASH_PORT" reject with tcp reset; then
             echo "leash: blocked local access to control plane port $LEASH_PORT (fallback nftables)"
         else
             echo "leash: FATAL: could not apply control plane isolation (nftables cgroup and fallback failed)" >&2
@@ -125,11 +134,11 @@ fi
 # cgroup namespace). The control plane must still be isolated, so block ALL local
 # access to the port — the same namespace-wide boundary as the cgroup fallback above.
 if [ -z "$TARGET_CGROUP" ] && [ -n "$LEASH_PORT" ]; then
-    ensure_chain inet leash out_filter { type filter hook output priority 0\; }
+    ensure_chain inet leash out_filter "{ type filter hook output priority 0; }"
     echo "leash: WARNING: no target cgroup (degraded mode); blocking all local access to control plane port $LEASH_PORT" >&2
     if nft_cmd list chain inet leash out_filter 2>/dev/null | grep -F "leash:block-control-plane-fallback" >/dev/null; then
         : # Rule already exists, nothing to do
-    elif ensure_rule inet leash out_filter "leash:block-control-plane-fallback" tcp dport $LEASH_PORT reject with tcp reset; then
+    elif ensure_rule inet leash out_filter "leash:block-control-plane-fallback" tcp dport "$LEASH_PORT" reject with tcp reset; then
         echo "leash: blocked local access to control plane port $LEASH_PORT (degraded, no cgroup)"
     else
         echo "leash: FATAL: could not apply control plane isolation (degraded mode)" >&2
@@ -138,7 +147,12 @@ if [ -z "$TARGET_CGROUP" ] && [ -n "$LEASH_PORT" ]; then
     fi
 fi
 
-# Report summary and exit successfully even if some rules failed
+if [ "$REQUIRED_ERRORS" -gt 0 ]; then
+    echo "leash: FATAL: $REQUIRED_ERRORS required nftables interception rule(s) (HTTP/HTTPS redirect, QUIC drop) failed to apply" >&2
+    exit 2
+fi
+
+# Report summary and exit successfully even if optional rules failed
 if [ "$RULE_ERRORS" -gt 0 ]; then
     echo "leash: WARNING: $RULE_ERRORS nftables rule(s) failed to apply (network interception may be incomplete)" >&2
 fi
