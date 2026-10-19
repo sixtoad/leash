@@ -213,8 +213,13 @@ type runner struct {
 	idmapSpecs          []idmap.Spec
 
 	// A session label and attempted names constrain cleanup to our own creates.
-	containerSession       string
-	containerLaunches      map[string]bool // true while the daemon may still create it
+	containerSession  string
+	containerLaunches map[string]bool // true while the daemon may still create it
+	// containerWatch is the write end of the watcher's lifeline (#201): the
+	// watcher removes this run's containers once it reads EOF, i.e. once leash
+	// is gone, unless disarmContainerWatch ran first.
+	containerWatch         *os.File
+	containerWatchStarted  bool
 	cleanupReconcileWindow time.Duration
 	cleanupPollInterval    time.Duration
 
@@ -1795,6 +1800,10 @@ func (r *runner) startContainers(ctx context.Context) error {
 	}
 	if err := r.preflightRootless(ctx); err != nil {
 		return err
+	}
+	if !r.usingNativeRuntime() {
+		// Containers of runs whose leash was killed (#201).
+		reapStaleContainersOnStart(r, ctx)
 	}
 
 	r.logDevImageSelections()
@@ -3634,6 +3643,11 @@ func (r *runner) finishLifecycle(ctx context.Context, exitCode int, runErr error
 		// LSM attached after leash exits (#143).
 		r.teardownInjectedPlugins()
 		r.stopLeashd()
+		// Kept on purpose: neither the watcher nor a later reaper removes them.
+		if !r.usingNativeRuntime() {
+			r.markContainersKept()
+		}
+		r.disarmContainerWatch()
 		if runErr != nil {
 			return runErr
 		}
@@ -3645,6 +3659,11 @@ func (r *runner) finishLifecycle(ctx context.Context, exitCode int, runErr error
 
 	stopCtx := cleanupContext(ctx)
 	stopErr := r.stopContainers(stopCtx)
+	if stopErr == nil {
+		// Teardown is complete; a failed one leaves the watcher armed so it
+		// retries the removal once leash exits.
+		r.disarmContainerWatch()
+	}
 	if runErr != nil {
 		if stopErr != nil {
 			r.debugf("failed to stop containers after error: %v", stopErr)

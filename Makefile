@@ -4,7 +4,9 @@ LEASH_IMAGE ?= ghcr.io/strongdm/leash:latest
 TARGET_IMAGE ?= ghcr.io/strongdm/coder:latest
 LEASH_ECR_LATEST ?= public.ecr.aws/s5i7k8t3/strongdm/leash:latest
 TARGET_ECR_LATEST ?= public.ecr.aws/s5i7k8t3/strongdm/coder:latest
-LSM_DOCKER_IMAGE ?= golang:1.25.3-bookworm
+# The pinned eBPF toolchain image, built from Dockerfile.leash's bpf-toolchain
+# stage (clang 18; see docs/DEVELOPMENT.md, "eBPF toolchain").
+LSM_DOCKER_IMAGE ?= leash/bpf-toolchain:latest
 DOCKER ?= docker
 #LEASH_PLATFORMS ?= darwin/amd64 darwin/arm64 linux/amd64 linux/arm64
 # TEMP: Disable multi-arch
@@ -69,8 +71,8 @@ precommit: fmt ## Configure git hooks for pre-commit guardrails
 lsm-generate: ## Generate LSM eBPF artifacts on the host system
 	@set -euo pipefail; \
 	if [ "$(shell uname -s)" = 'Linux' ]; then \
-	  command -v clang >/dev/null 2>&1 || { echo 'clang is required to generate LSM eBPF bindings' >&2; exit 1; }; \
-	  command -v llvm-strip >/dev/null 2>&1 || command -v llvm-objdump >/dev/null 2>&1 || echo 'warning: llvm tools not found; ensure LLVM is installed'; \
+	  cc="$$(bash internal/lsm/bpf_clang.sh)"; \
+	  echo "using $$cc to generate LSM eBPF bindings"; \
 	  echo 'installing pinned bpf2go v0.19.0...'; \
 	  go install github.com/cilium/ebpf/cmd/bpf2go@v0.19.0; \
 	  echo 'generating LSM BPF artifacts...'; \
@@ -80,14 +82,21 @@ lsm-generate: ## Generate LSM eBPF artifacts on the host system
 	fi
 
 .PHONY: lsm-generate-docker
-lsm-generate-docker: ## Generate LSM artifacts inside the Docker toolchain
+lsm-generate-docker: ## Generate LSM artifacts inside the pinned Docker toolchain
+	@set -euo pipefail; \
+	  echo "building $(LSM_DOCKER_IMAGE) (Dockerfile.leash bpf-toolchain)..."; \
+	  ctx="$$(mktemp -d)"; trap 'rm -rf "$$ctx"' EXIT; \
+	  $(DOCKER) buildx build --load \
+	    --target bpf-toolchain \
+	    -f Dockerfile.leash \
+	    -t $(LSM_DOCKER_IMAGE) "$$ctx"
 	@echo "running lsm-generate inside $(LSM_DOCKER_IMAGE)..."
-	@$(DOCKER) run --rm --platform=linux/amd64 --user 0 \
+	@$(DOCKER) run --rm --user 0 \
 	  -e CGO_ENABLED=1 -e GOWORK=off \
 	  -v "$(CURDIR)":/workspace \
 	  -w /workspace \
 	  $(LSM_DOCKER_IMAGE) \
-	  bash -lc 'set -euo pipefail; export PATH=$$PATH:/usr/local/go/bin:/go/bin; apt-get update >/dev/null; apt-get install -y --no-install-recommends clang llvm libbpf-dev pkg-config >/dev/null; go install github.com/cilium/ebpf/cmd/bpf2go@v0.19.0; make lsm-generate'
+	  bash -c 'set -euo pipefail; go install github.com/cilium/ebpf/cmd/bpf2go@v0.19.0; go generate ./internal/lsm'
 
 .PHONY: build-release
 build-release: build ## Build release artifacts and retag docker images
@@ -105,8 +114,9 @@ build-release: build ## Build release artifacts and retag docker images
 .PHONY: docker-base
 docker-base: precommit ## Build cached Docker base images if missing
 	@set -euo pipefail; \
-	  if ! $(DOCKER) image inspect leash/build-base:latest >/dev/null 2>&1; then \
-	    echo 'building leash/build-base:latest'; \
+	  if ! $(DOCKER) image inspect leash/build-base:latest >/dev/null 2>&1 || \
+	    ! $(DOCKER) run --rm --entrypoint clang-18 leash/build-base:latest --version >/dev/null 2>&1; then \
+	    echo 'building leash/build-base:latest (missing, or without the pinned clang-18)'; \
 	    $(DOCKER) buildx build --load \
 	      --target build-base \
 	      -f Dockerfile.leash \

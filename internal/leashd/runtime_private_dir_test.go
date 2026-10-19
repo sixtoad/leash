@@ -37,7 +37,7 @@ func TestPreFlightFailsOnKeyPermission(t *testing.T) {
 func TestPreFlightFailsWhenPrivateDirMissing(t *testing.T) {
 	t.Parallel()
 
-	privateDirMu.Lock()
+	release := leashEnv.acquire(t)
 	origPrivate, privateSet := os.LookupEnv("LEASH_PRIVATE_DIR")
 	origPublic, publicSet := os.LookupEnv("LEASH_DIR")
 	base := t.TempDir()
@@ -52,7 +52,7 @@ func TestPreFlightFailsWhenPrivateDirMissing(t *testing.T) {
 		} else {
 			_ = os.Unsetenv("LEASH_DIR")
 		}
-		privateDirMu.Unlock()
+		release()
 	})
 	cgroupDir := filepath.Join(base, "cgroup")
 	if err := os.MkdirAll(cgroupDir, 0o755); err != nil {
@@ -85,7 +85,7 @@ func TestPreFlightFailsWhenPrivateDirMissing(t *testing.T) {
 func setupRuntimeEnv(t *testing.T, includeBadKey bool) (*runtimeConfig, func()) {
 	t.Helper()
 
-	privateDirMu.Lock()
+	release := leashEnv.acquire(t)
 	base := t.TempDir()
 	origPrivate, privateSet := os.LookupEnv("LEASH_PRIVATE_DIR")
 	origPublic, publicSet := os.LookupEnv("LEASH_DIR")
@@ -138,10 +138,12 @@ func setupRuntimeEnv(t *testing.T, includeBadKey bool) (*runtimeConfig, func()) 
 		} else {
 			_ = os.Unsetenv("LEASH_DIR")
 		}
+		// Errorf, not Fatalf: release must run even when removal fails, or
+		// every later test blocks on the lock (#234).
 		if err := os.RemoveAll(base); err != nil {
-			t.Fatalf("cleanup runtime env: %v", err)
+			t.Errorf("cleanup runtime env: %v", err)
 		}
-		privateDirMu.Unlock()
+		release()
 	}
 	return cfg, cleanup
 }

@@ -50,6 +50,25 @@ Requirements: Linux with systemd, cgroup v2 with systemd user delegation
 (the default for rootless podman on current distributions), podman with crun
 (for `--group-add keep-groups`), and a kernel with `bpf` among its active LSMs.
 
+Two host setup steps that are easy to miss:
+
+- **Use crun, not runc.** Ubuntu's podman packages default to runc, which
+  fails `--group-add keep-groups` (only crun supports it), so the leash
+  container does not start. Install crun (`sudo apt install
+  crun`) and select it in `~/.config/containers/containers.conf`:
+
+  ```toml
+  [engine]
+  runtime = "crun"
+  ```
+
+  `podman info --format '{{.Host.OCIRuntime.Name}}'` should print `crun`.
+- **Run `podman system migrate` after joining the `leash` group.** Rootless
+  podman keeps a long-lived pause process that holds the user namespace with
+  the groups you had when it started. Logging back in is not enough: until you
+  run `podman system migrate` (which restarts that process), containers still
+  start without the `leash` group and the daemon socket is refused.
+
 ## What a rootless run does
 
 1. The runner detects a rootless engine (`podman info` reports
