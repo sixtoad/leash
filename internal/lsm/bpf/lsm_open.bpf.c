@@ -74,6 +74,7 @@ struct mount___proc {
 #define OP_LINK 7        // hard-link destination (new name)
 #define OP_LINK_SOURCE 8 // hard-link source (existing file)
 #define OP_CREATE 9      // new non-directory name: O_CREAT, mknod, mkfifo, socket bind
+#define OP_SYMLINK 10    // new symlink name (path_symlink)
 
 struct open_event {
     u32 pid;
@@ -892,21 +893,21 @@ static __noinline int build_created_path(const struct path *dir, struct dentry *
 }
 
 // check_directory_mutation for a created name (emits only a denial).
-static __noinline int check_created_name(const struct path *dir, struct dentry *dentry)
+static __noinline int check_created_name(const struct path *dir, struct dentry *dentry, u32 operation)
 {
     u32 zero = 0;
     struct mutation_scratch *scratch = bpf_map_lookup_elem(&mutation_scratch_map, &zero);
     struct mknod_scratch *walk = bpf_map_lookup_elem(&mknod_scratch_map, &zero);
     if (!scratch || !walk) {
-        return emit_mutation_decision(unresolved_path, OP_CREATE, 0);
+        return emit_mutation_decision(unresolved_path, operation, 0);
     }
     // The stamp also covers the walk buffer: every user stamps first.
     scratch->owner = bpf_get_current_pid_tgid();
     if (build_created_path(dir, dentry, walk->raw, scratch->target) != 0) {
-        return emit_mutation_decision(unresolved_path, OP_CREATE, 0);
+        return emit_mutation_decision(unresolved_path, operation, 0);
     }
     if (!check_mutation_policy(scratch->target)) {
-        return emit_mutation_decision(scratch->target, OP_CREATE, 0);
+        return emit_mutation_decision(scratch->target, operation, 0);
     }
     return mutation_generation_unchanged() ? 0 : -13;
 }
@@ -916,7 +917,7 @@ int BPF_PROG(lsm_mknod, const struct path *dir, struct dentry *dentry, umode_t m
 {
     if (ret != 0) return ret;
     if (!is_target_cgroup()) return 0;
-    ret = check_created_name(dir, dentry);
+    ret = check_created_name(dir, dentry, OP_CREATE);
     if (ret != 0) return ret;
     // io_uring always punts O_CREAT opens to an io-wq worker. As in
     // mark_allowed_overlay_open, a worker installs no correlation (it may not
@@ -930,6 +931,34 @@ int BPF_PROG(lsm_mknod, const struct path *dir, struct dentry *dentry, umode_t m
     u32 type = mode & S_IFMT_MASK;
     if (type == 0 || type == S_IFREG_MODE) return 0;
     return emit_current_mutation(OP_CREATE, 1);
+}
+
+// A new symlink is a new directory entry like any other (#226): symlinkat(2)
+// asks security_path_symlink before the inode exists, so a denial leaves
+// nothing behind. Same table, deny precedence and parent-path walk as
+// lsm_mknod (path_symlink is not sleepable either). The new name is decided,
+// not the link's target: the target is only resolved by a later open, which
+// file_open decides at the resolved path.
+//
+// No correlation skip: overlayfs creates its backing symlink with
+// vfs_symlink, which never re-enters security_path_symlink. An allowed overlay
+// symlink installs the correlation as an allowed create does; an io-wq worker
+// (io_uring always punts symlinkat) installs none and needs none, since
+// creating a symlink opens no backing file.
+//
+// Every decision is audited: nothing opens a new symlink, so no file_open
+// record follows an allowed one.
+SEC("lsm/path_symlink")
+int BPF_PROG(lsm_symlink, const struct path *dir, struct dentry *dentry, const char *old_name, int ret)
+{
+    if (ret != 0) return ret;
+    if (!is_target_cgroup()) return 0;
+    ret = check_created_name(dir, dentry, OP_SYMLINK);
+    if (ret != 0) return ret;
+    if (!current_is_io_worker() && mark_allowed_overlay_mutation(dir) != 0) {
+        return emit_current_mutation(OP_SYMLINK, 0);
+    }
+    return emit_current_mutation(OP_SYMLINK, 1);
 }
 
 // A detached procfs mount has no namespace mountpoint for bpf_d_path to report.

@@ -329,13 +329,17 @@ extension LeashMonitor {
                 // writing, as on Linux (path_mknod decides the entry before the
                 // inode exists, #204; file_open then sees the created file).
                 // mkdir is a mutation; so is any other object: fifo, socket and
-                // device (path_mknod on Linux too) and symlink, which the Linux
-                // LSM does not gate: macOS is stricter there, never looser.
+                // device (path_mknod on Linux too) and symlink (path_symlink,
+                // #226). The new name is decided, not the link's target, which
+                // a later open decides at the resolved path.
                 if type == 0 || type == S_IFREG {
                     return [
                         FileCheck(operation: .create, path: path, check: Self.mutation),
                         FileCheck(operation: .create, path: path, check: Self.creation)
                     ]
+                }
+                if type == S_IFLNK {
+                    return [FileCheck(operation: .symlink, path: path, check: Self.mutation)]
                 }
                 return [FileCheck(operation: .mkdir, path: path, check: Self.mutation)]
             }

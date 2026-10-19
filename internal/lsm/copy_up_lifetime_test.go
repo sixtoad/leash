@@ -67,7 +67,7 @@ func TestContainerCopyUpContextIsClearedAtSyscallExit(t *testing.T) {
 }
 
 func TestContainerCopyUpAttachmentOrderAndRequiredCleanup(t *testing.T) {
-	want := []string{"lsm_open", "lsm_mkdir", "lsm_unlink", "lsm_rmdir", "lsm_rename_source", "lsm_rename_destination", "lsm_mknod"}
+	want := []string{"lsm_open", "lsm_mkdir", "lsm_unlink", "lsm_rmdir", "lsm_rename_source", "lsm_rename_destination", "lsm_mknod", "lsm_symlink"}
 	if got := (&OpenLsm{}).requiredProgramNames(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("native required programs = %v", got)
 	}

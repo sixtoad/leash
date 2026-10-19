@@ -197,7 +197,7 @@ mode when the modes differ.
 **Directory mutations.** mkdir, unlink, rmdir, both sides of rename, the
 new name of a hard link and every other new name (`path_mknod`: a regular
 file from `open(O_CREAT)` or `mknod`, a fifo, a device, a unix socket's path,
-#204) are checked by the kernel against the path they create or remove,
+#204; `path_symlink`: a symlink, #226) are checked by the kernel against the path they create or remove,
 before the entry exists, through a
 table of their own: allow prefixes, deny prefixes and exact denies. They have
 no Cedar action. A mutation of path t is allowed iff Cedar allows
@@ -222,7 +222,15 @@ forbidden file cannot be unlinked even in a writable directory.
   the kernel refuses `bpf_d_path` there: the parent path is rebuilt by
   walking dentries and mounts as `d_path` does (to the task's root, or the
   namespace root), one step per `bpf_loop` iteration so the verifier checks
-  the step once. Symlinks (`path_symlink`) are still not gated on Linux.
+  the step once.
+- **Symlinks (#226).** `lsm_symlink` decides a new symlink's name the same
+  way, with the same walk (`path_symlink` is not sleepable either), before
+  the inode exists: a denied `ln -s` leaves nothing. The link's target is
+  not decided; it is only resolved by a later open, which `file_open`
+  decides at the resolved path. Every decision writes a `file.symlink`
+  record, since nothing opens a new symlink. overlayfs creates its backing
+  symlink through `vfs_symlink`, which does not re-enter `path_symlink`, so
+  there is no correlation skip either.
 
 - The compiler builds this table from those decisions, as `lsm.OpMutation`
   rules carried with the open rules: the single source of truth. It is never
@@ -323,10 +331,10 @@ mac-leash`. Differences that are macOS's own:
 - Endpoint Security reports `/tmp`, `/etc` and `/var` as `/private/...`; the
   matcher maps them back to the short form, and a policy naming a path only
   reachable in the `/private` form fails to compile for macOS.
-- Creating a regular file is decided as a write open of it (Linux sees the
-  created file in `file_open`); creating any other object (directory, symlink,
-  fifo) as a mutation; truncate, clonefile, copyfile and exchangedata as write
-  opens. Linux does not gate symlink or fifo creation: macOS is stricter there.
+- Creating a regular file is decided as a mutation and a write open of it
+  (Linux: `path_mknod`, then `file_open` of the created file); creating any
+  other object (directory, symlink, fifo, socket, device) as a mutation, as
+  on Linux; truncate, clonefile, copyfile and exchangedata as write opens.
 - The content filter never sees loopback flows, so loopback connections are
   not decided by the connect table on macOS. Leash's own listeners refuse
   leashed clients instead (peer PID check).

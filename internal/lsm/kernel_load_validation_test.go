@@ -229,7 +229,9 @@ const (
 	boxWrite = `: > "$1"`
 	boxRead  = `cat "$1" > /dev/null`
 	boxLink  = `ln "$1" "$2"`
-	eperm    = "Operation not permitted"
+	// boxSymlink creates the symlink $1 pointing at $2 (args[0] is the new name).
+	boxSymlink = `ln -s "$2" "$1"`
+	eperm      = "Operation not permitted"
 )
 
 func runBoxCases(t *testing.T, cgroupFD int, cases []boxCase) {
@@ -342,6 +344,13 @@ func (l longPathTrees) verifyCreates(t *testing.T, cgroupFD int) {
 		// The path is rebuilt across two mounts (mountM, /lp) to the rootfs:
 		// a wrong prefix would miss the rw grant and deny.
 		{boxCase{"native: O_CREAT inside the nested 146-byte mount", boxWrite, []string{l.mountM + "/leash-new"}, true, ""}},
+		// Symlinks are new entries too (#226), whatever they point at.
+		{boxCase{"native: symlink in dir with only exact file permits", boxSymlink, []string{denyDir + "leash-symlink", "/etc/hostname"}, false, ""}},
+		{boxCase{"native: symlink to a permitted file in dir without mutation authority", boxSymlink, []string{denyDir + "leash-symlink-ok", l.permit64}, false, ""}},
+		{boxCase{"native: symlink in rw dir", boxSymlink, []string{rwDir + "leash-symlink", "/etc/hostname"}, true, ""}},
+		{boxCase{"native: dangling symlink in rw dir", boxSymlink, []string{rwDir + "leash-dangling", "/nonexistent/leash"}, true, ""}},
+		// The parent path is rebuilt across two mounts, as for creates.
+		{boxCase{"native: symlink inside the nested 146-byte mount", boxSymlink, []string{l.mountM + "/leash-symlink", "/etc/hostname"}, true, ""}},
 	})
 }
 
@@ -359,7 +368,8 @@ func (b bindMountCases) policy() []string {
 }
 
 func (b bindMountCases) createdNames() []string {
-	return []string{bindMountRoot + "/creat-probe", bindMountRoot + "/touch-probe", bindMountRoot + "/fifo-probe", bindMountRoot + "/rw/ok"}
+	return []string{bindMountRoot + "/creat-probe", bindMountRoot + "/touch-probe", bindMountRoot + "/fifo-probe", bindMountRoot + "/rw/ok",
+		bindMountRoot + "/symlink-probe", bindMountRoot + "/rw/symlink-ok"}
 }
 
 // prepare runs after longPathTrees.prepare: the fallback source is on /lp.
@@ -407,6 +417,8 @@ func (b bindMountCases) verify(t *testing.T, cgroupFD int) {
 		{boxCase{"bind: mkfifo in default-deny volume", `mkfifo "$1"`, []string{bindMountRoot + "/fifo-probe"}, false, ""}},
 		{boxCase{"bind: O_CREAT on existing rw-permitted file in default-deny volume", boxWrite, []string{b.existing}, true, ""}},
 		{boxCase{"bind: O_CREAT in rw-permitted volume dir", boxWrite, []string{bindMountRoot + "/rw/ok"}, true, ""}},
+		{boxCase{"bind: symlink in default-deny volume", boxSymlink, []string{bindMountRoot + "/symlink-probe", b.existing}, false, ""}},
+		{boxCase{"bind: symlink in rw-permitted volume dir", boxSymlink, []string{bindMountRoot + "/rw/symlink-ok", b.existing}, true, ""}},
 	})
 }
 
@@ -414,6 +426,8 @@ func (b bindMountCases) auditPatterns() []string {
 	return []string{
 		`event=file.create .*path="` + regexp.QuoteMeta(bindMountRoot+"/creat-probe") + `" decision=denied`,
 		`event=file.open:rw .*path="` + regexp.QuoteMeta(b.existing) + `" decision=allowed`,
+		`event=file.symlink .*path="` + regexp.QuoteMeta(bindMountRoot+"/symlink-probe") + `" decision=denied`,
+		`event=file.symlink .*path="` + regexp.QuoteMeta(bindMountRoot+"/rw/symlink-ok") + `" decision=allowed`,
 	}
 }
 
@@ -741,7 +755,9 @@ collect:
 	required = append(required, bindMount.auditPatterns()...)
 	required = append(required,
 		`event=file.create .*path="`+regexp.QuoteMeta(longPathRoot+"/e/leash-null")+`" decision=denied`,
-		`event=file.create .*path="`+regexp.QuoteMeta(longPathRoot+"/s/leash-fifo")+`" decision=allowed`)
+		`event=file.create .*path="`+regexp.QuoteMeta(longPathRoot+"/s/leash-fifo")+`" decision=allowed`,
+		`event=file.symlink .*path="`+regexp.QuoteMeta(longPathRoot+"/e/leash-symlink")+`" decision=denied`,
+		`event=file.symlink .*path="`+regexp.QuoteMeta(longPaths.mountM+"/leash-symlink")+`" decision=allowed`)
 	var events []byte
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(250 * time.Millisecond) {
 		events, _ = os.ReadFile(eventLog)
