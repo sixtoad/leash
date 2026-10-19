@@ -183,7 +183,11 @@ func (l longPathTrees) prepare(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The exact file permits and okA sit in directories without mutation
+	// authority: creating them is a denied mutation (#204), writing them is
+	// not. They exist, so these writes are O_CREAT opens of existing files.
 	for _, file := range []string{l.blockedA, l.roSecretA, l.forbid64, l.forbid65, l.forbid255,
+		l.okA, l.permit64, l.permit65, l.permit64 + "x", l.file200, l.file255,
 		l.dirB + "victim.txt", l.siblingB + "victim.txt", l.dirB + "from.txt", l.deepM, l.shallowM,
 		l.linkDeepSecret, l.linkDeepOK, l.linkLongName, l.linkTmp} {
 		if err := os.WriteFile(file, []byte("x"), 0o666); err != nil {
@@ -249,6 +253,28 @@ func runBoxCases(t *testing.T, cgroupFD int, cases []boxCase) {
 	}
 }
 
+// createCase is a box case that creates args[0]. Whatever the shell reports,
+// the name must exist afterwards exactly when the case is allowed: a denied
+// create used to leave an empty file behind (#204).
+type createCase struct{ boxCase }
+
+func runCreateCases(t *testing.T, cgroupFD int, cases []createCase) {
+	t.Helper()
+	for _, c := range cases {
+		runBoxCases(t, cgroupFD, []boxCase{c.boxCase})
+		name := c.args[0]
+		_, err := os.Lstat(name)
+		switch {
+		case c.allow && err != nil:
+			t.Errorf("FAIL %s: allowed create left no %s: %v", c.name, name, err)
+		case !c.allow && err == nil:
+			t.Errorf("FAIL %s: denied create still left %s behind", c.name, name)
+		case !c.allow && !errors.Is(err, os.ErrNotExist):
+			t.Errorf("FAIL %s: stat %s: %v", c.name, name, err)
+		}
+	}
+}
+
 func (l longPathTrees) verify(t *testing.T, cgroupFD int) {
 	t.Helper()
 	runBoxCases(t, cgroupFD, []boxCase{
@@ -296,6 +322,99 @@ func (l longPathTrees) verify(t *testing.T, cgroupFD int) {
 		{"read >255-byte path under permitted mount (unresolvable)", boxRead, []string{l.deepM}, false, ""},
 		{"hard-link >255-byte source to a short alias", boxLink, []string{l.deepM, l.mountM + "/deep-alias"}, false, eperm},
 	})
+}
+
+// verifyCreates: on a plain filesystem (the /lp tmpfs, as in a native run) a
+// create in a directory without mutation authority is refused before the
+// name exists, whatever the object type (#204).
+func (l longPathTrees) verifyCreates(t *testing.T, cgroupFD int) {
+	t.Helper()
+	denyDir, rwDir := longPathRoot+"/e/", longPathRoot+"/s/"
+	runCreateCases(t, cgroupFD, []createCase{
+		{boxCase{"native: O_CREAT in dir with only exact file permits", boxWrite, []string{denyDir + "leash-new"}, false, ""}},
+		{boxCase{"native: touch a new file in dir with only exact file permits", `touch "$1"`, []string{denyDir + "leash-touch"}, false, ""}},
+		{boxCase{"native: mkfifo in dir without mutation authority", `mkfifo "$1"`, []string{denyDir + "leash-fifo"}, false, ""}},
+		{boxCase{"native: mknod char device in dir without mutation authority", `mknod "$1" c 1 3`, []string{denyDir + "leash-null"}, false, ""}},
+		{boxCase{"native: O_CREAT on existing exact-permitted file in that dir", boxWrite, []string{l.permit64}, true, ""}},
+		{boxCase{"native: O_CREAT in rw dir", boxWrite, []string{rwDir + "leash-new"}, true, ""}},
+		{boxCase{"native: mkfifo in rw dir", `mkfifo "$1"`, []string{rwDir + "leash-fifo"}, true, ""}},
+		{boxCase{"native: mknod fifo in rw dir", `mknod "$1" p`, []string{rwDir + "leash-pipe"}, true, ""}},
+		// The path is rebuilt across two mounts (mountM, /lp) to the rootfs:
+		// a wrong prefix would miss the rw grant and deny.
+		{boxCase{"native: O_CREAT inside the nested 146-byte mount", boxWrite, []string{l.mountM + "/leash-new"}, true, ""}},
+	})
+}
+
+// bindMountRoot is a host directory the gate script bind-mounts into the
+// container (-v), the shape of a workload volume. Run without it, the test
+// bind-mounts a tmpfs directory there instead.
+const bindMountRoot = "/leash-bind"
+
+type bindMountCases struct{ existing string }
+
+func newBindMountCases() bindMountCases { return bindMountCases{existing: bindMountRoot + "/existing"} }
+
+func (b bindMountCases) policy() []string {
+	return []string{"allow file.open:rw " + bindMountRoot + "/rw/", "allow file.open:rw " + b.existing}
+}
+
+func (b bindMountCases) createdNames() []string {
+	return []string{bindMountRoot + "/creat-probe", bindMountRoot + "/touch-probe", bindMountRoot + "/fifo-probe", bindMountRoot + "/rw/ok"}
+}
+
+// prepare runs after longPathTrees.prepare: the fallback source is on /lp.
+func (b bindMountCases) prepare(t *testing.T) {
+	t.Helper()
+	var root, bind syscall.Stat_t
+	if err := syscall.Stat("/", &root); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Stat(bindMountRoot, &bind); err != nil || bind.Dev == root.Dev {
+		src := longPathRoot + "/bind-src"
+		if err := os.MkdirAll(src, 0o777); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(bindMountRoot, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := syscall.Mount(src, bindMountRoot, "", syscall.MS_BIND, ""); err != nil {
+			t.Fatalf("bind-mount %s at %s: %v", src, bindMountRoot, err)
+		}
+		t.Cleanup(func() { _ = syscall.Unmount(bindMountRoot, syscall.MNT_DETACH); _ = os.Remove(bindMountRoot) })
+		t.Logf("bind cases: no %s volume, bind-mounted %s", bindMountRoot, src)
+	}
+	if err := os.MkdirAll(bindMountRoot+"/rw", 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(b.existing, []byte("x"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	// The volume is the gate host's temp dir: leave nothing root-owned in it.
+	t.Cleanup(func() { _ = os.Remove(bindMountRoot + "/rw"); _ = os.Remove(b.existing) })
+	for _, name := range b.createdNames() {
+		_ = os.Remove(name)
+		t.Cleanup(func() { _ = os.Remove(name) })
+	}
+}
+
+// verify: the issue's bind-mount repro (#204). The volume itself has no
+// rule (default deny); only its rw/ subdirectory and one existing file do.
+func (b bindMountCases) verify(t *testing.T, cgroupFD int) {
+	t.Helper()
+	runCreateCases(t, cgroupFD, []createCase{
+		{boxCase{"bind: O_CREAT in default-deny volume", boxWrite, []string{bindMountRoot + "/creat-probe"}, false, ""}},
+		{boxCase{"bind: touch a new file in default-deny volume", `touch "$1"`, []string{bindMountRoot + "/touch-probe"}, false, ""}},
+		{boxCase{"bind: mkfifo in default-deny volume", `mkfifo "$1"`, []string{bindMountRoot + "/fifo-probe"}, false, ""}},
+		{boxCase{"bind: O_CREAT on existing rw-permitted file in default-deny volume", boxWrite, []string{b.existing}, true, ""}},
+		{boxCase{"bind: O_CREAT in rw-permitted volume dir", boxWrite, []string{bindMountRoot + "/rw/ok"}, true, ""}},
+	})
+}
+
+func (b bindMountCases) auditPatterns() []string {
+	return []string{
+		`event=file.create .*path="` + regexp.QuoteMeta(bindMountRoot+"/creat-probe") + `" decision=denied`,
+		`event=file.open:rw .*path="` + regexp.QuoteMeta(b.existing) + `" decision=allowed`,
+	}
 }
 
 // verifyReload applies reloadPolicy live and checks the cases a root allow
@@ -461,8 +580,11 @@ func TestKernelLoadAllModulesWithExecRule(t *testing.T) {
 	longPaths.prepare(t)
 	overlayRoot := newOverlayRootCases()
 	overlayRoot.prepare(t)
+	bindMount := newBindMountCases()
+	bindMount.prepare(t)
 	loopback := newLoopbackTargets(t)
 	extra := append(longPaths.policy(), loopback.policy()...)
+	extra = append(extra, bindMount.policy()...)
 	policies := kernelLoadPolicySet(t, append(extra, overlayRoot.policy()...)...)
 	eventLog := filepath.Join(t.TempDir(), "events.log")
 	logger, err := NewSharedLogger(eventLog)
@@ -590,6 +712,9 @@ collect:
 	// Long policy paths must be enforced byte-for-byte by the attached
 	// file-open and directory-mutation hooks (issues #108/#109).
 	longPaths.verify(t, int(cgroupDir.Fd()))
+	// Creates are refused before the name exists (#204).
+	longPaths.verifyCreates(t, int(cgroupDir.Fd()))
+	bindMount.verify(t, int(cgroupDir.Fd()))
 	// Overlay-rootfs writes obey the policy like any other path (#186/#125).
 	overlayRoot.verify(t, int(cgroupDir.Fd()))
 	longPaths.verifyReload(t, openLsm, int(cgroupDir.Fd()))
@@ -602,7 +727,9 @@ collect:
 		`event=file.link .*path="` + regexp.QuoteMeta(longPaths.dirB+"final.txt") + `" decision=allowed`,
 		`event=file.link:source .*path="` + regexp.QuoteMeta(longPaths.linkTmp) + `" decision=allowed`,
 		`event=file.open:rw .*path="` + regexp.QuoteMeta(longPaths.file255) + `" decision=allowed`,
-		`event=file.open:rw .*path="` + regexp.QuoteMeta(longPaths.sibling255) + `" decision=denied`,
+		// The sibling does not exist: its create is refused first (#204),
+		// with the complete 255-byte path rebuilt without bpf_d_path.
+		`event=file.create .*path="` + regexp.QuoteMeta(longPaths.sibling255) + `" decision=denied`,
 		`event=file.open:rw .*path="` + regexp.QuoteMeta(longPaths.blockedA) + `" decision=denied`,
 		`event=file.unlink .*path="` + regexp.QuoteMeta(longPaths.dirB+"victim.txt") + `" decision=allowed`,
 		// No DNS-cache entry for loopback: the record must carry no hostname field.
@@ -611,6 +738,10 @@ collect:
 		`event=net.send .*protocol=udp addr="` + regexp.QuoteMeta(loopback.deniedAddr()) + `" decision=denied`,
 	}
 	required = append(required, overlayRoot.auditPatterns()...)
+	required = append(required, bindMount.auditPatterns()...)
+	required = append(required,
+		`event=file.create .*path="`+regexp.QuoteMeta(longPathRoot+"/e/leash-null")+`" decision=denied`,
+		`event=file.create .*path="`+regexp.QuoteMeta(longPathRoot+"/s/leash-fifo")+`" decision=allowed`)
 	var events []byte
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(250 * time.Millisecond) {
 		events, _ = os.ReadFile(eventLog)

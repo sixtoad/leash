@@ -235,8 +235,9 @@ func TestNativeWorkloadScript(t *testing.T) {
 		"/tmp/.X11-unix",
 		"cgroup.procs",
 		"exec unshare --ipc --pid --fork --mount-proc --",
-		"runuser -u alice --",
-		"/opt/leash --harden-exec --",
+		// harden-exec drops to the user itself: the bounding set can only be
+		// emptied before leaving root (#203).
+		"/opt/leash --harden-exec --user alice -- env -u",
 		"env -u DBUS_SESSION_BUS_ADDRESS -u DISPLAY -u XAUTHORITY",
 		// CA trust is exported for every tool family (Node, OpenSSL/curl, python-requests,
 		// git), not just Node — see the MITM-CA-for-non-Node change.
@@ -252,18 +253,27 @@ func TestNativeWorkloadScript(t *testing.T) {
 		t.Fatalf("cgroup write must come before the unshare: %s", h)
 	}
 	// The seccomp filter must be applied AFTER leash's own unshare/mount (so leash's
-	// setup succeeds) but is inherited by the agent: harden-exec sits inside runuser,
-	// which sits inside unshare.
-	if !(strings.Index(h, "unshare") < strings.Index(h, "runuser") &&
-		strings.Index(h, "runuser") < strings.Index(h, "--harden-exec")) {
-		t.Fatalf("harden-exec must nest inside runuser inside unshare: %s", h)
+	// setup succeeds) but is inherited by the agent: harden-exec sits inside
+	// unshare and does the user drop itself, so runuser (which would run it
+	// without CAP_SETPCAP, leaving CapBnd full) is not in the hardened chain.
+	if strings.Index(h, "unshare") > strings.Index(h, "--harden-exec") {
+		t.Fatalf("harden-exec must nest inside unshare: %s", h)
+	}
+	if strings.Contains(h, "runuser") {
+		t.Fatalf("the hardened script must drop the user in harden-exec, not runuser: %s", h)
+	}
+
+	// Explicit --user root (no drop user): harden-exec still runs, with no --user.
+	root := nativeWorkloadScript(cg, "/wd", "bash", nativeWorkloadShellFlag, "claude", "", "", "/opt/leash", hardenOpts{enabled: true, uid: "1000"})
+	if !strings.Contains(root, "/opt/leash --harden-exec -- ") || strings.Contains(root, "--user") || strings.Contains(root, "runuser") {
+		t.Fatalf("root script must harden without a user switch: %s", root)
 	}
 
 	// Hardened but no self path (os.Executable failed): degrade gracefully — the
-	// session isolation still applies, but no seccomp re-exec.
+	// session isolation and the runuser drop still apply, but no harden re-exec.
 	noSelf := nativeWorkloadScript(cg, "/wd", "bash", nativeWorkloadShellFlag, "claude", "alice", "", "", hardenOpts{enabled: true, uid: "1000"})
-	if strings.Contains(noSelf, "--harden-exec") {
-		t.Fatalf("no-self script must not contain harden-exec: %s", noSelf)
+	if strings.Contains(noSelf, "--harden-exec") || !strings.Contains(noSelf, "runuser -u alice --") {
+		t.Fatalf("no-self script must drop with runuser and not harden-exec: %s", noSelf)
 	}
 
 	// GUI opt-outs: --allow-display + --share-ipc → no X11 mask, DISPLAY kept, no

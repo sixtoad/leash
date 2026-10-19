@@ -164,18 +164,30 @@ func (c *Client) do(req Request) (Message, error) {
 	defer timer.Stop()
 	select {
 	case m := <-c.results:
-		if !m.OK {
-			if m.Error == "" {
-				m.Error = "refused"
-			}
-			return m, errors.New(m.Error)
-		}
-		return m, nil
+		return answer(m)
 	case <-c.ended:
+		// The reader queues a result before it marks the session ended, so a
+		// result the daemon sent first (a failed attach's reason, a detach's
+		// success) is already waiting here: it is this request's answer.
+		select {
+		case m := <-c.results:
+			return answer(m)
+		default:
+		}
 		return Message{}, c.endErr
 	case <-timer.C:
 		return Message{}, fmt.Errorf("no answer from the enforcer daemon within %s", c.timeout)
 	}
+}
+
+func answer(m Message) (Message, error) {
+	if !m.OK {
+		if m.Error == "" {
+			m.Error = "refused"
+		}
+		return m, errors.New(m.Error)
+	}
+	return m, nil
 }
 
 // Status asks the daemon to describe itself.

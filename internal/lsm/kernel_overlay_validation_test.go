@@ -40,6 +40,8 @@ type overlayRootCases struct {
 	uringHelper     string // copy of this test binary where the box may exec it
 	linkSource      string // readable lower-layer image file
 	linkTarget      string // in the permitted rw dir
+	genericDir      string // image directory under only a generic /etc/-style allow (no rw dir grant)
+	rwDir           string // image directory under the /tmp/ rw allow
 }
 
 func newOverlayRootCases() overlayRootCases {
@@ -58,6 +60,8 @@ func newOverlayRootCases() overlayRootCases {
 		uringHelper:     "/usr/local/bin/leash-ovl-uring-helper",
 		linkSource:      "/etc/issue",
 		linkTarget:      "/tmp/leash-ovl-issue-link",
+		genericDir:      "/usr",
+		rwDir:           "/tmp",
 	}
 }
 
@@ -83,8 +87,9 @@ func (o overlayRootCases) prepare(t *testing.T) {
 			t.Fatalf("image file %s: %v", file, err)
 		}
 	}
-	for _, path := range []string{o.renameTarget, o.renameOKTo, o.linkTarget, o.linkTarget + "-denied", o.defaultDenyDir + "/leash-ovl-new", o.permittedDir + "/leash-ovl-new"} {
+	for _, path := range append([]string{o.renameTarget, o.renameOKTo, o.linkTarget, o.linkTarget + "-denied"}, o.createdNames()...) {
 		_ = os.Remove(path)
+		t.Cleanup(func() { _ = os.Remove(path) })
 	}
 	for _, file := range []string{o.renameOKFrom, o.uringPermitted} {
 		if err := os.WriteFile(file, []byte("x"), 0o666); err != nil {
@@ -106,13 +111,13 @@ func (o overlayRootCases) verify(t *testing.T, cgroupFD int) {
 	runBoxCases(t, cgroupFD, []boxCase{
 		{"overlay: write default-deny image file", boxWrite, []string{o.defaultDenyFile}, false, ""},
 		{"overlay: append default-deny image file", `echo x >> "$1"`, []string{o.defaultDenyFile}, false, ""},
-		{"overlay: O_CREAT in default-deny image dir", boxWrite, []string{o.defaultDenyDir + "/leash-ovl-new"}, false, ""},
 		{"overlay: write image file under :rw forbid", boxWrite, []string{o.forbiddenWrite}, false, ""},
 		{"overlay: read image file under :rw forbid (read still permitted)", boxRead, []string{o.forbiddenWrite}, true, ""},
 		{"overlay: read forbidden image file", boxRead, []string{o.readForbidden}, false, ""},
 		{"overlay: read default-deny image file", boxRead, []string{o.defaultDenyFile}, false, ""},
+		// O_CREAT on an existing file in a directory without mutation
+		// authority: the create check only drops O_CREAT, the open decides.
 		{"overlay: write permitted lower-layer image file (copy-up)", `echo x >> "$1"`, []string{o.permittedLower}, true, ""},
-		{"overlay: O_CREAT in permitted image dir", boxWrite, []string{o.permittedDir + "/leash-ovl-new"}, true, ""},
 		{"overlay: rename default-deny image file into permitted rw dir", `mv "$1" "$2"`, []string{o.renameSource, o.renameTarget}, false, ""},
 		{"overlay: rename inside permitted rw dir", `mv "$1" "$2"`, []string{o.renameOKFrom, o.renameOKTo}, true, ""},
 		// The link copies the lower-layer source up; its backing opens ride the
@@ -120,6 +125,7 @@ func (o overlayRootCases) verify(t *testing.T, cgroupFD int) {
 		{"overlay: hard-link readable lower-layer image file into permitted rw dir", boxLink, []string{o.linkSource, o.linkTarget}, true, ""},
 		{"overlay: hard-link default-deny image file into permitted rw dir", boxLink, []string{o.defaultDenyFile, o.linkTarget + "-denied"}, false, eperm},
 	})
+	o.verifyCreates(t, cgroupFD)
 	o.verifyURing(t, cgroupFD)
 	if _, err := os.Stat(o.renameTarget); err == nil {
 		t.Errorf("FAIL overlay: denied rename still moved %s to %s", o.renameSource, o.renameTarget)
@@ -129,6 +135,34 @@ func (o overlayRootCases) verify(t *testing.T, cgroupFD int) {
 	}
 }
 
+// createdNames are the names the create cases may leave behind.
+func (o overlayRootCases) createdNames() []string {
+	return []string{
+		o.defaultDenyDir + "/leash-ovl-new", o.defaultDenyDir + "/leash-ovl-fifo", o.defaultDenyDir + "/leash-ovl-null",
+		o.permittedDir + "/leash-ovl-new", o.genericDir + "/leash-ovl-touch",
+		o.rwDir + "/leash-ovl-new", o.rwDir + "/leash-ovl-fifo",
+	}
+}
+
+// verifyCreates: a denied create must leave no name behind (#204). The
+// kernel creates the inode before file_open runs, so only a check on
+// path_mknod can refuse it in time. The kernel-load policy is a legacy rule
+// set, whose derived mutation table grants only rw directory rules: /etc/
+// and /usr/ (generic allows) get no new entries, /tmp/ does.
+func (o overlayRootCases) verifyCreates(t *testing.T, cgroupFD int) {
+	t.Helper()
+	cases := []createCase{
+		{boxCase{"overlay: O_CREAT in default-deny image dir", boxWrite, []string{o.defaultDenyDir + "/leash-ovl-new"}, false, ""}},
+		{boxCase{"overlay: O_CREAT in generic-only image dir", boxWrite, []string{o.permittedDir + "/leash-ovl-new"}, false, ""}},
+		{boxCase{"overlay: touch a new file in generic-only image dir", `touch "$1"`, []string{o.genericDir + "/leash-ovl-touch"}, false, ""}},
+		{boxCase{"overlay: mkfifo in default-deny image dir", `mkfifo "$1"`, []string{o.defaultDenyDir + "/leash-ovl-fifo"}, false, ""}},
+		{boxCase{"overlay: mknod char device in default-deny image dir", `mknod "$1" c 1 3`, []string{o.defaultDenyDir + "/leash-ovl-null"}, false, ""}},
+		{boxCase{"overlay: O_CREAT in permitted rw image dir", boxWrite, []string{o.rwDir + "/leash-ovl-new"}, true, ""}},
+		{boxCase{"overlay: mkfifo in permitted rw image dir", `mkfifo "$1"`, []string{o.rwDir + "/leash-ovl-fifo"}, true, ""}},
+	}
+	runCreateCases(t, cgroupFD, cases)
+}
+
 // auditPatterns are records the overlay cases must leave in the event log.
 func (o overlayRootCases) auditPatterns() []string {
 	return []string{
@@ -136,5 +170,8 @@ func (o overlayRootCases) auditPatterns() []string {
 		`event=file.open:rw .*path="` + regexp.QuoteMeta(o.forbiddenWrite) + `" decision=denied`,
 		`event=file.open:rw .*path="` + regexp.QuoteMeta(o.permittedLower) + `" decision=allowed`,
 		`event=file.rename .*path="` + regexp.QuoteMeta(o.renameSource) + `" decision=denied`,
+		`event=file.create .*path="` + regexp.QuoteMeta(o.defaultDenyDir+"/leash-ovl-new") + `" decision=denied`,
+		`event=file.create .*path="` + regexp.QuoteMeta(o.genericDir+"/leash-ovl-touch") + `" decision=denied`,
+		`event=file.create .*path="` + regexp.QuoteMeta(o.rwDir+"/leash-ovl-fifo") + `" decision=allowed`,
 	}
 }
