@@ -197,8 +197,10 @@ kernel enforcement.
   attaching to their own cgroups. That is not an escalation.
 - The daemon trusts its caller's resolved addresses for hostname rules. They
   only feed rules that cover the caller's own workload.
-- SELinux hosts (Fedora, RHEL): the leash container connecting to a socket in
-  `/run` may need a policy module; not verified.
+- SELinux hosts (Fedora, RHEL): verified on Fedora 44 (podman 5, SELinux
+  enforcing, including `userns = "keep-id"` and fuse-overlayfs storage); the
+  socket needs no policy module. The agent container's project and config
+  mounts need a label decision: see [SELINUX.md](SELINUX.md).
 - Rootless Docker is not supported yet
   ([#207](https://github.com/sixtoad/leash/issues/207)). Its containers cannot
   keep the caller's `leash` group, so a rootless Docker run is refused.

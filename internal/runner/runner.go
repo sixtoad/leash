@@ -109,6 +109,7 @@ type options struct {
 	containerName  string
 	network        string
 	runtime        string
+	selinuxMode    string // --selinux: auto|relabel|disable (see selinux_workspace.go)
 	listen         string
 	listenSet      bool
 	openUI         bool
@@ -185,6 +186,7 @@ type config struct {
 	listenCfg           listen.Config
 	listenExplicit      bool
 	dockerNetwork       string
+	selinuxMode         string
 	runtime             string
 	dropUser            string
 	// loginShell runs the container governed command through a login shell
@@ -554,6 +556,7 @@ Flags:
   --container-name <name>         Force the exact agent container name (no sanitization, no collision suffix; leash container becomes <name>-leash).
   --network <name>                Attach the agent container to a docker network (e.g. a compose network). The leash container follows it automatically.
   --runtime <docker|podman>       Container runtime CLI to drive (defaults to docker).
+  --selinux <auto|relabel|disable>  (container, SELinux hosts) How the agent container reaches the project and agent config mounts. auto (default) refuses when they are not labelled for containers; relabel adds :z to them (persistent container_file_t label); disable runs the agent container with label=disable (leash enforcement unchanged, no SELinux confinement). Also LEASH_SELINUX.
   --login-shell                   (container) Run the command via a login shell (<shell> -lc), sourcing /etc/profile. Default is a non-login shell (-c), which preserves the image's ENV PATH. Native always uses a login shell.
   --cpus <n>                      (container) CPU limit for the target container, e.g. 1.5. Also LEASH_CPUS or [leash.resources] cpus.
   --memory <n[b|k|m|g]>           (container) Hard memory limit for the target container (swap pinned to the same value), e.g. 2g. Also LEASH_MEMORY or [leash.resources] memory.
@@ -574,6 +577,7 @@ Environment variables:
   LEASH_LISTEN                 Overrides Control UI bind address.
   LEASH_NETWORK                Docker network for the agent container (overridden by --network).
   LEASH_RUNTIME                Container runtime CLI: docker (default) or podman (overridden by --runtime).
+  LEASH_SELINUX                SELinux mode for the agent container's project/config mounts: auto, relabel or disable (same as --selinux).
   LEASH_EXTRA_ARGS             Additional arguments passed into leash-entry.
   LEASH_CGROUP_PATH            Override cgroup path for the leash container.
   LEASH_REQUIRE_LSM            Accepted for compatibility; no effect (fail-closed is the only posture; a falsy value does NOT opt out).
@@ -845,6 +849,12 @@ func parseArgs(args []string) (options, error) {
 				return opts, fmt.Errorf("missing argument for %s", arg)
 			}
 			opts.network = strings.TrimSpace(args[i+1])
+			i++
+		case "--selinux":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for %s", arg)
+			}
+			opts.selinuxMode = strings.TrimSpace(args[i+1])
 			i++
 		case "--runtime":
 			if i+1 >= len(args) {
@@ -1559,6 +1569,18 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 	if cfg.runtime == "" {
 		cfg.runtime = defaultRuntimeName()
 	}
+
+	// SELinux handling of the agent container's user-owned mounts (#175).
+	// Flag wins over LEASH_SELINUX; validated here so a typo fails early.
+	selinuxRaw := strings.TrimSpace(os.Getenv("LEASH_SELINUX"))
+	if trimmed := strings.TrimSpace(opts.selinuxMode); trimmed != "" {
+		selinuxRaw = trimmed
+	}
+	selinuxMode, err := parseSELinuxMode(selinuxRaw)
+	if err != nil {
+		return config{}, nil, err
+	}
+	cfg.selinuxMode = selinuxMode
 
 	if err := validatePostureOverrides(opts.envVars); err != nil {
 		return cfg, nil, err
@@ -2662,12 +2684,29 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 	}
 	entryName := fmt.Sprintf("leash-entry-linux-%s", arch)
 
+	selinuxMode, err := r.selinuxTargetMode(ctx, r.userOwnedTargetMounts())
+	if err != nil {
+		return err
+	}
+	userMount := func(host, container, mode string) string {
+		if selinuxMode == selinuxModeRelabel {
+			mode = withSELinuxRelabelMode(mode)
+		}
+		if mode == "" {
+			return fmt.Sprintf("%s:%s", host, container)
+		}
+		return fmt.Sprintf("%s:%s:%s", host, container, mode)
+	}
+
 	args := []string{
 		"run", "--pull=missing", "-d",
 		"--name", r.cfg.targetContainer,
 		"--user", "0",
 		"--entrypoint", filepath.Join(leashPublicMount, entryName),
 		"--cgroupns", "host",
+	}
+	if selinuxMode == selinuxModeDisable {
+		args = append(args, "--security-opt", "label=disable")
 	}
 	// Join the user-requested docker network (issue #69). The leash container
 	// attaches to this container's netns, so it follows onto the same network.
@@ -2693,7 +2732,7 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 	}
 	args = append(args,
 		"-v", r.internalBindMountSpec(r.cfg.shareDir, leashPublicMount, ""),
-		"-v", fmt.Sprintf("%s:%s", r.cfg.callerDir, r.cfg.callerDir),
+		"-v", userMount(r.cfg.callerDir, r.cfg.callerDir, ""),
 		"-w", r.cfg.callerDir,
 		"-e", fmt.Sprintf("LEASH_DIR=%s", leashPublicMount),
 		"-e", fmt.Sprintf("LEASH_ENTRY_READY_FILE=%s/%s", leashPublicMount, entrypoint.ReadyFileName),
@@ -2791,7 +2830,7 @@ func (r *runner) launchTargetContainer(ctx context.Context, stopSignal string) e
 				// No additional validation; defer to docker `-v` handling.
 			}
 
-			args = append(args, "-v", fmt.Sprintf("%s:%s:%s", host, container, mount.Mode))
+			args = append(args, "-v", userMount(host, container, mount.Mode))
 			existingPairs[key] = struct{}{}
 			existingContainers[container] = struct{}{}
 			targetMounts = append(targetMounts, container)
@@ -2900,6 +2939,22 @@ func (r *runner) shouldRelabelMountPath(host string) bool {
 	}
 	host = filepath.Clean(strings.TrimSpace(host))
 	return host == workDir || strings.HasPrefix(host, workDir+string(os.PathSeparator))
+}
+
+// userOwnedTargetMounts lists the caller-owned host paths the target container
+// binds and leash itself chooses: the project directory and the existing
+// auto-mounted agent config. Explicit -v volumes keep the caller's own flags.
+func (r *runner) userOwnedTargetMounts() []string {
+	paths := []string{r.cfg.callerDir}
+	if r.mountState != nil {
+		for _, mount := range r.mountState.mounts {
+			host := filepath.Clean(mount.Host)
+			if _, err := os.Stat(host); err == nil {
+				paths = append(paths, host)
+			}
+		}
+	}
+	return paths
 }
 
 func (r *runner) internalBindMountSpec(host, container, mode string) string {
