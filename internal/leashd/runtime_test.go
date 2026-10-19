@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"log"
 
@@ -25,14 +26,71 @@ when {
 
 var (
 	iptablesOverrideMu sync.Mutex
-	privateDirMu       sync.Mutex
 	logCaptureMu       sync.Mutex
 )
+
+// leashEnv serializes the tests that use the process-wide LEASH_DIR and
+// LEASH_PRIVATE_DIR: those that point them at their own directories, and
+// those whose code writes there (a policy API persisting cedar-runtime.cedar
+// into LEASH_DIR). A test that writes there without holding it races another
+// test's RemoveAll of its directory (#234).
+var leashEnv = &envLock{sem: make(chan struct{}, 1)}
+
+// envLockWait bounds how long a test waits for leashEnv. The holders are short
+// tests, so a long wait means the holder is hung or leaked the lock; failing
+// then names it, instead of every later test blocking until go test's
+// 10-minute timeout.
+const envLockWait = 2 * time.Minute
+
+type envLock struct {
+	sem    chan struct{}
+	mu     sync.Mutex
+	holder string
+}
+
+// acquire takes the lock for t. The returned release is idempotent and is
+// also registered as a cleanup, so a failure anywhere in the test (setup, body
+// or another cleanup) can never leak the lock (#234).
+func (l *envLock) acquire(t *testing.T) (release func()) {
+	t.Helper()
+	timer := time.NewTimer(envLockWait)
+	defer timer.Stop()
+	select {
+	case l.sem <- struct{}{}:
+	case <-timer.C:
+		l.mu.Lock()
+		holder := l.holder
+		l.mu.Unlock()
+		t.Fatalf("waited %s for the LEASH_DIR test lock, still held by %s: that test is hung or leaked the lock\n%s",
+			envLockWait, holder, allGoroutines())
+	}
+	l.mu.Lock()
+	l.holder = t.Name()
+	l.mu.Unlock()
+	var once sync.Once
+	release = func() {
+		once.Do(func() {
+			l.mu.Lock()
+			l.holder = ""
+			l.mu.Unlock()
+			<-l.sem
+		})
+	}
+	t.Cleanup(release)
+	return release
+}
+
+// allGoroutines returns every goroutine's stack, so a test that gives up
+// waiting shows what is blocked.
+func allGoroutines() string {
+	buf := make([]byte, 1<<20)
+	return string(buf[:runtime.Stack(buf, true)])
+}
 
 func provisionLeashEnv(t *testing.T) (string, string) {
 	t.Helper()
 
-	privateDirMu.Lock()
+	release := leashEnv.acquire(t)
 	base, err := os.MkdirTemp("", "leash-env-")
 	if err != nil {
 		t.Fatalf("failed to create leash env base: %v", err)
@@ -66,8 +124,10 @@ func provisionLeashEnv(t *testing.T) (string, string) {
 		} else {
 			_ = os.Unsetenv("LEASH_PRIVATE_DIR")
 		}
-		_ = os.RemoveAll(base)
-		privateDirMu.Unlock()
+		if err := os.RemoveAll(base); err != nil {
+			t.Errorf("cleanup leash env: %v", err)
+		}
+		release()
 	})
 
 	return publicDir, privateDir

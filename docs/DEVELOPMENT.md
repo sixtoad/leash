@@ -18,6 +18,45 @@ make docker build
 # See also: make help
 ```
 
+## eBPF toolchain
+
+The eBPF LSM objects (`internal/lsm/*_bpf{el,eb}.o`, embedded into the leash
+CLI and the manager image) are generated with **clang/LLVM 18** and nothing
+else. A different clang can compile the same sources into objects the kernel
+verifier rejects: Debian bookworm's packaged clang (the one in the
+`golang:1.25` image) builds `lsm_rename_*` programs that kernel 6.8 refuses
+with "verifier bug", while Ubuntu noble's clang 18 loads them (#227).
+
+`internal/lsm/bpf_clang.sh` holds the pinned major and is the single check:
+`go generate ./internal/lsm` runs it before bpf2go, so every generation path
+(`make lsm-generate`, `make lsm-generate-docker`, `Dockerfile.leash`,
+`scripts/release.sh`, CI) goes through it. It uses `clang-18` when installed
+(else `clang`, which must then be 18) and refuses any other major with an
+error naming the compiler it found; `BPF2GO_CC` picks a different binary but
+never skips the check.
+
+Where the toolchain comes from:
+
+| Path | Toolchain |
+|---|---|
+| Linux host (`make lsm-generate`) | install `clang-18 llvm-18 libbpf-dev` (Ubuntu 24.04: `apt install clang-18 llvm-18 libbpf-dev`; elsewhere apt.llvm.org) |
+| `make lsm-generate-docker` (the macOS default, and the release script's fallback) | `leash/bpf-toolchain:latest`, built from the `bpf-toolchain` stage of `Dockerfile.leash` (`ubuntu:noble` + `clang-18`/`llvm-18`, Go copied from `golang:1.25.3`) |
+| `Dockerfile.leash` (`lsm-generate` stage) | `build-base`, which extends `bpf-toolchain` |
+| CI and release workflows | Ubuntu runner packages (`clang-18`/`llvm-18`, or `clang` = 18 on 24.04) |
+
+CI's `kernel-load (Docker-built objects)` job generates the objects with
+`make lsm-generate-docker` and runs the verifier load against them, next to
+the `kernel-load` job for host-built objects.
+
+A `leash/build-base:latest` cached from before the pin has Debian's clang;
+`make docker-base` rebuilds it when it lacks `clang-18` (or remove it with
+`docker image rm leash/build-base:latest`).
+
+To move to another clang major, change `REQUIRED_MAJOR` in
+`internal/lsm/bpf_clang.sh`, the `clang-18`/`llvm-18` packages in
+`Dockerfile.leash`, and `BPF_CLANG_MAJOR` in `.github/workflows/ci.yml`
+together, and let both kernel-load jobs pass.
+
 ## Versioning
 
 Version strings are resolved centrally by `build/versionator.py`. The helper looks for:

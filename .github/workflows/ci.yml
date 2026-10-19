@@ -20,6 +20,8 @@ env:
   GO_VERSION: '1.25.3'
   # Pinned as in the Makefile (lsm-generate) and Dockerfile.leash.
   BPF2GO_VERSION: v0.19.0
+  # The eBPF clang/LLVM major (#227); internal/lsm/bpf_clang.sh enforces it.
+  BPF_CLANG_MAJOR: '18'
   GOFLAGS: -buildvcs=false
 
 jobs:
@@ -100,8 +102,8 @@ jobs:
       - name: Install eBPF toolchain
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends clang llvm libbpf-dev pkg-config
-          clang --version | head -1
+          sudo apt-get install -y -q --no-install-recommends "clang-${BPF_CLANG_MAJOR}" "llvm-${BPF_CLANG_MAJOR}" libbpf-dev pkg-config
+          bash internal/lsm/bpf_clang.sh
 
       - name: Generate eBPF objects and embedded leash-entry
         run: |
@@ -148,7 +150,8 @@ jobs:
       - name: Install eBPF toolchain
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends clang llvm libbpf-dev pkg-config
+          sudo apt-get install -y -q --no-install-recommends "clang-${BPF_CLANG_MAJOR}" "llvm-${BPF_CLANG_MAJOR}" libbpf-dev pkg-config
+          bash internal/lsm/bpf_clang.sh
 
       - name: Generate eBPF objects
         run: |
@@ -188,6 +191,55 @@ jobs:
             echo "| program | verifier-processed instructions |"
             echo "|---|---:|"
             sed -nE 's#.* ([a-z_]+/[A-Za-z0-9_]+): ([0-9]+) verifier-processed instructions.*#| \1 | \2 |#p' kernel-load.log 2>/dev/null
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The Docker generation path (`make lsm-generate-docker`, which
+  # scripts/release.sh falls back to; Dockerfile.leash's build-base extends the
+  # same bpf-toolchain stage) must produce objects the verifier loads too: a
+  # Debian golang image's clang once produced objects that 6.8 rejects (#227).
+  kernel-load-docker:
+    name: kernel-load (Docker-built objects)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6.1.0
+
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - uses: docker/setup-buildx-action@v4.4.1
+
+      # No host toolchain is installed: the objects come from the image.
+      - name: Generate eBPF objects in the Docker toolchain
+        run: |
+          make lsm-generate-docker
+          sudo chown -R "$(id -u):$(id -g)" internal/lsm
+          ls -l internal/lsm/*_bpf*.o
+          docker run --rm --entrypoint clang-18 leash/bpf-toolchain:latest --version | head -1 | tee toolchain.txt
+
+      - name: Verifier load + attach
+        env:
+          LEASH_KERNEL_LOAD_ALLOW_INERT: '1'
+        run: |
+          set -o pipefail
+          scripts/verify-lsm-kernel-load.sh 2>&1 | tee kernel-load.log
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### eBPF kernel load (Docker-built objects)"
+            echo
+            echo "- kernel: \`$(uname -r)\`"
+            echo "- toolchain: \`$(cat toolchain.txt 2>/dev/null)\`"
+            if grep -q -- '^--- PASS: TestKernelLoadAllModulesWithExecRule' kernel-load.log 2>/dev/null; then
+              echo "- result: verified, attached and enforcement checked"
+            elif grep -q 'LSM-INERT' kernel-load.log 2>/dev/null; then
+              echo "- result: verified and attached; enforcement not checked (bpf not an active LSM)"
+            else
+              echo "- result: **failed** (see log)"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
   test-darwin:
