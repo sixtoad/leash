@@ -6,10 +6,16 @@ ARG UI_SOURCE=ui-build
 ARG BASE_BUILD_IMAGE=leash/build-base:latest
 ARG BASE_RUNTIME_IMAGE=leash/runtime-base:latest
 
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS build-base
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS go-toolchain
+
+# The pinned eBPF toolchain (#227): Ubuntu noble's clang 18, the compiler the
+# CI and release runners generate and verifier-load the LSM objects with.
+# Debian bookworm's packaged clang (the golang image's) builds objects that
+# kernel 6.8 rejects. internal/lsm/bpf_clang.sh refuses any other major; keep
+# the two in step. Go is copied from the official image (static binaries).
+# `make lsm-generate-docker` runs in this stage; build-base extends it.
+FROM --platform=$BUILDPLATFORM ubuntu:noble AS bpf-toolchain
 ARG DEBIAN_FRONTEND
-# Install Node.js 20 repo first (required by Next.js 16)
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -18,12 +24,24 @@ RUN set -eux; \
         git \
         make \
         pkg-config \
-        clang \
-        llvm \
+        clang-18 \
+        llvm-18 \
         libbpf-dev \
         libelf-dev \
-        build-essential \
-        nodejs; \
+        build-essential; \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=go-toolchain /usr/local/go /usr/local/go
+ENV GOPATH=/go \
+    PATH=/usr/local/go/bin:/go/bin:$PATH
+RUN clang-18 --version | head -1 && go version
+
+FROM bpf-toolchain AS build-base
+ARG DEBIAN_FRONTEND
+# Install Node.js 20 repo first (required by Next.js 16)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends nodejs; \
     rm -rf /var/lib/apt/lists/*
 RUN npm install -g pnpm
 
