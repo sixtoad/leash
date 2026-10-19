@@ -37,8 +37,8 @@ or be refused, never silently weaker.**
 | Workload launch | after the LSM is attached | after ES, NE and the proxy are connected, ES and NE applied the daemon's current tables, and ES tracks leashcli | `leash --darwin exec` gate; leashcli runs nothing without the go-ahead |
 | Policy semantics | kernel tables from Cedar | the same tables, the same lookups | parity test: random strict policies, Go model of the Swift matcher == `cedar.Authorize`; vectors replayed against Swift |
 | File open, by mode (read / write) | eBPF `file_open` | ES `AUTH_OPEN` | exact, prefix and directory entries; longest prefix; forbid-overrides-permit via the compiled exceptions |
-| File creation | `file_open` of the new file | ES `AUTH_CREATE` (write open of the new file), `AUTH_TRUNCATE`, `AUTH_CLONE`, `AUTH_COPYFILE`, `AUTH_EXCHANGEDATA` | |
-| Directory mutations (mkdir, unlink, rmdir, rename, link) | mutation table | ES `AUTH_CREATE` (non-regular), `AUTH_UNLINK`, `AUTH_RENAME`, `AUTH_LINK` | same table, same over-denials |
+| File creation | mutation table (`path_mknod`, before the file exists) and `file_open` of the new file | ES `AUTH_CREATE` (mutation table and write open of the new file), `AUTH_TRUNCATE`, `AUTH_CLONE`, `AUTH_COPYFILE`, `AUTH_EXCHANGEDATA` | a denied create leaves no file (#204) |
+| Directory mutations (mkdir, unlink, rmdir, rename, link, mknod/mkfifo/socket) | mutation table | ES `AUTH_CREATE` (non-regular), `AUTH_UNLINK`, `AUTH_RENAME`, `AUTH_LINK` | same table, same over-denials; macOS also gates symlinks |
 | Hard-link source must be readable | link guard | `AUTH_LINK` | |
 | Exec | eBPF `bprm_check_security` | ES `AUTH_EXEC` | exact and prefix rules, kernel length limits apply |
 | Network: IPv4, IPv6, ports, default deny | eBPF connect/sendmsg | NE content filter | hostnames resolved at load, IPv4-mapped decided as IPv4 |

@@ -120,6 +120,14 @@ jobs:
       - name: go test -race (non-root)
         run: go test -race -count=1 ./...
 
+      # The native workload hardening (empty capability bounding set, no
+      # capability left, no_new_privs, seccomp, the user drop; #203) can only
+      # be exercised as root; the non-root run above checks it refuses.
+      - name: native workload hardening (root)
+        run: |
+          go test -c -o "$RUNNER_TEMP/hardening.test" ./internal/hardening
+          sudo "$RUNNER_TEMP/hardening.test" -test.v -test.count=1 -test.run 'TestHardened'
+
   kernel-load:
     name: kernel-load
     runs-on: ubuntu-latest

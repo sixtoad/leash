@@ -73,6 +73,7 @@ struct mount___proc {
 #define OP_RENAME 6
 #define OP_LINK 7        // hard-link destination (new name)
 #define OP_LINK_SOURCE 8 // hard-link source (existing file)
+#define OP_CREATE 9      // new non-directory name: O_CREAT, mknod, mkfifo, socket bind
 
 struct open_event {
     u32 pid;
@@ -685,6 +686,250 @@ int BPF_PROG(lsm_rename_destination, const struct path *old_dir, struct dentry *
     if (mark_allowed_overlay_mutation(new_dir) != 0) return emit_current_mutation(OP_RENAME, 0);
     // Emit one success only after the chained source and destination checks.
     return emit_current_mutation(OP_RENAME, 1);
+}
+
+#define S_IFMT_MASK 00170000
+#define S_IFREG_MODE 0100000
+
+// Every new non-directory name passes security_path_mknod before the inode
+// exists (#204): open(O_CREAT) from may_o_create (mode S_IFREG), mknod(2) and
+// mkfifo, and the bind of a path-named unix socket (S_IFSOCK). file_open only
+// sees the file after the kernel created it, so a denied create used to leave
+// an empty file behind. A new entry is a directory mutation like mkdir: the
+// same table, deny precedence and audit record.
+//
+// For O_CREAT the kernel asks before it knows whether the name exists (the
+// dentry may not be looked up yet). A denial then only drops O_CREAT: the open
+// of an existing file proceeds and file_open decides it as before, so a
+// denied-create record can precede the open of an existing file.
+//
+// No correlation skip, as for rename: overlayfs creates its backing objects
+// with vfs_create/vfs_mknod, which never re-enter security_path_mknod. An
+// allowed overlay create still installs the correlation so the backing opens
+// of the new file (under the mounter's creds) pass file_open.
+//
+// path_mknod is not a sleepable hook, so bpf_d_path is refused there: the
+// path is rebuilt by walking the dentries and mounts the way d_path does,
+// from the trusted parent path up to the task's root (or its namespace root).
+#define MKNOD_MAX_MOUNTS 16
+
+struct vfsmount___walk {
+    struct dentry *mnt_root;
+} __attribute__((preserve_access_index));
+
+struct mount___walk {
+    struct mount___walk *mnt_parent;
+    struct dentry *mnt_mountpoint;
+    struct vfsmount___walk mnt;
+} __attribute__((preserve_access_index));
+
+struct path___walk {
+    struct vfsmount___walk *mnt;
+    struct dentry *dentry;
+} __attribute__((preserve_access_index));
+
+struct fs_struct___walk {
+    struct path___walk root;
+} __attribute__((preserve_access_index));
+
+struct task_struct___walk {
+    struct fs_struct___walk *fs;
+} __attribute__((preserve_access_index));
+
+struct mknod_scratch {
+    char raw[MAX_PATH_LEN * 2]; // parent path, reverse-built in [0, MAX_PATH_LEN)
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, struct mknod_scratch);
+} mknod_scratch_map SEC(".maps");
+
+// One step of the walk per bpf_loop iteration. A plain bounded loop forks the
+// verifier state at every mount crossing (crossing and descending continue
+// with different offsets), which exceeds the 1M-instruction budget; the
+// callback is verified once, whatever the depth (#63).
+struct parent_walk {
+    u64 d, vm, mnt, mnt_root, root_dentry, root_mnt, mnt_offset;
+    int off;
+    int state; // 0 walking, 1 reached the root, -1 unresolvable
+};
+
+static long walk_parent_step(u64 index, void *ctx)
+{
+    struct parent_walk *w = ctx;
+    if (w->d == w->root_dentry && w->vm == w->root_mnt) {
+        w->state = 1;
+        return 1;
+    }
+    if (w->d == w->mnt_root) {
+        struct mount___walk *mnt = (void *)w->mnt;
+        u64 parent = (u64)BPF_CORE_READ(mnt, mnt_parent);
+        if (parent == w->mnt || !parent) {
+            // Namespace root, or a detached mount: d_path reports the path
+            // below it, so does this walk.
+            w->state = 1;
+            return 1;
+        }
+        w->d = (u64)BPF_CORE_READ(mnt, mnt_mountpoint);
+        w->mnt = parent;
+        w->vm = parent + w->mnt_offset;
+        struct vfsmount___walk *vm = (void *)w->vm;
+        w->mnt_root = (u64)BPF_CORE_READ(vm, mnt_root);
+        return 0;
+    }
+    struct dentry *d = (void *)w->d;
+    u64 up = (u64)BPF_CORE_READ(d, d_parent);
+    if (up == w->d) {
+        w->state = 1;
+        return 1;
+    }
+    u32 zero = 0;
+    struct mknod_scratch *s = bpf_map_lookup_elem(&mknod_scratch_map, &zero);
+    __u32 len = BPF_CORE_READ(d, d_name.len);
+    const char *name = (const char *)BPF_CORE_READ(d, d_name.name);
+    int off = w->off;
+    if (!s || len == 0 || len >= MAX_PATH_LEN || off > MAX_PATH_LEN || off - (int)len - 1 < 1) {
+        w->state = -1;
+        return 1;
+    }
+    // The checks above let clang prove the masks redundant; the barriers keep
+    // them, so the verifier (which does not see that proof) sees the bounds.
+    __u32 dst = (__u32)(off - (int)len);
+    __u32 size = len;
+    barrier_var(dst);
+    barrier_var(size);
+    dst &= MAX_PATH_LEN - 1;
+    size &= MAX_PATH_LEN - 1;
+    if (bpf_probe_read_kernel(s->raw + dst, size, name) < 0) {
+        w->state = -1;
+        return 1;
+    }
+    off -= (int)len + 1;
+    __u32 slash = (__u32)off;
+    barrier_var(slash);
+    s->raw[slash & (MAX_PATH_LEN - 1)] = '/';
+    w->off = off;
+    w->d = up;
+    return 0;
+}
+
+// Reverse-fills the walk scratch with dir's absolute path and returns its
+// start offset (the path is raw[start, MAX_PATH_LEN)), or -1 when it is
+// unresolvable or longer than the 255-byte contract. Each component is at
+// least "/x", so a path that fits crosses at most MAX_PATH_LEN/2 dentries.
+static __noinline int walk_parent_path(const struct path *dir, char *raw)
+{
+    struct task_struct___walk *task = (void *)bpf_get_current_task_btf();
+    struct parent_walk w = {};
+    w.root_dentry = (u64)BPF_CORE_READ(task, fs, root.dentry);
+    w.root_mnt = (u64)BPF_CORE_READ(task, fs, root.mnt);
+    w.mnt_offset = bpf_core_field_offset(struct mount___walk, mnt);
+    w.vm = (u64)BPF_CORE_READ(dir, mnt);
+    w.mnt = w.vm - w.mnt_offset;
+    struct vfsmount___walk *vm = (void *)w.vm;
+    w.mnt_root = (u64)BPF_CORE_READ(vm, mnt_root);
+    w.d = (u64)BPF_CORE_READ(dir, dentry);
+    w.off = MAX_PATH_LEN;
+    bpf_loop(MAX_PATH_LEN / 2 + MKNOD_MAX_MOUNTS, walk_parent_step, &w, 0);
+    if (w.state != 1) {
+        return -1;
+    }
+    int off = w.off;
+    if (off >= MAX_PATH_LEN) {
+        off = MAX_PATH_LEN - 1; // the parent is the root: "/"
+        raw[off & (MAX_PATH_LEN - 1)] = '/';
+    }
+    if (off < 1) {
+        return -1;
+    }
+    return off;
+}
+
+// build_mutation_path without bpf_d_path: target = walked parent + "/" + name.
+static __noinline int build_created_path(const struct path *dir, struct dentry *dentry, char *raw, char *target)
+{
+    __builtin_memset(target, 0, MAX_PATH_LEN);
+    int start = walk_parent_path(dir, raw);
+    if (start < 1 || start >= MAX_PATH_LEN) {
+        return -1;
+    }
+    int parent_len = MAX_PATH_LEN - start;
+    __u32 name_len = BPF_CORE_READ(dentry, d_name.len);
+    const unsigned char *name = BPF_CORE_READ(dentry, d_name.name);
+    if (name_len == 0 || name_len >= MAX_PATH_LEN) {
+        return -1;
+    }
+    bool root = parent_len == 1;
+    int separator = root ? 0 : 1;
+    if (parent_len + separator + (int)name_len >= MAX_PATH_LEN) {
+        return -1;
+    }
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < MAX_PATH_LEN; i++) {
+        if (i >= parent_len) break;
+        __u32 from = (__u32)(start + i);
+        barrier_var(from);
+        target[i & (MAX_PATH_LEN - 1)] = raw[from & (MAX_PATH_LEN - 1)];
+    }
+    if (!root) {
+        target[parent_len & (MAX_PATH_LEN - 1)] = '/';
+    }
+    #pragma clang loop unroll(disable)
+    for (int i = 0; i < MAX_PATH_LEN; i++) {
+        if ((__u32)i >= name_len) break;
+        unsigned char c = 0;
+        if (bpf_probe_read_kernel(&c, sizeof(c), name + (i & (MAX_PATH_LEN - 1))) < 0) {
+            return -1;
+        }
+        __u32 to = (__u32)(parent_len + separator + i);
+        barrier_var(to);
+        target[to & (MAX_PATH_LEN - 1)] = c;
+    }
+    return 0;
+}
+
+// check_directory_mutation for a created name (emits only a denial).
+static __noinline int check_created_name(const struct path *dir, struct dentry *dentry)
+{
+    u32 zero = 0;
+    struct mutation_scratch *scratch = bpf_map_lookup_elem(&mutation_scratch_map, &zero);
+    struct mknod_scratch *walk = bpf_map_lookup_elem(&mknod_scratch_map, &zero);
+    if (!scratch || !walk) {
+        return emit_mutation_decision(unresolved_path, OP_CREATE, 0);
+    }
+    // The stamp also covers the walk buffer: every user stamps first.
+    scratch->owner = bpf_get_current_pid_tgid();
+    if (build_created_path(dir, dentry, walk->raw, scratch->target) != 0) {
+        return emit_mutation_decision(unresolved_path, OP_CREATE, 0);
+    }
+    if (!check_mutation_policy(scratch->target)) {
+        return emit_mutation_decision(scratch->target, OP_CREATE, 0);
+    }
+    return mutation_generation_unchanged() ? 0 : -13;
+}
+
+SEC("lsm/path_mknod")
+int BPF_PROG(lsm_mknod, const struct path *dir, struct dentry *dentry, umode_t mode, unsigned int dev, int ret)
+{
+    if (ret != 0) return ret;
+    if (!is_target_cgroup()) return 0;
+    ret = check_created_name(dir, dentry);
+    if (ret != 0) return ret;
+    // io_uring always punts O_CREAT opens to an io-wq worker. As in
+    // mark_allowed_overlay_open, a worker installs no correlation (it may not
+    // pass this task's sys_exit) and its opens meet ordinary policy; refusing
+    // the create there would break every io_uring create on an overlay.
+    if (!current_is_io_worker() && mark_allowed_overlay_mutation(dir) != 0) {
+        return emit_current_mutation(OP_CREATE, 0);
+    }
+    // A regular file is opened right after: its file_open record is the
+    // allowed record, so an allowed regular create stays silent here.
+    u32 type = mode & S_IFMT_MASK;
+    if (type == 0 || type == S_IFREG_MODE) return 0;
+    return emit_current_mutation(OP_CREATE, 1);
 }
 
 // A detached procfs mount has no namespace mountpoint for bpf_d_path to report.

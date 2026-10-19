@@ -78,7 +78,7 @@ root, the workload launches in **fresh PID + IPC namespaces** (its own `/proc`),
 and the private mount ns **masks the keyring/D-Bus runtime dir** (`/run/user/<uid>`)
 and the **X11 socket dir** (`/tmp/.X11-unix`), with `DBUS_SESSION_BUS_ADDRESS` /
 `DISPLAY` / `XAUTHORITY` scrubbed from the env. Net effect, verified from inside
-the box: the agent **can't see host processes** (`/proc/1` is its own `runuser`,
+the box: the agent **can't see host processes** (`/proc/1` is its own `leash` init,
 not `systemd`), **can't reach your keyring** (no D-Bus), and **can't keylog or
 screenshot** your session (no X11) — Cedar models file/exec/network, and these
 namespaces/masks cover the channels it doesn't. Result: **container-grade session
@@ -105,7 +105,8 @@ so it works regardless of the endpoint's rotating IPs.
 ## How it runs (architecture)
 
 - **Privilege split.** leash/leashd stay root (to attach the LSM + build the
-  netns); the workload is dropped to `$SUDO_USER` via `runuser`. So Claude runs
+  netns); the workload is dropped to `$SUDO_USER` by `leash --harden-exec`
+  with no capability left (#203). So Claude runs
   non-root — which also lets it accept `--dangerously-skip-permissions` (Claude
   refuses that as root). The eBPF LSM enforces on the *cgroup*, uid-independent.
 - **Layer 2 / egress.** The workload runs in a dedicated netns with veth + host
