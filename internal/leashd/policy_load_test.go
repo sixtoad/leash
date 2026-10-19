@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,8 +50,9 @@ func TestPolicyReloadKeepsPreviousOnBadUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var lastProxy *lsm.PolicySet
-	mgr := policy.NewManager(nil, func(active *cedarutil.Compilation) { lastProxy = active.Policies })
+	// The policy watcher goroutine sets it, the test reads it: atomic (#234).
+	var lastProxyPtr atomic.Pointer[lsm.PolicySet]
+	mgr := policy.NewManager(nil, func(active *cedarutil.Compilation) { lastProxyPtr.Store(active.Policies) })
 	if err := mgr.UpdateFileRules(initial.LSMPolicies, initial.HTTPRewrites); err != nil {
 		t.Fatal(err)
 	}
@@ -97,6 +99,7 @@ func TestPolicyReloadKeepsPreviousOnBadUpdate(t *testing.T) {
 	} {
 		write(bad)
 		time.Sleep(2500 * time.Millisecond) // the watcher polls every second
+		lastProxy := lastProxyPtr.Load()
 		if got := openPaths(); got != want {
 			t.Fatalf("bad reload %q replaced the policy: open=%q", bad, got)
 		}
