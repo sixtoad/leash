@@ -325,12 +325,17 @@ extension LeashMonitor {
                 let newPath = create.destination.new_path
                 let path = joinPath(resolvePath(for: newPath.dir), string(from: newPath.filename))
                 let type = newPath.mode & S_IFMT
-                // A new regular file is an open for writing, as on Linux
-                // (file_open sees the created file). mkdir is a mutation; so is
-                // any other object (symlink, fifo, socket), which the Linux LSM
-                // does not gate at all: macOS is stricter there, never looser.
+                // A new regular file is a new directory entry and an open for
+                // writing, as on Linux (path_mknod decides the entry before the
+                // inode exists, #204; file_open then sees the created file).
+                // mkdir is a mutation; so is any other object: fifo, socket and
+                // device (path_mknod on Linux too) and symlink, which the Linux
+                // LSM does not gate: macOS is stricter there, never looser.
                 if type == 0 || type == S_IFREG {
-                    return [FileCheck(operation: .create, path: path, check: Self.creation)]
+                    return [
+                        FileCheck(operation: .create, path: path, check: Self.mutation),
+                        FileCheck(operation: .create, path: path, check: Self.creation)
+                    ]
                 }
                 return [FileCheck(operation: .mkdir, path: path, check: Self.mutation)]
             }
