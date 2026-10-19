@@ -6,29 +6,105 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 
 ## [Unreleased]
 
-### Security
-- **The native workload keeps no capability it could regain** (#203). It ran
-  with a full bounding set (`CapBnd=000001ffffffffff`): `leash --harden-exec`
-  dropped it after `runuser` had already left root, without `CAP_SETPCAP`, so
-  the drop failed silently. `--harden-exec --user` now empties the bounding
-  set and clears the ambient set while still root, then drops to the user
-  itself (in place of `runuser`), clears the inheritable/permitted/effective
-  sets, sets `no_new_privs` and the seccomp filter, and refuses to run the
-  workload if any capability is left. Inside the box: `CapBnd`, `CapAmb`,
-  `CapInh`, `CapPrm`, `CapEff` all `0`, `NoNewPrivs: 1`; setuid binaries
-  (`sudo`) gain nothing and file-capability binaries (iputils `ping`) cannot
-  be executed. `--allow-namespaces` keeps the previous `runuser` launch so
-  nested rootless containers can still use `newuidmap`. Container mode is
-  unchanged (see docs/design/SECURITY-MODEL.md § Workload capabilities).
+## [native-v0.4.1] — 2026-10-19
 
-### Fixed
-- **A denied create no longer leaves a file behind** (#204). `open(O_CREAT)`,
-  `touch`, `mknod`, `mkfifo` and unix-socket binds create a name through
-  `security_path_mknod` before `file_open` can refuse the open; the new
-  `lsm_mknod` program decides that name with the directory-mutation table
-  (writable-directory authority, deny precedence, a `file.create` audit
+Patch release on top of `native-v0.4.0` (PRs #221–#236), driven by a Layer 2
+fail-open in the native runtime on hosts whose `/bin/sh` is bash. No change
+to the CLI contract: `contractVersion` stays 3, `minCompatibleContract` 0,
+and the `capabilities` list is unchanged.
+
+### Security
+- **Layer 2 no longer fails open when `/bin/sh` is bash** (#232, part of
+  #208/#209). `apply-nftables.sh` passed the redirect ports as `{80,443}`,
+  which bash (`/bin/sh` on Fedora, RHEL, Arch) brace-expands, so nft rejected
+  the HTTP/HTTPS redirect rule and the script only warned. The native runtime
+  runs the script with the host's `/bin/sh`: it reported `layer2=active`
+  while HTTPS went straight to the origin, forbidden MCP `tools/call`s
+  succeeded and header rewrites did not apply (the eBPF connect policy still
+  held). The port set is now one quoted word, and the HTTP/HTTPS redirect and
+  QUIC drop are required rules in both the nftables and iptables scripts: if
+  one cannot be applied the script exits with `FATAL`, leashd falls back to
+  iptables or refuses to start. Container runs (dash in the manager image)
+  were not affected.
+- **The native workload keeps no capability it could regain** (#223, #203).
+  `--harden-exec` dropped the bounding set after `runuser` had already left
+  root, without `CAP_SETPCAP`, so the drop failed silently and the workload
+  ran with `CapBnd=000001ffffffffff`. See **Changed**.
+- **A denied create no longer leaves a file behind** (#224, #204).
+  `open(O_CREAT)`, `touch`, `mknod`, `mkfifo` and unix-socket binds create a
+  name through `security_path_mknod` before `file_open` can refuse the open;
+  the new `lsm_mknod` program decides that name with the directory-mutation
+  table (writable-directory authority, deny precedence, a `file.create` audit
   record), on overlay rootfs, bind mounts and plain filesystems alike. macOS
   `AUTH_CREATE` of a regular file now checks the same table as well.
+
+### Fixed
+- **SELinux hosts: `podman exec` / `docker exec` into a governed container
+  works** (#231, part of #208). The procfs canonicalizer now recognises the
+  OCI runtime's SELinux `attr/exec` and `attr/keycreate` writes (crun and
+  runc), which were denied as unprefixed paths, so no run got past "locate a
+  usable shell". They still go through the ordinary `/proc/` policy.
+- **A `kill -9` of the leash client no longer strands its containers**
+  (#222, #201). A detached watcher bound to the client by a lifeline pipe
+  removes the run's target and sidecar containers (sidecar first, no stop
+  timeout) and its temp work dir; containers carry owner labels so the next
+  container run also reaps runs whose owner is provably gone (never runs from
+  another machine or PID namespace, never kept runs).
+- **Enforcer client race** (#221, #220): a result the daemon sends just
+  before ending the session is no longer lost to a random `select`, so a
+  failed attach reports the worker's reason and a successful `Detach` no
+  longer returns an error.
+- **SELinux build containers** (#233, #173): `make lsm-generate-docker` and
+  `make docker-ui` run their throwaway build containers with
+  `--security-opt label=disable` (`BUILD_CONTAINER_SECURITY_OPTS`), instead
+  of failing on unlabelled bind mounts or relabelling the checkout.
+- **eBPF objects are always built with clang 18** (#230, #227). Every
+  generation path (`make lsm-generate`, `lsm-generate-docker`,
+  `Dockerfile.leash`, `make docker-base`, release) checks the pinned major
+  and refuses any other; clang 14 objects failed the 6.8 verifier in
+  `lsm_rename_*`.
+- Test-only: a data race in `TestPolicyReloadKeepsPreviousOnBadUpdate`
+  (#229, #225) and a leaked test lock behind the 10-minute darwin CI hang
+  (#235, #234).
+
+### Added
+- **`--selinux` / `LEASH_SELINUX` = `auto` | `relabel` | `disable`** (#236,
+  fixes #175, #208, #209) for the agent's project and config mounts on
+  SELinux-enforcing hosts. `auto` (default) changes nothing unless SELinux is
+  enforcing and the engine labels containers; then a project or config mount
+  that is not a container type refuses the run before any container starts,
+  naming each path and the choices. `relabel` adds `:z` (shared
+  `container_file_t`; never `:Z`; refuses `/`, top-level system directories
+  and home directories). `disable` runs only the target container with
+  `label=disable`; leash's LSM and proxy are unaffected. Explicit `-v`
+  volumes keep their own flags. Verified on Fedora 44 with rootful and
+  rootless podman and rootful Docker.
+- **docs/SELINUX.md**: the label decision for every mount, the verified
+  matrix, and the enforcer-daemon and build-container notes. ROOTLESS.md
+  drops its "not verified on SELinux" caveat.
+
+### Changed
+- **Capability drop in the native runtime** (#223, #203). `--harden-exec
+  --user <name>` now empties the bounding set and clears the ambient set
+  while still root, then drops to the user itself (setgroups / setresgid /
+  setresuid, with `runuser -u`'s `HOME`/`SHELL`/`USER`/`LOGNAME`), clears the
+  inheritable/permitted/effective sets, sets `no_new_privs` and the seccomp
+  filter, verifies, and refuses to run the workload if any capability is
+  left. Inside the box `CapBnd`, `CapAmb`, `CapInh`, `CapPrm`, `CapEff` are
+  all `0` and `NoNewPrivs` is `1`; setuid binaries gain nothing and
+  file-capability binaries (iputils `ping`) cannot be executed. It stays
+  PID 1 of the box (reaps orphans, forwards TERM/HUP/USR1/USR2).
+- **`runuser` (and its PAM session) is no longer used to launch the native
+  workload** (#223). `--allow-namespaces` keeps the previous `runuser` launch
+  so nested rootless containers can still use `newuidmap`, and the
+  `--inject-service` plugin launch still uses `runuser`. Container mode is
+  unchanged (docs/design/SECURITY-MODEL.md § Workload capabilities).
+- **Unix-socket binds, `mknod` and `mkfifo` are policy-checked creates**
+  (#224): a policy without write authority over the directory now refuses
+  them, as it already did `mkdir` and `O_CREAT` opens.
+- On an SELinux-enforcing host, `--selinux auto` refuses a container run
+  whose project or config mount is not labelled for containers, where it
+  previously started and failed inside the container (#236).
 
 ## [native-v0.4.0] — 2026-10-18
 
