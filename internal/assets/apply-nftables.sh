@@ -21,6 +21,15 @@ PROXY_MARK=${PROXY_MARK:-0x2000}
 NFT=${NFT:-nft}
 
 RULE_ERRORS=0
+# Rules without which the MITM proxy (Layer 2) would silently see no traffic.
+# Any failure here is fatal, so the caller falls back to iptables or refuses to
+# start instead of reporting an intercepting proxy that intercepts nothing.
+REQUIRED_ERRORS=0
+
+# The redirect port set is passed to nft as ONE quoted word. Unquoted, a shell
+# that brace-expands (bash, which is /bin/sh on Fedora/RHEL/Arch) turns
+# {80,443} into "80 443" and nft rejects the rule.
+HTTP_PORTS='{ 80, 443 }'
 
 nft_cmd() {
     "$NFT" "$@"
@@ -71,19 +80,19 @@ ensure_table ip leash
 ensure_chain ip leash out_nat { type nat hook output priority -100\; }
 ensure_rule ip leash out_nat "leash:return-mitm" tcp dport $MITM_PORT return
 ensure_rule ip leash out_nat "leash:return-mark" meta mark $PROXY_MARK return
-ensure_rule ip leash out_nat "leash:redir-80-443" tcp dport {80,443} redirect to :$MITM_PORT
+ensure_rule ip leash out_nat "leash:redir-80-443" tcp dport "$HTTP_PORTS" redirect to :$MITM_PORT || REQUIRED_ERRORS=$((REQUIRED_ERRORS + 1))
 
 # IPv6 NAT OUTPUT
 ensure_table ip6 leash6
 ensure_chain ip6 leash6 out_nat { type nat hook output priority -100\; }
 ensure_rule ip6 leash6 out_nat "leash:return-mitm" tcp dport $MITM_PORT return
 ensure_rule ip6 leash6 out_nat "leash:return-mark" meta mark $PROXY_MARK return
-ensure_rule ip6 leash6 out_nat "leash:redir-80-443" tcp dport {80,443} redirect to :$MITM_PORT
+ensure_rule ip6 leash6 out_nat "leash:redir-80-443" tcp dport "$HTTP_PORTS" redirect to :$MITM_PORT || REQUIRED_ERRORS=$((REQUIRED_ERRORS + 1))
 
 # inet route hook to drop QUIC for both families
 ensure_table inet leash
 ensure_chain inet leash out_route { type route hook output priority 0\; }
-ensure_rule inet leash out_route "leash:drop-quic" udp dport 443 drop
+ensure_rule inet leash out_route "leash:drop-quic" udp dport 443 drop || REQUIRED_ERRORS=$((REQUIRED_ERRORS + 1))
 
 # Block target cgroup from reaching leashd control plane on any interface.
 # This prevents a compromised agent from accessing the leashd API.
@@ -138,7 +147,12 @@ if [ -z "$TARGET_CGROUP" ] && [ -n "$LEASH_PORT" ]; then
     fi
 fi
 
-# Report summary and exit successfully even if some rules failed
+if [ "$REQUIRED_ERRORS" -gt 0 ]; then
+    echo "leash: FATAL: $REQUIRED_ERRORS required nftables interception rule(s) (HTTP/HTTPS redirect, QUIC drop) failed to apply" >&2
+    exit 2
+fi
+
+# Report summary and exit successfully even if optional rules failed
 if [ "$RULE_ERRORS" -gt 0 ]; then
     echo "leash: WARNING: $RULE_ERRORS nftables rule(s) failed to apply (network interception may be incomplete)" >&2
 fi

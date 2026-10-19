@@ -83,8 +83,19 @@ func TestNftablesScriptArgs(t *testing.T) {
 // contains failMatch fails too, to simulate kernels lacking a feature.
 func runNftScriptWithFake(t *testing.T, failMatch string, args ...string) string {
 	t.Helper()
-	if _, err := exec.LookPath("sh"); err != nil {
-		t.Skip("sh not available")
+	log, out, err := runNftScriptWithShell(t, "sh", failMatch, args...)
+	if err != nil {
+		t.Fatalf("script failed: %v\n%s", err, out)
+	}
+	return log
+}
+
+// runNftScriptWithShell is runNftScriptWithFake under an explicit shell, and
+// returns the script's error instead of failing the test.
+func runNftScriptWithShell(t *testing.T, shell, failMatch string, args ...string) (string, []byte, error) {
+	t.Helper()
+	if _, err := exec.LookPath(shell); err != nil {
+		t.Skipf("%s not available", shell)
 	}
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "nft.log")
@@ -103,18 +114,50 @@ exit 0
 	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("sh", append([]string{"-s"}, args...)...)
+	cmd := exec.Command(shell, append([]string{"-s"}, args...)...)
 	cmd.Stdin = strings.NewReader(assets.ApplyNftablesScript)
 	cmd.Env = append(os.Environ(), "NFT="+fake, "FAKE_NFT_LOG="+logPath, "FAKE_FAIL="+failMatch)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("script failed: %v\n%s", err, out)
-	}
+	out, runErr := cmd.CombinedOutput()
 	data, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(data)
+	return string(data), out, runErr
+}
+
+// The redirect port set must reach nft as one word under every /bin/sh. bash
+// (the /bin/sh of Fedora/RHEL/Arch) brace-expands an unquoted {80,443} into
+// "80 443", nft rejects the rule, and the MITM proxy silently saw no traffic.
+func TestApplyNftablesScriptRedirectPortSetSurvivesBash(t *testing.T) {
+	for _, shell := range []string{"sh", "bash"} {
+		t.Run(shell, func(t *testing.T) {
+			log, out, err := runNftScriptWithShell(t, shell, "", "18000", "18080", "system.slice/foo.service", "2")
+			if err != nil {
+				t.Fatalf("script failed: %v\n%s", err, out)
+			}
+			got := findInvocation(log, `"leash:redir-80-443"`)
+			want := []string{"add", "rule", "ip", "leash", "out_nat", "tcp", "dport", "{ 80, 443 }", "redirect", "to", ":18000", "comment", `"leash:redir-80-443"`}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("redirect rule argv\n got: %q\nwant: %q", got, want)
+			}
+		})
+	}
+}
+
+// A redirect or QUIC-drop rule that cannot be applied leaves Layer 2 with no
+// traffic; the script must fail so leashd falls back to iptables or refuses.
+func TestApplyNftablesScriptFailsWhenInterceptionRuleRejected(t *testing.T) {
+	for _, match := range []string{"leash:redir-80-443", "leash:drop-quic"} {
+		t.Run(match, func(t *testing.T) {
+			_, out, err := runNftScriptWithShell(t, "sh", match, "18000", "18080", "system.slice/foo.service", "2")
+			if err == nil {
+				t.Fatalf("script succeeded although %s was rejected:\n%s", match, out)
+			}
+			if !strings.Contains(string(out), "FATAL: ") {
+				t.Fatalf("missing FATAL diagnostic:\n%s", out)
+			}
+		})
+	}
 }
 
 // findInvocation returns the argv of the first recorded nft call that has an
