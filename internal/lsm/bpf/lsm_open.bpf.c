@@ -791,7 +791,7 @@ struct {
     __type(value, u32);
 } open_tail_calls SEC(".maps");
 
-enum proc_component { PROC_SETGROUPS, PROC_EXEC, PROC_APPARMOR, PROC_ATTR, PROC_TASK, PROC_FD };
+enum proc_component { PROC_SETGROUPS, PROC_EXEC, PROC_APPARMOR, PROC_ATTR, PROC_TASK, PROC_FD, PROC_KEYCREATE };
 
 static __noinline bool proc_name_is(struct dentry *dentry, int component)
 {
@@ -806,6 +806,7 @@ static __noinline bool proc_name_is(struct dentry *dentry, int component)
     if (component == PROC_ATTR) return len == 4 && value[0]=='a' && value[1]=='t' && value[2]=='t' && value[3]=='r';
     if (component == PROC_TASK) return len == 4 && value[0]=='t' && value[1]=='a' && value[2]=='s' && value[3]=='k';
     if (component == PROC_FD) return len == 2 && value[0]=='f' && value[1]=='d';
+    if (component == PROC_KEYCREATE) return len == 9 && value[0]=='k' && value[1]=='e' && value[2]=='y' && value[3]=='c' && value[4]=='r' && value[5]=='e' && value[6]=='a' && value[7]=='t' && value[8]=='e';
     return false;
 }
 
@@ -845,23 +846,28 @@ static __noinline int proc_runtime_control_relative_len(struct file *file, struc
         if (!proc_name_is_numeric(parent) || BPF_CORE_READ(parent, d_parent) != root) return 0;
         return (int)pid_len + (int)tid_len + 11; // /PID/task/TID/fd plus NUL
     }
-    if (!proc_name_is(leaf, PROC_EXEC)) return 0;
-    // The OCI runtime labels the exec'd process through the active LSM's
-    // exec attribute: attr/apparmor/exec on AppArmor hosts, the generic
-    // attr/exec on SELinux hosts (runc/crun write it on every `exec`).
-    bool apparmor = proc_name_is(parent, PROC_APPARMOR);
+    // The OCI runtime labels the process it execs through the active LSM's
+    // attributes: attr/apparmor/exec on AppArmor hosts; attr/exec and
+    // attr/keycreate on SELinux hosts (runc and crun write them on every
+    // `exec`, via /proc/self or /proc/thread-self).
+    bool keycreate = proc_name_is(leaf, PROC_KEYCREATE);
+    if (!keycreate && !proc_name_is(leaf, PROC_EXEC)) return 0;
+    bool apparmor = !keycreate && proc_name_is(parent, PROC_APPARMOR);
     if (apparmor) parent = BPF_CORE_READ(parent, d_parent);
     if (!proc_name_is(parent, PROC_ATTR)) return 0;
+    // Bytes after the numeric component: /attr/keycreate, /attr/apparmor/exec
+    // or /attr/exec.
+    int tail = keycreate ? 15 : (apparmor ? 19 : 10);
     parent = BPF_CORE_READ(parent, d_parent);
     if (!proc_name_is_numeric(parent)) return 0;
-    __u32 tid_len = BPF_CORE_READ(parent, d_name.len);
+    __u32 id_len = BPF_CORE_READ(parent, d_name.len);
     parent = BPF_CORE_READ(parent, d_parent);
+    if (parent == root) return (int)id_len + tail + 2; // /PID/attr/... plus NUL
     if (!proc_name_is(parent, PROC_TASK)) return 0;
     parent = BPF_CORE_READ(parent, d_parent);
     __u32 pid_len = BPF_CORE_READ(parent, d_name.len);
     if (!proc_name_is_numeric(parent) || BPF_CORE_READ(parent, d_parent) != root) return 0;
-    if (!apparmor) return (int)pid_len + (int)tid_len + 18; // /PID/task/TID/attr/exec plus NUL
-    return (int)pid_len + (int)tid_len + 27; // /PID/task/TID/attr/apparmor/exec plus NUL
+    return (int)pid_len + (int)id_len + tail + 8; // /PID/task/TID/attr/... plus NUL
 }
 
 static __always_inline int canonicalize_proc_runtime_path(struct file *file, char *path, int path_len)

@@ -44,8 +44,9 @@ func TestOpenTailCallFallthroughIsFailClosed(t *testing.T) {
 		"struct open_path_scratch *scratch = bpf_map_lookup_elem(&open_path_scratch_map, &zero);",
 		"if (relative_len == 0 || path_len != relative_len) return false;",
 		"return (int)pid_len + 12; // /<pid>/setgroups plus NUL",
-		"return (int)pid_len + (int)tid_len + 27; // /PID/task/TID/attr/apparmor/exec plus NUL",
-		"if (!apparmor) return (int)pid_len + (int)tid_len + 18; // /PID/task/TID/attr/exec plus NUL",
+		"int tail = keycreate ? 15 : (apparmor ? 19 : 10);",
+		"if (parent == root) return (int)id_len + tail + 2; // /PID/attr/... plus NUL",
+		"return (int)pid_len + (int)id_len + tail + 8; // /PID/task/TID/attr/... plus NUL",
 		"return (int)pid_len + (int)tid_len + 11; // /PID/task/TID/fd plus NUL",
 		"if (path[0] != '/' || path[1] < '0' || path[1] > '9') return false;",
 	} {
