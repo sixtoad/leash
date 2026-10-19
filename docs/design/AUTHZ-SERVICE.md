@@ -194,8 +194,11 @@ mode when the modes differ.
 - An exact allow on `/` covers only the root directory; it does not turn
   the kernel default to allow.
 
-**Directory mutations.** mkdir, unlink, rmdir and both sides of rename are
-checked by the kernel against the path they create or remove, through a
+**Directory mutations.** mkdir, unlink, rmdir, both sides of rename, the
+new name of a hard link and every other new name (`path_mknod`: a regular
+file from `open(O_CREAT)` or `mknod`, a fifo, a device, a unix socket's path,
+#204) are checked by the kernel against the path they create or remove,
+before the entry exists, through a
 table of their own: allow prefixes, deny prefixes and exact denies. They have
 no Cedar action. A mutation of path t is allowed iff Cedar allows
 `FileOpenReadWrite` on t **and** on a new entry of t's directory (writing the
@@ -203,6 +206,23 @@ directory's contents), `engine.DecideMutation`. So a granted tree
 `Dir::"/work/"` lets the workload create and remove entries below `/work`,
 but not remove or rename `/work` itself unless `/` is writable too, and a
 forbidden file cannot be unlinked even in a writable directory.
+
+- **Creates (#204).** `file_open` runs only after the kernel created the
+  inode, so a create used to leave an empty file behind even when the open
+  was denied. `lsm_mknod` decides the new name first, with this table: no new
+  decision, no new Cedar meaning. `open(O_CREAT)` asks before the kernel knows
+  whether the name exists; a denial only drops `O_CREAT`, so the open of an
+  existing file still proceeds and `file_open` decides it (a `file.create`
+  denial record can then precede an allowed open). An allowed regular create
+  writes no record of its own (the open writes one); other objects do.
+  Unlike mkdir, the hook never skips on the overlay correlation (overlayfs
+  creates its backing objects through `vfs_create`/`vfs_mknod`, which do not
+  re-enter `path_mknod`), but an allowed create still installs it for the
+  backing opens of the new file. `path_mknod` is not a sleepable hook, so
+  the kernel refuses `bpf_d_path` there: the parent path is rebuilt by
+  walking dentries and mounts as `d_path` does (to the task's root, or the
+  namespace root), one step per `bpf_loop` iteration so the verifier checks
+  the step once. Symlinks (`path_symlink`) are still not gated on Linux.
 
 - The compiler builds this table from those decisions, as `lsm.OpMutation`
   rules carried with the open rules: the single source of truth. It is never
