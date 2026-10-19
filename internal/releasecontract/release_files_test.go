@@ -86,8 +86,24 @@ func TestManagerTargetConsumesGeneratedBPFArtifacts(t *testing.T) {
 		strings.Contains(dockerfile, `org.opencontainers.image.version="v${VERSION}"`) {
 		t.Fatal("manager OCI labels must preserve the exact release identifier")
 	}
-	if !strings.Contains(dockerfile, "FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS build-base") {
+	if !strings.Contains(dockerfile, "FROM --platform=$BUILDPLATFORM ubuntu:noble AS bpf-toolchain") ||
+		!strings.Contains(dockerfile, "FROM --platform=$BUILDPLATFORM bpf-toolchain AS build-base") {
 		t.Fatal("shared manager build-base must execute on BUILDPLATFORM")
+	}
+	// The pinned eBPF toolchain (#227): the objects must come from clang 18.
+	toolchainStart := strings.Index(dockerfile, "AS bpf-toolchain")
+	toolchainEnd := strings.Index(dockerfile, "AS build-base")
+	if toolchainStart < 0 || toolchainEnd < toolchainStart {
+		t.Fatal("bpf-toolchain stage must precede build-base")
+	}
+	toolchain := dockerfile[toolchainStart:toolchainEnd]
+	for _, want := range []string{"clang-18", "llvm-18", "COPY --from=go-toolchain /usr/local/go /usr/local/go"} {
+		if !strings.Contains(toolchain, want) {
+			t.Fatalf("bpf-toolchain stage missing %q", want)
+		}
+	}
+	if strings.Contains(toolchain, "        clang \\") || strings.Contains(toolchain, "        llvm \\") {
+		t.Fatal("bpf-toolchain must install the pinned clang-18/llvm-18, not the distribution default")
 	}
 	if !strings.Contains(dockerfile, "FROM --platform=$BUILDPLATFORM ${BASE_BUILD_IMAGE} AS lsm-generate") {
 		t.Fatal("BPF generator must execute on BUILDPLATFORM")

@@ -35,7 +35,7 @@ ENV GOPATH=/go \
     PATH=/usr/local/go/bin:/go/bin:$PATH
 RUN clang-18 --version | head -1 && go version
 
-FROM bpf-toolchain AS build-base
+FROM --platform=$BUILDPLATFORM bpf-toolchain AS build-base
 ARG DEBIAN_FRONTEND
 # Install Node.js 20 repo first (required by Next.js 16)
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
