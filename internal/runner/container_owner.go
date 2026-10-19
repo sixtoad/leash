@@ -46,6 +46,11 @@ const (
 	containerOwnerMachineLabel = "dev.leash.machine-id"
 	containerOwnerPidNSLabel   = "dev.leash.pid-ns"
 	containerWorkDirLabel      = "dev.leash.work-dir"
+	// containerRoleLabel is "leash" on the sidecar, "target" on the workload's
+	// container. The sidecar joins the target's network namespace, and podman
+	// refuses to remove a container another one depends on, so the sidecar is
+	// always removed first.
+	containerRoleLabel = "dev.leash.role"
 )
 
 // ownerIdentity identifies a leash process across PID reuse and reboots, and
@@ -86,9 +91,14 @@ var ownerProcessAlive = func(pid int, start uint64) bool {
 
 // ownerLabelArgs are the `--label` flags recording this run's owner on each
 // container it creates.
-func (r *runner) ownerLabelArgs() []string {
+func (r *runner) ownerLabelArgs(name string) []string {
 	id := selfOwnerIdentity()
+	role := "target"
+	if name == r.cfg.leashContainer {
+		role = "leash"
+	}
 	labels := []string{
+		containerRoleLabel + "=" + role,
 		containerOwnerPIDLabel + "=" + strconv.Itoa(id.PID),
 		containerOwnerStartLabel + "=" + strconv.FormatUint(id.Start, 10),
 		containerOwnerBootLabel + "=" + id.BootID,
@@ -259,8 +269,12 @@ func containerWatch(lifeline *os.File, rt Runtime, session, workDir string) int 
 func sweepContainerSession(ctx context.Context, rt Runtime, session string) {
 	deadline := time.Now().Add(containerWatchSweepWindow)
 	empty := 0
+	filter := "label=" + containerSessionLabel + "=" + session
 	for {
-		out, err := rt.Output(ctx, "ps", "-a", "-q", "--filter", "label="+containerSessionLabel+"="+session)
+		if out, _ := rt.Output(ctx, "ps", "-a", "-q", "--filter", filter, "--filter", "label="+containerRoleLabel+"=leash"); strings.TrimSpace(out) != "" {
+			_, _ = rt.Output(ctx, forceRemoveArgs(rt, strings.Fields(out))...)
+		}
+		out, err := rt.Output(ctx, "ps", "-a", "-q", "--filter", filter)
 		ids := strings.Fields(out)
 		if err == nil && len(ids) == 0 {
 			empty++
@@ -382,9 +396,11 @@ func (r *runner) markContainersKept() {
 // staleContainerRun is one dead run's containers.
 type staleContainerRun struct {
 	Session string
-	IDs     []string
-	Names   []string
-	WorkDir string
+	// Sidecars are the leash containers (removed first), IDs the rest.
+	Sidecars []string
+	IDs      []string
+	Names    []string
+	WorkDir  string
 }
 
 // labelledContainer is what the reaper reads back from the engine.
@@ -492,7 +508,11 @@ func staleContainerRunsWithSessions(ctx context.Context, rt Runtime) ([]staleCon
 			runs[session] = run
 			order = append(order, session)
 		}
-		run.IDs = append(run.IDs, c.ID)
+		if c.Labels[containerRoleLabel] == "leash" {
+			run.Sidecars = append(run.Sidecars, c.ID)
+		} else {
+			run.IDs = append(run.IDs, c.ID)
+		}
 		run.Names = append(run.Names, c.Name)
 		if wd := c.Labels[containerWorkDirLabel]; wd != "" && isLeashTempWorkDir(wd) {
 			run.WorkDir = wd
@@ -516,7 +536,16 @@ func reapStaleContainerRuns(ctx context.Context, rt Runtime) []string {
 	pruneKeptMarkers(containerStateDir(), rt.Name(), sessions)
 	var names []string
 	for _, run := range runs {
-		if _, err := rt.Output(ctx, forceRemoveArgs(rt, run.IDs)...); err != nil && !isNoSuchObjectError(err) {
+		failed := false
+		for _, ids := range [][]string{run.Sidecars, run.IDs} {
+			if len(ids) == 0 {
+				continue
+			}
+			if _, err := rt.Output(ctx, forceRemoveArgs(rt, ids)...); err != nil && !isNoSuchObjectError(err) {
+				failed = true
+			}
+		}
+		if failed {
 			continue
 		}
 		if run.WorkDir != "" {

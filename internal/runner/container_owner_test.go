@@ -187,7 +187,7 @@ func TestReapStaleContainerRuns(t *testing.T) {
 	gone := strings.Repeat("f", 32) // a kept run whose containers were removed
 	eng := &scriptedEngine{containers: []labelledContainer{
 		{ID: "t1", Name: "agent", Labels: label(dead, 200, func(l map[string]string) { l[containerWorkDirLabel] = deadWork })},
-		{ID: "l1", Name: "agent-leash", Labels: label(dead, 200, nil)},
+		{ID: "l1", Name: "agent-leash", Labels: label(dead, 200, func(l map[string]string) { l[containerRoleLabel] = "leash" })},
 		{ID: "t2", Name: "live", Labels: label(live, 100, nil)},
 		{ID: "t3", Name: "kept", Labels: label(kept, 201, nil)},
 		{ID: "t4", Name: "remote", Labels: label(other, 202, func(l map[string]string) { l[containerOwnerMachineLabel] = "m2" })},
@@ -207,7 +207,7 @@ func TestReapStaleContainerRuns(t *testing.T) {
 	if strings.Join(names, ",") != "agent,agent-leash,userwd" {
 		t.Fatalf("reaped %v", names)
 	}
-	if strings.Join(eng.removed, ",") != "t1,l1,t5" {
+	if strings.Join(eng.removed, ",") != "l1,t1,t5" { // sidecar first
 		t.Fatalf("removed ids %v", eng.removed)
 	}
 	if _, err := os.Stat(deadWork); !os.IsNotExist(err) {
@@ -241,6 +241,7 @@ func TestLaunchContainerLabelsOwner(t *testing.T) {
 		"--label " + containerOwnerStartLabel + "=" + strconv.FormatUint(self.Start, 10),
 		"--label " + containerOwnerBootLabel + "=" + self.BootID,
 		"--label " + containerWorkDirLabel + "=" + r.cfg.workDir,
+		"--label " + containerRoleLabel + "=target",
 	} {
 		if len(runs) != 1 || !strings.Contains(runs[0], want) {
 			t.Fatalf("runs=%v, missing %q", runs, want)
@@ -294,7 +295,9 @@ run)
   for a in "$@"; do [ "$prev" = "--name" ] && name="$a"; prev="$a"; done
   echo "$name" >> "$d/containers"; echo "$name";;
 ps)
-  [ -f "$d/containers" ] && cat "$d/containers"; exit 0;;
+  [ -f "$d/containers" ] || exit 0
+  case "$*" in *dev.leash.role=leash*) grep -- '-leash$' "$d/containers"; exit 0;; esac
+  cat "$d/containers"; exit 0;;
 rm)
   shift; [ "$1" = "-f" ] && shift
   for id in "$@"; do grep -vx "$id" "$d/containers" > "$d/c.tmp"; mv "$d/c.tmp" "$d/containers"; done;;
@@ -411,6 +414,15 @@ func TestContainerKill9(t *testing.T) {
 					t.Fatalf("after SIGKILL: containers=%q work dir exists=%v\nengine log:\n%s", containers(), exists(work), log)
 				}
 				time.Sleep(50 * time.Millisecond)
+			}
+			engineLog, _ := os.ReadFile(filepath.Join(dir, "log"))
+			for _, line := range strings.Split(string(engineLog), "\n") {
+				if strings.HasPrefix(line, "rm ") {
+					if line != "rm -f agent-leash" {
+						t.Fatalf("first removal %q, want the sidecar alone first", line)
+					}
+					break
+				}
 			}
 		})
 	}

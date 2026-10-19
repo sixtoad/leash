@@ -68,7 +68,7 @@ func (r *runner) launchContainer(ctx context.Context, name string, args ...strin
 	// Bind the run's containers to this leash's lifetime before the first one
 	// exists, so a SIGKILL at any later point is covered (#201).
 	startContainerWatcher(r)
-	labeledArgs := append([]string{args[0], "--label", containerSessionLabel + "=" + r.containerSession}, r.ownerLabelArgs()...)
+	labeledArgs := append([]string{args[0], "--label", containerSessionLabel + "=" + r.containerSession}, r.ownerLabelArgs(name)...)
 	labeledArgs = append(labeledArgs, args[1:]...)
 	r.containerLaunches[name] = true
 	err := r.runDocker(launchCtx, labeledArgs...)
