@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 )
@@ -162,6 +163,9 @@ func refuseRelabel(host string) string {
 	if systemTopLevelDirs[clean] {
 		return "a system directory"
 	}
+	if filepath.Dir(clean) == "/home" {
+		return "a home directory"
+	}
 	for _, home := range candidateHomes() {
 		if home != "" && clean == filepath.Clean(home) {
 			return "a home directory"
@@ -177,10 +181,17 @@ var systemTopLevelDirs = map[string]bool{
 	"/usr": true, "/var": true,
 }
 
+// candidateHomes are the invoking user's home directories, including the
+// sudo caller's (a rootful run is usually `sudo leash` from the user's tree).
 func candidateHomes() []string {
 	homes := []string{os.Getenv("HOME")}
 	if h, err := os.UserHomeDir(); err == nil {
 		homes = append(homes, h)
+	}
+	if name := strings.TrimSpace(os.Getenv("SUDO_USER")); name != "" {
+		if u, err := user.Lookup(name); err == nil {
+			homes = append(homes, u.HomeDir)
+		}
 	}
 	return homes
 }

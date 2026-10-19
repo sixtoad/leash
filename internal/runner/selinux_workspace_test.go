@@ -203,7 +203,7 @@ func TestSELinuxRelabelAddsSharedLabelToUserMounts(t *testing.T) {
 func TestSELinuxRelabelRefusesHomeAndSystemDirs(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	for _, dir := range []string{home, "/", "/home", "/usr"} {
+	for _, dir := range []string{home, "/", "/home", "/usr", "/home/someone"} {
 		if refuseRelabel(dir) == "" {
 			t.Fatalf("refuseRelabel(%q) allowed a recursive relabel", dir)
 		}
