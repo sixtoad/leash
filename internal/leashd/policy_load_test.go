@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -49,8 +50,24 @@ func TestPolicyReloadKeepsPreviousOnBadUpdate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var lastProxy *lsm.PolicySet
-	mgr := policy.NewManager(nil, func(active *cedarutil.Compilation) { lastProxy = active.Policies })
+	// The apply callback runs on the watcher goroutine; guard what it records.
+	var (
+		proxyMu   sync.Mutex
+		lastProxy *lsm.PolicySet
+	)
+	mgr := policy.NewManager(nil, func(active *cedarutil.Compilation) {
+		proxyMu.Lock()
+		lastProxy = active.Policies
+		proxyMu.Unlock()
+	})
+	proxyOpen := func() (*lsm.PolicySet, string) {
+		proxyMu.Lock()
+		defer proxyMu.Unlock()
+		if lastProxy == nil || len(lastProxy.Open) == 0 {
+			return lastProxy, ""
+		}
+		return lastProxy, string(lastProxy.Open[0].Path[:lastProxy.Open[0].PathLen])
+	}
 	if err := mgr.UpdateFileRules(initial.LSMPolicies, initial.HTTPRewrites); err != nil {
 		t.Fatal(err)
 	}
@@ -100,16 +117,21 @@ func TestPolicyReloadKeepsPreviousOnBadUpdate(t *testing.T) {
 		if got := openPaths(); got != want {
 			t.Fatalf("bad reload %q replaced the policy: open=%q", bad, got)
 		}
-		if lastProxy == nil || len(lastProxy.Open) == 0 || string(lastProxy.Open[0].Path[:lastProxy.Open[0].PathLen]) != "/tmp/" {
-			t.Fatalf("proxy lost the previous policy after %q: %+v", bad, lastProxy)
+		if ps, got := proxyOpen(); got != "/tmp/" {
+			t.Fatalf("proxy lost the previous policy after %q: %+v", bad, ps)
 		}
 	}
 
 	write(`permit (principal, action in Action::"FileOpen", resource in Dir::"/var/");`)
 	deadline := time.Now().Add(5 * time.Second)
-	for openPaths() != "/var/" {
+	for {
+		ps, proxyGot := proxyOpen()
+		got := openPaths()
+		if got == "/var/" && proxyGot == "/var/" {
+			break
+		}
 		if time.Now().After(deadline) {
-			t.Fatalf("valid reload never applied: open=%q", openPaths())
+			t.Fatalf("valid reload never applied: open=%q proxy=%+v", got, ps)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
