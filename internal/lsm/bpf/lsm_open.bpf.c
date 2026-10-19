@@ -845,8 +845,12 @@ static __noinline int proc_runtime_control_relative_len(struct file *file, struc
         if (!proc_name_is_numeric(parent) || BPF_CORE_READ(parent, d_parent) != root) return 0;
         return (int)pid_len + (int)tid_len + 11; // /PID/task/TID/fd plus NUL
     }
-    if (!proc_name_is(leaf, PROC_EXEC) || !proc_name_is(parent, PROC_APPARMOR)) return 0;
-    parent = BPF_CORE_READ(parent, d_parent);
+    if (!proc_name_is(leaf, PROC_EXEC)) return 0;
+    // The OCI runtime labels the exec'd process through the active LSM's
+    // exec attribute: attr/apparmor/exec on AppArmor hosts, the generic
+    // attr/exec on SELinux hosts (runc/crun write it on every `exec`).
+    bool apparmor = proc_name_is(parent, PROC_APPARMOR);
+    if (apparmor) parent = BPF_CORE_READ(parent, d_parent);
     if (!proc_name_is(parent, PROC_ATTR)) return 0;
     parent = BPF_CORE_READ(parent, d_parent);
     if (!proc_name_is_numeric(parent)) return 0;
@@ -856,6 +860,7 @@ static __noinline int proc_runtime_control_relative_len(struct file *file, struc
     parent = BPF_CORE_READ(parent, d_parent);
     __u32 pid_len = BPF_CORE_READ(parent, d_name.len);
     if (!proc_name_is_numeric(parent) || BPF_CORE_READ(parent, d_parent) != root) return 0;
+    if (!apparmor) return (int)pid_len + (int)tid_len + 18; // /PID/task/TID/attr/exec plus NUL
     return (int)pid_len + (int)tid_len + 27; // /PID/task/TID/attr/apparmor/exec plus NUL
 }
 
