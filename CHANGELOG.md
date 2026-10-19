@@ -6,6 +6,15 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 
 ## [Unreleased]
 
+### Fixed
+- **A denied create no longer leaves a file behind** (#204). `open(O_CREAT)`,
+  `touch`, `mknod`, `mkfifo` and unix-socket binds create a name through
+  `security_path_mknod` before `file_open` can refuse the open; the new
+  `lsm_mknod` program decides that name with the directory-mutation table
+  (writable-directory authority, deny precedence, a `file.create` audit
+  record), on overlay rootfs, bind mounts and plain filesystems alike. macOS
+  `AUTH_CREATE` of a regular file now checks the same table as well.
+
 ## [native-v0.4.0] — 2026-10-18
 
 Everything merged since `native-v0.3.15` (PRs #129–#216). The headline: one
