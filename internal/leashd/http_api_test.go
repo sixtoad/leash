@@ -10,15 +10,40 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/policy"
 )
 
+// setupLeashDirs points LEASH_DIR and LEASH_PRIVATE_DIR at fresh directories
+// for t and holds the env lock until t ends. Every test whose policy API can
+// write runtime Cedar must call it: the API writes into LEASH_DIR (#234).
 func setupLeashDirs(t *testing.T) string {
 	t.Helper()
 	publicDir, _ := provisionLeashEnv(t)
 	return publicDir
+}
+
+// requestDeadline bounds one in-process API request, so a handler that
+// deadlocks fails its test with the goroutine dump instead of hanging the
+// package to go test's 10-minute timeout (#234).
+const requestDeadline = 30 * time.Second
+
+func serveWithin(t *testing.T, h http.Handler, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.ServeHTTP(w, r)
+	}()
+	timer := time.NewTimer(requestDeadline)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		t.Fatalf("%s %s did not return within %s\n%s", r.Method, r.URL, requestDeadline, allGoroutines())
+	}
 }
 
 type captureBroadcaster struct {
@@ -124,6 +149,7 @@ func extractCaretCoords(t *testing.T, src string) (string, int, int) {
 
 func TestPoliciesCORSOptions(t *testing.T) {
 	t.Parallel()
+	setupLeashDirs(t)
 	mux := http.NewServeMux()
 	mgr := policy.NewManager(nil, nil)
 	api := newPolicyAPI(mgr, "", nil, nil, nil)
@@ -131,7 +157,7 @@ func TestPoliciesCORSOptions(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodOptions, "/api/policies", nil)
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+	serveWithin(t, mux, w, req)
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d", w.Code)
 	}
@@ -142,6 +168,7 @@ func TestPoliciesCORSOptions(t *testing.T) {
 
 func TestPoliciesPostZeroRuleGuard(t *testing.T) {
 	t.Parallel()
+	setupLeashDirs(t)
 	mux := http.NewServeMux()
 	mgr := policy.NewManager(nil, nil)
 	api := newPolicyAPI(mgr, "", nil, nil, nil)
@@ -152,7 +179,7 @@ func TestPoliciesPostZeroRuleGuard(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/policies", body)
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+	serveWithin(t, mux, w, req)
 	if w.Code == http.StatusOK {
 		t.Fatalf("expected non-200 due to zero-rule guard, got %d", w.Code)
 	}
@@ -160,6 +187,7 @@ func TestPoliciesPostZeroRuleGuard(t *testing.T) {
 
 func TestPoliciesPostJSONAccepts(t *testing.T) {
 	t.Parallel()
+	setupLeashDirs(t)
 	mux := http.NewServeMux()
 	mgr := policy.NewManager(nil, nil)
 	api := newPolicyAPI(mgr, "", nil, nil, nil)
@@ -170,7 +198,7 @@ func TestPoliciesPostJSONAccepts(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/policies", bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+	serveWithin(t, mux, w, req)
 	if w.Code != http.StatusOK && w.Code != http.StatusBadRequest { // transpiler may reject example; accept non-500
 		t.Fatalf("unexpected status: %d", w.Code)
 	}
@@ -190,14 +218,14 @@ func TestPersistPoliciesEmptyBodyUsesRuntimeCedar(t *testing.T) {
 	seed := policy.DefaultCedar()
 	reqSeed := httptest.NewRequest(http.MethodPost, "/api/policies", bytes.NewBufferString(seed))
 	wSeed := httptest.NewRecorder()
-	mux.ServeHTTP(wSeed, reqSeed)
+	serveWithin(t, mux, wSeed, reqSeed)
 	if wSeed.Code != http.StatusOK {
 		t.Fatalf("seed policies POST returned %d", wSeed.Code)
 	}
 
 	reqPersist := httptest.NewRequest(http.MethodPost, "/api/policies/persist?force=1", nil)
 	wPersist := httptest.NewRecorder()
-	mux.ServeHTTP(wPersist, reqPersist)
+	serveWithin(t, mux, wPersist, reqPersist)
 	if wPersist.Code != http.StatusOK {
 		t.Fatalf("persist policies returned %d", wPersist.Code)
 	}
@@ -238,7 +266,7 @@ func TestPoliciesPatchAddPersistEnforce(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPatch, "/api/policies", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+	serveWithin(t, mux, w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("patch policies returned %d: %s", w.Code, w.Body.String())
 	}
@@ -302,23 +330,7 @@ func TestPoliciesPatchAddPersistEnforce(t *testing.T) {
 func TestPoliciesPatchPermitAllKeepsRuntimeOverlay(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
-	origLeashDir := os.Getenv("LEASH_DIR")
-	if err := os.Setenv("LEASH_DIR", tmpDir); err != nil {
-		t.Fatalf("failed to set LEASH_DIR: %v", err)
-	}
-	t.Cleanup(func() {
-		if origLeashDir == "" {
-			_ = os.Unsetenv("LEASH_DIR")
-		} else {
-			_ = os.Setenv("LEASH_DIR", origLeashDir)
-		}
-		if entries, err := os.ReadDir(tmpDir); err == nil {
-			for _, entry := range entries {
-				_ = os.RemoveAll(filepath.Join(tmpDir, entry.Name()))
-			}
-		}
-	})
+	tmpDir := setupLeashDirs(t)
 	policyPath := filepath.Join(tmpDir, "policies.cedar")
 
 	mux := http.NewServeMux()
@@ -331,7 +343,7 @@ func TestPoliciesPatchPermitAllKeepsRuntimeOverlay(t *testing.T) {
 	seed := policy.DefaultCedar()
 	reqSeed := httptest.NewRequest(http.MethodPost, "/api/policies", bytes.NewBufferString(seed))
 	wSeed := httptest.NewRecorder()
-	mux.ServeHTTP(wSeed, reqSeed)
+	serveWithin(t, mux, wSeed, reqSeed)
 	if wSeed.Code != http.StatusOK {
 		t.Fatalf("seed policies POST returned %d", wSeed.Code)
 	}
@@ -339,7 +351,7 @@ func TestPoliciesPatchPermitAllKeepsRuntimeOverlay(t *testing.T) {
 	// Switch to permit-all mode
 	reqPermit := httptest.NewRequest(http.MethodPost, "/api/policies/permit-all", nil)
 	wPermit := httptest.NewRecorder()
-	mux.ServeHTTP(wPermit, reqPermit)
+	serveWithin(t, mux, wPermit, reqPermit)
 	if wPermit.Code != http.StatusOK {
 		t.Fatalf("permit-all returned %d", wPermit.Code)
 	}
@@ -361,7 +373,7 @@ func TestPoliciesPatchPermitAllKeepsRuntimeOverlay(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPatch, "/api/policies", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+	serveWithin(t, mux, w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("patch in permit-all returned %d: %s", w.Code, w.Body.String())
 	}
@@ -401,6 +413,7 @@ func TestPoliciesPatchPermitAllKeepsRuntimeOverlay(t *testing.T) {
 
 func TestPoliciesPatchRequiresChanges(t *testing.T) {
 	t.Parallel()
+	setupLeashDirs(t)
 
 	mux := http.NewServeMux()
 	mgr := policy.NewManager(nil, nil)
@@ -410,7 +423,7 @@ func TestPoliciesPatchRequiresChanges(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPatch, "/api/policies", bytes.NewBufferString(`{}`))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+	serveWithin(t, mux, w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for empty patch, got %d", w.Code)
 	}
@@ -418,6 +431,7 @@ func TestPoliciesPatchRequiresChanges(t *testing.T) {
 
 func TestPoliciesPostRejectsInternalConflict(t *testing.T) {
 	t.Parallel()
+	setupLeashDirs(t)
 
 	mux := http.NewServeMux()
 	mgr := policy.NewManager(nil, nil)
@@ -431,7 +445,7 @@ forbid (principal, action == Action::"NetworkConnect", resource == Host::"api.op
 `
 	req := httptest.NewRequest(http.MethodPost, "/api/policies", bytes.NewBufferString(cedar))
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+	serveWithin(t, mux, w, req)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict for internal conflicting policies, got %d: %s", w.Code, w.Body.String())
 	}
@@ -439,6 +453,7 @@ forbid (principal, action == Action::"NetworkConnect", resource == Host::"api.op
 
 func TestAddPolicyFromActionDetectsConflict(t *testing.T) {
 	t.Parallel()
+	setupLeashDirs(t)
 
 	mux := http.NewServeMux()
 	mgr := policy.NewManager(nil, nil)
@@ -457,7 +472,7 @@ func TestAddPolicyFromActionDetectsConflict(t *testing.T) {
 	req1 := httptest.NewRequest(http.MethodPost, "/api/policies/add-from-action", bytes.NewReader(b1))
 	req1.Header.Set("Content-Type", "application/json")
 	w1 := httptest.NewRecorder()
-	mux.ServeHTTP(w1, req1)
+	serveWithin(t, mux, w1, req1)
 	if w1.Code != http.StatusOK {
 		t.Fatalf("seed add-from-action returned %d: %s", w1.Code, w1.Body.String())
 	}
@@ -474,7 +489,7 @@ func TestAddPolicyFromActionDetectsConflict(t *testing.T) {
 	req2 := httptest.NewRequest(http.MethodPost, "/api/policies/add-from-action", bytes.NewReader(b2))
 	req2.Header.Set("Content-Type", "application/json")
 	w2 := httptest.NewRecorder()
-	mux.ServeHTTP(w2, req2)
+	serveWithin(t, mux, w2, req2)
 	if w2.Code != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict on conflicting add-from-action, got %d: %s", w2.Code, w2.Body.String())
 	}
@@ -508,7 +523,7 @@ func TestPoliciesPatchAddMCPSpecificTool(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPatch, "/api/policies", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+	serveWithin(t, mux, w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("patch policies returned %d: %s", w.Code, w.Body.String())
@@ -552,7 +567,7 @@ func TestAddPolicyFromActionMCPSpecificTool(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/policies/add-from-action", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+	serveWithin(t, mux, w, req)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("add-from-action returned %d: %s", w.Code, w.Body.String())
@@ -575,7 +590,7 @@ func TestAddPolicyFromActionMCPSpecificTool(t *testing.T) {
 func TestPoliciesPatchRejectsConflict(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
+	tmpDir := setupLeashDirs(t)
 	policyPath := filepath.Join(tmpDir, "policies.cedar")
 
 	mux := http.NewServeMux()
@@ -587,7 +602,7 @@ func TestPoliciesPatchRejectsConflict(t *testing.T) {
 	seed := `permit (principal, action == Action::"NetworkConnect", resource == Host::"api.openai.com");`
 	reqSeed := httptest.NewRequest(http.MethodPost, "/api/policies", bytes.NewBufferString(seed))
 	wSeed := httptest.NewRecorder()
-	mux.ServeHTTP(wSeed, reqSeed)
+	serveWithin(t, mux, wSeed, reqSeed)
 	if wSeed.Code != http.StatusOK {
 		t.Fatalf("seed POST returned %d: %s", wSeed.Code, wSeed.Body.String())
 	}
@@ -608,7 +623,7 @@ func TestPoliciesPatchRejectsConflict(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPatch, "/api/policies", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+	serveWithin(t, mux, w, req)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict for patch conflict, got %d: %s", w.Code, w.Body.String())
 	}
@@ -617,7 +632,7 @@ func TestPoliciesPatchRejectsConflict(t *testing.T) {
 func TestPersistPoliciesRejectsConflict(t *testing.T) {
 	t.Parallel()
 
-	tmpDir := t.TempDir()
+	tmpDir := setupLeashDirs(t)
 	policyPath := filepath.Join(tmpDir, "policies.cedar")
 
 	mux := http.NewServeMux()
@@ -642,7 +657,7 @@ when { resource in [ Host::"*" ] };
 
 	req := httptest.NewRequest(http.MethodPost, "/api/policies/persist", bytes.NewBufferString(cedar))
 	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
+	serveWithin(t, mux, w, req)
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict for persist conflict, got %d: %s", w.Code, w.Body.String())
 	}
@@ -650,6 +665,7 @@ when { resource in [ Host::"*" ] };
 
 func TestPoliciesCompleteBasic(t *testing.T) {
 	t.Parallel()
+	setupLeashDirs(t) // newPolicyAPI seeds cedar-runtime.cedar into LEASH_DIR
 
 	mgr := policy.NewManager(nil, nil)
 	api := newPolicyAPI(mgr, "", nil, nil, nil)
@@ -688,6 +704,7 @@ func TestPoliciesCompleteBasic(t *testing.T) {
 
 func TestPoliciesCompleteRejectsInvalidCursor(t *testing.T) {
 	t.Parallel()
+	setupLeashDirs(t) // newPolicyAPI seeds cedar-runtime.cedar into LEASH_DIR
 
 	mgr := policy.NewManager(nil, nil)
 	api := newPolicyAPI(mgr, "", nil, nil, nil)
@@ -712,6 +729,7 @@ func TestPoliciesCompleteRejectsInvalidCursor(t *testing.T) {
 
 func TestPoliciesCompleteUsesPolicyHints(t *testing.T) {
 	t.Parallel()
+	setupLeashDirs(t) // newPolicyAPI seeds cedar-runtime.cedar into LEASH_DIR
 
 	mgr := policy.NewManager(nil, nil)
 

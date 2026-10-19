@@ -56,7 +56,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	// Native boxes (holder unit, netns, work dir) left behind by a leash that
 	// was SIGKILLed are reported on stderr; --reap removes them (#158). Only
 	// boxes whose owning leash is provably gone are listed or touched.
-	reap := fs.Bool("reap", false, "remove native boxes (systemd unit, netns, temp dirs) left by leash runs whose process is gone")
+	reap := fs.Bool("reap", false, "remove native boxes (systemd unit, netns, temp dirs) and docker/podman containers left by leash runs whose process is gone")
 	daemonAddr := fs.String("darwin-daemon", "", "macOS: `address` of the running \"leash --darwin\" daemon (default $LEASH_LISTEN, else "+DefaultDarwinDaemonAddr+")")
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "usage: leash doctor [--json] [--quick] [--reap] [--leash-cli-path PATH] [--darwin-daemon ADDR]\n\nChecks whether this machine can enforce, per runtime.\n\nflags:\n")
@@ -82,6 +82,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	}
 
 	reportStaleNativeBoxes(stderr, *reap)
+	reportStaleContainerRuns(stderr, *reap)
 
 	report := Evaluate(ProbeWithOptions(ProbeOptions{
 		Quick:            *quick,
@@ -116,7 +117,25 @@ func Main(args []string, stdout, stderr io.Writer) int {
 var (
 	staleNativeBoxes = runner.StaleNativeBoxes
 	reapNativeBoxes  = func() []string { return runner.ReapStaleNativeBoxes(context.Background()) }
+	// Containers of container runs whose leash was killed (#201).
+	staleContainerRuns = func() []string { return runner.StaleContainerRuns(context.Background()) }
+	reapContainerRuns  = func() []string { return runner.ReapStaleContainerRuns(context.Background()) }
 )
+
+// reportStaleContainerRuns notes (or, with reap, removes) the docker/podman
+// containers left by container runs whose leash is gone. stderr only, like
+// reportStaleNativeBoxes.
+func reportStaleContainerRuns(stderr io.Writer, reap bool) {
+	if reap {
+		if names := reapContainerRuns(); len(names) > 0 {
+			fmt.Fprintf(stderr, "leash doctor: removed %d stale container(s) from dead runs: %s\n", len(names), strings.Join(names, ", "))
+		}
+		return
+	}
+	if names := staleContainerRuns(); len(names) > 0 {
+		fmt.Fprintf(stderr, "leash doctor: %d stale container(s) left by dead runs: %s (remove with `leash doctor --reap`; the next container run also removes them)\n", len(names), strings.Join(names, ", "))
+	}
+}
 
 // reportStaleNativeBoxes notes (or, with reap, removes) native boxes left by
 // dead leash runs. It writes to stderr only, so the JSON report on stdout and

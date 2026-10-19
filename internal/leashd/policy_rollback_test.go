@@ -96,7 +96,7 @@ func TestPolicyAPIApplyFailureKeepsPreviousPolicy(t *testing.T) {
 	post := func(path, body string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, path, bytes.NewBufferString(body))
 		w := httptest.NewRecorder()
-		mux.ServeHTTP(w, req)
+		serveWithin(t, mux, w, req)
 		return w
 	}
 	if w := post("/api/policies", policy.DefaultCedar()); w.Code != http.StatusOK {
