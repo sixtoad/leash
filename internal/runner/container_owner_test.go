@@ -431,3 +431,14 @@ func TestReapStaleContainersOnStartUsesRuntime(t *testing.T) {
 		t.Fatalf("removed %v", eng.removed)
 	}
 }
+
+// podman's `rm -f` waits out the stop timeout; a dead run's containers are
+// killed at once on both engines.
+func TestForceRemoveArgs(t *testing.T) {
+	if got := strings.Join(forceRemoveArgs(cliRuntime{bin: "docker"}, []string{"a", "b"}), " "); got != "rm -f a b" {
+		t.Fatalf("docker: %q", got)
+	}
+	if got := strings.Join(forceRemoveArgs(cliRuntime{bin: "podman"}, []string{"a"}), " "); got != "rm -f --time 0 a" {
+		t.Fatalf("podman: %q", got)
+	}
+}

@@ -268,7 +268,7 @@ func sweepContainerSession(ctx context.Context, rt Runtime, session string) {
 			empty = 0
 		}
 		if len(ids) > 0 {
-			_, _ = rt.Output(ctx, append([]string{"rm", "-f"}, ids...)...)
+			_, _ = rt.Output(ctx, forceRemoveArgs(rt, ids)...)
 		}
 		if empty >= 2 || !time.Now().Before(deadline) || ctx.Err() != nil {
 			return
@@ -279,6 +279,17 @@ func sweepContainerSession(ctx context.Context, rt Runtime, session string) {
 		case <-time.After(containerWatchSweepInterval):
 		}
 	}
+}
+
+// forceRemoveArgs removes containers at once. The owner is gone, so there is
+// no orderly stop to wait for: docker's `rm -f` kills immediately, podman's
+// waits out the stop timeout (10s) unless told not to.
+func forceRemoveArgs(rt Runtime, ids []string) []string {
+	args := []string{"rm", "-f"}
+	if rt.Name() == "podman" {
+		args = append(args, "--time", "0")
+	}
+	return append(args, ids...)
 }
 
 func validContainerSession(s string) bool {
@@ -505,7 +516,7 @@ func reapStaleContainerRuns(ctx context.Context, rt Runtime) []string {
 	pruneKeptMarkers(containerStateDir(), rt.Name(), sessions)
 	var names []string
 	for _, run := range runs {
-		if _, err := rt.Output(ctx, append([]string{"rm", "-f"}, run.IDs...)...); err != nil && !isNoSuchObjectError(err) {
+		if _, err := rt.Output(ctx, forceRemoveArgs(rt, run.IDs)...); err != nil && !isNoSuchObjectError(err) {
 			continue
 		}
 		if run.WorkDir != "" {
