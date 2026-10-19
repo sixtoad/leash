@@ -1,4 +1,4 @@
-//go:generate bash -c "if [ \"$(uname -s)\" = 'Linux' ]; then command -v bpf2go 1>/dev/null 2>&1 || go install github.com/cilium/ebpf/cmd/bpf2go && bpf2go -cc clang -tags linux lsmOpen bpf/lsm_open.bpf.c -- -I./bpf && bpf2go -cc clang -tags linux lsmExec bpf/lsm_exec.bpf.c -- -I./bpf && bpf2go -cc clang -tags linux lsmConnect bpf/lsm_connect.bpf.c -- -I./bpf; else echo 'Skipping bpf2go in non-Linux build environment'; fi"
+//go:generate bash -c "if [ \"$(uname -s)\" = 'Linux' ]; then BPF2GO_CC=\"$(bash ./bpf_clang.sh)\" || exit 1; export BPF2GO_CC; command -v bpf2go 1>/dev/null 2>&1 || go install github.com/cilium/ebpf/cmd/bpf2go || exit 1; bpf2go -tags linux lsmOpen bpf/lsm_open.bpf.c -- -I./bpf && bpf2go -tags linux lsmExec bpf/lsm_exec.bpf.c -- -I./bpf && bpf2go -tags linux lsmConnect bpf/lsm_connect.bpf.c -- -I./bpf; else echo 'Skipping bpf2go in non-Linux build environment'; fi"
 
 package lsm
 
