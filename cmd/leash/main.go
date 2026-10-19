@@ -7,9 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
-	"os/exec"
 	"runtime"
-	"syscall"
 
 	"github.com/strongdm/leash/internal/darwind"
 	"github.com/strongdm/leash/internal/doctor"
@@ -126,26 +124,43 @@ func runResolverSubcommand(args []string, stdout, stderr io.Writer) (bool, int) 
 	return true, resolvercontract.Main(args[2:], stdout, stderr, runtime.GOOS, runner.NativeEgressResolvers)
 }
 
-// hardenExec applies the seccomp/no-new-privs/cap-drop hardening to the current
-// process, then execs the remaining command. Inserted into the native workload
-// launch (after leash's own namespace setup) so the filter is inherited by the
-// agent and every subprocess — closing the userns→bind-mount path-LSM bypass.
-// Usage: leash --harden-exec -- <cmd> [args...]
+// hardenExec applies the seccomp/no-new-privs/capability hardening to the
+// current process, then runs the remaining command. Inserted into the native
+// workload launch (after leash's own namespace setup) so it is inherited by
+// the agent and every subprocess — closing the userns→bind-mount path-LSM
+// bypass. With --user it also drops root to that user: the bounding set can
+// only be emptied while still privileged, so the drop happens here instead of
+// in runuser (#203).
+// Usage: leash --harden-exec [--user <name>] -- <cmd> [args...]
 func hardenExec(rest []string) error {
+	var drop *hardening.Identity
+	if len(rest) >= 2 && rest[0] == "--user" {
+		id, err := hardening.LookupIdentity(rest[1])
+		if err != nil {
+			return fmt.Errorf("--harden-exec: %w", err)
+		}
+		drop = id
+		rest = rest[2:]
+	}
 	if len(rest) > 0 && rest[0] == "--" {
 		rest = rest[1:]
 	}
 	if len(rest) == 0 {
 		return errors.New("--harden-exec: no command given")
 	}
-	if err := hardening.Apply(); err != nil {
+	env := os.Environ()
+	if drop != nil {
+		env = hardening.UserEnv(env, drop)
+	}
+	if err := hardening.Apply(drop); err != nil {
 		return fmt.Errorf("--harden-exec: %w", err)
 	}
-	path := rest[0]
-	if resolved, err := exec.LookPath(path); err == nil {
-		path = resolved
+	code, err := hardening.Run(rest, env)
+	if err != nil {
+		return fmt.Errorf("--harden-exec: %w", err)
 	}
-	return syscall.Exec(path, rest, os.Environ())
+	os.Exit(code)
+	return nil
 }
 
 // buildInfo bundles the link-time values for internal/version, which does the

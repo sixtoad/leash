@@ -1368,9 +1368,10 @@ func nativeRootWithoutDropTarget(euid int, dropUser, sudoUser string) bool {
 }
 
 // nativeWorkloadScript builds the shell placed in the box: join the LSM-scoped
-// cgroup, cd to workdir, then exec the command — dropping to dropUser via runuser
-// when set, and exporting NODE_EXTRA_CA_CERTS (for the L2 MITM) when caCert is
-// set. The export goes in the innermost shell so it survives the runuser hop.
+// cgroup, cd to workdir, then exec the command — dropping to dropUser when set
+// (via `leash --harden-exec --user` when hardened, else runuser), and exporting
+// NODE_EXTRA_CA_CERTS (for the L2 MITM) when caCert is set. The export goes in
+// the innermost shell so it survives the user switch.
 // Pure, so it is unit-tested.
 // hardenOpts controls the workload's session isolation. Default (enabled, no
 // opt-outs): fresh PID+IPC ns, keyring/GUI socket masks, and a scrubbed env.
@@ -1453,24 +1454,35 @@ func nativeWorkloadScript(cgroupPath, workdir, shellBin, shellFlag, cmd, dropUse
 		}
 	}
 
-	// Seccomp-harden the workload just before it execs the agent: re-exec through
-	// `leash --harden-exec`, which installs the mount/unshare-denying filter and
-	// then execs onward. Placed INSIDE runuser (so it runs as the dropped user) but
-	// AFTER leash's own `unshare --mount-proc` below — leash's namespace setup
-	// completes first, then the filter blocks the agent from creating its own
-	// user+mount namespace to bind-mount a denied path under an allowed prefix
-	// (the path-LSM bypass). Inherited across exec → covers every subprocess.
+	// Harden the workload just before it execs the agent: re-exec through
+	// `leash --harden-exec`, which sets no_new_privs, empties the capability
+	// bounding set and clears the ambient set while still root, drops to
+	// dropUser itself (setgroups/setgid/setuid), clears the remaining capability
+	// sets, installs the mount/unshare-denying seccomp filter and runs the
+	// command. The drop happens there rather than in runuser because the
+	// bounding set can only be emptied with CAP_SETPCAP: run as the dropped user
+	// (inside runuser) the drop failed silently and the workload kept a full
+	// CapBnd (#203). Placed AFTER leash's own `unshare --mount-proc` below —
+	// leash's namespace setup completes first, then the filter blocks the agent
+	// from creating its own user+mount namespace to bind-mount a denied path
+	// under an allowed prefix (the path-LSM bypass). Inherited across exec →
+	// covers every subprocess.
 	// --allow-namespaces opts out for workloads that legitimately need unshare/
 	// mount (nested containers, sandbox tools) — at the cost of reopening the
-	// bypass, so it is off by default.
+	// bypass, so it is off by default. It keeps the runuser drop and the
+	// runtime's bounding set: nested rootless containers need newuidmap's
+	// setuid bit or file capability, which no_new_privs or an empty bounding
+	// set would disable.
 	payload := scrub + shellRun
-	if h.enabled && !h.allowNamespaces && self != "" {
-		payload = quoteShellArg(self) + " --harden-exec -- " + scrub + shellRun
-	}
-
-	// Drop privileges (runuser), keeping the harden+scrub in the innermost exec.
 	userRun := payload
-	if dropUser != "" {
+	switch {
+	case h.enabled && !h.allowNamespaces && self != "":
+		user := ""
+		if dropUser != "" {
+			user = "--user " + quoteShellArg(dropUser) + " "
+		}
+		userRun = quoteShellArg(self) + " --harden-exec " + user + "-- " + payload
+	case dropUser != "":
 		userRun = "runuser -u " + quoteShellArg(dropUser) + " -- " + payload
 	}
 

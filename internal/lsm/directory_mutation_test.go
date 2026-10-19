@@ -20,7 +20,7 @@ func TestDirectoryMutationHooksRequireWritableDirectoryRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(source)
-	for _, hook := range []string{"lsm/path_mkdir", "lsm/path_unlink", "lsm/path_rmdir", "lsm/path_rename"} {
+	for _, hook := range []string{"lsm/path_mkdir", "lsm/path_unlink", "lsm/path_rmdir", "lsm/path_rename", "lsm/path_mknod"} {
 		if !strings.Contains(text, hook) {
 			t.Fatalf("required directory mutation hook %q is absent", hook)
 		}
@@ -31,6 +31,7 @@ func TestDirectoryMutationHooksRequireWritableDirectoryRules(t *testing.T) {
 		"int BPF_PROG(lsm_rmdir,",
 		"int BPF_PROG(lsm_rename_source,",
 		"int BPF_PROG(lsm_rename_destination,",
+		"int BPF_PROG(lsm_mknod,",
 	} {
 		start := strings.Index(text, signature)
 		if start < 0 {
@@ -72,6 +73,10 @@ func TestDirectoryMutationHooksRequireWritableDirectoryRules(t *testing.T) {
 		"if (ret != 0) return ret;",
 		"bpf_map_delete_elem(&overlay_write_context, &pid_tgid);",
 		"int allowed = check_mutation_policy(scratch->target);",
+		// #204: a create is decided before the inode exists, by the shared
+		// mutation check, never skipped on the overlay correlation.
+		"ret = check_created_name(dir, dentry);",
+		"if (!current_is_io_worker() && mark_allowed_overlay_mutation(dir) != 0) {",
 	} {
 		if !strings.Contains(text, guard) {
 			t.Fatalf("directory mutation enforcement is missing %q", guard)
@@ -82,6 +87,9 @@ func TestDirectoryMutationHooksRequireWritableDirectoryRules(t *testing.T) {
 	}
 	if strings.Contains(text, "check_path_policy(scratch->target, operation)") {
 		t.Fatal("mutation hooks still carry ordinary open-policy branches through the verifier")
+	}
+	if mknod := text[strings.Index(text, "int BPF_PROG(lsm_mknod,"):]; strings.Contains(mknod[:strings.Index(mknod, "\n}\n")], "mutation_overlay_context_active()") {
+		t.Fatal("lsm_mknod skips its check on the overlay correlation; overlayfs never re-enters path_mknod")
 	}
 	if got := strings.Count(text, "bpf_map_lookup_elem(&active_mutation_generation, &zero)"); got != 2 {
 		t.Fatalf("mutation decision performs %d activation-token lookups, want snapshot and confirmation", got)
@@ -373,6 +381,7 @@ func TestDirectoryMutationDenialNamesOperationAndPath(t *testing.T) {
 		mutationOpRename:     "file.rename",
 		mutationOpLink:       "file.link",
 		mutationOpLinkSource: "file.link:source",
+		mutationOpCreate:     "file.create",
 	} {
 		event := OpenEvent{PID: 42, TGID: 42, Operation: op, Result: -13}
 		copy(event.Comm[:], "fixture\x00")

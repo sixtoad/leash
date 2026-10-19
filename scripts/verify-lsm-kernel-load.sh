@@ -91,11 +91,17 @@ if [ -r /sys/kernel/security/lsm ]; then
   printf '%s\n' "verify-lsm-kernel-load: active LSMs: $(cat /sys/kernel/security/lsm)" >&2
 fi
 
+# A host directory as a bind-mounted volume: a denied create in it must leave
+# no file behind (#204).
+mkdir -p "$WORKDIR/bind"
+chmod 0777 "$WORKDIR/bind"
+
 printf '%s\n' "verify-lsm-kernel-load: loading lsm_open/lsm_exec/lsm_connect on kernel $(uname -r)..." >&2
 docker run --rm --name "$CONTAINER" \
   --privileged --cgroupns=host "${TRACEFS[@]}" \
   -e LEASH_LSM_KERNEL_LOAD_VALIDATION=1 \
   -v "$TEST_BINARY:/lsm.test:ro" \
+  -v "$WORKDIR/bind:/leash-bind" \
   "$IMAGE" /lsm.test -test.v -test.count=1 \
   -test.run '^TestKernelLoadAllModulesWithExecRule$' | tee "$WORKDIR/output"
 
