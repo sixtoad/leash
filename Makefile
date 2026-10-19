@@ -6,6 +6,12 @@ LEASH_ECR_LATEST ?= public.ecr.aws/s5i7k8t3/strongdm/leash:latest
 TARGET_ECR_LATEST ?= public.ecr.aws/s5i7k8t3/strongdm/coder:latest
 LSM_DOCKER_IMAGE ?= golang:1.25.3-bookworm
 DOCKER ?= docker
+# Throwaway build containers bind-mount the source tree. On SELinux-enforcing
+# hosts (Fedora/RHEL) those host paths are not labelled for container access,
+# and relabelling them (:z/:Z) would rewrite the labels of the whole checkout.
+# Disable SELinux separation for these build containers only; it is a no-op on
+# hosts without SELinux. Override with BUILD_CONTAINER_SECURITY_OPTS= to drop it.
+BUILD_CONTAINER_SECURITY_OPTS ?= --security-opt label=disable
 #LEASH_PLATFORMS ?= darwin/amd64 darwin/arm64 linux/amd64 linux/arm64
 # TEMP: Disable multi-arch
 LEASH_PLATFORMS ?= "$(shell uname -s | tr '[A-Z]' '[a-z]')/$(shell uname -m)"
@@ -82,7 +88,7 @@ lsm-generate: ## Generate LSM eBPF artifacts on the host system
 .PHONY: lsm-generate-docker
 lsm-generate-docker: ## Generate LSM artifacts inside the Docker toolchain
 	@echo "running lsm-generate inside $(LSM_DOCKER_IMAGE)..."
-	@$(DOCKER) run --rm --platform=linux/amd64 --user 0 \
+	@$(DOCKER) run --rm --platform=linux/amd64 --user 0 $(BUILD_CONTAINER_SECURITY_OPTS) \
 	  -e CGO_ENABLED=1 -e GOWORK=off \
 	  -v "$(CURDIR)":/workspace \
 	  -w /workspace \
@@ -228,7 +234,7 @@ docker-ui: precommit ## Build the Control UI using Docker
 	@#      way to silence interactive confirmation in headless environments.
 	@#      With CI=true it proceeds non-interactively, avoiding the prompt that
 	@#      otherwise kills the build.
-	@$(DOCKER) run --rm \
+	@$(DOCKER) run --rm $(BUILD_CONTAINER_SECURITY_OPTS) \
 	  -e CI=true \
 	  -e PNPM_STORE_DIR=/pnpm/store \
 	  -e HOST_UID=$(shell id -u) -e HOST_GID=$(shell id -g) \
