@@ -6,6 +6,21 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 
 ## [Unreleased]
 
+### Security
+- **The native workload keeps no capability it could regain** (#203). It ran
+  with a full bounding set (`CapBnd=000001ffffffffff`): `leash --harden-exec`
+  dropped it after `runuser` had already left root, without `CAP_SETPCAP`, so
+  the drop failed silently. `--harden-exec --user` now empties the bounding
+  set and clears the ambient set while still root, then drops to the user
+  itself (in place of `runuser`), clears the inheritable/permitted/effective
+  sets, sets `no_new_privs` and the seccomp filter, and refuses to run the
+  workload if any capability is left. Inside the box: `CapBnd`, `CapAmb`,
+  `CapInh`, `CapPrm`, `CapEff` all `0`, `NoNewPrivs: 1`; setuid binaries
+  (`sudo`) gain nothing and file-capability binaries (iputils `ping`) cannot
+  be executed. `--allow-namespaces` keeps the previous `runuser` launch so
+  nested rootless containers can still use `newuidmap`. Container mode is
+  unchanged (see docs/design/SECURITY-MODEL.md § Workload capabilities).
+
 ### Fixed
 - **A denied create no longer leaves a file behind** (#204). `open(O_CREAT)`,
   `touch`, `mknod`, `mkfifo` and unix-socket binds create a name through

@@ -39,8 +39,9 @@ Leash closes this at three points:
   destination (connect default allow, no deny connect rule, no MCP forbid).
   This holds whatever capabilities the workload has (rootless podman,
   custom `--cap-add`). Each decision is logged as `event=net.socket`.
-- **Native mode:** the workload has no `CAP_NET_RAW` (cleared bounding set,
-  drop-user).
+- **Native mode:** the workload has no `CAP_NET_RAW`, nor any other
+  capability (empty bounding set, `no_new_privs`, drop-user; see
+  [Workload capabilities](#workload-capabilities)).
 - **Container mode:** a run never starts without the kernel gate (leash
   always fails closed when the eBPF LSM is unavailable), so the target keeps
   the runtime's capability set: dropping `NET_RAW` would add nothing the
@@ -58,6 +59,65 @@ a fresh network namespace (native mode) and Podman's default (`0 0`) do not,
 so `ping` already failed there without `CAP_NET_RAW`. BusyBox `ping` uses
 only a raw socket and is refused under a restricting policy, as are tools
 that need raw sockets (`tcpdump`, `nmap -sS`, `mtr`, `arping`).
+
+### Workload capabilities
+
+**Native mode** (#203). The workload holds no capability and cannot regain
+one. `leash --harden-exec --user <user>`, the last step of the native launch
+(after leash's own cgroup placement, mounts and `unshare`), runs as root and,
+on one locked OS thread:
+
+1. sets `no_new_privs`;
+2. drops every capability from the bounding set and clears the ambient set
+   (this needs `CAP_SETPCAP`, which is why it runs before the user switch;
+   until #203 it ran after `runuser` and failed silently, leaving
+   `CapBnd=000001ffffffffff`);
+3. switches to the invoking user (supplementary groups from NSS, gid, uid)
+   and sets `HOME`, `SHELL`, `USER`, `LOGNAME` as `runuser -u` did;
+4. clears the inheritable, permitted and effective sets;
+5. installs the seccomp filter (mount family, `unshare`, `setns`);
+6. checks the result and refuses to run the workload if any capability set is
+   non-empty or `no_new_privs` is unset;
+7. runs the workload. As PID 1 of the box's PID namespace it stays as init
+   (reaps orphans, forwards `SIGTERM`/`SIGHUP`/`SIGUSR1`/`SIGUSR2`; the
+   terminal delivers `SIGINT`/`SIGQUIT` to the workload directly), as
+   `runuser` did before it.
+
+Nothing the native box needs runs after this step with privilege: the CA
+trust is environment variables, the masks and namespaces are set up before
+it, and the agent runs as the user. Inside the box `/proc/self/status` shows
+`CapInh`, `CapPrm`, `CapEff`, `CapBnd`, `CapAmb` all zero, `NoNewPrivs: 1` and
+`Seccomp: 2`. A setuid-root binary (`sudo`) runs without raising its euid, and
+a file-capability binary with the effective bit (iputils `ping`,
+`cap_net_raw+ep`) cannot be executed (`EPERM`). `--user root` gets the same
+treatment: uid 0 with no capabilities. `runuser`'s PAM session (for example
+`pam_limits`) no longer runs for the workload; the limits are those of the
+`sudo` session.
+
+`--allow-namespaces` (nested containers, sandbox tools) skips this step and
+keeps the earlier `runuser` launch with the runtime's bounding set and no
+`no_new_privs`: rootless podman/docker inside the box need `newuidmap`'s setuid
+bit or file capability, which either would disable. That flag already
+reopens the bind-mount bypass and is off by default.
+
+**Container mode** keeps the runtime's default capability set for the target
+(Docker: `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`, `KILL`, `SETGID`,
+`SETUID`, `SETPCAP`, `NET_BIND_SERVICE`, `NET_RAW`, `SYS_CHROOT`, `MKNOD`,
+`AUDIT_WRITE`, `SETFCAP`; Podman's default omits `NET_RAW`, `MKNOD` and
+`AUDIT_WRITE`), and leash adds no `--cap-drop` or `no-new-privileges`. The
+target is an arbitrary image whose workload is often root and whose
+entrypoint and tools rely on these: `leash-entry` installs the CA as root or
+through `sudo` in a non-root image (#181), entrypoints `chown` volumes and use
+`gosu`/`su-exec`/`sudo` (`SETUID`, `SETGID`, `AUDIT_WRITE`), package installs
+need `CHOWN`/`DAC_OVERRIDE`/`FOWNER`/`FSETID` and `setcap` in postinst scripts
+(`SETFCAP`), dev servers bind low ports (`NET_BIND_SERVICE`). None of the
+default capabilities lets the workload get around the kernel policy: the eBPF
+LSM decides file opens, execs, connects and socket creation for the cgroup
+whatever the capabilities (`NET_RAW` is covered by the socket gate above),
+`SYS_ADMIN`/`BPF`/`NET_ADMIN` are not in the default set, and the runtime's
+seccomp profile and device cgroup still apply (`MKNOD` creates no usable
+device beyond the default ones). A user who wants less can pass the runtime's
+own `--cap-drop` for their image; leash does not guess one for every image.
 
 ### Proxy Certificate Management
 
