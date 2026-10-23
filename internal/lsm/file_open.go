@@ -106,9 +106,10 @@ const (
 	mutationOpUnlink              uint32 = 4
 	mutationOpRmdir               uint32 = 5
 	mutationOpRename              uint32 = 6
-	mutationOpLink                uint32 = 7 // hard-link destination (new name)
-	mutationOpLinkSource          uint32 = 8 // hard-link source (existing file)
-	mutationOpCreate              uint32 = 9 // new non-directory name (path_mknod, #204)
+	mutationOpLink                uint32 = 7  // hard-link destination (new name)
+	mutationOpLinkSource          uint32 = 8  // hard-link source (existing file)
+	mutationOpCreate              uint32 = 9  // new non-directory name (path_mknod, #204)
+	mutationOpSymlink             uint32 = 10 // new symlink name (path_symlink, #226)
 	linkTailCallMapName                  = "link_tail_calls"
 	linkTailCallProgramName              = "lsm_link_policy"
 	linkGuardProgramName                 = "lsm_link"
@@ -329,7 +330,7 @@ func (l *OpenLsm) requiredProgramNames() []string {
 	// Container mode adds no file_open program: the overlay copy-up correlation
 	// is installed by the deciding program itself, so enforcement never depends
 	// on the order the kernel runs links on one hook (#186/#125).
-	return []string{"lsm_open", "lsm_mkdir", "lsm_unlink", "lsm_rmdir", "lsm_rename_source", "lsm_rename_destination", "lsm_mknod"}
+	return []string{"lsm_open", "lsm_mkdir", "lsm_unlink", "lsm_rmdir", "lsm_rename_source", "lsm_rename_destination", "lsm_mknod", "lsm_symlink"}
 }
 
 func (l *OpenLsm) attachCopyUpExitTracepoint(coll *ebpf.Collection) error {
@@ -1044,6 +1045,8 @@ func (l *OpenLsm) handleEvent(data []byte) {
 		eventName = "file.link:source"
 	case mutationOpCreate:
 		eventName = "file.create"
+	case mutationOpSymlink:
+		eventName = "file.symlink"
 	}
 
 	// Format in logfmt (key=value pairs) - matching C version format exactly

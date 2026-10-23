@@ -37,6 +37,13 @@ and the `capabilities` list is unchanged.
   table (writable-directory authority, deny precedence, a `file.create` audit
   record), on overlay rootfs, bind mounts and plain filesystems alike. macOS
   `AUTH_CREATE` of a regular file now checks the same table as well.
+- **Symlink creation is policy-checked on Linux** (#226). The new
+  `lsm_symlink` program on `security_path_symlink` decides a new symlink's
+  name with the directory-mutation table, like mkdir and mknod, before the
+  link exists, and writes a `file.symlink` record for every decision. A
+  workload can no longer plant a symlink in a directory it has no write
+  authority over. macOS already checked `AUTH_CREATE` of a symlink against
+  the same table; its events now name the operation `symlink`.
 
 ### Fixed
 - **SELinux hosts: `podman exec` / `docker exec` into a governed container

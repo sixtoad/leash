@@ -18,8 +18,10 @@ struct LeashPolicyEvent: Codable, Identifiable {
         case write
         /// truncate(2): decided as a write open
         case truncate
-        /// mkdir, and the creation of any non-regular file
+        /// mkdir, and the creation of any other non-regular file
         case mkdir
+        /// a new symlink (the new name; decided as a mutation)
+        case symlink
         /// unlink and rmdir
         case unlink
         /// either side of a rename or an exchangedata

@@ -20,7 +20,7 @@ func TestDirectoryMutationHooksRequireWritableDirectoryRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(source)
-	for _, hook := range []string{"lsm/path_mkdir", "lsm/path_unlink", "lsm/path_rmdir", "lsm/path_rename", "lsm/path_mknod"} {
+	for _, hook := range []string{"lsm/path_mkdir", "lsm/path_unlink", "lsm/path_rmdir", "lsm/path_rename", "lsm/path_mknod", "lsm/path_symlink"} {
 		if !strings.Contains(text, hook) {
 			t.Fatalf("required directory mutation hook %q is absent", hook)
 		}
@@ -32,6 +32,7 @@ func TestDirectoryMutationHooksRequireWritableDirectoryRules(t *testing.T) {
 		"int BPF_PROG(lsm_rename_source,",
 		"int BPF_PROG(lsm_rename_destination,",
 		"int BPF_PROG(lsm_mknod,",
+		"int BPF_PROG(lsm_symlink,",
 	} {
 		start := strings.Index(text, signature)
 		if start < 0 {
@@ -75,7 +76,9 @@ func TestDirectoryMutationHooksRequireWritableDirectoryRules(t *testing.T) {
 		"int allowed = check_mutation_policy(scratch->target);",
 		// #204: a create is decided before the inode exists, by the shared
 		// mutation check, never skipped on the overlay correlation.
-		"ret = check_created_name(dir, dentry);",
+		"ret = check_created_name(dir, dentry, OP_CREATE);",
+		// #226: a symlink is decided the same way, before its inode exists.
+		"ret = check_created_name(dir, dentry, OP_SYMLINK);",
 		"if (!current_is_io_worker() && mark_allowed_overlay_mutation(dir) != 0) {",
 	} {
 		if !strings.Contains(text, guard) {
@@ -90,6 +93,9 @@ func TestDirectoryMutationHooksRequireWritableDirectoryRules(t *testing.T) {
 	}
 	if mknod := text[strings.Index(text, "int BPF_PROG(lsm_mknod,"):]; strings.Contains(mknod[:strings.Index(mknod, "\n}\n")], "mutation_overlay_context_active()") {
 		t.Fatal("lsm_mknod skips its check on the overlay correlation; overlayfs never re-enters path_mknod")
+	}
+	if symlink := text[strings.Index(text, "int BPF_PROG(lsm_symlink,"):]; strings.Contains(symlink[:strings.Index(symlink, "\n}\n")], "mutation_overlay_context_active()") {
+		t.Fatal("lsm_symlink skips its check on the overlay correlation; overlayfs never re-enters path_symlink")
 	}
 	if got := strings.Count(text, "bpf_map_lookup_elem(&active_mutation_generation, &zero)"); got != 2 {
 		t.Fatalf("mutation decision performs %d activation-token lookups, want snapshot and confirmation", got)
@@ -382,6 +388,7 @@ func TestDirectoryMutationDenialNamesOperationAndPath(t *testing.T) {
 		mutationOpLink:       "file.link",
 		mutationOpLinkSource: "file.link:source",
 		mutationOpCreate:     "file.create",
+		mutationOpSymlink:    "file.symlink",
 	} {
 		event := OpenEvent{PID: 42, TGID: 42, Operation: op, Result: -13}
 		copy(event.Comm[:], "fixture\x00")

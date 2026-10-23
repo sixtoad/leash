@@ -152,7 +152,7 @@ final class LeashCommunicationService: NSObject {
                     eventName = "file.open:rw"
                 case .open:
                     eventName = "file.open"
-                case .mkdir, .unlink, .rename, .link, .clone:
+                case .mkdir, .symlink, .unlink, .rename, .link, .clone:
                     eventName = "file.mutation"
                 }
             }

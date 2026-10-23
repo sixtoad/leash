@@ -141,6 +141,7 @@ func (o overlayRootCases) createdNames() []string {
 		o.defaultDenyDir + "/leash-ovl-new", o.defaultDenyDir + "/leash-ovl-fifo", o.defaultDenyDir + "/leash-ovl-null",
 		o.permittedDir + "/leash-ovl-new", o.genericDir + "/leash-ovl-touch",
 		o.rwDir + "/leash-ovl-new", o.rwDir + "/leash-ovl-fifo",
+		o.defaultDenyDir + "/leash-ovl-symlink", o.genericDir + "/leash-ovl-symlink", o.rwDir + "/leash-ovl-symlink",
 	}
 }
 
@@ -159,6 +160,11 @@ func (o overlayRootCases) verifyCreates(t *testing.T, cgroupFD int) {
 		{boxCase{"overlay: mknod char device in default-deny image dir", `mknod "$1" c 1 3`, []string{o.defaultDenyDir + "/leash-ovl-null"}, false, ""}},
 		{boxCase{"overlay: O_CREAT in permitted rw image dir", boxWrite, []string{o.rwDir + "/leash-ovl-new"}, true, ""}},
 		{boxCase{"overlay: mkfifo in permitted rw image dir", `mkfifo "$1"`, []string{o.rwDir + "/leash-ovl-fifo"}, true, ""}},
+		// A symlink is a new entry (#226); overlayfs's own vfs_symlink on the
+		// upper layer never re-enters path_symlink.
+		{boxCase{"overlay: symlink in default-deny image dir", boxSymlink, []string{o.defaultDenyDir + "/leash-ovl-symlink", "/etc/hostname"}, false, ""}},
+		{boxCase{"overlay: symlink in generic-only image dir", boxSymlink, []string{o.genericDir + "/leash-ovl-symlink", "/etc/hostname"}, false, ""}},
+		{boxCase{"overlay: symlink in permitted rw image dir", boxSymlink, []string{o.rwDir + "/leash-ovl-symlink", "/etc/hostname"}, true, ""}},
 	}
 	runCreateCases(t, cgroupFD, cases)
 }
@@ -173,5 +179,7 @@ func (o overlayRootCases) auditPatterns() []string {
 		`event=file.create .*path="` + regexp.QuoteMeta(o.defaultDenyDir+"/leash-ovl-new") + `" decision=denied`,
 		`event=file.create .*path="` + regexp.QuoteMeta(o.genericDir+"/leash-ovl-touch") + `" decision=denied`,
 		`event=file.create .*path="` + regexp.QuoteMeta(o.rwDir+"/leash-ovl-fifo") + `" decision=allowed`,
+		`event=file.symlink .*path="` + regexp.QuoteMeta(o.defaultDenyDir+"/leash-ovl-symlink") + `" decision=denied`,
+		`event=file.symlink .*path="` + regexp.QuoteMeta(o.rwDir+"/leash-ovl-symlink") + `" decision=allowed`,
 	}
 }

@@ -38,7 +38,7 @@ or be refused, never silently weaker.**
 | Policy semantics | kernel tables from Cedar | the same tables, the same lookups | parity test: random strict policies, Go model of the Swift matcher == `cedar.Authorize`; vectors replayed against Swift |
 | File open, by mode (read / write) | eBPF `file_open` | ES `AUTH_OPEN` | exact, prefix and directory entries; longest prefix; forbid-overrides-permit via the compiled exceptions |
 | File creation | mutation table (`path_mknod`, before the file exists) and `file_open` of the new file | ES `AUTH_CREATE` (mutation table and write open of the new file), `AUTH_TRUNCATE`, `AUTH_CLONE`, `AUTH_COPYFILE`, `AUTH_EXCHANGEDATA` | a denied create leaves no file (#204) |
-| Directory mutations (mkdir, unlink, rmdir, rename, link, mknod/mkfifo/socket) | mutation table | ES `AUTH_CREATE` (non-regular), `AUTH_UNLINK`, `AUTH_RENAME`, `AUTH_LINK` | same table, same over-denials; macOS also gates symlinks |
+| Directory mutations (mkdir, unlink, rmdir, rename, link, mknod/mkfifo/socket, symlink) | mutation table (`path_symlink` for symlinks, #226) | ES `AUTH_CREATE` (non-regular, symlinks included), `AUTH_UNLINK`, `AUTH_RENAME`, `AUTH_LINK` | same table, same over-denials; a denied symlink leaves nothing |
 | Hard-link source must be readable | link guard | `AUTH_LINK` | |
 | Exec | eBPF `bprm_check_security` | ES `AUTH_EXEC` | exact and prefix rules, kernel length limits apply |
 | Network: IPv4, IPv6, ports, default deny | eBPF connect/sendmsg | NE content filter | hostnames resolved at load, IPv4-mapped decided as IPv4 |
