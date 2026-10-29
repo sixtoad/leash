@@ -29,6 +29,7 @@ import (
 	"github.com/strongdm/leash/internal/entrypoint"
 	"github.com/strongdm/leash/internal/idmap"
 	"github.com/strongdm/leash/internal/leashd/listen"
+	"github.com/strongdm/leash/internal/networkpin"
 	"github.com/strongdm/leash/internal/openflag"
 	"github.com/strongdm/leash/internal/telemetry/statsig"
 )
@@ -95,26 +96,27 @@ var autoEnvForCommand = func() map[string][]string {
 }()
 
 type options struct {
-	noInteractive  bool
-	machineOutput  bool
-	policyOverride string
-	verbose        bool
-	volumes        []string
-	idmapVolumes   []idmapVolume
-	envVars        []string
-	command        []string
-	subcommand     string
-	targetImage    string
-	leashImage     string
-	containerName  string
-	network        string
-	runtime        string
-	selinuxMode    string // --selinux: auto|relabel|disable (see selinux_workspace.go)
-	listen         string
-	listenSet      bool
-	openUI         bool
-	publishes      []publishSpec
-	publishAll     bool
+	noInteractive   bool
+	machineOutput   bool
+	policyOverride  string
+	verbose         bool
+	volumes         []string
+	idmapVolumes    []idmapVolume
+	envVars         []string
+	command         []string
+	subcommand      string
+	targetImage     string
+	leashImage      string
+	containerName   string
+	network         string
+	pinNetworkHosts []string
+	runtime         string
+	selinuxMode     string // --selinux: auto|relabel|disable (see selinux_workspace.go)
+	listen          string
+	listenSet       bool
+	openUI          bool
+	publishes       []publishSpec
+	publishAll      bool
 
 	// Native session-isolation opt-outs (default: hardened). See launcher_native.go.
 	allowDisplay    bool            // keep DISPLAY/XAUTHORITY + the X11 socket (GUI apps)
@@ -559,6 +561,7 @@ Flags:
   --image <name[:tag]>            Override the target container image (defaults to %s).
   --leash-image <name[:tag]>      Override the leash manager image (defaults to %s).
   --container-name <name>         Force the exact agent container name (no sanitization, no collision suffix; leash container becomes <name>-leash).
+  --pin-network-host <name>       Freeze an exact hostname to target IPv4 answers before enforcement (repeatable; Linux Docker only).
   --network <name>                Attach the agent container to a docker network (e.g. a compose network). The leash container follows it automatically.
   --runtime <docker|podman>       Container runtime CLI to drive (defaults to docker).
   --selinux <auto|relabel|disable>  (container, SELinux hosts) How the agent container reaches the project and agent config mounts. auto (default) refuses when they are not labelled for containers; relabel adds :z to them (persistent container_file_t label); disable runs the agent container with label=disable (leash enforcement unchanged, no SELinux confinement). Also LEASH_SELINUX.
@@ -739,6 +742,12 @@ func parseArgs(args []string) (options, error) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch arg {
+		case "--pin-network-host":
+			if i+1 >= len(args) {
+				return opts, fmt.Errorf("missing argument for %s", arg)
+			}
+			opts.pinNetworkHosts = append(opts.pinNetworkHosts, args[i+1])
+			i++
 		case "-I", "--no-interactive":
 			opts.noInteractive = true
 		case "--machine-output":
@@ -924,6 +933,8 @@ func parseArgs(args []string) (options, error) {
 				if opts.containerName == "" {
 					return opts, fmt.Errorf("container name cannot be empty")
 				}
+			case strings.HasPrefix(arg, "--pin-network-host="):
+				opts.pinNetworkHosts = append(opts.pinNetworkHosts, strings.TrimPrefix(arg, "--pin-network-host="))
 			case strings.HasPrefix(arg, "--network="):
 				opts.network = strings.TrimSpace(strings.TrimPrefix(arg, "--network="))
 			case strings.HasPrefix(arg, "--inject-service="):
@@ -1006,6 +1017,13 @@ func parseArgs(args []string) (options, error) {
 }
 
 func finalizeOptions(opts options) (options, error) {
+	if len(opts.pinNetworkHosts) > 0 {
+		names, err := networkpin.Names(opts.pinNetworkHosts)
+		if err != nil {
+			return opts, fmt.Errorf("--pin-network-host: %w", err)
+		}
+		opts.pinNetworkHosts = names
+	}
 	if opts.machineOutput {
 		opts.noInteractive = true
 	}
@@ -1573,6 +1591,9 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 	// never silently falls back to docker. Docker/podman are opt-in via --runtime.
 	if cfg.runtime == "" {
 		cfg.runtime = defaultRuntimeName()
+	}
+	if len(opts.pinNetworkHosts) > 0 && (runtime.GOOS != "linux" || cfg.runtime != "docker") {
+		return cfg, nil, errors.New("--pin-network-host requires Linux Docker; other runtimes are unsupported")
 	}
 
 	// SELinux handling of the agent container's user-owned mounts (#175).

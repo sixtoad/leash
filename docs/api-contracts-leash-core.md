@@ -605,3 +605,23 @@ Decode it the way `version --json` is decoded: with a struct of your own. Go con
 - `validate` always returns `200` — issues live inside the body so the editor can render them as markers.
 - `complete` always returns `200` with `items` (empty on malformed input, comment context, or zero hints).
 - No CSRF/auth today — the listener defaults to `127.0.0.1:18080`. Operators that change `--listen` to a non-loopback address are responsible for fronting it with auth.
+
+### Stable exact-host resolution for Docker preparation
+
+The optional `pin-network-host` capability advertises repeatable
+`--pin-network-host <exact-hostname>` (equals form also accepted). It requires
+Linux Docker; native and Podman runs reject it. The launcher resolves at most
+32 distinct hostnames to a bounded IPv4 snapshot inside the actual target
+container, before starting enforcement, and updates Docker's shared hosts file.
+The existing manager and both libc and Go clients then use the same addresses.
+Policy authority is unchanged. This pins initially reachable addresses for the
+container lifetime; it does not provide DNS failover.
+
+Resolution and writes fail closed. Hostnames must be exact ASCII DNS names,
+without wildcard, port, address literal or trailing dot. Custom mounts shadowing
+`/etc/hosts`, network mode `container:<id>`, and name-service configuration that
+does not begin its `hosts:` rule with `files` are refused. The static bundled
+entry helper performs the operation; the target need not provide `getent`.
+The selected snapshot is reported on the runner diagnostic stream as
+`event=runner.network-hosts status=pinned snapshot=<JSON>`. Callers must require
+the capability before passing this additive flag; contract bounds are unchanged.
