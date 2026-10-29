@@ -6,6 +6,42 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 
 ## [Unreleased]
 
+## [native-v0.5.0] — 2026-10-29
+
+Minor release on top of `native-v0.4.1` (PRs #228, #238, #239). It adds one
+optional capability, `pin-network-host`; `contractVersion` stays 3 and
+`minCompatibleContract` 0, so existing callers are unaffected.
+
+### Added
+- **`--pin-network-host` keeps exact-host policies working across DNS
+  changes on Linux Docker** (#239). An exact-host rule resolves its addresses
+  when the policy loads, so a permitted host whose address later rotated (a
+  package registry behind a CDN) failed the kernel connect check. The new
+  repeatable flag resolves up to 32 exact hostnames to a bounded IPv4
+  snapshot inside the target container before enforcement starts and pins
+  them in Docker's shared hosts file, so the manager and both libc and Go
+  clients use the same addresses. Policy authority is unchanged, and the pin
+  lasts for the container's lifetime (no DNS failover). Native and Podman
+  runs reject the flag; wildcards, ports, address literals, a shadowed
+  `/etc/hosts`, `container:<id>` networking and an NSS `hosts:` rule not
+  starting with `files` are refused. The selected snapshot is reported as
+  `event=runner.network-hosts status=pinned`. Advertised as the
+  `pin-network-host` capability; callers must check it before passing the
+  flag. Default invocations pin nothing.
+
+### Security
+- **Symlink creation is policy-checked on Linux** (#226). The new
+  `lsm_symlink` program on `security_path_symlink` decides a new symlink's
+  name with the directory-mutation table, like mkdir and mknod, before the
+  link exists, and writes a `file.symlink` record for every decision. A
+  workload can no longer plant a symlink in a directory it has no write
+  authority over. macOS already checked `AUTH_CREATE` of a symlink against
+  the same table; its events now name the operation `symlink`.
+
+### Fixed
+- **The upstream coder-CLI releases watchdog no longer runs in forks**
+  (#238).
+
 ## [native-v0.4.1] — 2026-10-19
 
 Patch release on top of `native-v0.4.0` (PRs #221–#236), driven by a Layer 2
@@ -37,13 +73,6 @@ and the `capabilities` list is unchanged.
   table (writable-directory authority, deny precedence, a `file.create` audit
   record), on overlay rootfs, bind mounts and plain filesystems alike. macOS
   `AUTH_CREATE` of a regular file now checks the same table as well.
-- **Symlink creation is policy-checked on Linux** (#226). The new
-  `lsm_symlink` program on `security_path_symlink` decides a new symlink's
-  name with the directory-mutation table, like mkdir and mknod, before the
-  link exists, and writes a `file.symlink` record for every decision. A
-  workload can no longer plant a symlink in a directory it has no write
-  authority over. macOS already checked `AUTH_CREATE` of a symlink against
-  the same table; its events now name the operation `symlink`.
 
 ### Fixed
 - **SELinux hosts: `podman exec` / `docker exec` into a governed container
