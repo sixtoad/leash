@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/strongdm/leash/internal/entrypoint"
+	"github.com/strongdm/leash/internal/networkpin"
 )
 
 const (
@@ -32,6 +34,20 @@ const (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--pin-network-hosts" {
+		ctx, cancel := context.WithTimeout(context.Background(), networkpin.Timeout)
+		defer cancel()
+		mappings, err := networkpin.PinDefault(ctx, os.Args[2:])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "leash-error: pin network hosts:", err)
+			os.Exit(1)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(mappings); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) == 3 && os.Args[1] == "--resolve-identity" {
 		if err := printResolvedIdentity(os.Args[2]); err != nil {
 			os.Stderr.WriteString("leash-error: resolve identity: " + err.Error() + "\n")

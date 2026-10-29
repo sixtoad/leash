@@ -153,6 +153,8 @@ const (
 	// revision, contract ranges and capabilities that image's OCI labels
 	// advertise, plus whether this CLI would accept it.
 	CapabilityManagerInspect = "manager-inspect"
+	// CapabilityPinNetworkHost is repeatable --pin-network-host for Linux Docker.
+	CapabilityPinNetworkHost = "pin-network-host"
 )
 
 // Enforced policy path limits, in bytes of the resolved path (a directory
@@ -198,6 +200,7 @@ var capabilities = []string{
 	CapabilityRawSocketGate,
 	CapabilityCedarStrictDefault,
 	CapabilityManagerInspect,
+	CapabilityPinNetworkHost,
 }
 
 // Capabilities returns the surface names this build advertises. The slice is a

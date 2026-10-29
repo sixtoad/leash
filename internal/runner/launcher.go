@@ -325,6 +325,9 @@ func (c containerLauncher) Provision(ctx context.Context, stopSignal string) (st
 	if err := c.r.verifyTargetResourceLimits(ctx); err != nil {
 		return "", err
 	}
+	if err := c.r.prepareNetworkPins(ctx); err != nil {
+		return "", err
+	}
 	if err := c.r.prepareIDMapVolumes(ctx); err != nil {
 		return "", err
 	}
