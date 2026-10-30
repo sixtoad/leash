@@ -38,6 +38,11 @@ typedef int bool;
 
 char LICENSE[] SEC("license") = "GPL";
 
+#include "audit_drops.h"
+// audit_drops slots for this object (internal/lsm/audit_drops.go).
+#define AUDIT_SLOT_OPEN 0
+#define AUDIT_SLOT_MUTATION 1
+
 #define MAX_PATH_LEN 256
 #define MAX_ENTRIES 8192
 // BPF verifier-friendly constant bound for policy rules (max 256 with loop-based implementation)
@@ -120,7 +125,7 @@ struct mutation_exact_rule_key {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
+    __uint(max_entries, AUDIT_RINGBUF_DEFAULT_BYTES);
 } events SEC(".maps");
 
 // Box cgroup descriptor: [0] = box cgroup id (0 = monitoring off), [1] = box
@@ -507,6 +512,7 @@ static __noinline int emit_mutation_decision(const char *path, u32 operation, in
     if (!mutation_generation_unchanged()) allowed = 0;
     struct open_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
     if (!event) {
+        if (audit_record_dropped(AUDIT_SLOT_MUTATION)) allowed = 0;
         return allowed ? 0 : -13;
     }
     u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -1316,7 +1322,11 @@ int BPF_PROG(lsm_open_policy, struct file *file)
     // Reserve ringbuf space. Audit assembly is optional, but every path joins
     // the same activation-token check immediately before enforcement returns.
     struct open_event *event = bpf_ringbuf_reserve(&events, sizeof(*event), 0);
-    if (event) {
+    if (!event) {
+        // The decision stands; only the record is lost, and it is counted.
+        // Under lossless audit the operation is denied instead.
+        if (audit_record_dropped(AUDIT_SLOT_OPEN)) policy_result = 0;
+    } else {
         // Get process information
         u64 pid_tgid = bpf_get_current_pid_tgid();
         event->pid = pid_tgid >> 32;

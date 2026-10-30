@@ -31,10 +31,10 @@ func TestDescribe(t *testing.T) {
 		l1, l2 bool
 		want   Status
 	}{
-		{true, true, Status{LevelLSM, LayerActive, LayerActive, true, "", ""}},
-		{true, false, Status{LevelLSM, LayerActive, LayerDisabled, true, "", ""}},
-		{false, true, Status{LevelNone, LayerUnavailable, LayerActive, true, "", ""}},
-		{false, false, Status{LevelNone, LayerUnavailable, LayerDisabled, true, "", ""}},
+		{true, true, Status{LevelLSM, LayerActive, LayerActive, true, "", "", nil}},
+		{true, false, Status{LevelLSM, LayerActive, LayerDisabled, true, "", "", nil}},
+		{false, true, Status{LevelNone, LayerUnavailable, LayerActive, true, "", "", nil}},
+		{false, false, Status{LevelNone, LayerUnavailable, LayerDisabled, true, "", "", nil}},
 	}
 	for _, tc := range cases {
 		got := Describe(tc.l1, tc.l2)

@@ -168,6 +168,7 @@ func (l *ExecLsm) LoadAndAttach(loader func() (*ebpf.CollectionSpec, error)) err
 	config := BPFConfig{
 		ProgramNames:      []string{"lsm_exec"}, // LSM program only
 		EventMapName:      "exec_events",
+		AuditLogger:       l.logger,
 		AllowedCgroupsMap: "exec_allowed_cgroups",
 		TargetCgroupMap:   "exec_target_cgroup",
 		StartMessage:      "Successfully started monitoring program execution",

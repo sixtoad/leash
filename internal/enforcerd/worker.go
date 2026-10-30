@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -172,6 +173,17 @@ func RunWorker(conn io.ReadWriteCloser, hooks WorkerHooks) error {
 	if err != nil {
 		return fail(err.Error())
 	}
+	audit := lsm.AuditConfig{Lossless: req.AuditLossless}
+	if req.AuditRingBufferKB != 0 {
+		size, err := lsm.ParseAuditRingBufferKB(strconv.FormatUint(uint64(req.AuditRingBufferKB), 10))
+		if err != nil {
+			return fail(err.Error())
+		}
+		audit.RingBufferBytes = size
+	}
+	if err := lsm.SetAuditConfig(audit); err != nil {
+		return fail(err.Error())
+	}
 
 	hosts := &hostTable{}
 	hosts.set(req.Hosts)
@@ -207,7 +219,7 @@ func RunWorker(conn io.ReadWriteCloser, hooks WorkerHooks) error {
 	case state != enforcement.LSMListActive:
 		return fail(reason)
 	}
-	out.send(Message{Type: TypeResult, OK: true, Programs: lsm.Layer1AttachedPrograms()})
+	out.send(Message{Type: TypeResult, OK: true, Programs: lsm.Layer1AttachedPrograms(), AuditLossless: audit.Lossless})
 
 	var endReason string
 	var endMu sync.Mutex

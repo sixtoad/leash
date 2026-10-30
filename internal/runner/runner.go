@@ -3126,6 +3126,16 @@ func (r *runner) launchLeashContainer(ctx context.Context, cgroupPath string) er
 		leashEnv = append(leashEnv, value)
 	}
 
+	// The audit posture (issue #241) is leashd's: forward it from the
+	// caller's environment. Native leashd inherits the environment directly.
+	for _, name := range []string{"LEASH_AUDIT_RINGBUF_KB", "LEASH_AUDIT_LOSSLESS"} {
+		if v, ok := os.LookupEnv(name); ok {
+			value := name + "=" + v
+			args = append(args, "-e", value)
+			leashEnv = append(leashEnv, value)
+		}
+	}
+
 	// n.b. Used to show `<title>Leash | {workspace} > {command}</title>` in the frontend.
 	if workspace := strings.TrimSpace(workspaceNameFrom(r.cfg.callerDir)); workspace != "" {
 		value := fmt.Sprintf("LEASH_PROJECT=%s", workspace)
