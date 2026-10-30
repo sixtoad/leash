@@ -7,16 +7,16 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		AEA1CF032E9586F500F22D99 /* com.strongdm.leash.LeashProxy.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = AEA1CF022E9586F500F22D99 /* com.strongdm.leash.LeashProxy.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		AEA1CF032E9586F500F22D99 /* com.sixtoad.leash.LeashProxy.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = AEA1CF022E9586F500F22D99 /* com.sixtoad.leash.LeashProxy.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		AEA1CF042E9586F500F22D99 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 41CFD5792E9586F500F22D99 /* NetworkExtension.framework */; };
 		AEA1CF052E9586F500F22D99 /* libbsm.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 3E5930002E9450E0007328DD /* libbsm.tbd */; };
 		3E5917F92E9448FE007328DD /* libEndpointSecurity.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 3E5917F82E9448FE007328DD /* libEndpointSecurity.tbd */; };
-		3E5918012E9448FE007328DD /* com.strongdm.leash.LeashES.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = 3E5917F62E9448FE007328DD /* com.strongdm.leash.LeashES.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		3E5918012E9448FE007328DD /* com.sixtoad.leash.LeashES.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = 3E5917F62E9448FE007328DD /* com.sixtoad.leash.LeashES.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		3E5930012E9450E0007328DD /* libbsm.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 3E5930002E9450E0007328DD /* libbsm.tbd */; };
 		3E9F6A012F123456007328DD /* leashcli in Embed CLI */ = {isa = PBXBuildFile; fileRef = 3E59180B2E944B76007328DD /* leashcli */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
 		41B5AA2C2EA6D37A00B22540 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 41B5AA2B2EA6D37A00B22540 /* Sparkle */; };
 		41CFD57A2E9586F500F22D99 /* NetworkExtension.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 41CFD5792E9586F500F22D99 /* NetworkExtension.framework */; };
-		41CFD5842E9586F500F22D99 /* com.strongdm.leash.LeashNetworkFilter.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = 41CFD5782E9586F500F22D99 /* com.strongdm.leash.LeashNetworkFilter.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		41CFD5842E9586F500F22D99 /* com.sixtoad.leash.LeashNetworkFilter.systemextension in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = 41CFD5782E9586F500F22D99 /* com.sixtoad.leash.LeashNetworkFilter.systemextension */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		41CFD5902E9589A500F22D99 /* libbsm.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 3E5930002E9450E0007328DD /* libbsm.tbd */; };
 /* End PBXBuildFile section */
 
@@ -58,9 +58,9 @@
 			dstPath = "$(SYSTEM_EXTENSIONS_FOLDER_PATH)";
 			dstSubfolderSpec = 16;
 			files = (
-				41CFD5842E9586F500F22D99 /* com.strongdm.leash.LeashNetworkFilter.systemextension in Embed System Extensions */,
-				AEA1CF032E9586F500F22D99 /* com.strongdm.leash.LeashProxy.systemextension in Embed System Extensions */,
-				3E5918012E9448FE007328DD /* com.strongdm.leash.LeashES.systemextension in Embed System Extensions */,
+				41CFD5842E9586F500F22D99 /* com.sixtoad.leash.LeashNetworkFilter.systemextension in Embed System Extensions */,
+				AEA1CF032E9586F500F22D99 /* com.sixtoad.leash.LeashProxy.systemextension in Embed System Extensions */,
+				3E5918012E9448FE007328DD /* com.sixtoad.leash.LeashES.systemextension in Embed System Extensions */,
 			);
 			name = "Embed System Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -98,13 +98,13 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		AEA1CF022E9586F500F22D99 /* com.strongdm.leash.LeashProxy.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = com.strongdm.leash.LeashProxy.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
+		AEA1CF022E9586F500F22D99 /* com.sixtoad.leash.LeashProxy.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = com.sixtoad.leash.LeashProxy.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
 		3E5917E22E9448D9007328DD /* Leash.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Leash.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		3E5917F62E9448FE007328DD /* com.strongdm.leash.LeashES.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = com.strongdm.leash.LeashES.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
+		3E5917F62E9448FE007328DD /* com.sixtoad.leash.LeashES.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = com.sixtoad.leash.LeashES.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
 		3E5917F82E9448FE007328DD /* libEndpointSecurity.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libEndpointSecurity.tbd; path = usr/lib/libEndpointSecurity.tbd; sourceTree = SDKROOT; };
 		3E59180B2E944B76007328DD /* leashcli */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = leashcli; sourceTree = BUILT_PRODUCTS_DIR; };
 		3E5930002E9450E0007328DD /* libbsm.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libbsm.tbd; path = usr/lib/libbsm.tbd; sourceTree = SDKROOT; };
-		41CFD5782E9586F500F22D99 /* com.strongdm.leash.LeashNetworkFilter.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = com.strongdm.leash.LeashNetworkFilter.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
+		41CFD5782E9586F500F22D99 /* com.sixtoad.leash.LeashNetworkFilter.systemextension */ = {isa = PBXFileReference; explicitFileType = "wrapper.system-extension"; includeInIndex = 0; path = com.sixtoad.leash.LeashNetworkFilter.systemextension; sourceTree = BUILT_PRODUCTS_DIR; };
 		41CFD5792E9586F500F22D99 /* NetworkExtension.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NetworkExtension.framework; path = System/Library/Frameworks/NetworkExtension.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
@@ -264,10 +264,10 @@
 			isa = PBXGroup;
 			children = (
 				3E5917E22E9448D9007328DD /* Leash.app */,
-				3E5917F62E9448FE007328DD /* com.strongdm.leash.LeashES.systemextension */,
+				3E5917F62E9448FE007328DD /* com.sixtoad.leash.LeashES.systemextension */,
 				3E59180B2E944B76007328DD /* leashcli */,
-				41CFD5782E9586F500F22D99 /* com.strongdm.leash.LeashNetworkFilter.systemextension */,
-				AEA1CF022E9586F500F22D99 /* com.strongdm.leash.LeashProxy.systemextension */,
+				41CFD5782E9586F500F22D99 /* com.sixtoad.leash.LeashNetworkFilter.systemextension */,
+				AEA1CF022E9586F500F22D99 /* com.sixtoad.leash.LeashProxy.systemextension */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -327,7 +327,7 @@
 			packageProductDependencies = (
 			);
 			productName = LeashProxy;
-			productReference = AEA1CF022E9586F500F22D99 /* com.strongdm.leash.LeashProxy.systemextension */;
+			productReference = AEA1CF022E9586F500F22D99 /* com.sixtoad.leash.LeashProxy.systemextension */;
 			productType = "com.apple.product-type.system-extension";
 		};
 		3E5917E12E9448D9007328DD /* Leash */ = {
@@ -382,7 +382,7 @@
 			packageProductDependencies = (
 			);
 			productName = LeashES;
-			productReference = 3E5917F62E9448FE007328DD /* com.strongdm.leash.LeashES.systemextension */;
+			productReference = 3E5917F62E9448FE007328DD /* com.sixtoad.leash.LeashES.systemextension */;
 			productType = "com.apple.product-type.system-extension";
 		};
 		3E59180A2E944B76007328DD /* LeashCLI */ = {
@@ -427,7 +427,7 @@
 			packageProductDependencies = (
 			);
 			productName = LeashNetworkFilter;
-			productReference = 41CFD5782E9586F500F22D99 /* com.strongdm.leash.LeashNetworkFilter.systemextension */;
+			productReference = 41CFD5782E9586F500F22D99 /* com.sixtoad.leash.LeashNetworkFilter.systemextension */;
 			productType = "com.apple.product-type.system-extension";
 		};
 /* End PBXNativeTarget section */
@@ -584,7 +584,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CURRENT_PROJECT_VERSION = 20251027.1;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 9884BZY594;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -599,7 +599,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.LeashProxy;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sixtoad.leash.LeashProxy;
 				PRODUCT_NAME = "$(inherited)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
@@ -621,7 +621,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CURRENT_PROJECT_VERSION = 20251027.1;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 9884BZY594;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -636,7 +636,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.LeashProxy;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sixtoad.leash.LeashProxy;
 				PRODUCT_NAME = "$(inherited)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
@@ -686,7 +686,7 @@
 				COPY_PHASE_STRIP = NO;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = 6BS49F3GLW;
+				DEVELOPMENT_TEAM = 9884BZY594;
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -755,7 +755,7 @@
 				COPY_PHASE_STRIP = NO;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = 6BS49F3GLW;
+				DEVELOPMENT_TEAM = 9884BZY594;
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -789,7 +789,7 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 20251027.1;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 9884BZY594;
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -806,7 +806,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sixtoad.leash;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
@@ -831,7 +831,7 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 20251027.1;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 9884BZY594;
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -848,7 +848,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sixtoad.leash;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
@@ -870,7 +870,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CURRENT_PROJECT_VERSION = 20251027.1;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 9884BZY594;
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -885,7 +885,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.LeashES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sixtoad.leash.LeashES;
 				PRODUCT_NAME = "$(inherited)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
@@ -907,7 +907,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CURRENT_PROJECT_VERSION = 20251027.1;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 9884BZY594;
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -922,7 +922,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.LeashES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sixtoad.leash.LeashES;
 				PRODUCT_NAME = "$(inherited)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
@@ -943,7 +943,7 @@
 				CODE_SIGN_STYLE = Manual;
 				CODE_SIGN_IDENTITY = "-";
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 9884BZY594;
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_HARDENED_RUNTIME = NO;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
@@ -955,8 +955,8 @@
 				GENERATE_APP_INTENTS_METADATA = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				OTHER_CODE_SIGN_FLAGS = "-i com.strongdm.leash.cli";
-				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.cli;
+				OTHER_CODE_SIGN_FLAGS = "-i com.sixtoad.leash.cli";
+				PRODUCT_BUNDLE_IDENTIFIER = com.sixtoad.leash.cli;
 				PRODUCT_NAME = leashcli;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
@@ -980,7 +980,7 @@
 				CODE_SIGN_STYLE = Manual;
 				CODE_SIGN_IDENTITY = "-";
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 9884BZY594;
 				ENABLE_APP_INTENTS_METADATA_GENERATION = NO;
 				ENABLE_HARDENED_RUNTIME = NO;
 				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
@@ -992,8 +992,8 @@
 				GENERATE_APP_INTENTS_METADATA = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				OTHER_CODE_SIGN_FLAGS = "-i com.strongdm.leash.cli";
-				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.cli;
+				OTHER_CODE_SIGN_FLAGS = "-i com.sixtoad.leash.cli";
+				PRODUCT_BUNDLE_IDENTIFIER = com.sixtoad.leash.cli;
 				PRODUCT_NAME = leashcli;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
@@ -1018,7 +1018,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CURRENT_PROJECT_VERSION = 20251027.1;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 9884BZY594;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1033,7 +1033,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.LeashNetworkFilter;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sixtoad.leash.LeashNetworkFilter;
 				PRODUCT_NAME = "$(inherited)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;
@@ -1055,7 +1055,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CURRENT_PROJECT_VERSION = 20251027.1;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 9884BZY594;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -1070,7 +1070,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
 				MARKETING_VERSION = 1.1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.strongdm.leash.LeashNetworkFilter;
+				PRODUCT_BUNDLE_IDENTIFIER = com.sixtoad.leash.LeashNetworkFilter;
 				PRODUCT_NAME = "$(inherited)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = YES;

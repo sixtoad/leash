@@ -7,17 +7,17 @@ import "testing"
 func TestParseMatchesBundleIDColumnExactly(t *testing.T) {
 	t.Parallel()
 	const listing = "enabled\tactive\tteamID\tbundleID (version)\tname\t[state]\n" +
-		"*\t*\t-\tcom.strongdm.leash.LeashESHelper (1/1)\tHelper\t[activated enabled]\n" +
-		"*\t\t-\tcom.strongdm.leash.LeashES (1/1)\tLeashES\t[activated waiting for user]\n"
-	if got := Parse(listing, "com.strongdm.leash.LeashES"); got != StateDisabled {
+		"*\t*\t-\tcom.sixtoad.leash.LeashESHelper (1/1)\tHelper\t[activated enabled]\n" +
+		"*\t\t-\tcom.sixtoad.leash.LeashES (1/1)\tLeashES\t[activated waiting for user]\n"
+	if got := Parse(listing, "com.sixtoad.leash.LeashES"); got != StateDisabled {
 		t.Fatalf("LeashES = %v, want disabled (the active row is a different extension)", got)
 	}
-	if got := Parse("note: com.strongdm.leash.LeashES [activated enabled]\n", "com.strongdm.leash.LeashES"); got != StateMissing {
+	if got := Parse("note: com.sixtoad.leash.LeashES [activated enabled]\n", "com.sixtoad.leash.LeashES"); got != StateMissing {
 		t.Fatalf("a non-row line mentioning the id = %v, want missing", got)
 	}
 	// The format an ad-hoc build prints on the validation VM ("-" team).
-	const vm = "*\t*\t-\tcom.strongdm.leash.LeashES (1.1.0/20260820.2)\tLeashES\t[activated enabled]\n"
-	if got := Parse(vm, "COM.strongdm.leash.LeashES"); got != StateActive {
+	const vm = "*\t*\t-\tcom.sixtoad.leash.LeashES (1.1.0/20260820.2)\tLeashES\t[activated enabled]\n"
+	if got := Parse(vm, "COM.sixtoad.leash.LeashES"); got != StateActive {
 		t.Fatalf("ad-hoc row = %v, want active", got)
 	}
 }

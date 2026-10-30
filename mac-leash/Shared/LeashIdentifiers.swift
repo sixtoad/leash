@@ -16,7 +16,7 @@ enum LeashIdentifiers {
             return bundleIdentifier
         }
 
-        return "com.strongdm.leash"
+        return "com.sixtoad.leash"
     }()
 
     static let teamIdentifier: String = {
@@ -39,7 +39,7 @@ enum LeashIdentifiers {
             }
         }
 
-        return "W5HSYBBJGA"
+        return "9884BZY594"
     }()
 
     static let endpointSecurityExtension = "\(bundle).LeashES"

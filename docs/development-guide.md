@@ -10,7 +10,7 @@ This expands [`DEVELOPMENT.md`](DEVELOPMENT.md) with the everyday workflows for 
 | **Docker** (or Podman, OrbStack) | Building images, running containers | Override with `DOCKER=podman make ...`. Required even for local UI builds if `pnpm` is absent (falls back to `node:22-bookworm` container). |
 | **clang + llvm + libbpf-dev** | eBPF generation on Linux hosts | Not needed on macOS — `lsm-generate` runs in a `golang:1.25.3-bookworm` container. |
 | **pnpm 10** (via corepack) | Building/running the UI | `corepack enable` from any Node 18+ install. CI pins `pnpm@10.18.0`. |
-| **Xcode 15+** | mac-leash | macOS 14+; requires Apple developer team ID `W5HSYBBJGA` to sign locally with the same bundle IDs. |
+| **Xcode 15+** | mac-leash | macOS 14+; requires Apple developer team ID `9884BZY594` to sign locally with the same bundle IDs. |
 
 ## Repo entry points
 
@@ -113,7 +113,7 @@ make build                 # repackages leash binary with the new dist
 open mac-leash/Leash.xcodeproj
 ```
 
-Build & run from Xcode against a local team that controls bundle IDs `com.strongdm.leash.*`. For local builds without the StrongDM team, override via env at compile time:
+Build & run from Xcode against a local team that controls bundle IDs `com.sixtoad.leash.*`. For local builds without the StrongDM team, override via env at compile time:
 
 ```bash
 export LEASH_BUNDLE_IDENTIFIER=com.you.leash.dev

@@ -106,7 +106,7 @@ leash/
 │       ├── DaemonSync.swift (+Extensions)         # WebSocket client to ws://127.0.0.1:18080/api
 │       ├── PolicyModels.swift                     # LeashPolicyEvent/Decision/Rule
 │       ├── NetworkRule.swift                      # allow|deny × domain|ip|cidr
-│       ├── LeashIdentifiers.swift                 # team ID W5HSYBBJGA, bundle IDs
+│       ├── LeashIdentifiers.swift                 # team ID 9884BZY594, bundle IDs
 │       └── LeashNotifications.swift               # FDA distributed notifications
 │
 ├── e2e/                       # End-to-end Go tests (folded into leash-core)

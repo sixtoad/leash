@@ -500,11 +500,11 @@ func TestProbeDarwinSkipsEverySeamOnNonDarwin(t *testing.T) {
 const activeExtensionList = `3 extension(s)
 --- com.apple.system_extension.endpoint_security
 enabled	active	teamID	bundleID (version)	name	[state]
-*	*	W5HSYBBJGA	com.strongdm.leash.LeashES (1.0/1)	LeashES	[activated enabled]
+*	*	9884BZY594	com.sixtoad.leash.LeashES (1.0/1)	LeashES	[activated enabled]
 --- com.apple.system_extension.network_extension
 enabled	active	teamID	bundleID (version)	name	[state]
-*	*	W5HSYBBJGA	com.strongdm.leash.LeashNetworkFilter (1.0/1)	LeashNetworkFilter	[activated enabled]
-*		W5HSYBBJGA	com.strongdm.leash.LeashProxy (1.0/1)	LeashProxy	[activated waiting for user]
+*	*	9884BZY594	com.sixtoad.leash.LeashNetworkFilter (1.0/1)	LeashNetworkFilter	[activated enabled]
+*		9884BZY594	com.sixtoad.leash.LeashProxy (1.0/1)	LeashProxy	[activated waiting for user]
 `
 
 func TestProbeDarwinReadsEveryFact(t *testing.T) {

@@ -74,7 +74,7 @@ func BundleID() string {
 	if v := strings.TrimSpace(os.Getenv("LEASH_BUNDLE_IDENTIFIER")); v != "" {
 		return v
 	}
-	return "com.strongdm.leash"
+	return "com.sixtoad.leash"
 }
 
 // EndpointSecurityExtensionID is the ES extension: leash's file and exec
@@ -93,7 +93,7 @@ func TransparentProxyExtensionID() string { return BundleID() + ".LeashProxy" }
 // truth). `systemextensionsctl list` rows are tab-separated:
 //
 //	enabled  active  teamID  bundleID (version)  name  [state]
-//	  *        *     W5H…    com.strongdm.leash.LeashES (1/1)  LeashES  [activated enabled]
+//	  *        *     W5H…    com.sixtoad.leash.LeashES (1/1)  LeashES  [activated enabled]
 //
 // column 0 carries a "*" when enabled, column 1 when active, and the last column
 // is a bracketed [state]. ok is false only for an empty line.
@@ -121,7 +121,7 @@ func InterpretEntry(line string) (isActive, isInstalledButDisabled bool, state s
 
 // RowBundleID extracts the bundle identifier from a `systemextensionsctl list`
 // data row. Rows are tab-separated and the bundleID column carries a trailing
-// version, e.g. "com.strongdm.leash.LeashES (1.0/1)"; this returns just the id.
+// version, e.g. "com.sixtoad.leash.LeashES (1.0/1)"; this returns just the id.
 // It returns "" for header and other non-data rows (fewer than 4 columns).
 func RowBundleID(line string) string {
 	cols := strings.Split(line, "\t")

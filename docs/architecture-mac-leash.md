@@ -13,7 +13,7 @@ The macOS path replaces containers+eBPF with Apple's native security frameworks.
 | LeashES | `mac-leash/LeashES/` | System Extension (Endpoint Security) | `.LeashES` | `com.apple.developer.endpoint-security.client` |
 | LeashNetworkFilter | `mac-leash/LeashNetworkFilter/` | System Extension (Network Extension content-filter) | `.LeashNetworkFilter` | `com.apple.developer.networking.networkextension` (`content-filter-provider`) |
 
-Team ID: `W5HSYBBJGA`. Base bundle is derived from `LEASH_BUNDLE_IDENTIFIER` env or the parent app's identifier — default `com.strongdm.leash`.
+Team ID: `9884BZY594`. Base bundle is derived from `LEASH_BUNDLE_IDENTIFIER` env or the parent app's identifier — default `com.sixtoad.leash`.
 
 ## 2. Status-bar app (`Leash/`)
 
@@ -152,7 +152,7 @@ These are documented in [`MACOS.md`](MACOS.md); included here for cross-referenc
 - System Settings → Privacy & Security → Full Disk Access: enable for `LeashES`.
 - System Settings → Network → VPN & Filters → "Leash Network Filter" should show green + Enabled.
 
-Removal via `systemextensionsctl uninstall W5HSYBBJGA com.strongdm.leash.LeashES` and `…LeashNetworkFilter`, or via the app's per-section "Remove" buttons.
+Removal via `systemextensionsctl uninstall 9884BZY594 com.sixtoad.leash.LeashES` and `…LeashNetworkFilter`, or via the app's per-section "Remove" buttons.
 
 ## 9. Known limitations (current)
 

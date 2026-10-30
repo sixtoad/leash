@@ -10,16 +10,16 @@ import (
 const sampleSystemExtensionsList = `3 extension(s)
 --- com.apple.system_extension.endpoint_security
 enabled	active	teamID	bundleID (version)	name	[state]
-*	*	W5HSYBBJGA	com.strongdm.leash.LeashES (1.0/1)	LeashES	[activated enabled]
+*	*	9884BZY594	com.sixtoad.leash.LeashES (1.0/1)	LeashES	[activated enabled]
 --- com.apple.system_extension.network_extension
 enabled	active	teamID	bundleID (version)	name	[state]
-*		W5HSYBBJGA	com.strongdm.leash.LeashNetworkFilter (1.0/1)	LeashNetworkFilter	[activated waiting for user]
-*		W5HSYBBJGA	com.strongdm.leash.LeashProxy (1.0/1)	LeashProxy	[activated waiting for user]
+*		9884BZY594	com.sixtoad.leash.LeashNetworkFilter (1.0/1)	LeashNetworkFilter	[activated waiting for user]
+*		9884BZY594	com.sixtoad.leash.LeashProxy (1.0/1)	LeashProxy	[activated waiting for user]
 `
 
 func TestParseExtensionStateActive(t *testing.T) {
 	t.Parallel()
-	if got := Parse(sampleSystemExtensionsList, "com.strongdm.leash.LeashES"); got != StateActive {
+	if got := Parse(sampleSystemExtensionsList, "com.sixtoad.leash.LeashES"); got != StateActive {
 		t.Fatalf("ES state = %v, want active", got)
 	}
 }
@@ -27,14 +27,14 @@ func TestParseExtensionStateActive(t *testing.T) {
 func TestParseExtensionStateDisabled(t *testing.T) {
 	t.Parallel()
 	// NE row has the active column unset and a non-"activated enabled" state.
-	if got := Parse(sampleSystemExtensionsList, "com.strongdm.leash.LeashNetworkFilter"); got != StateDisabled {
+	if got := Parse(sampleSystemExtensionsList, "com.sixtoad.leash.LeashNetworkFilter"); got != StateDisabled {
 		t.Fatalf("NE state = %v, want disabled", got)
 	}
 }
 
 func TestParseExtensionStateNotInstalled(t *testing.T) {
 	t.Parallel()
-	if got := Parse(sampleSystemExtensionsList, "com.strongdm.leash.DoesNotExist"); got != StateMissing {
+	if got := Parse(sampleSystemExtensionsList, "com.sixtoad.leash.DoesNotExist"); got != StateMissing {
 		t.Fatalf("missing extension state = %v, want missing", got)
 	}
 }
@@ -68,9 +68,9 @@ func TestExtensionIdentifiers(t *testing.T) {
 	for _, c := range []struct {
 		got, want string
 	}{
-		{EndpointSecurityExtensionID(), "com.strongdm.leash.LeashES"},
-		{NetworkFilterExtensionID(), "com.strongdm.leash.LeashNetworkFilter"},
-		{TransparentProxyExtensionID(), "com.strongdm.leash.LeashProxy"},
+		{EndpointSecurityExtensionID(), "com.sixtoad.leash.LeashES"},
+		{NetworkFilterExtensionID(), "com.sixtoad.leash.LeashNetworkFilter"},
+		{TransparentProxyExtensionID(), "com.sixtoad.leash.LeashProxy"},
 	} {
 		if c.got != c.want {
 			t.Errorf("id = %q, want %q", c.got, c.want)
@@ -89,7 +89,7 @@ func TestExtensionIdentifiers(t *testing.T) {
 // which is the state that must not read as "active".
 func TestParseExtensionStateProxyPendingApproval(t *testing.T) {
 	t.Parallel()
-	if got := Parse(sampleSystemExtensionsList, "com.strongdm.leash.LeashProxy"); got != StateDisabled {
+	if got := Parse(sampleSystemExtensionsList, "com.sixtoad.leash.LeashProxy"); got != StateDisabled {
 		t.Fatalf("proxy state = %v, want disabled", got)
 	}
 }
