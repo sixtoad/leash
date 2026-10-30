@@ -507,6 +507,7 @@ type BPFConfig struct {
 	OptionalStageNames   []string                     // Tail-called stages of optional programs: stripped with them, never attached
 	AfterRequiredAttach  func(*ebpf.Collection) error // Required setup after ordered core attachments, before optional hooks
 	EventMapName         string                       // Name of the event ring buffer map
+	AuditLogger          *SharedLogger                // Where audit.dropped records go (issue #241); nil = stderr only
 	AllowedCgroupsMap    string                       // Name of the allowed cgroups map
 	TargetCgroupMap      string                       // Name of the target cgroup map
 	StartMessage         string                       // Success message to display
@@ -572,6 +573,7 @@ func LoadAndAttachBPFWithSetup(
 	if err != nil {
 		return fmt.Errorf("failed to load BPF spec: %w", err)
 	}
+	applyAuditSpec(spec, config.EventMapName)
 
 	coll, err := ebpf.NewCollection(spec)
 	if err != nil && len(config.OptionalProgramNames) > 0 {
@@ -583,6 +585,7 @@ func LoadAndAttachBPFWithSetup(
 		// spec with the optional programs stripped so core enforcement survives;
 		// the optional attach loop no-ops when a program is absent.
 		if fresh, lerr := loader(); lerr == nil {
+			applyAuditSpec(fresh, config.EventMapName)
 			for _, name := range append(append([]string(nil), config.OptionalProgramNames...), config.OptionalStageNames...) {
 				delete(fresh.Programs, name)
 			}
@@ -596,6 +599,11 @@ func LoadAndAttachBPFWithSetup(
 		return fmt.Errorf("failed to create BPF collection: %w", err)
 	}
 	defer coll.Close()
+
+	// The lossless audit flag must be in place before any program attaches.
+	if err := applyAuditConfig(coll); err != nil {
+		return err
+	}
 
 	// Store the eBPF collection for policy reloading
 	module.setEbpfCollection(coll)
@@ -708,8 +716,13 @@ func LoadAndAttachBPFWithSetup(
 	startTime := now.Format("15:04:05")
 	fmt.Printf("time=%s level=info msg=\"%s\"\n", startTime, config.StartMessage)
 
-	// Poll for events
-	eventChan := make(chan ringbuf.Record, 1000)
+	drops := newAuditDropReporter(coll, config.EventMapName, config.AuditLogger)
+
+	// Poll for events. The reader goroutine only moves records from the ring
+	// into this channel, so the ring drains even while a handler writes; the
+	// handlers never block on disk sync (SharedLogger syncs off the write
+	// path), so a full ring means a real burst, which audit_drops counts.
+	eventChan := make(chan ringbuf.Record, 4096)
 	errChan := make(chan error, 1)
 
 	go func() {
@@ -739,13 +752,15 @@ func LoadAndAttachBPFWithSetup(
 			goto cleanup
 		case record := <-eventChan:
 			module.handleEvent(record.RawSample)
+			drops.maybePoll(time.Now())
 		case <-ticker.C:
-			// Timeout - just continue
-			continue
+			drops.maybePoll(time.Now())
 		}
 	}
 
 cleanup:
+	// Report drops counted since the last poll before going away.
+	drops.poll()
 	now = time.Now()
 	endTime := now.Format("15:04:05")
 	fmt.Printf("time=%s level=info msg=\"%s\"\n", endTime, config.ShutdownMessage)

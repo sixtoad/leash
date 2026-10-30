@@ -40,6 +40,9 @@ type Client struct {
 	onEvent func(string)
 	events  chan string
 	timeout time.Duration
+
+	auditRingBufferKB uint32
+	auditLossless     bool
 }
 
 // Dial connects to the daemon at path. onEvent may be nil.
@@ -207,11 +210,23 @@ func (c *Client) Status() (*Status, error) {
 // connection then carries the session: events arrive on OnEvent, and Ended
 // closes if enforcement is lost.
 func (c *Client) Attach(cgroup, policy string, hosts map[string][]string) (session string, programs int, err error) {
-	m, err := c.do(Request{Op: OpAttach, Cgroup: cgroup, Policy: policy, Hosts: hosts})
+	m, err := c.do(Request{Op: OpAttach, Cgroup: cgroup, Policy: policy, Hosts: hosts,
+		AuditRingBufferKB: c.auditRingBufferKB, AuditLossless: c.auditLossless})
 	if err != nil {
 		return "", 0, err
 	}
+	if c.auditLossless && !m.AuditLossless {
+		_ = c.Detach()
+		return "", 0, errors.New("lossless audit was requested but the enforcer daemon did not confirm it (upgrade leash-enforcerd)")
+	}
 	return m.Session, m.Programs, nil
+}
+
+// SetAudit sets the audit posture the next Attach asks for (issue #241):
+// the ring buffer size in KiB (0 = default) and lossless audit.
+func (c *Client) SetAudit(ringBufferKB uint32, lossless bool) {
+	c.auditRingBufferKB = ringBufferKB
+	c.auditLossless = lossless
 }
 
 // Update replaces the attached session's policy.

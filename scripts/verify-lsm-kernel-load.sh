@@ -107,6 +107,12 @@ docker run --rm --name "$CONTAINER" \
 
 # A renamed or skipped test must not pass the gate vacuously.
 if grep -q -- '^--- PASS: TestKernelLoadAllModulesWithExecRule' "$WORKDIR/output"; then
+  # Audit records the kernel could not write (ring buffer full under host
+  # load) are tolerated only when every one was counted and reported (#241);
+  # say so, since those records' content was not checked on this run.
+  if grep -q -- 'AUDIT-LOSS:' "$WORKDIR/output"; then
+    printf '%s\n' "verify-lsm-kernel-load: passed, but some audit records were dropped (counted and reported); their content was not checked on this run" >&2
+  fi
   exit 0
 fi
 

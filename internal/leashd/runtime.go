@@ -98,6 +98,9 @@ func Main(args []string) error {
 	// Every launcher must wait for the same post-attach signal. Container mode
 	// previously observed bootstrap.ready, which is written before the LSM attach
 	// goroutines settle and let the workload race ahead unenforced.
+	if err := lsm.SetAuditConfig(cfg.Audit); err != nil {
+		return err
+	}
 	enableEnforcementReady(cfg)
 	if cfg.HostMode {
 		enableHostMode()
@@ -167,7 +170,10 @@ type runtimeConfig struct {
 	// EnforcerSocket, when set, is the leash enforcer daemon's socket: the
 	// eBPF LSM programs are attached by the daemon instead of by leashd
 	// (rootless runs, docs/ROOTLESS.md).
-	EnforcerSocket  string
+	EnforcerSocket string
+	// Audit is the eBPF audit posture: ring buffer size and lossless mode
+	// (issue #241).
+	Audit           lsm.AuditConfig
 	MCPConfig       proxy.MCPConfig
 	TelemetryConfig otel.Config
 }
@@ -218,6 +224,8 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 	defaultCgroupPath := strings.TrimSpace(os.Getenv("LEASH_CGROUP_PATH"))
 	cgroupFlag := fs.String("cgroup", defaultCgroupPath, "Cgroup path to monitor")
 	enforcerSocket := fs.String("enforcer-socket", strings.TrimSpace(os.Getenv(enforcerd.EnvSocket)), "Attach the eBPF LSM through the leash enforcer daemon listening on this socket (rootless runs) instead of loading it in this process")
+	auditRingKB := fs.String("audit-ringbuf-kb", strings.TrimSpace(os.Getenv(lsm.EnvAuditRingBufferKB)), "Size of each eBPF LSM object's audit ring buffer in KiB (power of two, 64..262144; default 1024). Records that do not fit are counted and reported as audit.dropped")
+	auditLossless := fs.Bool("audit-lossless", leashdEnvTruthy(lsm.EnvAuditLossless), "Lossless audit: deny an operation whose audit record cannot be written (ring buffer full) instead of deciding it without a record")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: %s [flags]\n\n", name)
 		fmt.Fprintf(fs.Output(), "Flags:\n")
@@ -264,6 +272,15 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 		timeout = parsed
 	}
 
+	auditCfg := lsm.AuditConfig{Lossless: *auditLossless}
+	if v := strings.TrimSpace(*auditRingKB); v != "" {
+		size, err := lsm.ParseAuditRingBufferKB(v)
+		if err != nil {
+			return nil, fmt.Errorf("parse --audit-ringbuf-kb: %w", err)
+		}
+		auditCfg.RingBufferBytes = size
+	}
+
 	cfg := &runtimeConfig{
 		LogPath:          strings.TrimSpace(*logPath),
 		PolicyPath:       resolvePolicyPath(strings.TrimSpace(*policyPath), *hostMode),
@@ -278,6 +295,7 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 		HostMode:         *hostMode,
 		LSMOnly:          *lsmOnly,
 		EnforcerSocket:   strings.TrimSpace(*enforcerSocket),
+		Audit:            auditCfg,
 	}
 	cfg.MCPConfig = loadMCPConfigFromEnv()
 	cfg.TelemetryConfig = otel.LoadConfigFromEnv()
@@ -491,7 +509,10 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 	})
 
 	if cfg.EnforcerSocket != "" {
-		state.remote = newRemoteKernel(cfg.EnforcerSocket, cfg.CgroupPath, func(line string) { _ = logger.Write(line) })
+		state.remote = newRemoteKernel(cfg.EnforcerSocket, cfg.CgroupPath, func(line string) {
+			_ = logger.Write(line)
+			noteRemoteAuditLine(line)
+		})
 		policyManager.SetRemoteKernel(state.remote.update)
 	}
 

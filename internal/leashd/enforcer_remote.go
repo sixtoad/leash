@@ -85,6 +85,8 @@ func (k *remoteKernel) attach(active func() *cedarutil.Compilation) (int, error)
 	if comp != nil {
 		text = comp.StrictText
 	}
+	audit := lsm.CurrentAuditConfig()
+	c.SetAudit(audit.RingBufferBytes>>10, audit.Lossless)
 	_, programs, err := c.Attach(k.cgroup, text, k.resolveHosts(comp))
 	if err != nil {
 		_ = c.Close()

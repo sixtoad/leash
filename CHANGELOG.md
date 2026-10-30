@@ -6,6 +6,22 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 
 ## [Unreleased]
 
+### Fixed
+- **eBPF audit records are no longer lost silently** (#241). A record the
+  kernel could not write because the event ring buffer was full used to
+  vanish (the decision was still enforced). Each loss is now counted in the
+  kernel and reported as an `audit.dropped` event, a leashd log line and an
+  `audit` object in the enforcement-ready marker. The event log no longer
+  fsyncs every line on the event loop (it syncs within 200 ms), which was
+  what let the reader fall behind on a loaded host, and the default ring
+  buffer grew from 256 KiB to 1 MiB per object.
+
+### Added
+- **`LEASH_AUDIT_RINGBUF_KB` / `--audit-ringbuf-kb`** sizes the audit ring
+  buffers, and **`LEASH_AUDIT_LOSSLESS=1` / `--audit-lossless`** denies an
+  operation whose audit record cannot be written (docs/deployment-guide.md,
+  "Audit completeness").
+
 ## [native-v0.5.0] — 2026-10-29
 
 Minor release on top of `native-v0.4.1` (PRs #228, #238, #239). It adds one
