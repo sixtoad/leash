@@ -167,9 +167,20 @@ type runtimeConfig struct {
 	// EnforcerSocket, when set, is the leash enforcer daemon's socket: the
 	// eBPF LSM programs are attached by the daemon instead of by leashd
 	// (rootless runs, docs/ROOTLESS.md).
-	EnforcerSocket  string
+	EnforcerSocket string
+	// EnforcerBroker, when set, is the leash client's broker socket: leashd
+	// receives its daemon connection from the client instead of dialing
+	// EnforcerSocket (rootless Docker, whose containers cannot keep the
+	// caller's leash group).
+	EnforcerBroker  string
 	MCPConfig       proxy.MCPConfig
 	TelemetryConfig otel.Config
+}
+
+// viaEnforcerDaemon reports whether the eBPF LSM is attached by the leash
+// enforcer daemon (rootless runs) rather than by this process.
+func (c *runtimeConfig) viaEnforcerDaemon() bool {
+	return c.EnforcerSocket != "" || c.EnforcerBroker != ""
 }
 
 type runtimeState struct {
@@ -218,6 +229,7 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 	defaultCgroupPath := strings.TrimSpace(os.Getenv("LEASH_CGROUP_PATH"))
 	cgroupFlag := fs.String("cgroup", defaultCgroupPath, "Cgroup path to monitor")
 	enforcerSocket := fs.String("enforcer-socket", strings.TrimSpace(os.Getenv(enforcerd.EnvSocket)), "Attach the eBPF LSM through the leash enforcer daemon listening on this socket (rootless runs) instead of loading it in this process")
+	enforcerBroker := fs.String("enforcer-broker", strings.TrimSpace(os.Getenv(enforcerd.EnvBroker)), "Attach the eBPF LSM through the leash enforcer daemon, using the connection the leash client hands over on this broker socket (rootless Docker)")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "Usage: %s [flags]\n\n", name)
 		fmt.Fprintf(fs.Output(), "Flags:\n")
@@ -278,6 +290,7 @@ func parseConfig(args []string) (*runtimeConfig, error) {
 		HostMode:         *hostMode,
 		LSMOnly:          *lsmOnly,
 		EnforcerSocket:   strings.TrimSpace(*enforcerSocket),
+		EnforcerBroker:   strings.TrimSpace(*enforcerBroker),
 	}
 	cfg.MCPConfig = loadMCPConfigFromEnv()
 	cfg.TelemetryConfig = otel.LoadConfigFromEnv()
@@ -431,7 +444,7 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 	// daemon the programs live in the daemon: the local
 	// manager keeps the compiled tables but attaches nothing.
 	lsmCgroup := cfg.CgroupPath
-	if cfg.EnforcerSocket != "" {
+	if cfg.viaEnforcerDaemon() {
 		lsmCgroup = ""
 	}
 	lsmManager := lsm.NewLSMManager(lsmCgroup, logger, true)
@@ -490,8 +503,12 @@ func initRuntime(cfg *runtimeConfig, leashDir string) (*runtimeState, error) {
 		state.decisions.Publish(active.Engine, state.mitmProxy.SetEngine)
 	})
 
-	if cfg.EnforcerSocket != "" {
+	if cfg.viaEnforcerDaemon() {
 		state.remote = newRemoteKernel(cfg.EnforcerSocket, cfg.CgroupPath, func(line string) { _ = logger.Write(line) })
+		if cfg.EnforcerBroker != "" {
+			state.remote.socket = cfg.EnforcerBroker
+			state.remote.dial = enforcerd.DialBroker
+		}
 		policyManager.SetRemoteKernel(state.remote.update)
 	}
 

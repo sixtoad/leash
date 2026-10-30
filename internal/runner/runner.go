@@ -246,8 +246,13 @@ type runner struct {
 	layer1PreflightDown string
 
 	// enforcerSocket is the leash enforcer daemon's socket (host path) when a
-	// rootless podman run is enforced through it; "" otherwise.
+	// rootless run is enforced through it; "" otherwise.
 	enforcerSocket string
+	// enforcerViaBroker: rootless Docker. leashd gets its daemon connection
+	// from this client through enforcerBroker (a socket in enforcerBrokerDir).
+	enforcerViaBroker bool
+	enforcerBroker    *enforcerd.Broker
+	enforcerBrokerDir string
 	// workloadFinished is set once the workload exited, so the daemon
 	// enforcement watch does not report the normal teardown as a loss.
 	workloadFinished workloadFinishedFlag
@@ -537,7 +542,7 @@ entrypoint is left running.
 
 Subcommands:
   version [--json]                Print build metadata. --json adds the contract range provisioners check before driving leash.
-  daemon install|status|uninstall The leash enforcer daemon: eBPF LSM enforcement for rootless podman (sudo for install/uninstall; see docs/ROOTLESS.md).
+  daemon install|status|uninstall The leash enforcer daemon: eBPF LSM enforcement for rootless podman and Docker (sudo for install/uninstall; see docs/ROOTLESS.md).
   doctor [--json]                 Report whether this machine can enforce, per runtime. Exits 0 only when a runtime enforces both layers; 3 when a runtime is usable but a layer is off (leash run then refuses); 1 when none runs.
 
 Flags:
@@ -3155,11 +3160,19 @@ func (r *runner) launchLeashContainer(ctx context.Context, cgroupPath string) er
 		leashEnv = append(leashEnv, env)
 	}
 
-	// Rootless podman: Layer 1 through the enforcer daemon.
-	if daemonArgs := r.enforcerDaemonArgs(); len(daemonArgs) > 0 {
+	// Rootless podman and Docker: Layer 1 through the enforcer daemon.
+	daemonArgs, err := r.enforcerDaemonArgs(cgroupPath)
+	if err != nil {
+		return err
+	}
+	if len(daemonArgs) > 0 {
 		args = append(args, daemonArgs...)
 		leashMounts = append(leashMounts, enforcerSocketDirInContainer)
-		leashEnv = append(leashEnv, enforcerd.EnvSocket+"=<set>")
+		if r.enforcerViaBroker {
+			leashEnv = append(leashEnv, enforcerd.EnvBroker+"=<set>")
+		} else {
+			leashEnv = append(leashEnv, enforcerd.EnvSocket+"=<set>")
+		}
 	}
 
 	args = append(args, r.cfg.leashImage, "--cgroup", cgroupPath)
@@ -3696,6 +3709,7 @@ func (r *runner) finishLifecycle(ctx context.Context, exitCode int, runErr error
 
 func (r *runner) stopContainers(ctx context.Context) error {
 	cleanupErr := r.launcher().Remove(ctx)
+	r.closeEnforcerBroker()
 
 	if r.cfg.shareDir != "" && !r.cfg.shareDirFromEnv {
 		if r.shareDirCreated || strings.HasPrefix(r.cfg.shareDir, r.cfg.workDir+string(os.PathSeparator)) {
