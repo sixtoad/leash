@@ -122,8 +122,8 @@ keeping it away from the policy file is the Endpoint Security extension's job.
 Deleting `Leash.app` should delete the system extensions, but you can also use the the app UI (each section has a “Remove” button). You can also remove from the terminal:
 
 ```bash
-systemextensionsctl uninstall W5HSYBBJGA com.strongdm.leash.LeashES
-systemextensionsctl uninstall W5HSYBBJGA com.strongdm.leash.LeashNetworkFilter
+systemextensionsctl uninstall 9884BZY594 com.sixtoad.leash.LeashES
+systemextensionsctl uninstall 9884BZY594 com.sixtoad.leash.LeashNetworkFilter
 ```
 
 ## Troubleshooting
@@ -131,7 +131,7 @@ systemextensionsctl uninstall W5HSYBBJGA com.strongdm.leash.LeashNetworkFilter
 ### Stream Logs
 
 ```bash
-log stream --style compact --level debug --predicate 'subsystem == "com.strongdm.leash"'
+log stream --style compact --level debug --predicate 'subsystem == "com.sixtoad.leash"'
 ```
 
 Examples:
@@ -141,7 +141,7 @@ Examples:
 ### Console.app
 
 - Open Console.app -> Start
-- Search for `com.strongdm.leash` and switch the filter to “Subsystem”
+- Search for `com.sixtoad.leash` and switch the filter to “Subsystem”
 
 ## Known Limitations
 

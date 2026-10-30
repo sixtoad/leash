@@ -18,7 +18,7 @@
 			<key>FilterSockets</key>
 			<true/>
 			<key>NEMachServiceName</key>
-			<string>$(TeamIdentifierPrefix)com.strongdm.leash.LeashNetworkFilter</string>
+			<string>$(TeamIdentifierPrefix)com.sixtoad.leash.LeashNetworkFilter</string>
 		</dict>
 		<key>NEProviderClasses</key>
 		<dict>

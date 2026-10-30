@@ -7,7 +7,7 @@ The macOS native path (`mac-leash/`) ships two system extensions that need
 - `com.apple.developer.networking.networkextension` = `content-filter-provider` (LeashNetworkFilter)
 
 These are only honored when they come from an Apple-issued provisioning profile
-bound to your Team ID. The production build uses team `W5HSYBBJGA`. To iterate on
+bound to your Team ID. The production build uses team `9884BZY594`. To iterate on
 the Swift **without** a paid account / entitlement grant / notarization, you run
 in a **VM with SIP and AMFI relaxed**, and self-sign.
 
@@ -78,15 +78,15 @@ trust check (`LeashES/LeashMonitor+Handlers.swift` `isLeashExecutable`) already
 degrades correctly: it trusts the binary at `/Leash.app/Contents/Resources/leashcli`
 by path (no signing check), and when matching by `signing_id` it skips the team
 comparison if the process has no `team_id` — which is exactly the ad-hoc case. The
-hardcoded `W5HSYBBJGA` in `Shared/LeashIdentifiers.swift` is only a last-resort
+hardcoded `9884BZY594` in `Shared/LeashIdentifiers.swift` is only a last-resort
 default (overridable via `LEASH_TEAM_IDENTIFIER`, or auto-derived from the app's
 `AppIdentifierPrefix` when signed with a real team). So:
 
 1. The targets are already configured for this: **manual signing**, `CODE_SIGN_IDENTITY
-   = "-"` (ad-hoc / "Sign to Run Locally"), empty `DEVELOPMENT_TEAM` /
-   `PROVISIONING_PROFILE_SPECIFIER`, and the existing `com.strongdm.leash.*` bundle
-   identifiers are kept (avoids needing the IDs registered to your team). Do not
-   switch to automatic signing — that forces a team + a bundle-ID change.
+   = "-"` (ad-hoc / "Sign to Run Locally") and an empty
+   `PROVISIONING_PROFILE_SPECIFIER`. `DEVELOPMENT_TEAM` is set to `9884BZY594`, but
+   ad-hoc signing ignores it, so the `com.sixtoad.leash.*` bundle identifiers do
+   not need to be registered for the VM loop. Do not switch to automatic signing.
 2. Build the `Leash` scheme in **Debug**. Note that Xcode will *not* ad-hoc sign the
    restricted ES / NetworkExtension entitlements inline — with a real identity it
    demands a provisioning profile ("`LeashES requires a provisioning profile`"). The

@@ -87,8 +87,8 @@
       ],
       "targets": ["Leash (status-bar app)", "LeashCLI (CLI helper /Applications/Leash.app/Contents/Resources/leashcli)", "LeashES (Endpoint Security extension)", "LeashNetworkFilter (Network Filter extension)"],
       "shared": "Swift sources in mac-leash/Shared/ (DaemonSync, NetworkRule, PolicyModels, LeashIdentifiers, LeashNotifications)",
-      "bundle_team_id": "W5HSYBBJGA",
-      "bundle_ids": ["com.strongdm.leash.LeashES", "com.strongdm.leash.LeashNetworkFilter"]
+      "bundle_team_id": "9884BZY594",
+      "bundle_ids": ["com.sixtoad.leash.LeashES", "com.sixtoad.leash.LeashNetworkFilter"]
     }
   },
   "build_release_summary": {

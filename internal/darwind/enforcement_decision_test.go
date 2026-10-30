@@ -9,7 +9,7 @@ import (
 
 func TestDecideDarwinEnforcementRequiresBothExtensions(t *testing.T) {
 	t.Parallel()
-	const es, ne = "com.strongdm.leash.LeashES", "com.strongdm.leash.LeashNetworkFilter"
+	const es, ne = "com.sixtoad.leash.LeashES", "com.sixtoad.leash.LeashNetworkFilter"
 	if err := decideDarwinEnforcement(es, ne, macext.StateActive, macext.StateActive, ""); err != nil {
 		t.Fatalf("both active: %v", err)
 	}

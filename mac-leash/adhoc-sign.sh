@@ -22,18 +22,18 @@ sign() { codesign --force --timestamp=none --options runtime=0 --sign - "$@"; }
 codesign --force --deep --sign - "$APP/Contents/Frameworks/Sparkle.framework"
 
 # 2. Bundled CLI (bare mach-o, fixed identifier, no entitlements)
-codesign --force --sign - -i com.strongdm.leash.cli "$APP/Contents/Resources/leashcli"
+codesign --force --sign - -i com.sixtoad.leash.cli "$APP/Contents/Resources/leashcli"
 
 # 3. Endpoint Security system extension (restricted entitlement)
 codesign --force --sign - --entitlements "$ES_ENT" \
-  "$APP/Contents/Library/SystemExtensions/com.strongdm.leash.LeashES.systemextension"
+  "$APP/Contents/Library/SystemExtensions/com.sixtoad.leash.LeashES.systemextension"
 
 # 4. Network Filter system extension (restricted entitlement)
 codesign --force --sign - --entitlements "$NF_ENT" \
-  "$APP/Contents/Library/SystemExtensions/com.strongdm.leash.LeashNetworkFilter.systemextension"
+  "$APP/Contents/Library/SystemExtensions/com.sixtoad.leash.LeashNetworkFilter.systemextension"
 
 # 5. Transparent Proxy system extension (restricted entitlement), if present.
-PROXY_EXT="$APP/Contents/Library/SystemExtensions/com.strongdm.leash.LeashProxy.systemextension"
+PROXY_EXT="$APP/Contents/Library/SystemExtensions/com.sixtoad.leash.LeashProxy.systemextension"
 if [ -d "$PROXY_EXT" ]; then
   codesign --force --sign - --entitlements "$PROXY_ENT" "$PROXY_EXT"
 fi
@@ -44,5 +44,5 @@ codesign --force --sign - --entitlements "$APP_ENT" "$APP"
 echo ">> Verifying..."
 codesign --verify --verbose=2 "$APP"
 echo ">> Entitlements on LeashES:"
-codesign -d --entitlements - "$APP/Contents/Library/SystemExtensions/com.strongdm.leash.LeashES.systemextension" 2>/dev/null
+codesign -d --entitlements - "$APP/Contents/Library/SystemExtensions/com.sixtoad.leash.LeashES.systemextension" 2>/dev/null
 echo ">> Done."

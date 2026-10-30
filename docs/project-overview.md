@@ -39,7 +39,7 @@ Monorepo at [`github.com/strongdm/leash`](https://github.com/strongdm/leash). Th
 ### mac-leash (Swift)
 - Swift 5 / Xcode project.
 - EndpointSecurity.framework (exec/file events), NetworkExtension.framework (content-filter provider with TLS SNI), SwiftUI status-bar host app, Sparkle for auto-update.
-- Team ID: `W5HSYBBJGA`. Bundle IDs: `com.strongdm.leash.{LeashES,LeashNetworkFilter}`.
+- Team ID: `9884BZY594`. Bundle IDs: `com.sixtoad.leash.{LeashES,LeashNetworkFilter}`.
 
 ## How parts compose at runtime
 

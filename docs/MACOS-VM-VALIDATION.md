@@ -28,7 +28,7 @@ Two artifacts must reach the VM:
 
 Stream logs in a second terminal throughout:
 ```bash
-log stream --style compact --level debug --predicate 'subsystem == "com.strongdm.leash"'
+log stream --style compact --level debug --predicate 'subsystem == "com.sixtoad.leash"'
 ```
 
 ## 1. Activate extensions
@@ -98,7 +98,7 @@ Connect to an IP inside the range → allowed; outside → denied. Confirms `isI
 
 ### 1f. Domain persistence across restart
 1. Under a hostname policy, make a request so a domain→IP mapping is learned.
-2. Confirm `~/Library/Application Support/com.strongdm.leash/resolved-domains.json` exists and has entries.
+2. Confirm `~/Library/Application Support/com.sixtoad.leash/resolved-domains.json` exists and has entries.
 3. Toggle the Network Filter off/on (or reboot). Log shows `Restored N resolved domains from disk`.
 
 ### 1g. Fail-open degrade (daemon down)
@@ -116,7 +116,7 @@ and the provider relays *all* TCP flows (tracked-PID gating stubbed). So:
 - **Buildable/embed check (done on host):** the `LeashProxy.systemextension` is embedded and
   ad-hoc signed with `app-proxy-provider`.
 - **Smoke test (VM):** if activation is triggered, `systemextensionsctl list` should show
-  `com.strongdm.leash.LeashProxy [activated enabled]`, and the darwind proxy (`:18000`) should
+  `com.sixtoad.leash.LeashProxy [activated enabled]`, and the darwind proxy (`:18000`) should
   log PROXY-protocol connections when a flow is relayed. Watch category `transparent-proxy`.
 - **Blocked until:** activate() is called from the app lifecycle, tracked-PID gating lands, and
   the darwin CA path is confirmed for `leashcli` injection. See `docs/MACOS-P1-PROXY.md`.
