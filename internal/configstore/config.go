@@ -31,6 +31,7 @@ type ResourceLimits struct {
 	CPUs      string
 	Memory    string
 	PidsLimit string
+	ShmSize   string
 }
 
 // DecisionScope models the precedence layer that yielded an effective choice.
@@ -291,6 +292,9 @@ func Merge(base, overlay Config) Config {
 	}
 	if v := strings.TrimSpace(overlay.Resources.PidsLimit); v != "" {
 		out.Resources.PidsLimit = v
+	}
+	if v := strings.TrimSpace(overlay.Resources.ShmSize); v != "" {
+		out.Resources.ShmSize = v
 	}
 
 	for cmd, value := range overlay.CommandVolumes {
