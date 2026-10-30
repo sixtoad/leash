@@ -130,7 +130,7 @@ const (
 	// id=) and leashd serves that plugin a private Cedar authorization socket
 	// speaking protocol v1 (pkg/authz, docs/design/AUTHZ-SERVICE.md).
 	CapabilityAuthzSocket = "authz-socket"
-	// CapabilityRootlessDaemon means a rootless podman run gets the eBPF LSM
+	// CapabilityRootlessDaemon means a rootless podman or Docker run gets the eBPF LSM
 	// through the leash enforcer daemon (`leash daemon install|status|
 	// uninstall`, docs/ROOTLESS.md) and reports enforcement=lsm with
 	// layer1Via=enforcer-daemon in the enforcement-ready marker; without a

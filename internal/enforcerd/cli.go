@@ -13,7 +13,7 @@ import (
 
 const daemonUsage = `Usage: leash daemon <command>
 
-The leash enforcer daemon gives rootless containers (rootless podman) the same
+The leash enforcer daemon gives rootless containers (rootless podman and Docker) the same
 eBPF LSM enforcement leash applies as root. It is a small socket-activated
 system service holding only CAP_BPF and CAP_PERFMON; members of the "leash"
 group can ask it to enforce their own sessions' policies on their own

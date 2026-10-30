@@ -17,6 +17,22 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
   buffer grew from 256 KiB to 1 MiB per object.
 
 ### Added
+- **Rootless Docker gets full eBPF LSM enforcement through the enforcer
+  daemon** (#207). Rootless Docker runs were refused because Docker cannot
+  keep the caller's `leash` group in a container, so leashd could not open the
+  daemon's `root:leash 0660` socket. The leash client now opens the daemon
+  connection itself and hands it to leashd over a single-use broker socket
+  (`SCM_RIGHTS`) in a private directory mounted only into the leash container
+  (`LEASH_ENFORCER_BROKER`). The daemon authenticates the client with its
+  unchanged checks (`SO_PEERCRED` uid and pid, `leash` group, peer outside
+  every governed cgroup, target inside the caller's delegated subtree); the
+  broker refuses peers inside the workload's cgroup and serves one
+  connection. Without a usable daemon a rootless Docker run is still refused
+  before anything starts, now with the `sudo leash daemon install` hint. The
+  `rootless-daemon` capability now covers rootless Docker; the capability
+  list is unchanged. Rootless podman is unchanged. A `DOCKER_HOST` naming a
+  local unix socket (what `dockerd-rootless-setuptool.sh` recommends) is now
+  treated as this host's engine rather than a remote one.
 - **Configurable target `/dev/shm` size**: `--shm-size` / `LEASH_SHM_SIZE` /
   `[leash.resources] shm_size`, validated, read back from the engine and
   reported with the other resource limits; refused by the native runtime

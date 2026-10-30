@@ -2,7 +2,7 @@
 // socket-activated system service that attaches leash's eBPF LSM enforcement
 // to the cgroups of rootless container workloads.
 //
-// Rootless podman cannot load BPF LSM programs: the leash container is root
+// Rootless podman and Docker cannot load BPF LSM programs: the leash container is root
 // only inside a user namespace, and BPF_PROG_TYPE_LSM needs CAP_BPF and
 // CAP_PERFMON in the initial user namespace. The daemon holds exactly those
 // two capabilities. A rootless leashd asks it, over a group-restricted Unix
