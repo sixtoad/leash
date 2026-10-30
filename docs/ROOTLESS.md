@@ -100,7 +100,9 @@ Two rootless podman setup steps that are easy to miss:
    - **Rootless Docker:** Docker cannot keep the caller's supplementary groups
      in a container, so leashd could not open the `root:leash 0660` socket.
      The leash client opens the connection instead. It creates a private
-     directory (`/tmp/leash-enforcer-*`, mode 0700) with a single-use broker
+     directory (`leash-enforcer-*`, mode 0700, in the run's temporary work
+     dir so it goes away with the run even if leash is killed; else in
+     `/tmp`) with a single-use broker
      socket (mode 0600), mounts only that directory into the leash container
      at `/run/leash-enforcer`, and sets `LEASH_ENFORCER_BROKER`. When leashd
      connects to the broker, the client checks the peer (below), dials the
@@ -142,7 +144,7 @@ container, by one of your subordinate uids).
 
 ## What is enforced
 
-| Layer | Rootful (Docker/podman) | Rootless podman + daemon |
+| Layer | Rootful (Docker/podman) | Rootless podman or Docker + daemon |
 |---|---|---|
 | file open (read / write), directory mutations, hard links | eBPF LSM | same programs, same tables |
 | exec | eBPF LSM | same |
@@ -154,7 +156,10 @@ container, by one of your subordinate uids).
 Verified on a real kernel with an identical policy: the same denials, rootful
 and through the daemon (forbidden read, write outside the permitted tree,
 mkdir and unlink outside it, forbidden exec, TCP and UDP to non-permitted
-addresses, HTTPS allowed and denied by the proxy).
+addresses, HTTPS allowed and denied by the proxy). Rootless Docker (Docker CE
+with its rootless extras and the systemd cgroup driver, Ubuntu 24.04, kernel
+6.8) gives the same results as rootless podman on the same host, including
+denied file creation and symlink creation outside the permitted tree.
 
 ## Security model
 

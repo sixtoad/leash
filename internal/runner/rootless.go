@@ -92,7 +92,7 @@ func (r *runner) preflightRootless(ctx context.Context) error {
 	if r.usingNativeRuntime() || rootlessHostOS != "linux" {
 		return nil
 	}
-	if strings.TrimSpace(os.Getenv("DOCKER_HOST")) != "" || strings.TrimSpace(os.Getenv("CONTAINER_HOST")) != "" {
+	if remoteEngineHost(os.Getenv("DOCKER_HOST")) || remoteEngineHost(os.Getenv("CONTAINER_HOST")) {
 		return nil // remote engine: the kernel that matters is not this host's
 	}
 	rootless, err := r.detectRootlessEngine(ctx)
@@ -111,6 +111,15 @@ func (r *runner) preflightRootless(ctx context.Context) error {
 		return nil
 	}
 	return rootlessRefusal(engine, rep)
+}
+
+// remoteEngineHost reports whether an engine address (DOCKER_HOST,
+// CONTAINER_HOST) points at another machine. A unix socket is this host's
+// engine: rootless Docker's setup tool tells users to export
+// DOCKER_HOST=unix:///run/user/<uid>/docker.sock.
+func remoteEngineHost(v string) bool {
+	v = strings.TrimSpace(v)
+	return v != "" && !strings.HasPrefix(v, "unix://")
 }
 
 // enforcerDaemonArgs are the leash container's extra arguments for a run
@@ -138,10 +147,9 @@ func (r *runner) enforcerDaemonArgs(workload string) ([]string, error) {
 		if strings.TrimSpace(workload) == "" {
 			return nil, errors.New("rootless Docker: no workload cgroup to govern through the leash enforcer daemon")
 		}
-		// /tmp, not $TMPDIR: unix socket paths are limited to ~104 bytes.
 		// MkdirTemp creates the directory 0700: only this user can reach it
 		// (a rootless Docker container's root is this user).
-		dir, err := os.MkdirTemp("/tmp", "leash-enforcer-")
+		dir, err := os.MkdirTemp(r.enforcerBrokerParent(), "leash-enforcer-")
 		if err != nil {
 			return nil, fmt.Errorf("rootless Docker: create the enforcer broker directory: %w", err)
 		}
@@ -162,6 +170,20 @@ func (r *runner) enforcerDaemonArgs(workload string) ([]string, error) {
 		"-v", r.enforcerBrokerDir + ":" + enforcerSocketDirInContainer,
 		"-e", enforcerd.EnvBroker + "=" + filepath.Join(enforcerSocketDirInContainer, enforcerd.BrokerSocketName),
 	}, nil
+}
+
+// enforcerBrokerParent is where the broker directory is created: the run's
+// temporary work dir, which the container watcher removes even when leash is
+// killed (#222), when the socket path fits; else /tmp (not $TMPDIR: unix
+// socket paths are limited to ~104 bytes).
+func (r *runner) enforcerBrokerParent() string {
+	const suffix = "/leash-enforcer-0123456789/" + enforcerd.BrokerSocketName
+	if wd := r.cfg.workDir; r.cfg.workDirIsTemp && filepath.IsAbs(wd) && len(wd)+len(suffix) <= 100 {
+		if st, err := os.Stat(wd); err == nil && st.IsDir() {
+			return wd
+		}
+	}
+	return "/tmp"
 }
 
 // closeEnforcerBroker stops the broker (if leashd never took its connection)

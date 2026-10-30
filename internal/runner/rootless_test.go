@@ -151,6 +151,25 @@ func TestRootlessDockerWithoutDaemonIsRefused(t *testing.T) {
 	}
 }
 
+// DOCKER_HOST=unix:///run/user/<uid>/docker.sock (what rootless Docker's
+// setup tool recommends) is this host's engine; tcp:// and ssh:// are not.
+func TestRootlessDockerHostUnixSocketIsLocal(t *testing.T) {
+	calls := withDaemon(t, enforcerd.Report{Error: "connect: no such file or directory"})
+	t.Setenv("DOCKER_HOST", "unix:///run/user/1000/docker.sock")
+	if err := rootlessRunner(infoRuntime{name: "docker", info: rootlessDockerInfo}).preflightRootless(context.Background()); err == nil || *calls != 1 {
+		t.Fatalf("a local unix DOCKER_HOST must get the rootless preflight: err=%v calls=%d", err, *calls)
+	}
+	for _, remote := range []string{"tcp://10.0.0.1:2376", "ssh://me@host"} {
+		t.Setenv("DOCKER_HOST", remote)
+		if err := rootlessRunner(infoRuntime{name: "docker", info: rootlessDockerInfo}).preflightRootless(context.Background()); err != nil {
+			t.Fatalf("%s: %v", remote, err)
+		}
+	}
+	if *calls != 1 {
+		t.Fatalf("remote engines must not consult the local daemon (calls=%d)", *calls)
+	}
+}
+
 // Rootless Docker with a usable daemon goes through the client-side broker:
 // the leash container gets a private broker directory and no group or daemon
 // socket.
@@ -197,6 +216,29 @@ func TestRootlessDockerUsesTheBroker(t *testing.T) {
 	r.closeEnforcerBroker()
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("broker dir %s not removed: %v", dir, err)
+	}
+}
+
+// The broker directory goes in the run's temporary work dir (removed by the
+// container watcher even when leash is killed) when the socket path fits.
+func TestEnforcerBrokerParent(t *testing.T) {
+	wd, err := os.MkdirTemp("/tmp", "leash.x.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(wd) })
+	r := rootlessRunner(infoRuntime{name: "docker"})
+	r.cfg.workDir, r.cfg.workDirIsTemp = wd, true
+	if got := r.enforcerBrokerParent(); got != wd {
+		t.Fatalf("parent = %q, want the temp work dir %q", got, wd)
+	}
+	r.cfg.workDirIsTemp = false
+	if got := r.enforcerBrokerParent(); got != "/tmp" {
+		t.Fatalf("a user-chosen work dir must not be used: %q", got)
+	}
+	r.cfg.workDir, r.cfg.workDirIsTemp = "/tmp/"+strings.Repeat("x", 90), true
+	if got := r.enforcerBrokerParent(); got != "/tmp" {
+		t.Fatalf("a long work dir must fall back to /tmp: %q", got)
 	}
 }
 
