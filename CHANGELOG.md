@@ -6,6 +6,12 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 
 ## [Unreleased]
 
+### Added
+- **Configurable target `/dev/shm` size**: `--shm-size` / `LEASH_SHM_SIZE` /
+  `[leash.resources] shm_size`, validated, read back from the engine and
+  reported with the other resource limits; refused by the native runtime
+  (#171; capability `container-shm-size`).
+
 ## [native-v0.5.0] — 2026-10-29
 
 Minor release on top of `native-v0.4.1` (PRs #228, #238, #239). It adds one
