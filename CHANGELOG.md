@@ -20,7 +20,9 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
   connection. Without a usable daemon a rootless Docker run is still refused
   before anything starts, now with the `sudo leash daemon install` hint. The
   `rootless-daemon` capability now covers rootless Docker; the capability
-  list is unchanged. Rootless podman is unchanged.
+  list is unchanged. Rootless podman is unchanged. A `DOCKER_HOST` naming a
+  local unix socket (what `dockerd-rootless-setuptool.sh` recommends) is now
+  treated as this host's engine rather than a remote one.
 
 ## [native-v0.5.0] — 2026-10-29
 
