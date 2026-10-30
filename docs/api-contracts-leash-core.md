@@ -186,7 +186,7 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
   "contractVersion": 3,             // current CLI surface
   "minCompatibleContract": 0,       // oldest caller contract still served
   "capabilities": [                 // surface elements a provisioner can drive
-    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "rootless-daemon", "raw-socket-gate", "cedar-strict-default", "manager-inspect"
+    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "rootless-daemon", "raw-socket-gate", "cedar-strict-default", "manager-inspect", "pin-network-host", "mcp-call-args"
   ],
   "policyLimits": {                 // enforced policy path lengths, in bytes
     "filePathBytes": 255,           // file.open rules: every byte matched; longer rules rejected at load
@@ -605,6 +605,19 @@ Decode it the way `version --json` is decoded: with a struct of your own. Go con
 - `validate` always returns `200` — issues live inside the body so the editor can render them as markers.
 - `complete` always returns `200` with `items` (empty on malformed input, comment context, or zero hints).
 - No CSRF/auth today — the listener defaults to `127.0.0.1:18080`. Operators that change `--listen` to a non-loopback address are responsible for fronting it with auth.
+
+### MCP call arguments
+
+The optional `mcp-call-args` capability means `Action::"McpCall"` decisions
+carry the call's arguments: `context.args` (a record of the top-level string,
+integer and boolean arguments) and `context.argNames` (the set of every
+argument name), so a strict policy can pin an MCP endpoint to one repository
+and a retrieval-only tool list (#113). With it, while MCP policies are active,
+the proxy decides every `tools/call` of a JSON-RPC batch and denies JSON
+requests it cannot decide unambiguously. A leash without the capability
+rejects a policy reading `context.args` at load, so a caller generating one
+must check it first. Policy shape: `docs/design/CEDAR.md`, "Pin an MCP
+endpoint to one repository".
 
 ### Stable exact-host resolution for Docker preparation
 

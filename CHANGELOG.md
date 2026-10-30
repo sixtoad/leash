@@ -6,6 +6,24 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 
 ## [Unreleased]
 
+### Added
+- **MCP policies can read the call's arguments** (#113). `Action::"McpCall"`
+  requests carry `context.args` (the top-level string, integer and boolean
+  arguments, strictly typed and bounded) and `context.argNames`, so a strict
+  policy can pin an MCP endpoint to one repository and a retrieval-only tool
+  list (the Walk code-indexer capability; shape in `docs/design/CEDAR.md`).
+  The authz socket accepts flat records in the context for the same query.
+  Advertised as the `mcp-call-args` capability.
+
+### Changed
+- **MCP enforcement is fail-closed on ambiguous requests** (#113). While MCP
+  policies are active the proxy parses request bodies case-sensitively,
+  decides every `tools/call` of a JSON-RPC batch, and denies a JSON request
+  it cannot decide unambiguously (invalid JSON, a duplicated key, a malformed
+  `tools/call`, a body over 64 MiB) instead of forwarding it unchecked.
+  Previously a batch, a body over the 1 MiB sniff limit or an unparseable
+  body passed without an MCP decision.
+
 ## [native-v0.5.0] — 2026-10-29
 
 Minor release on top of `native-v0.4.1` (PRs #228, #238, #239). It adds one

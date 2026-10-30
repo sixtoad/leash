@@ -155,6 +155,16 @@ const (
 	CapabilityManagerInspect = "manager-inspect"
 	// CapabilityPinNetworkHost is repeatable --pin-network-host for Linux Docker.
 	CapabilityPinNetworkHost = "pin-network-host"
+	// CapabilityMCPCallArgs means McpCall decisions carry the call's
+	// arguments (context.args, a record of the top-level string, long and
+	// boolean arguments, and context.argNames, the set of every argument
+	// name), so a strict policy can pin an MCP endpoint to one repository and
+	// a retrieval-only tool list (#113). The proxy decides every tools/call of
+	// a JSON-RPC batch and, while MCP policies are active, denies a request
+	// it cannot decide unambiguously (duplicate keys, invalid JSON, a body
+	// over the read-ahead limit). An older leash rejects such a policy at
+	// load, so a caller generating one should check this capability first.
+	CapabilityMCPCallArgs = "mcp-call-args"
 )
 
 // Enforced policy path limits, in bytes of the resolved path (a directory
@@ -201,6 +211,7 @@ var capabilities = []string{
 	CapabilityCedarStrictDefault,
 	CapabilityManagerInspect,
 	CapabilityPinNetworkHost,
+	CapabilityMCPCallArgs,
 }
 
 // Capabilities returns the surface names this build advertises. The slice is a

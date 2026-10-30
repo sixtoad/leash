@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/strongdm/leash/internal/engine"
 )
 
 func TestLoadH2Mode(t *testing.T) {
@@ -621,8 +623,10 @@ func TestH2MITMNoSNIVerifiesAuthorityByResolution(t *testing.T) {
 type ipOnlyPolicy struct{}
 
 func (ipOnlyPolicy) CheckConnect(hostname, ip string, port uint16) bool { return ip != "" }
-func (ipOnlyPolicy) CheckMCPCall(string, string) bool                   { return true }
-func (ipOnlyPolicy) HasMCPPolicies() bool                               { return false }
+func (ipOnlyPolicy) DecideMCPCall(engine.MCPCall) engine.Decision {
+	return engine.Decision{Allow: true}
+}
+func (ipOnlyPolicy) HasMCPPolicies() bool { return false }
 
 // When the connect policy permits only the original destination IP, the h2
 // MITM dials that IP (SNI preserved for the upstream handshake) rather than

@@ -90,12 +90,13 @@ policy change builds a new engine.
   actions their scope can match, and a request's parents are filtered to the
   entities some policy names; both only skip evaluations that are false.
 - **Built-in requests.** `DecideOpen(path, FileOpenReadOnly|FileOpenReadWrite)`,
-  `DecideExec(path)`, `DecideConnect(host, ip, port)`, `DecideMCP(server,
-  tool)` build a Cedar request (principal `Workload::"workload"`, the action,
-  the resource with its parents, context) and call `cedar.Authorize`.
-  `Decide(Request)` routes the generic socket request. The engine implements
-  the proxy's `PolicyChecker` (`CheckConnect`, `CheckMCPCall`,
-  `HasMCPPolicies`).
+  `DecideExec(path)`, `DecideConnect(host, ip, port)`,
+  `DecideMCPCall(MCPCall)` (and `DecideMCP(server, tool)`, the same call with
+  unknown arguments) build a Cedar request (principal `Workload::"workload"`,
+  the action, the resource with its parents, context) and call
+  `cedar.Authorize`. `Decide(Request)` routes the generic socket request. The
+  engine implements the proxy's `PolicyChecker` (`CheckConnect`,
+  `DecideMCPCall`, `HasMCPPolicies`).
 - **Plugin requests** (`<Namespace>::Action::"Verb"`) are Cedar requests with
   the socket's principal, the given resource (no hierarchy) and context.
 - **Namespace rule.** A plugin request is evaluated only against policies
@@ -129,7 +130,7 @@ means, and what the kernel compiler compiles.
 |---|---|
 | `File::"<path>"` (open, exec) | Nothing else of type `File`: `File::"p"` is **exactly** the path p (`resource in File::"p"` and `resource == File::"p"` both mean p). `FilePrefix::"q"` for every byte prefix `q` of the path, the path itself included (`FilePrefix::"/bin/rm"` covers `/bin/rm` and `/bin/rmdir`; it is the strict form of a legacy `File` rule). `Dir::"d/"` (and `Dir::"d"`, the same directory) for every directory `d/` above the path. For **opens only**, also the directory itself: `Dir::"/x/"` covers `/x` (#119). |
 | `Host::"<name>"` (or `Host::"<ip>"` without a name) | `Host::"name"` (lowercased, trailing dot removed), `Host::"*.zone"` for every proper label suffix (`*.example.com` covers `a.example.com`, not `example.com` or `evilexample.com`), `Host::"<ip>"`, `Host::"*"`; with a known port each of those also as `Host::"<x>:<port>"`, plus `Host::"*:<port>"`. An IP literal is an address, never a name. |
-| `MCP::Tool::"<tool>"` (lowercased) | `MCP::Server::"<server>"` (lowercased; scheme, path and port removed). `context.server` carries the normalized server. |
+| `MCP::Tool::"<tool>"` (lowercased) | `MCP::Server::"<server>"` (lowercased; scheme, path and port removed). `context.server` carries the normalized server; `context.args` and `context.argNames` carry the call's arguments (§3.5). |
 | `Action::"FileOpenReadOnly"`, `Action::"FileOpenReadWrite"` | `Action::"FileOpen"` (write `action in Action::"FileOpen"` for both). |
 
 ### 3.3 Kernel compilation (`transpiler.CompileKernel`)
@@ -159,8 +160,9 @@ MCP and plugin policies are userspace only and may use the full language,
 with one limit for MCP (#164): the MCP adapters (the proxy's tools/call
 check and the socket's built-in `McpCall` query) send the workload as
 principal, `MCP::Tool`/`MCP::Server` entities without attributes or tags,
-and a context holding only `server`. An `McpCall` policy whose condition
-reads another context key, the principal, or an attribute or tag could
+and a context holding `server`, `args` and `argNames` (§3.5). An `McpCall`
+policy whose condition reads another context key, `context.args` as a whole
+value (rather than its fields), the principal, or an attribute or tag could
 never apply as written, so it fails the load (permit or forbid), naming the
 policy, its line and the construct. Plugin policies are not restricted: the
 plugin sends the context they test.
@@ -359,12 +361,76 @@ mac-leash`. Differences that are macOS's own:
 | Plugin decisions | `TestPluginDecisionsAreCedarAuthorize`, namespace rule, `@expires`, routing | |
 | Unenforceable constraints (#164) | `TestLegacyRejectsUnenforceablePermits`, `TestLegacyRejectsNarrowedForbids`, `TestLegacyForbidWithDroppedConditionIsStricter`, `TestStrictMCPConditionsMustBeSupplied`, `TestPluginConditionsAreEvaluatedWithRequestContext`, `TestServerPluginConditionsSurviveTheUnenforceableCheck`; the random generators above flag such policies, assert the rewrite rejects exactly those that have an effect, and check equivalence on the rest | |
 
+| MCP call arguments (#113) | `TestPinnedRetrievalOracle` (engine): random repo-pinned retrieval policies (with and without a broader MCP permit) and random calls (servers, tools, argument names and typed values, unknown arguments) vs the intended semantics, and the generic socket request vs `DecideMCPCall`; `TestDecideMCPCallContext`, `TestGenericMCPRequestValidation`; `TestParseMCPBodyExtractsCallsStrictly`, `TestPinnedCapabilityOverHTTPS` (HTTP/1.1 and h2, legacy SSE message endpoint), `TestPinnedCapabilityDeniesOtherServersOverHTTP`, `TestMalformedBodiesAreDeniedOnlyWhenMCPIsGoverned` (proxy); `TestServerBuiltinQueriesMatchTheProxy` (socket) | 60 policies, 24,000 decisions, equal |
+
 The oracle (`internal/lsm/legacy_model_test.go`) is test-only: it is the
 #150 `Decider` matcher code, kept as the statement of the legacy semantics
 and pinned to the kernel loaders. Mutation checks: disabling the exceptions,
 the synthesized defaults, the equal-length rule, the directory-self parent,
 the region pruning, the directory self entries, the split root or the
 explicit connect default each makes these tests fail.
+
+### 3.5 MCP call arguments (#113)
+
+An `McpCall` request carries the call's arguments, so a policy can pin an
+MCP endpoint to one repository or scope and a list of retrieval tools
+(the Walk code-indexer capability; the policy shape is in
+`docs/design/CEDAR.md`, "Pin an MCP endpoint to one repository").
+
+| Context key | Type | Value |
+|---|---|---|
+| `server` | String | the normalized server (always present) |
+| `args` | Record | the top-level `params.arguments` members whose value is a string of at most 4 KiB, a boolean, or an integer in the 64-bit range. Objects, arrays, floats, `null` and longer strings are omitted. |
+| `argNames` | Set of String | the name of every top-level argument, including the omitted ones |
+
+`args` and `argNames` are present together. Both are absent when the
+arguments cannot be represented faithfully (more than 64 arguments, a name
+over 128 bytes) or, on the socket, when the request did not send `args`
+(`argNames` then defaults to the keys of `args`). An absent key or field
+makes a condition that reads it an evaluation error, and a policy whose
+condition errors does not apply: guard every read with `has`, and write a
+forbid that must cover undecidable calls as `unless { <guarded condition> }`.
+Engine limits: `engine.MaxMCPArgs`, `MaxMCPArgNameBytes`,
+`MaxMCPArgStringBytes`; a request breaking them (a name outside `argNames`,
+a nested value) is `invalid_request`.
+
+**The proxy's parser** (`internal/proxy/mcp_call.go`) must read a call as
+the server will, or a crafted body could be decided as one call and run as
+another:
+
+- keys are matched case-sensitively (Go's struct decoding is not);
+- a duplicated key in the request object, `params` or `arguments` makes
+  the request ambiguous (parsers differ on which value wins);
+- every `tools/call` of a JSON-RPC batch (at most 64 requests) is decided,
+  and the request is denied if any is;
+- a `tools/call` is enforced whatever its `jsonrpc` member says.
+
+While MCP policies are active (`HasMCPPolicies`), a JSON request the proxy
+cannot decide is denied with a JSON-RPC error instead of being forwarded:
+invalid JSON (including `NaN`, trailing data, a compressed body), an
+ambiguous or malformed `tools/call` (missing `params`, a non-string `name`,
+non-object `arguments`), a body that cannot be read, and a body over the
+read-ahead limit (64 MiB, or `LEASH_MCP_SNIFF_LIMIT` if larger). With an
+unconditional MCP permit (MCP not governed) such bodies pass as before.
+Only `application/json` bodies are parsed: the MCP HTTP transports require
+that content type and the reference SDKs reject others.
+
+**Transports.** Streamable HTTP and the legacy HTTP+SSE transport send every
+client request as a JSON POST (to the MCP endpoint or the SSE message
+endpoint), so both are decided here over HTTP/1.1 and h2 (#148). The
+server-to-client SSE streams carry no tool calls and are only observed.
+The proxy sees TCP to ports 80 and 443 only (the netfilter redirect), so an
+endpoint to be checked per call must be reached there, at a non-loopback
+address. **stdio MCP is not mediated per call:** a stdio server is a child
+process of the agent, and the JSON-RPC between them never leaves the
+sandbox. Leash governs such a server like any process (ProcessExec, file
+and network policy); per-call checks for it need the server (or a bridge in
+front of it) to ask the authz socket's built-in `McpCall` with the same
+context, which this policy then decides identically.
+
+**Audit.** The `event=mcp.call` line names the deciding policies
+(`policies="..."`) and the argument names (`arg_names="..."`), never their
+values; a denial's JSON-RPC error names the reason and policies too.
 
 ## 4. Legacy semantics and the preparser
 
@@ -662,8 +728,11 @@ server and the client.
   caching.
 - Context mapping: a JSON string is a Cedar String; an integer is a Long
   (fractions are rejected); a bool is a Bool; an array of those is a Set;
-  `{"__entity":{"type","id"}}` is an entity (Cedar's JSON convention). Any
-  other object, and `null`, is rejected.
+  `{"__entity":{"type","id"}}` is an entity (Cedar's JSON convention); any
+  other object at the top level of the context is a flat record (#113) of at
+  most 64 keys whose values are strings, integers and booleans (an McpCall's
+  `context.args`, §3.5). Nested records, records in sets, sets in records,
+  and `null` are rejected.
 - Versioning: `v` must be `1`. A different version gets a deny with
   `unsupported_version` and the server's `v`. Unknown fields are ignored, so
   additions stay compatible. A breaking change bumps `v`, and the server can
@@ -754,7 +823,7 @@ if d.Allowed() { ... }               // false on any error
 | Secret broker, static | Walk writes one `permit` per agent `Secrets` entry, or a `Secret::Item` permit set, and spawns the broker with `authz=Secret`. The broker calls `Check` per `SearchItems`/`GetSecret` instead of using its allow-list. |
 | Secret broker, time-bound | `@expires` on the permit. It is added through the existing Cedar policy API (`POST /api/policies`) or by editing the file; the hot reload swaps the engine. |
 | Secret broker, approved per request | Future. A permit annotated `@approval("prompt")` decides `deny` with `approval_required`. leashd's Control UI prompts. Approval adds a short `@expires` permit (or a one-shot grant keyed by request id), and the plugin retries. Only the reason is reserved here; no prompt ships. |
-| #113 code-indexer gate | `CodeIndex::Action::"Retrieve"` per call, with `context.revision` and `context.tool`, plus mutation forbids. If the channel is MCP over stdio, the gate can query the built-in `McpCall` instead, so HTTP and stdio MCP share one policy. |
+| #113 code-indexer gate | The built-in `McpCall` with `context.args` (§3.5): one permit for the pinned server, retrieval tools and `context.args.repo`, and a forbid of every other call. The proxy enforces it for HTTP MCP; a stdio bridge or the provider can query the socket's built-in `McpCall` with the same context, so HTTP and stdio MCP share one policy. |
 | #18 manifest actions | The manifest declares namespaces, actions and resource types. Leash grants them (§7.4) and lints policies against them. |
 | Audit | `event=authz.decision` in the event log and the Control UI stream. |
 
