@@ -81,6 +81,12 @@ type Request struct {
 	// network namespace, for the policy's hostname connect rules (the kernel
 	// matches connects by IP; the daemon has no network).
 	Hosts map[string][]string `json:"hosts,omitempty"`
+	// AuditRingBufferKB sizes each eBPF object's audit ring buffer in KiB
+	// (attach; 0 = the default). Bounded by the lsm package's limits.
+	AuditRingBufferKB uint32 `json:"auditRingBufferKb,omitempty"`
+	// AuditLossless asks for the lossless audit posture (attach): an
+	// operation whose audit record cannot be written is denied.
+	AuditLossless bool `json:"auditLossless,omitempty"`
 }
 
 // Message is one daemon (or worker) message.
@@ -97,6 +103,10 @@ type Message struct {
 	Status *Status `json:"status,omitempty"`
 	// Line is an enforcement event log line (TypeEvent).
 	Line string `json:"line,omitempty"`
+	// AuditLossless confirms the lossless audit posture is in force (attach
+	// result). A client that asked for it refuses an attach without it: an
+	// older daemon ignores the request field.
+	AuditLossless bool `json:"auditLossless,omitempty"`
 }
 
 // Status describes the daemon to a client.

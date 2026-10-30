@@ -374,6 +374,7 @@ func (l *ConnectLsm) LoadAndAttach(loader func() (*ebpf.CollectionSpec, error)) 
 	config := BPFConfig{
 		ProgramNames:      []string{"lsm_connect", "lsm_sendmsg", "lsm_socket_create"},
 		EventMapName:      "connect_events",
+		AuditLogger:       l.logger,
 		AllowedCgroupsMap: "connect_allowed_cgroups",
 		TargetCgroupMap:   "connect_target_cgroup",
 		StartMessage:      "Successfully started monitoring network connections and sendmsg operations",
