@@ -221,13 +221,13 @@ func (b *Broker) handle(conn *net.UnixConn) bool {
 		b.cfg.Logf("enforcer broker: pass connection: %v", sendErr)
 		return false
 	}
+	b.mu.Lock()
+	b.served = true
+	b.mu.Unlock()
 	// Keep this end open until the peer has taken the connection (it closes
 	// the broker connection), so the handover never races our close.
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	_, _ = conn.Read(make([]byte, 1))
-	b.mu.Lock()
-	b.served = true
-	b.mu.Unlock()
 	return true
 }
 

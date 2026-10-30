@@ -96,8 +96,10 @@ func TestBrokerHandsOverOneDaemonConnection(t *testing.T) {
 	if status.Version != "fake" {
 		t.Fatalf("status over the handed-over connection = %+v", status)
 	}
-	if !b.Served() {
-		t.Fatal("broker does not report the handover")
+	for start := time.Now(); !b.Served(); time.Sleep(10 * time.Millisecond) {
+		if time.Since(start) > 2*time.Second {
+			t.Fatal("broker does not report the handover")
+		}
 	}
 	// Single use: the broker stopped listening and removed its socket.
 	deadline := time.Now().Add(2 * time.Second)
