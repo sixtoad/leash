@@ -40,7 +40,7 @@ Where the toolchain comes from:
 | Path | Toolchain |
 |---|---|
 | Linux host (`make lsm-generate`) | install `clang-18 llvm-18 libbpf-dev` (Ubuntu 24.04: `apt install clang-18 llvm-18 libbpf-dev`; elsewhere apt.llvm.org) |
-| `make lsm-generate-docker` (the macOS default, and the release script's fallback) | `leash/bpf-toolchain:latest`, built from the `bpf-toolchain` stage of `Dockerfile.leash` (`ubuntu:noble` + `clang-18`/`llvm-18`, Go copied from `golang:1.25.3`) |
+| `make lsm-generate-docker` (the macOS default, and the release script's fallback) | `localhost/leash/bpf-toolchain:latest`, built from the `bpf-toolchain` stage of `Dockerfile.leash` (`docker.io/library/ubuntu:noble` + `clang-18`/`llvm-18`, Go copied from `docker.io/library/golang:1.25.3`) |
 | `Dockerfile.leash` (`lsm-generate` stage) | `build-base`, which extends `bpf-toolchain` |
 | CI and release workflows | Ubuntu runner packages (`clang-18`/`llvm-18`, or `clang` = 18 on 24.04) |
 
@@ -48,9 +48,9 @@ CI's `kernel-load (Docker-built objects)` job generates the objects with
 `make lsm-generate-docker` and runs the verifier load against them, next to
 the `kernel-load` job for host-built objects.
 
-A `leash/build-base:latest` cached from before the pin has Debian's clang;
+A `localhost/leash/build-base:latest` cached from before the pin has Debian's clang;
 `make docker-base` rebuilds it when it lacks `clang-18` (or remove it with
-`docker image rm leash/build-base:latest`).
+`docker image rm localhost/leash/build-base:latest`).
 
 To move to another clang major, change `REQUIRED_MAJOR` in
 `internal/lsm/bpf_clang.sh`, the `clang-18`/`llvm-18` packages in

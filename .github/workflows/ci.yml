@@ -67,6 +67,11 @@ jobs:
           GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go vet ./...
           GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go vet ./...
 
+      # Podman prompts for a registry on short names (#172): every image
+      # reference must be fully qualified.
+      - name: image references qualified
+        run: scripts/check-image-refs.sh
+
       # Scoped to shell scripts this change touches, so pre-existing warnings
       # elsewhere do not fail unrelated PRs.
       - name: shellcheck (changed scripts)
@@ -216,7 +221,7 @@ jobs:
           make lsm-generate-docker
           sudo chown -R "$(id -u):$(id -g)" internal/lsm
           ls -l internal/lsm/*_bpf*.o
-          docker run --rm --entrypoint clang-18 leash/bpf-toolchain:latest --version | head -1 | tee toolchain.txt
+          docker run --rm --entrypoint clang-18 localhost/leash/bpf-toolchain:latest --version | head -1 | tee toolchain.txt
 
       - name: Verifier load + attach
         env:
