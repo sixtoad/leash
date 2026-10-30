@@ -576,10 +576,39 @@ func convertValue(raw json.RawMessage, allowSet bool) (engine.Value, error) {
 		var ent struct {
 			Entity *wire.EntityUID `json:"__entity"`
 		}
-		if len(x) != 1 || json.Unmarshal(raw, &ent) != nil || ent.Entity == nil || ent.Entity.Type == "" {
-			return engine.Value{}, errors.New(`records are not supported; use {"__entity":{"type":..,"id":..}} for an entity`)
+		if _, isEntity := x["__entity"]; isEntity {
+			if len(x) != 1 || json.Unmarshal(raw, &ent) != nil || ent.Entity == nil || ent.Entity.Type == "" {
+				return engine.Value{}, errors.New(`an entity is {"__entity":{"type":..,"id":..}}`)
+			}
+			return engine.EntityValue(engine.EntityUID{Type: ent.Entity.Type, ID: ent.Entity.ID}), nil
 		}
-		return engine.EntityValue(engine.EntityUID{Type: ent.Entity.Type, ID: ent.Entity.ID}), nil
+		// A flat record (#113: McpCall's context.args): only at the top
+		// level of the context, with string, long and boolean values.
+		if !allowSet {
+			return engine.Value{}, errors.New("nested records are not supported")
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			return engine.Value{}, err
+		}
+		if len(fields) > wire.MaxContextKeys {
+			return engine.Value{}, fmt.Errorf("record has %d keys, over the limit of %d", len(fields), wire.MaxContextKeys)
+		}
+		rec := make(map[string]engine.Value, len(fields))
+		for k, fv := range fields {
+			if len(k) > 256 {
+				return engine.Value{}, fmt.Errorf("record key %q is too long", k)
+			}
+			ev, err := convertValue(fv, false)
+			if err != nil {
+				return engine.Value{}, fmt.Errorf("record key %q: %w", k, err)
+			}
+			if ev.Kind == engine.ValueSet || ev.Kind == engine.ValueEntity || ev.Kind == engine.ValueRecord {
+				return engine.Value{}, fmt.Errorf("record key %q: record values are strings, longs and booleans", k)
+			}
+			rec[k] = ev
+		}
+		return engine.RecordValue(rec), nil
 	case nil:
 		return engine.Value{}, errors.New("null is not a Cedar value")
 	}

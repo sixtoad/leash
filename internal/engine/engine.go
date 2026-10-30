@@ -416,14 +416,11 @@ func (e *Engine) decideBuiltin(req Request) Decision {
 		if req.Resource.Type != TypeMCPTool {
 			return invalidRequest("McpCall needs resource MCP::Tool::\"name\"")
 		}
-		server := ""
-		if v, ok := req.Context["server"]; ok {
-			if v.Kind != ValueString {
-				return invalidRequest("context.server must be a string")
-			}
-			server = v.Str
+		call, err := mcpCallFromRequest(req)
+		if err != nil {
+			return invalidRequest("%v", err)
 		}
-		return e.DecideMCP(server, req.Resource.ID)
+		return e.DecideMCPCall(call)
 	}
 	return Decision{Reason: ReasonUnsupportedAction, Detail: fmt.Sprintf("Leash action %q cannot be queried", req.Action.ID)}
 }
@@ -476,15 +473,10 @@ func (e *Engine) DecideConnect(hostname, ip string, port uint16) Decision {
 	return e.builtinRequest(ActionNetworkConnect, res, parents, types.Record{})
 }
 
-// DecideMCP decides an MCP tools/call of tool on server. context.server
-// carries the normalized server name.
+// DecideMCP decides an MCP tools/call of tool on server whose arguments
+// are unknown: the context carries only server (see DecideMCPCall).
 func (e *Engine) DecideMCP(server, tool string) Decision {
-	if e == nil {
-		return Decision{Reason: ReasonNoPolicy}
-	}
-	res, parents := mcpResource(server, tool)
-	ctx := types.NewRecord(types.RecordMap{"server": types.String(NormalizeMCPServer(server))})
-	return e.builtinRequest(ActionMcpCall, res, parents, ctx)
+	return e.DecideMCPCall(MCPCall{Server: server, Tool: tool})
 }
 
 // CheckConnect implements the proxy PolicyChecker interface.
@@ -492,7 +484,7 @@ func (e *Engine) CheckConnect(hostname, ip string, port uint16) bool {
 	return e.DecideConnect(hostname, ip, port).Allow
 }
 
-// CheckMCPCall implements the proxy PolicyChecker interface.
+// CheckMCPCall reports whether DecideMCP allows the call.
 func (e *Engine) CheckMCPCall(server, tool string) bool { return e.DecideMCP(server, tool).Allow }
 
 func (e *Engine) builtinRequest(action string, res types.EntityUID, parents []types.EntityUID, ctx types.Record) Decision {
@@ -569,6 +561,19 @@ func cedarValue(v Value) (types.Value, error) {
 		return types.Boolean(v.Bool), nil
 	case ValueEntity:
 		return uid(v.Entity), nil
+	case ValueRecord:
+		m := make(types.RecordMap, len(v.Record))
+		for k, e := range v.Record {
+			if e.Kind == ValueSet || e.Kind == ValueRecord {
+				return nil, fmt.Errorf("record key %q: nested sets and records are not supported", k)
+			}
+			cv, err := cedarValue(e)
+			if err != nil {
+				return nil, err
+			}
+			m[types.String(k)] = cv
+		}
+		return types.NewRecord(m), nil
 	case ValueSet:
 		vals := make([]types.Value, 0, len(v.Set))
 		for _, e := range v.Set {

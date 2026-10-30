@@ -17,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/strongdm/leash/internal/engine"
 )
 
 type stubPolicyChecker struct {
@@ -29,11 +31,11 @@ func (s stubPolicyChecker) CheckConnect(hostname string, ip string, port uint16)
 	return s.allowConnect
 }
 
-func (s stubPolicyChecker) CheckMCPCall(server string, tool string) bool {
+func (s stubPolicyChecker) DecideMCPCall(engine.MCPCall) engine.Decision {
 	if !s.mcp {
-		return true
+		return engine.Decision{Allow: true}
 	}
-	return s.allowMCP
+	return engine.Decision{Allow: s.allowMCP}
 }
 
 func (s stubPolicyChecker) HasMCPPolicies() bool {
@@ -49,8 +51,8 @@ func (t toolOnlyPolicyChecker) CheckConnect(hostname string, ip string, port uin
 	return true
 }
 func (t toolOnlyPolicyChecker) HasMCPPolicies() bool { return true }
-func (t toolOnlyPolicyChecker) CheckMCPCall(server string, tool string) bool {
-	return strings.TrimSpace(strings.ToLower(tool)) != strings.TrimSpace(strings.ToLower(t.tool))
+func (t toolOnlyPolicyChecker) DecideMCPCall(c engine.MCPCall) engine.Decision {
+	return engine.Decision{Allow: strings.TrimSpace(strings.ToLower(c.Tool)) != strings.TrimSpace(strings.ToLower(t.tool))}
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
