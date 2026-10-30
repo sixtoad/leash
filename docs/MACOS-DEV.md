@@ -109,6 +109,34 @@ default (overridable via `LEASH_TEAM_IDENTIFIER`, or auto-derived from the app's
    uninstall dance. leashcli launched from the embedded Resources path is trusted
    by ES on the path rule, so exec authorization works with no team ID.
 
+## 5. Development-signed build on a SIP-enabled Mac
+
+With the team's development certificate and profiles you can skip the relaxed VM
+and run on a real Mac with SIP on. Apple allows the Endpoint Security
+entitlement in development profiles before the distribution grant is approved;
+such a build runs only on Macs listed in the profiles.
+
+Needs, in the developer portal for team `9884BZY594`:
+
+- an **Apple Development** certificate in the login keychain;
+- App IDs `com.sixtoad.leash`, `.LeashES` (Endpoint Security (development)),
+  `.LeashNetworkFilter`, `.LeashProxy` (Network Extensions) and `.cli`;
+- a **macOS App Development** profile for each, listing the Mac, installed in
+  `~/Library/Developer/Xcode/UserData/Provisioning Profiles/<UUID>.provisionprofile`.
+
+Then build Debug as usual and re-sign:
+
+```bash
+mac-leash/dev-sign.sh /path/to/Debug/Leash.app
+```
+
+The script picks the newest development profile per App ID, embeds it, adds the
+application and team identifiers to each target's entitlements, and sets the
+content filter's `NEMachServiceName` to the team-prefixed form (#19), which the
+unsigned Debug build leaves empty. `LEASH_TEAM_IDENTIFIER`,
+`LEASH_BUNDLE_IDENTIFIER`, `LEASH_PROFILES_DIR` and `LEASH_SIGN_IDENTITY`
+override the defaults.
+
 ## Security note
 
 Disabling SIP + AMFI removes real OS protections. Do this **only in a throwaway VM**,
