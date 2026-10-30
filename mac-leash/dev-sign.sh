@@ -57,6 +57,11 @@ sign() { codesign --force --timestamp=none --options runtime --sign "$IDENTITY" 
 
 # sign_bundle <bundle path> <bundle id> <source entitlements>
 sign_bundle() {
+  # Debug builds split the code into Contents/MacOS/*.debug.dylib (and
+  # __preview.dylib); with the hardened runtime dyld refuses one whose team
+  # differs from the executable's, so they must be re-signed too.
+  find "$1/Contents/MacOS" -maxdepth 1 -name '*.dylib' -print0 |
+    while IFS= read -r -d '' lib; do sign "$lib"; done
   cp "$(profile_for "$2")" "$1/Contents/embedded.provisionprofile"
   sign --entitlements "$(entitlements_for "$3" "$2")" "$1"
 }
