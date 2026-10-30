@@ -234,8 +234,10 @@ func decodeConfig(data []byte, path string, cfg *Config) error {
 					cfg.Resources.Memory = val
 				case "pids_limit":
 					cfg.Resources.PidsLimit = val
+				case "shm_size":
+					cfg.Resources.ShmSize = val
 				default:
-					return fmt.Errorf("parse leash.resources.%s: unknown key (supported: cpus, memory, pids_limit)", key)
+					return fmt.Errorf("parse leash.resources.%s: unknown key (supported: cpus, memory, pids_limit, shm_size)", key)
 				}
 			}
 		}
@@ -476,6 +478,9 @@ func buildPersisted(cfg Config) persistedConfig {
 	}
 	if v := strings.TrimSpace(cfg.Resources.PidsLimit); v != "" {
 		res["pids_limit"] = v
+	}
+	if v := strings.TrimSpace(cfg.Resources.ShmSize); v != "" {
+		res["shm_size"] = v
 	}
 	if len(res) > 0 {
 		if result.Leash == nil {

@@ -9,11 +9,11 @@ import (
 
 func TestDecodeLeashResources(t *testing.T) {
 	cfg := New()
-	data := []byte("[leash.resources]\ncpus = 1.5\nmemory = \"2g\"\npids_limit = 256\n")
+	data := []byte("[leash.resources]\ncpus = 1.5\nmemory = \"2g\"\npids_limit = 256\nshm_size = \"1g\"\n")
 	if err := decodeConfig(data, "test.toml", &cfg); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	want := ResourceLimits{CPUs: "1.5", Memory: "2g", PidsLimit: "256"}
+	want := ResourceLimits{CPUs: "1.5", Memory: "2g", PidsLimit: "256", ShmSize: "1g"}
 	if cfg.Resources != want {
 		t.Fatalf("Resources = %+v, want %+v", cfg.Resources, want)
 	}
@@ -42,7 +42,7 @@ func TestLoadWithOverlayMergesResources(t *testing.T) {
 	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	global := "[leash.resources]\ncpus = \"2\"\nmemory = \"4g\"\n"
+	global := "[leash.resources]\ncpus = \"2\"\nmemory = \"4g\"\nshm_size = \"512m\"\n"
 	if err := os.WriteFile(filepath.Join(cfgDir, configFileName), []byte(global), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestLoadWithOverlayMergesResources(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadWithOverlay: %v", err)
 	}
-	want := ResourceLimits{CPUs: "2", Memory: "1g", PidsLimit: "128"}
+	want := ResourceLimits{CPUs: "2", Memory: "1g", PidsLimit: "128", ShmSize: "512m"}
 	if cfg.Resources != want {
 		t.Fatalf("Resources = %+v, want %+v", cfg.Resources, want)
 	}
@@ -68,7 +68,7 @@ func TestSaveRoundTripsResources(t *testing.T) {
 	testSetEnv(t, "XDG_CONFIG_HOME", base)
 	setHome(t, filepath.Join(base, "home"))
 	cfg := New()
-	cfg.Resources = ResourceLimits{CPUs: "0.5", Memory: "512m", PidsLimit: "64"}
+	cfg.Resources = ResourceLimits{CPUs: "0.5", Memory: "512m", PidsLimit: "64", ShmSize: "1g"}
 	if err := Save(cfg); err != nil {
 		t.Fatalf("Save: %v", err)
 	}

@@ -36,6 +36,9 @@ func TestParseResourceValues(t *testing.T) {
 		{parseMemory, "8192k", "8192k", 8 << 20},
 		{parsePidsLimit, "256", "256", 256},
 		{parsePidsLimit, "0010", "10", 10},
+		{parseShmSize, "1g", "1g", 1 << 30},
+		{parseShmSize, " 256M ", "256m", 256 << 20},
+		{parseShmSize, "1048576", "1048576", 1 << 20},
 	}
 	for _, tc := range good {
 		norm, v, err := tc.fn(tc.in)
@@ -53,6 +56,11 @@ func TestParseResourceValues(t *testing.T) {
 			t.Errorf("value %q should be rejected", in)
 		}
 	}
+	for _, in := range []string{"512", "0", "1023k", "-1g", "1.5g", "2gb", "1g --privileged", "", "99999999999999999999g"} {
+		if _, _, err := parseShmSize(in); err == nil {
+			t.Errorf("shm size %q should be rejected", in)
+		}
+	}
 	for _, in := range []string{"0", "-1", "1.5", "abc", "99999999", "--privileged"} {
 		if _, _, err := parsePidsLimit(in); err == nil {
 			t.Errorf("pids limit %q should be rejected", in)
@@ -65,6 +73,7 @@ func clearResourceEnv(t *testing.T) {
 	clearEnv(t, "LEASH_CPUS")
 	clearEnv(t, "LEASH_MEMORY")
 	clearEnv(t, "LEASH_PIDS_LIMIT")
+	clearEnv(t, "LEASH_SHM_SIZE")
 }
 
 // Each limit resolves independently: flag > env > config.
@@ -76,6 +85,9 @@ func TestResolveResourceLimitsPrecedence(t *testing.T) {
 	if err != nil || got.cpus != "4" || got.memory != "8g" || got.pidsLimit != "1000" {
 		t.Fatalf("config layer: %+v, %v", got, err)
 	}
+	if got.shmSize != "" || got.shmBytes != 0 {
+		t.Fatalf("shm size must stay unset (engine default) when not configured: %+v", got)
+	}
 
 	setEnv(t, "LEASH_MEMORY", "2g")
 	setEnv(t, "LEASH_PIDS_LIMIT", "500")
@@ -85,6 +97,27 @@ func TestResolveResourceLimitsPrecedence(t *testing.T) {
 	}
 	if got.cpus != "4" || got.memory != "2g" || got.pidsLimit != "64" {
 		t.Fatalf("precedence wrong: %+v", got)
+	}
+}
+
+// The shm size layers flag > LEASH_SHM_SIZE > [leash.resources] shm_size (#171).
+func TestResolveShmSizePrecedence(t *testing.T) {
+	clearResourceEnv(t)
+	file := configstore.ResourceLimits{ShmSize: "512m"}
+	got, err := resolveResourceLimits(options{}, file)
+	if err != nil || got.shmSize != "512m" || got.shmBytes != 512<<20 || !got.any() {
+		t.Fatalf("config layer: %+v, %v", got, err)
+	}
+	setEnv(t, "LEASH_SHM_SIZE", "1G")
+	if got, err = resolveResourceLimits(options{}, file); err != nil || got.shmSize != "1g" || got.shmBytes != 1<<30 {
+		t.Fatalf("env layer: %+v, %v", got, err)
+	}
+	if got, err = resolveResourceLimits(options{shmSize: "2g"}, file); err != nil || got.shmSize != "2g" || got.shmBytes != 2<<30 {
+		t.Fatalf("flag layer: %+v, %v", got, err)
+	}
+	setEnv(t, "LEASH_SHM_SIZE", "huge")
+	if _, err = resolveResourceLimits(options{}, file); err == nil || !strings.Contains(err.Error(), "LEASH_SHM_SIZE") || !strings.Contains(err.Error(), "invalid shm size") {
+		t.Fatalf("garbage env must fail naming its source, got %v", err)
 	}
 }
 
@@ -111,12 +144,18 @@ func TestResolveResourceLimitsRejectsGarbage(t *testing.T) {
 }
 
 func TestParseArgsResourceFlags(t *testing.T) {
-	opts, err := parseArgs([]string{"--cpus", "1.5", "--memory=2g", "--pids-limit", "256", "--", "make", "test"})
+	opts, err := parseArgs([]string{"--cpus", "1.5", "--memory=2g", "--pids-limit", "256", "--shm-size", "1g", "--", "make", "test"})
 	if err != nil {
 		t.Fatalf("parseArgs: %v", err)
 	}
-	if opts.cpus != "1.5" || opts.memory != "2g" || opts.pidsLimit != "256" {
-		t.Fatalf("flags not captured: cpus=%q memory=%q pids=%q", opts.cpus, opts.memory, opts.pidsLimit)
+	if opts.cpus != "1.5" || opts.memory != "2g" || opts.pidsLimit != "256" || opts.shmSize != "1g" {
+		t.Fatalf("flags not captured: cpus=%q memory=%q pids=%q shm=%q", opts.cpus, opts.memory, opts.pidsLimit, opts.shmSize)
+	}
+	if opts, err = parseArgs([]string{"--shm-size=512m", "--", "true"}); err != nil || opts.shmSize != "512m" {
+		t.Fatalf("--shm-size= form: %q, %v", opts.shmSize, err)
+	}
+	if _, err := parseArgs([]string{"--shm-size"}); err == nil {
+		t.Fatal("--shm-size without a value must fail")
 	}
 	if _, err := parseArgs([]string{"--memory"}); err == nil {
 		t.Fatal("--memory without a value must fail")
@@ -149,6 +188,10 @@ func TestLoadConfigResourceLimitsByRuntime(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "not supported by the native runtime") {
 		t.Fatalf("native runtime with limits must fail, got %v", err)
 	}
+	_, _, err = loadConfig(t.TempDir(), options{runtime: nativeRuntimeName, shmSize: "1g"})
+	if err == nil || !strings.Contains(err.Error(), "not supported by the native runtime") || !strings.Contains(err.Error(), "--shm-size") {
+		t.Fatalf("native runtime with --shm-size must fail, got %v", err)
+	}
 	if _, _, err := loadConfig(t.TempDir(), options{runtime: nativeRuntimeName}); err != nil {
 		t.Fatalf("native without limits: %v", err)
 	}
@@ -156,18 +199,18 @@ func TestLoadConfigResourceLimitsByRuntime(t *testing.T) {
 
 func TestResourceLimitsDockerArgsAndReport(t *testing.T) {
 	clearResourceEnv(t)
-	l, err := resolveResourceLimits(options{cpus: "1.5", memory: "512M", pidsLimit: "256"}, configstore.ResourceLimits{})
+	l, err := resolveResourceLimits(options{cpus: "1.5", memory: "512M", pidsLimit: "256", shmSize: "1g"}, configstore.ResourceLimits{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"--cpus", "1.5", "--memory", "512m", "--memory-swap", "512m", "--pids-limit", "256"}
+	want := []string{"--cpus", "1.5", "--memory", "512m", "--memory-swap", "512m", "--pids-limit", "256", "--shm-size", "1g"}
 	if got := l.dockerArgs(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("dockerArgs = %q, want %q", got, want)
 	}
 	if got := (resourceLimits{}).dockerArgs(); len(got) != 0 {
 		t.Fatalf("no limits must add no args, got %q", got)
 	}
-	wantReport := "event=runner.resource-limits status=applied cpus=1.5 nano_cpus=1500000000 memory=512m memory_bytes=536870912 pids_limit=256"
+	wantReport := "event=runner.resource-limits status=applied cpus=1.5 nano_cpus=1500000000 memory=512m memory_bytes=536870912 pids_limit=256 shm_size=1g shm_bytes=1073741824"
 	if got := l.report(); got != wantReport {
 		t.Fatalf("report = %q\nwant     %q", got, wantReport)
 	}
@@ -200,7 +243,7 @@ func (rt *inspectRuntime) Name() string { return "docker" }
 
 func TestVerifyTargetResourceLimits(t *testing.T) {
 	clearResourceEnv(t)
-	limits, err := resolveResourceLimits(options{cpus: "1.5", memory: "512m", pidsLimit: "256"}, configstore.ResourceLimits{})
+	limits, err := resolveResourceLimits(options{cpus: "1.5", memory: "512m", pidsLimit: "256", shmSize: "1g"}, configstore.ResourceLimits{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,12 +253,12 @@ func TestVerifyTargetResourceLimits(t *testing.T) {
 	}
 
 	t.Run("applied", func(t *testing.T) {
-		rt := &inspectRuntime{out: "1500000000 536870912 256\n"}
+		rt := &inspectRuntime{out: "1500000000 536870912 256 1073741824\n"}
 		r, diag := newRunner(rt)
 		if err := r.verifyTargetResourceLimits(context.Background()); err != nil {
 			t.Fatalf("verify: %v", err)
 		}
-		if want := []string{"inspect", "-f", "{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}}", "target"}; !reflect.DeepEqual(rt.args, want) {
+		if want := []string{"inspect", "-f", "{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} {{.HostConfig.ShmSize}}", "target"}; !reflect.DeepEqual(rt.args, want) {
 			t.Fatalf("inspect args = %q", rt.args)
 		}
 		if got := strings.TrimSpace(diag.String()); got != limits.report() {
@@ -224,9 +267,9 @@ func TestVerifyTargetResourceLimits(t *testing.T) {
 	})
 
 	t.Run("dropped by engine fails closed", func(t *testing.T) {
-		r, diag := newRunner(&inspectRuntime{out: "1500000000 0 <nil>\n"})
+		r, diag := newRunner(&inspectRuntime{out: "1500000000 0 <nil> 67108864\n"})
 		err := r.verifyTargetResourceLimits(context.Background())
-		if err == nil || !strings.Contains(err.Error(), "memory: requested 512m") || !strings.Contains(err.Error(), "pids-limit: requested 256") {
+		if err == nil || !strings.Contains(err.Error(), "memory: requested 512m") || !strings.Contains(err.Error(), "pids-limit: requested 256") || !strings.Contains(err.Error(), "shm-size: requested 1g (1073741824 bytes), engine reports 67108864") {
 			t.Fatalf("want mismatch error, got %v", err)
 		}
 		if strings.Contains(diag.String(), "status=applied") {
@@ -254,7 +297,7 @@ func TestVerifyTargetResourceLimits(t *testing.T) {
 // leash sidecar's).
 func TestLaunchTargetContainerPassesResourceLimits(t *testing.T) {
 	clearResourceEnv(t)
-	limits, err := resolveResourceLimits(options{cpus: "2", memory: "1g", pidsLimit: "128"}, configstore.ResourceLimits{})
+	limits, err := resolveResourceLimits(options{cpus: "2", memory: "1g", pidsLimit: "128", shmSize: "256m"}, configstore.ResourceLimits{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,10 +353,10 @@ func TestLaunchTargetContainerPassesResourceLimits(t *testing.T) {
 		t.Fatalf("want 2 runs, got %d", len(commands))
 	}
 	target, leash := strings.Join(commands[0], " "), strings.Join(commands[1], " ")
-	if !strings.Contains(target, "--cpus 2 --memory 1g --memory-swap 1g --pids-limit 128") {
+	if !strings.Contains(target, "--cpus 2 --memory 1g --memory-swap 1g --pids-limit 128 --shm-size 256m") {
 		t.Fatalf("target run args missing limits: %s", target)
 	}
-	if strings.Contains(leash, "--memory") || strings.Contains(leash, "--pids-limit") || strings.Contains(leash, "--cpus") {
+	if strings.Contains(leash, "--memory") || strings.Contains(leash, "--pids-limit") || strings.Contains(leash, "--cpus") || strings.Contains(leash, "--shm-size") {
 		t.Fatalf("leash sidecar must not get the target limits: %s", leash)
 	}
 	// #188: every run is fail-closed, so the eBPF LSM refuses packet/raw

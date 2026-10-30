@@ -132,6 +132,7 @@ type options struct {
 	cpus      string // --cpus
 	memory    string // --memory
 	pidsLimit string // --pids-limit
+	shmSize   string // --shm-size (#171)
 }
 
 type idmapVolume struct {
@@ -569,6 +570,7 @@ Flags:
   --cpus <n>                      (container) CPU limit for the target container, e.g. 1.5. Also LEASH_CPUS or [leash.resources] cpus.
   --memory <n[b|k|m|g]>           (container) Hard memory limit for the target container (swap pinned to the same value), e.g. 2g. Also LEASH_MEMORY or [leash.resources] memory.
   --pids-limit <n>                (container) Max processes in the target container. Also LEASH_PIDS_LIMIT or [leash.resources] pids_limit.
+  --shm-size <n[b|k|m|g]>         (container) Size of the target container's /dev/shm (engine default 64m), e.g. 1g for headless Chromium. Counts against --memory when used. Also LEASH_SHM_SIZE or [leash.resources] shm_size.
   -V, --verbose                   Enable verbose logging (also set when -v is provided without a mount spec).
 
 Environment variables:
@@ -593,6 +595,7 @@ Environment variables:
   LEASH_CPUS                   Target container CPU limit (same as --cpus).
   LEASH_MEMORY                 Target container memory limit (same as --memory).
   LEASH_PIDS_LIMIT             Target container pids limit (same as --pids-limit).
+  LEASH_SHM_SIZE               Target container /dev/shm size (same as --shm-size).
   LEASH_HOME                   Base directory for persisted leash state.
 
 	Persisted mount decisions live at $XDG_CONFIG_HOME/leash/config.toml (or ~/.config/leash/config.toml). Set LEASH_HOME to override this base directory.
@@ -852,7 +855,7 @@ func parseArgs(args []string) (options, error) {
 				return opts, fmt.Errorf("container name cannot be empty")
 			}
 			i++
-		case "--cpus", "--memory", "--pids-limit":
+		case "--cpus", "--memory", "--pids-limit", "--shm-size":
 			if i+1 >= len(args) {
 				return opts, fmt.Errorf("missing argument for %s", arg)
 			}
@@ -980,7 +983,7 @@ func parseArgs(args []string) (options, error) {
 					return opts, err
 				}
 				opts.idmapVolumes = append(opts.idmapVolumes, volume)
-			case strings.HasPrefix(arg, "--cpus="), strings.HasPrefix(arg, "--memory="), strings.HasPrefix(arg, "--pids-limit="):
+			case strings.HasPrefix(arg, "--cpus="), strings.HasPrefix(arg, "--memory="), strings.HasPrefix(arg, "--pids-limit="), strings.HasPrefix(arg, "--shm-size="):
 				name, value, _ := strings.Cut(arg, "=")
 				if strings.TrimSpace(value) == "" {
 					return opts, fmt.Errorf("missing argument for %s", name)
@@ -1631,7 +1634,7 @@ func loadConfig(callerDir string, opts options) (config, map[string]configstore.
 		return config{}, nil, err
 	}
 	if resources.any() && cfg.runtime == nativeRuntimeName {
-		return config{}, nil, errors.New("resource limits (--cpus/--memory/--pids-limit, LEASH_CPUS/LEASH_MEMORY/LEASH_PIDS_LIMIT, [leash.resources]) apply to the target container only and are not supported by the native runtime; use --runtime docker or podman, or remove the limits")
+		return config{}, nil, errors.New("resource limits (--cpus/--memory/--pids-limit/--shm-size, LEASH_CPUS/LEASH_MEMORY/LEASH_PIDS_LIMIT/LEASH_SHM_SIZE, [leash.resources]) apply to the target container only and are not supported by the native runtime; use --runtime docker or podman, or remove the limits")
 	}
 	cfg.resources = resources
 
@@ -3959,7 +3962,7 @@ func isSafeShellRune(r rune) bool {
 	return false
 }
 
-// setResourceFlag records a raw --cpus/--memory/--pids-limit value; validation
+// setResourceFlag records a raw --cpus/--memory/--pids-limit/--shm-size value; validation
 // happens in loadConfig with the env/config layers.
 func setResourceFlag(opts *options, name, value string) {
 	switch name {
@@ -3969,5 +3972,7 @@ func setResourceFlag(opts *options, name, value string) {
 		opts.memory = value
 	case "--pids-limit":
 		opts.pidsLimit = value
+	case "--shm-size":
+		opts.shmSize = value
 	}
 }
