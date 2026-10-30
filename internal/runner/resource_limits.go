@@ -18,6 +18,7 @@ import (
 // the ceilings only reject obvious garbage.
 const (
 	minMemoryBytes = 6 * 1024 * 1024
+	minShmBytes    = 1024 * 1024
 	maxCPUs        = 4096
 	maxPidsLimit   = 1 << 22
 )
@@ -29,14 +30,16 @@ type resourceLimits struct {
 	cpus      string // --cpus, e.g. "1.5"
 	memory    string // --memory, e.g. "2g"
 	pidsLimit string // --pids-limit, e.g. "256"
+	shmSize   string // --shm-size, e.g. "1g" (#171)
 
 	nanoCPUs    int64
 	memoryBytes int64
 	pids        int64
+	shmBytes    int64
 }
 
 func (l resourceLimits) any() bool {
-	return l.cpus != "" || l.memory != "" || l.pidsLimit != ""
+	return l.cpus != "" || l.memory != "" || l.pidsLimit != "" || l.shmSize != ""
 }
 
 var (
@@ -62,14 +65,27 @@ func parseCPUs(raw string) (string, int64, error) {
 }
 
 func parseMemory(raw string) (string, int64, error) {
+	return parseByteSize(raw, "memory", "512m or 2g", minMemoryBytes, "6m")
+}
+
+// parseShmSize validates the target's /dev/shm size (#171). Same syntax as
+// --memory; the 1m floor rejects values that are almost certainly a missing
+// unit (e.g. "512" meaning 512 bytes).
+func parseShmSize(raw string) (string, int64, error) {
+	return parseByteSize(raw, "shm size", "256m or 1g", minShmBytes, "1m")
+}
+
+// parseByteSize parses <number>[b|k|m|g] (binary units, case-insensitive) and
+// enforces a floor. what/example/minName only shape the error messages.
+func parseByteSize(raw, what, example string, min int64, minName string) (string, int64, error) {
 	v := strings.ToLower(strings.TrimSpace(raw))
 	m := memoryPattern.FindStringSubmatch(v)
 	if m == nil {
-		return "", 0, fmt.Errorf("invalid memory %q: want <number>[b|k|m|g], e.g. 512m or 2g", raw)
+		return "", 0, fmt.Errorf("invalid %s %q: want <number>[b|k|m|g], e.g. %s", what, raw, example)
 	}
 	n, err := strconv.ParseInt(m[1], 10, 64)
 	if err != nil {
-		return "", 0, fmt.Errorf("invalid memory %q: %v", raw, err)
+		return "", 0, fmt.Errorf("invalid %s %q: %v", what, raw, err)
 	}
 	mult := int64(1)
 	switch m[2] {
@@ -81,11 +97,11 @@ func parseMemory(raw string) (string, int64, error) {
 		mult = 1 << 30
 	}
 	if n > math.MaxInt64/mult {
-		return "", 0, fmt.Errorf("invalid memory %q: too large", raw)
+		return "", 0, fmt.Errorf("invalid %s %q: too large", what, raw)
 	}
 	bytes := n * mult
-	if bytes < minMemoryBytes {
-		return "", 0, fmt.Errorf("invalid memory %q: minimum is 6m", raw)
+	if bytes < min {
+		return "", 0, fmt.Errorf("invalid %s %q: minimum is %s", what, raw, minName)
 	}
 	return v, bytes, nil
 }
@@ -141,6 +157,13 @@ func resolveResourceLimits(opts options, file configstore.ResourceLimits) (resou
 		}
 		out.pidsLimit, out.pids = norm, n
 	}
+	if v, src := pick(opts.shmSize, "LEASH_SHM_SIZE", file.ShmSize); v != "" {
+		norm, b, err := parseShmSize(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", src, err))
+		}
+		out.shmSize, out.shmBytes = norm, b
+	}
 	if err := errors.Join(errs...); err != nil {
 		return resourceLimits{}, fmt.Errorf("resource limits: %w", err)
 	}
@@ -160,6 +183,9 @@ func (l resourceLimits) dockerArgs() []string {
 	if l.pidsLimit != "" {
 		args = append(args, "--pids-limit", l.pidsLimit)
 	}
+	if l.shmSize != "" {
+		args = append(args, "--shm-size", l.shmSize)
+	}
 	return args
 }
 
@@ -177,6 +203,9 @@ func (l resourceLimits) report() string {
 	if l.pidsLimit != "" {
 		fmt.Fprintf(&b, " pids_limit=%d", l.pids)
 	}
+	if l.shmSize != "" {
+		fmt.Fprintf(&b, " shm_size=%s shm_bytes=%d", l.shmSize, l.shmBytes)
+	}
 	return b.String()
 }
 
@@ -189,15 +218,15 @@ func (r *runner) verifyTargetResourceLimits(ctx context.Context) error {
 	if !l.any() {
 		return nil
 	}
-	out, err := r.rt().Output(ctx, "inspect", "-f", "{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}}", r.cfg.targetContainer)
+	out, err := r.rt().Output(ctx, "inspect", "-f", "{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} {{.HostConfig.ShmSize}}", r.cfg.targetContainer)
 	if err != nil {
 		return fmt.Errorf("verify resource limits on %s: %w", r.cfg.targetContainer, err)
 	}
 	fields := strings.Fields(out)
-	if len(fields) != 3 {
+	if len(fields) != 4 {
 		return fmt.Errorf("verify resource limits on %s: unexpected inspect output %q", r.cfg.targetContainer, strings.TrimSpace(out))
 	}
-	got := make([]int64, 3)
+	got := make([]int64, 4)
 	for i, f := range fields {
 		if f == "<nil>" {
 			continue // unset (e.g. podman PidsLimit when not requested)
@@ -217,6 +246,9 @@ func (r *runner) verifyTargetResourceLimits(ctx context.Context) error {
 	}
 	if l.pidsLimit != "" && got[2] != l.pids {
 		mismatches = append(mismatches, fmt.Sprintf("pids-limit: requested %d, engine reports %d", l.pids, got[2]))
+	}
+	if l.shmSize != "" && got[3] != l.shmBytes {
+		mismatches = append(mismatches, fmt.Sprintf("shm-size: requested %s (%d bytes), engine reports %d", l.shmSize, l.shmBytes, got[3]))
 	}
 	if len(mismatches) > 0 {
 		return fmt.Errorf("target container %s: requested resource limits were not applied by %s (%s)", r.cfg.targetContainer, r.rt().Name(), strings.Join(mismatches, "; "))

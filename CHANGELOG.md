@@ -7,6 +7,10 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 ## [Unreleased]
 
 ### Added
+- **Configurable target `/dev/shm` size**: `--shm-size` / `LEASH_SHM_SIZE` /
+  `[leash.resources] shm_size`, validated, read back from the engine and
+  reported with the other resource limits; refused by the native runtime
+  (#171; capability `container-shm-size`).
 - **MCP policies can read the call's arguments** (#113). `Action::"McpCall"`
   requests carry `context.args` (the top-level string, integer and boolean
   arguments, strictly typed and bounded) and `context.argNames`, so a strict

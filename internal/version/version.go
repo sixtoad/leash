@@ -155,6 +155,12 @@ const (
 	CapabilityManagerInspect = "manager-inspect"
 	// CapabilityPinNetworkHost is repeatable --pin-network-host for Linux Docker.
 	CapabilityPinNetworkHost = "pin-network-host"
+	// CapabilityContainerShmSize is the `--shm-size` target-container /dev/shm
+	// size (also LEASH_SHM_SIZE and [leash.resources] shm_size). It is part of
+	// the container-resource-limits contract: same precedence, validation,
+	// native-runtime refusal, engine read-back and report line (shm_size= and
+	// shm_bytes=).
+	CapabilityContainerShmSize = "container-shm-size"
 	// CapabilityMCPCallArgs means McpCall decisions carry the call's
 	// arguments (context.args, a record of the top-level string, long and
 	// boolean arguments, and context.argNames, the set of every argument
@@ -211,6 +217,7 @@ var capabilities = []string{
 	CapabilityCedarStrictDefault,
 	CapabilityManagerInspect,
 	CapabilityPinNetworkHost,
+	CapabilityContainerShmSize,
 	CapabilityMCPCallArgs,
 }
 
