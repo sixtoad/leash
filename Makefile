@@ -6,7 +6,14 @@ LEASH_ECR_LATEST ?= public.ecr.aws/s5i7k8t3/strongdm/leash:latest
 TARGET_ECR_LATEST ?= public.ecr.aws/s5i7k8t3/strongdm/coder:latest
 # The pinned eBPF toolchain image, built from Dockerfile.leash's bpf-toolchain
 # stage (clang 18; see docs/DEVELOPMENT.md, "eBPF toolchain").
-LSM_DOCKER_IMAGE ?= leash/bpf-toolchain:latest
+LSM_DOCKER_IMAGE ?= localhost/leash/bpf-toolchain:latest
+# Locally built base images (Dockerfile.leash build-base / runtime-base stages).
+# Image references are fully qualified (localhost/ for local builds,
+# docker.io/library/ for Docker Hub) so Podman never prompts for a registry;
+# scripts/check-image-refs.sh enforces this in CI (#172).
+BASE_BUILD_IMAGE ?= localhost/leash/build-base:latest
+BASE_RUNTIME_IMAGE ?= localhost/leash/runtime-base:latest
+UI_BUILD_IMAGE ?= docker.io/library/node:22-bookworm
 DOCKER ?= docker
 # Throwaway build containers bind-mount the source tree. On SELinux-enforcing
 # hosts (Fedora/RHEL) those host paths are not labelled for container access,
@@ -73,6 +80,10 @@ precommit: fmt ## Configure git hooks for pre-commit guardrails
 	@chmod a+x build/.hooks/pre-commit
 	@echo "git hooks path set to: $$(git config --get core.hooksPath)"
 
+.PHONY: check-image-refs
+check-image-refs: ## Fail on unqualified container image references (Podman short names, #172)
+	@scripts/check-image-refs.sh
+
 .PHONY: lsm-generate
 lsm-generate: ## Generate LSM eBPF artifacts on the host system
 	@set -euo pipefail; \
@@ -120,24 +131,24 @@ build-release: build ## Build release artifacts and retag docker images
 .PHONY: docker-base
 docker-base: precommit ## Build cached Docker base images if missing
 	@set -euo pipefail; \
-	  if ! $(DOCKER) image inspect leash/build-base:latest >/dev/null 2>&1 || \
-	    ! $(DOCKER) run --rm --entrypoint clang-18 leash/build-base:latest --version >/dev/null 2>&1; then \
-	    echo 'building leash/build-base:latest (missing, or without the pinned clang-18)'; \
+	  if ! $(DOCKER) image inspect $(BASE_BUILD_IMAGE) >/dev/null 2>&1 || \
+	    ! $(DOCKER) run --rm --entrypoint clang-18 $(BASE_BUILD_IMAGE) --version >/dev/null 2>&1; then \
+	    echo 'building $(BASE_BUILD_IMAGE) (missing, or without the pinned clang-18)'; \
 	    $(DOCKER) buildx build --load \
 	      --target build-base \
 	      -f Dockerfile.leash \
-	      -t leash/build-base:latest .; \
+	      -t $(BASE_BUILD_IMAGE) .; \
 	  else \
-	    echo 'leash/build-base:latest already present; skipping'; \
+	    echo '$(BASE_BUILD_IMAGE) already present; skipping'; \
 	  fi; \
-	  if ! $(DOCKER) image inspect leash/runtime-base:latest >/dev/null 2>&1; then \
-	    echo 'building leash/runtime-base:latest'; \
+	  if ! $(DOCKER) image inspect $(BASE_RUNTIME_IMAGE) >/dev/null 2>&1; then \
+	    echo 'building $(BASE_RUNTIME_IMAGE)'; \
 	    $(DOCKER) buildx build --load \
 	      --target runtime-base \
 	      -f Dockerfile.leash \
-	      -t leash/runtime-base:latest .; \
+	      -t $(BASE_RUNTIME_IMAGE) .; \
 	  else \
-	    echo 'leash/runtime-base:latest already present; skipping'; \
+	    echo '$(BASE_RUNTIME_IMAGE) already present; skipping'; \
 	  fi
 
 .PHONY: docker-leash
@@ -157,6 +168,8 @@ docker-leash: precommit docker-base build-ui lsm-generate-docker ## Build Leash 
 	  trap cleanup_dev EXIT; \
 	  DOCKER_BUILDKIT=1 $(DOCKER) build -f Dockerfile.leash \
 	    --target final \
+	    --build-arg BASE_BUILD_IMAGE="$(BASE_BUILD_IMAGE)" \
+	    --build-arg BASE_RUNTIME_IMAGE="$(BASE_RUNTIME_IMAGE)" \
 	    --build-arg COMMIT="$$COMMIT" \
 	    --build-arg BUILD_DATE="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 	    --build-arg VERSION="$(VERSION)" \
@@ -186,6 +199,8 @@ docker-leash-prebuilt: precommit docker-base ## Build Docker image using prebuil
 	  DOCKER_BUILDKIT=1 $(DOCKER) build -f Dockerfile.leash \
 	    --target final-prebuilt \
 	    --build-arg UI_SOURCE=ui-prebuilt \
+	    --build-arg BASE_BUILD_IMAGE="$(BASE_BUILD_IMAGE)" \
+	    --build-arg BASE_RUNTIME_IMAGE="$(BASE_RUNTIME_IMAGE)" \
 	    --build-arg COMMIT="$$COMMIT" \
 	    --build-arg BUILD_DATE="$$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 	    --build-arg VERSION="$(VERSION)" \
@@ -254,7 +269,7 @@ docker-ui: precommit ## Build the Control UI using Docker
 	  -v $(PNPM_CACHE_VOLUME):/pnpm/store \
 	  -v $(COREPACK_CACHE_VOLUME):/root/.cache/node/corepack \
 	  -v $(NEXT_CACHE_VOLUME):/work/.next/cache \
-	  node:22-bookworm bash -lc \
+	  $(UI_BUILD_IMAGE) bash -lc \
 	    'set -euo pipefail; mkdir -p /work /pnpm/store; corepack enable; cp -a /src/. /work; cd /work; pnpm config set store-dir $$PNPM_STORE_DIR; echo "Y" | pnpm install --frozen-lockfile --prefer-offline; node scripts/build-if-changed.mjs --out /out --hash /cache/controlui.buildhash; chown -R $$HOST_UID:$$HOST_GID /out'
 
 .PHONY: build-ui
@@ -385,8 +400,8 @@ clean-ui:
 clean-docker:
 	@#     -> Cached Docker base images.
 	@if command -v $(DOCKER) >/dev/null 2>&1; then \
-	  $(DOCKER) image inspect leash/build-base:latest >/dev/null 2>&1 && $(DOCKER) image rm -f leash/build-base:latest >/dev/null 2>&1 || true; \
-	  $(DOCKER) image inspect leash/runtime-base:latest >/dev/null 2>&1 && $(DOCKER) image rm -f leash/runtime-base:latest >/dev/null 2>&1 || true; \
+	  $(DOCKER) image inspect $(BASE_BUILD_IMAGE) >/dev/null 2>&1 && $(DOCKER) image rm -f $(BASE_BUILD_IMAGE) >/dev/null 2>&1 || true; \
+	  $(DOCKER) image inspect $(BASE_RUNTIME_IMAGE) >/dev/null 2>&1 && $(DOCKER) image rm -f $(BASE_RUNTIME_IMAGE) >/dev/null 2>&1 || true; \
 	fi
 
 .PHONY: clean

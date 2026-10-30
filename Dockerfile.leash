@@ -3,10 +3,10 @@
 ARG GO_VERSION=1.25.3
 ARG DEBIAN_FRONTEND=noninteractive
 ARG UI_SOURCE=ui-build
-ARG BASE_BUILD_IMAGE=leash/build-base:latest
-ARG BASE_RUNTIME_IMAGE=leash/runtime-base:latest
+ARG BASE_BUILD_IMAGE=localhost/leash/build-base:latest
+ARG BASE_RUNTIME_IMAGE=localhost/leash/runtime-base:latest
 
-FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS go-toolchain
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:${GO_VERSION}-bookworm AS go-toolchain
 
 # The pinned eBPF toolchain (#227): Ubuntu noble's clang 18, the compiler the
 # CI and release runners generate and verifier-load the LSM objects with.
@@ -14,7 +14,7 @@ FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-bookworm AS go-toolchain
 # kernel 6.8 rejects. internal/lsm/bpf_clang.sh refuses any other major; keep
 # the two in step. Go is copied from the official image (static binaries).
 # `make lsm-generate-docker` runs in this stage; build-base extends it.
-FROM --platform=$BUILDPLATFORM ubuntu:noble AS bpf-toolchain
+FROM --platform=$BUILDPLATFORM docker.io/library/ubuntu:noble AS bpf-toolchain
 ARG DEBIAN_FRONTEND
 RUN set -eux; \
     apt-get update; \
@@ -149,7 +149,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -buildvcs=false -trimpath -o /out/leash-entry ./cmd/leash-entry
 
-FROM debian:bookworm AS runtime-base
+FROM docker.io/library/debian:bookworm AS runtime-base
 ARG DEBIAN_FRONTEND
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
@@ -241,7 +241,7 @@ COPY --from=build /out/leash-entry /usr/local/bin/leash-entry
 
 # Lightweight variant targets for integration tests ---------------------------
 
-FROM alpine:3.20 AS leash-test-alpine
+FROM docker.io/library/alpine:3.20 AS leash-test-alpine
 RUN apk add --no-cache \
     bash \
     ca-certificates \
@@ -251,7 +251,7 @@ RUN apk add --no-cache \
     iputils \
     wget
 
-FROM debian:bookworm AS leash-test-debian
+FROM docker.io/library/debian:bookworm AS leash-test-debian
 ARG DEBIAN_FRONTEND
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
@@ -264,7 +264,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget && \
     rm -rf /var/lib/apt/lists/*
 
-FROM rockylinux:9 AS leash-test-rocky
+FROM docker.io/library/rockylinux:9 AS leash-test-rocky
 RUN dnf install -y --allowerasing --setopt=install_weak_deps=False \
     bash \
     ca-certificates \

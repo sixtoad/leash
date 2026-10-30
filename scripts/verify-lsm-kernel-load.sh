@@ -33,7 +33,7 @@ case "${1:-}" in
 esac
 
 ROOT="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
-IMAGE="${LEASH_KERNEL_LOAD_IMAGE:-debian:bookworm-slim}"
+IMAGE="${LEASH_KERNEL_LOAD_IMAGE:-docker.io/library/debian:bookworm-slim}"
 CONTAINER="leash-lsm-kernel-load-$$"
 WORKDIR="$(mktemp -d /tmp/leash-lsm-kernel-load.XXXXXX)"
 

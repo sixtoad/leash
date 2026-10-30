@@ -112,7 +112,7 @@ jobs:
         run: |
           docker version
           docker info --format 'storage driver: {{.Driver}}'
-          docker run --rm --platform linux/arm64 alpine uname -m
+          docker run --rm --platform linux/arm64 docker.io/library/alpine:3.20 uname -m
 
       - name: Control UI
         run: |

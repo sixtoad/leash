@@ -1,4 +1,4 @@
-FROM debian:testing-slim
+FROM docker.io/library/debian:testing-slim
 
 ARG NODE_MAJOR=22
 ENV DEBIAN_FRONTEND=noninteractive
