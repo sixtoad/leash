@@ -7,6 +7,18 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 ## [Unreleased]
 
 ### Fixed
+- **Plugin authz connections no longer die after 2 minutes of silence.**
+  leashd closed any authz socket connection idle for 2 minutes, so a plugin
+  that kept one connection for its run got `broken pipe` on its next
+  question. Walk's walk-git-service reported that as "read denied by
+  policy" and failed a live run (denies right after 8m24s and 3m18s idle
+  gaps). The idle timeout is gone: a connection lives as long as the plugin
+  or leashd and closes only when the plugin closes it, on a protocol error,
+  or at shutdown (which still closes every connection). The connection cap,
+  rate limit and line limits are unchanged. The `pkg/authz` client now
+  retries a question once on a fresh connection when its kept connection
+  was closed by the server before replying (e.g. a leashd restart), and
+  docs/design/AUTHZ-SERVICE.md §7.2 asks other clients to do the same.
 - **eBPF audit records are no longer lost silently** (#241). A record the
   kernel could not write because the event ring buffer was full used to
   vanish (the decision was still enforced). Each loss is now counted in the

@@ -38,11 +38,17 @@ const BuiltinNamespace = engine.BuiltinActionType
 const PrincipalType = "Plugin"
 
 // Server limits.
+//
+// There is deliberately no idle timeout. The only peers are plugins leash
+// itself spawned (--inject-service), so a connection lives as long as the
+// plugin or leashd: it closes when the peer closes it, on a protocol error
+// (an oversized line), or when Close shuts the server down. A plugin that
+// keeps one connection for a whole run and stays silent for minutes must
+// still get an answer to its next question.
 const (
 	MaxConnsPerPlugin = 16
 	RatePerSecond     = 200
 	RateBurst         = 400
-	IdleTimeout       = 2 * time.Minute
 )
 
 // PluginGrant is one authz-enabled plugin, as the runner describes it.
@@ -175,6 +181,8 @@ func (s *Server) Start() error {
 }
 
 // Close stops every listener and connection and removes the sockets.
+// Closing a connection unblocks its serve goroutine's read (connections have
+// no read deadline), so Close returns only after every goroutine has exited.
 func (s *Server) Close() error {
 	s.mu.Lock()
 	s.closed = true
@@ -411,7 +419,8 @@ func (s *Server) serve(conn net.Conn, p *pluginState) {
 	rd := bufio.NewReaderSize(conn, 4096)
 	enc := json.NewEncoder(conn)
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(IdleTimeout))
+		// No read deadline: an idle connection stays open (see the limits
+		// above). Close unblocks this read by closing the connection.
 		line, err := wire.ReadLine(rd, wire.MaxLineBytes)
 		if err != nil {
 			if errors.Is(err, wire.ErrLineTooLong) {
