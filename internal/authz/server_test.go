@@ -526,3 +526,112 @@ func TestFakePluginProcessIntegration(t *testing.T) {
 		t.Fatalf("plugin allowed with leashd gone:\n%s", out)
 	}
 }
+
+// deadlineConn records every non-zero read deadline the server sets.
+type deadlineConn struct {
+	net.Conn
+	readDeadlines atomic.Int32
+}
+
+func (c *deadlineConn) SetReadDeadline(t time.Time) error {
+	if !t.IsZero() {
+		c.readDeadlines.Add(1)
+	}
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *deadlineConn) SetDeadline(t time.Time) error {
+	if !t.IsZero() {
+		c.readDeadlines.Add(1)
+	}
+	return c.Conn.SetDeadline(t)
+}
+
+// The server must not time out an idle plugin connection: a plugin keeps one
+// connection for its whole run, and after minutes of silence its next
+// question must still be answered (the 2-minute idle timeout broke Walk's
+// walk-git-service, 2026-11-02). The connection is checked for read
+// deadlines instead of sleeping past an old timeout: with none set, the
+// kernel never expires the read.
+func TestServerSetsNoReadDeadline(t *testing.T) {
+	decisions := &policy.Decisions{}
+	publish(t, decisions, testPolicy)
+	srv := New(Config{Source: decisions.Current})
+	client, server := net.Pipe()
+	defer func() { _ = client.Close() }()
+	dc := &deadlineConn{Conn: server}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.serve(dc, newPluginState(secretbroker(), time.Now))
+	}()
+
+	rd := bufio.NewReader(client)
+	ask := func(id string) wire.Response {
+		t.Helper()
+		req := read("gemini")
+		req.V, req.ID = wire.ProtocolVersion, id
+		line, _ := json.Marshal(req)
+		_ = client.SetDeadline(time.Now().Add(5 * time.Second))
+		if _, err := client.Write(append(line, '\n')); err != nil {
+			t.Fatalf("write %s: %v", id, err)
+		}
+		raw, err := rd.ReadBytes('\n')
+		if err != nil {
+			t.Fatalf("read %s: %v", id, err)
+		}
+		var resp wire.Response
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+	if r := ask("1"); r.Decision != wire.DecisionAllow || r.ID != "1" {
+		t.Fatalf("first: %+v", r)
+	}
+	// Idle, then ask again on the same connection.
+	time.Sleep(100 * time.Millisecond)
+	if r := ask("2"); r.Decision != wire.DecisionAllow || r.ID != "2" {
+		t.Fatalf("after idle: %+v", r)
+	}
+	if n := dc.readDeadlines.Load(); n != 0 {
+		t.Fatalf("server set %d read deadline(s) on a plugin connection; want none", n)
+	}
+	_ = client.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serve did not return after the peer closed")
+	}
+}
+
+// Without an idle timeout, shutdown is what ends an idle connection: Close
+// must unblock the serve goroutine's read and return.
+func TestServerCloseEndsIdleConnections(t *testing.T) {
+	ts := startServer(t, secretbroker(), nil)
+	publish(t, ts.decisions, testPolicy)
+	conn, err := net.Dial("unix", ts.socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.Write([]byte(`{"v":1,"id":"1","action":{"type":"Secret::Action","id":"Read"},"resource":{"type":"Secret::Item","id":"gemini"}}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	rd := bufio.NewReader(conn)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := rd.ReadBytes('\n'); err != nil {
+		t.Fatalf("first answer: %v", err)
+	}
+	// The connection is now idle, its serve goroutine blocked in a read.
+	closed := make(chan struct{})
+	go func() { _ = ts.srv.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return: an idle connection kept its goroutine alive")
+	}
+	if _, err := rd.ReadBytes('\n'); err == nil {
+		t.Fatal("connection still open after Close")
+	}
+}

@@ -21,11 +21,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -126,7 +128,11 @@ func (d Decision) Allowed() bool {
 }
 
 // Client talks to one authz socket. It keeps one connection and serializes
-// requests on it; it reconnects after an error. Safe for concurrent use.
+// requests on it; it reconnects after an error. If the kept connection turns
+// out to be closed by the server (EPIPE, ECONNRESET or EOF before any reply
+// byte, e.g. after a leashd restart), Check retries the question once on a
+// fresh connection; a failure on a fresh connection is not retried. Safe for
+// concurrent use.
 type Client struct {
 	path    string
 	timeout time.Duration
@@ -239,31 +245,56 @@ func (c *Client) Check(ctx context.Context, req Request) Decision {
 }
 
 func (c *Client) roundTripLocked(ctx context.Context, line []byte, deadline time.Time) (*Response, error) {
+	reused := c.conn != nil
+	resp, stale, err := c.exchangeLocked(ctx, line, deadline)
+	if err == nil || !reused || !stale || ctx.Err() != nil || !time.Now().Before(deadline) {
+		return resp, err
+	}
+	// The kept connection was closed by the other end before it answered
+	// (typically a leashd restart). Questions are idempotent reads, so drop
+	// it and ask once more on a fresh connection. A failure on the fresh
+	// connection is returned as is.
+	_ = c.dropLocked()
+	resp, _, err = c.exchangeLocked(ctx, line, deadline)
+	return resp, err
+}
+
+// exchangeLocked sends line and reads one reply, dialing first if there is no
+// connection. stale reports that the connection was found closed by the peer
+// (EPIPE, ECONNRESET or EOF) before any reply byte arrived, i.e. the request
+// can be retried on a fresh connection.
+func (c *Client) exchangeLocked(ctx context.Context, line []byte, deadline time.Time) (*Response, bool, error) {
 	if c.conn == nil {
 		dialer := net.Dialer{Deadline: deadline}
 		conn, err := dialer.DialContext(ctx, "unix", c.path)
 		if err != nil {
-			return nil, fmt.Errorf("authz: connect %s: %w", c.path, err)
+			return nil, false, fmt.Errorf("authz: connect %s: %w", c.path, err)
 		}
 		c.conn, c.rd = conn, bufio.NewReaderSize(conn, 4096)
 	}
 	if err := c.conn.SetDeadline(deadline); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	stop := context.AfterFunc(ctx, func() { _ = c.conn.SetDeadline(time.Unix(1, 0)) })
+	conn := c.conn
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
 	defer stop()
 	if _, err := c.conn.Write(line); err != nil {
-		return nil, fmt.Errorf("authz: write: %w", err)
+		return nil, peerClosed(err), fmt.Errorf("authz: write: %w", err)
 	}
-	raw, err := readLine(c.rd, MaxLineBytes)
+	raw, n, err := readLineN(c.rd, MaxLineBytes)
 	if err != nil {
-		return nil, fmt.Errorf("authz: read: %w", err)
+		return nil, n == 0 && peerClosed(err), fmt.Errorf("authz: read: %w", err)
 	}
 	var resp Response
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return nil, fmt.Errorf("authz: malformed reply: %w", err)
+		return nil, false, fmt.Errorf("authz: malformed reply: %w", err)
 	}
-	return &resp, nil
+	return &resp, false, nil
+}
+
+// peerClosed reports whether err means the other end closed the connection.
+func peerClosed(err error) bool {
+	return errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, io.EOF)
 }
 
 // ErrLineTooLong is returned when a protocol line exceeds MaxLineBytes.
@@ -272,18 +303,25 @@ var ErrLineTooLong = errors.New("authz: line exceeds the protocol limit")
 // readLine reads one '\n'-terminated line of at most limit bytes (newline
 // included) and returns it without the newline. Shared by client and server.
 func readLine(rd *bufio.Reader, limit int) ([]byte, error) {
+	line, _, err := readLineN(rd, limit)
+	return line, err
+}
+
+// readLineN is readLine that also reports how many bytes it consumed, so the
+// client can tell "closed before any reply" from "closed mid-reply".
+func readLineN(rd *bufio.Reader, limit int) ([]byte, int, error) {
 	var buf []byte
 	for {
 		chunk, err := rd.ReadSlice('\n')
 		buf = append(buf, chunk...)
 		if len(buf) > limit {
-			return nil, ErrLineTooLong
+			return nil, len(buf), ErrLineTooLong
 		}
 		if err == nil {
-			return buf[:len(buf)-1], nil
+			return buf[:len(buf)-1], len(buf), nil
 		}
 		if !errors.Is(err, bufio.ErrBufferFull) {
-			return nil, err
+			return nil, len(buf), err
 		}
 	}
 }
