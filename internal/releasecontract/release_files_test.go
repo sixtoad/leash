@@ -86,7 +86,7 @@ func TestManagerTargetConsumesGeneratedBPFArtifacts(t *testing.T) {
 		strings.Contains(dockerfile, `org.opencontainers.image.version="v${VERSION}"`) {
 		t.Fatal("manager OCI labels must preserve the exact release identifier")
 	}
-	if !strings.Contains(dockerfile, "FROM --platform=$BUILDPLATFORM ubuntu:noble AS bpf-toolchain") ||
+	if !strings.Contains(dockerfile, "FROM --platform=$BUILDPLATFORM docker.io/library/ubuntu:noble AS bpf-toolchain") ||
 		!strings.Contains(dockerfile, "FROM --platform=$BUILDPLATFORM bpf-toolchain AS build-base") {
 		t.Fatal("shared manager build-base must execute on BUILDPLATFORM")
 	}
