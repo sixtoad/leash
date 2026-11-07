@@ -6,6 +6,14 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 
 ## [Unreleased]
 
+## [native-v0.6.0] — 2026-11-07
+
+Minor release on top of `native-v0.5.0` (PRs #242–#250, #247). It adds two
+optional capabilities, `container-shm-size` and `mcp-call-args`;
+`contractVersion` stays 3 and `minCompatibleContract` 0, so existing callers
+are unaffected. MCP enforcement is now fail-closed on ambiguous requests while
+MCP policies are active (see Changed).
+
 ### Fixed
 - **Plugin authz connections no longer die after 2 minutes of silence.**
   leashd closed any authz socket connection idle for 2 minutes, so a plugin
