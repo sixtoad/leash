@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/strongdm/leash/internal/cedar"
+	"github.com/strongdm/leash/internal/engine"
 	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/policy"
 	wire "github.com/strongdm/leash/pkg/authz"
@@ -127,8 +128,14 @@ func TestServerDecidesThroughTheDecisionCore(t *testing.T) {
 		{"builtin not granted", wire.Request{Action: wire.UID("Action", "McpCall"), Resource: wire.UID("MCP::Tool", "delete")}, false, wire.ReasonNamespaceNotGranted},
 		{"bad context", wire.Request{Action: wire.UID("Secret::Action", "Read"), Resource: wire.UID("Secret::Item", "aws"),
 			Context: map[string]any{"n": 1.5}}, false, wire.ReasonInvalidRequest},
-		{"record context", wire.Request{Action: wire.UID("Secret::Action", "Read"), Resource: wire.UID("Secret::Item", "aws"),
-			Context: map[string]any{"r": map[string]any{"a": 1}}}, false, wire.ReasonInvalidRequest},
+		{"flat record context", wire.Request{Action: wire.UID("Secret::Action", "Read"), Resource: wire.UID("Secret::Item", "aws"),
+			Context: map[string]any{"r": map[string]any{"a": 1}}}, false, wire.ReasonDefaultDeny},
+		{"nested record context", wire.Request{Action: wire.UID("Secret::Action", "Read"), Resource: wire.UID("Secret::Item", "aws"),
+			Context: map[string]any{"r": map[string]any{"a": map[string]any{"b": 1}}}}, false, wire.ReasonInvalidRequest},
+		{"record holding a set", wire.Request{Action: wire.UID("Secret::Action", "Read"), Resource: wire.UID("Secret::Item", "aws"),
+			Context: map[string]any{"r": map[string]any{"a": []string{"x"}}}}, false, wire.ReasonInvalidRequest},
+		{"record in a set", wire.Request{Action: wire.UID("Secret::Action", "Read"), Resource: wire.UID("Secret::Item", "aws"),
+			Context: map[string]any{"r": []any{map[string]any{"a": 1}}}}, false, wire.ReasonInvalidRequest},
 		{"unknown action type", wire.Request{Action: wire.UID("Bogus", "x"), Resource: wire.UID("X", "y")}, false, wire.ReasonUnsupportedAction},
 	}
 	for _, tc := range cases {
@@ -215,6 +222,35 @@ func TestServerBuiltinQueriesMatchTheProxy(t *testing.T) {
 		if want := proxy.CheckMCPCall("mcp.example.com", tool); d.Allowed() != want {
 			t.Errorf("McpCall %s: socket=%v proxy=%v", tool, d.Allowed(), want)
 		}
+	}
+	// #113: context.args and context.argNames reach the same decision as the
+	// proxy's DecideMCPCall.
+	publish(t, ts.decisions, `@id("pinned")
+permit (principal, action == Action::"McpCall", resource in MCP::Server::"ci.example.com")
+when { resource in [MCP::Tool::"search"] && context has args && context.args has repo && context.args.repo == "github.com/o/r" && ["repo", "query"].containsAll(context.argNames) };`)
+	proxy = ts.decisions.Current().Engine
+	for _, tc := range []struct {
+		name string
+		ctx  map[string]any
+		call engine.MCPCall
+	}{
+		{"pinned", map[string]any{"server": "ci.example.com", "args": map[string]any{"repo": "github.com/o/r", "query": "x"}},
+			engine.MCPCall{Server: "ci.example.com", Tool: "search", ArgsKnown: true, Args: map[string]engine.Value{"repo": engine.StringValue("github.com/o/r"), "query": engine.StringValue("x")}, ArgNames: []string{"query", "repo"}}},
+		{"other repo", map[string]any{"server": "ci.example.com", "args": map[string]any{"repo": "github.com/o/x"}},
+			engine.MCPCall{Server: "ci.example.com", Tool: "search", ArgsKnown: true, Args: map[string]engine.Value{"repo": engine.StringValue("github.com/o/x")}, ArgNames: []string{"repo"}}},
+		{"extra argument named", map[string]any{"server": "ci.example.com", "args": map[string]any{"repo": "github.com/o/r"}, "argNames": []string{"repo", "repos"}},
+			engine.MCPCall{Server: "ci.example.com", Tool: "search", ArgsKnown: true, Args: map[string]engine.Value{"repo": engine.StringValue("github.com/o/r")}, ArgNames: []string{"repo", "repos"}}},
+		{"no args", map[string]any{"server": "ci.example.com"}, engine.MCPCall{Server: "ci.example.com", Tool: "search"}},
+	} {
+		d := c.Check(context.Background(), wire.Request{Action: wire.UID("Action", "McpCall"), Resource: wire.UID("MCP::Tool", "search"), Context: tc.ctx})
+		want := proxy.DecideMCPCall(tc.call)
+		if d.Err != nil || d.Allowed() != want.Allow || d.Reason != want.Reason {
+			t.Errorf("McpCall %s: socket=%v/%s (%v) proxy=%+v", tc.name, d.Allowed(), d.Reason, d.Err, want)
+		}
+	}
+	if d := c.Check(context.Background(), wire.Request{Action: wire.UID("Action", "McpCall"), Resource: wire.UID("MCP::Tool", "search"),
+		Context: map[string]any{"server": "ci.example.com", "args": map[string]any{"repo": "github.com/o/r"}, "argNames": []string{"query"}}}); d.Allowed() || d.Reason != wire.ReasonInvalidRequest {
+		t.Errorf("args outside argNames must be an invalid request: %+v", d.Response)
 	}
 	for _, host := range []string{"api.example.com", "evil.example.com"} {
 		d := c.Check(context.Background(), wire.Request{Action: wire.UID("Action", "NetworkConnect"), Resource: wire.UID("Host", host), Context: map[string]any{"port": 443}})

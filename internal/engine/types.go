@@ -22,6 +22,7 @@ package engine
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -117,7 +118,8 @@ func invalidRequest(format string, args ...any) Decision {
 //	FileOpen                              allowed only when both of the above are
 //	ProcessExec                           resource File::"<absolute path>"
 //	NetworkConnect                        resource Host::"<hostname or IP>", context.port (long, optional), context.ip (string, optional)
-//	McpCall                               resource MCP::Tool::"<tool>", context.server (string)
+//	McpCall                               resource MCP::Tool::"<tool>", context.server (string),
+//	                                      context.args (record, optional), context.argNames (set, optional); see MCPCall
 //
 // The built-in principal is always WorkloadPrincipal. Any other action must
 // be a plugin action (Namespace::Action::"Name"), evaluated with the given
@@ -138,10 +140,13 @@ const (
 	ValueBool
 	ValueSet
 	ValueEntity
+	// ValueRecord is a flat record of string, long and boolean values
+	// (#113: an McpCall's context.args).
+	ValueRecord
 )
 
-// Value is a Cedar context value. Records and extension types are not
-// supported on the wire.
+// Value is a Cedar context value. Records are flat (their values are
+// strings, longs and booleans); extension types are not supported.
 type Value struct {
 	Kind   ValueKind
 	Str    string
@@ -149,6 +154,7 @@ type Value struct {
 	Bool   bool
 	Set    []Value
 	Entity EntityUID
+	Record map[string]Value
 }
 
 // Value constructors.
@@ -157,6 +163,9 @@ func LongValue(n int64) Value         { return Value{Kind: ValueLong, Long: n} }
 func BoolValue(b bool) Value          { return Value{Kind: ValueBool, Bool: b} }
 func SetValue(vs ...Value) Value      { return Value{Kind: ValueSet, Set: vs} }
 func EntityValue(uid EntityUID) Value { return Value{Kind: ValueEntity, Entity: uid} }
+func RecordValue(m map[string]Value) Value {
+	return Value{Kind: ValueRecord, Record: m}
+}
 
 // String renders the value in Cedar syntax.
 func (v Value) String() string {
@@ -175,6 +184,17 @@ func (v Value) String() string {
 			parts[i] = e.String()
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
+	case ValueRecord:
+		keys := make([]string, 0, len(v.Record))
+		for k := range v.Record {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, len(keys))
+		for i, k := range keys {
+			parts[i] = strconv.Quote(k) + ": " + v.Record[k].String()
+		}
+		return "{" + strings.Join(parts, ", ") + "}"
 	}
 	return "<invalid>"
 }

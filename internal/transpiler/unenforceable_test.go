@@ -199,7 +199,8 @@ func compileStrictText(t *testing.T, text string) error {
 }
 
 // Strict McpCall policies are evaluated in userspace, but the MCP adapters
-// supply only context.server: anything else could never apply as written.
+// supply context.server, context.args and context.argNames (#113): anything
+// else could never apply as written.
 func TestStrictMCPConditionsMustBeSupplied(t *testing.T) {
 	for _, tc := range []struct {
 		policy string
@@ -209,8 +210,17 @@ func TestStrictMCPConditionsMustBeSupplied(t *testing.T) {
 		{`permit (principal, action == Action::"McpCall", resource) when { context has server && context["server"] like "*.example.com" };`, true},
 		{`permit (principal, action == Action::"McpCall", resource in MCP::Server::"s") unless { resource == MCP::Tool::"shell" };`, true},
 		{`forbid (principal, action == Action::"McpCall", resource) when { context.server == "evil" };`, true},
+		// #113: the call's arguments.
+		{`permit (principal, action == Action::"McpCall", resource) when { context has args };`, true},
+		{`permit (principal, action == Action::"McpCall", resource) when { context has args && context.args has repo && context.args.repo == "github.com/o/r" };`, true},
+		{`permit (principal, action == Action::"McpCall", resource) when { context.args["repo-id"] == "r" && context.args.limit < 50 && context.args.exact == true };`, true},
+		{`permit (principal, action == Action::"McpCall", resource) when { context has argNames && ["repo", "query"].containsAll(context.argNames) };`, true},
+		{`forbid (principal, action == Action::"McpCall", resource) unless { context has args && context.args has repo && context.args.repo == "r" && !context.argNames.contains("repos") };`, true},
 		{`permit (principal, action == Action::"McpCall", resource) when { context.args == "x" };`, false},
-		{`permit (principal, action == Action::"McpCall", resource) when { context has args };`, false},
+		{`permit (principal, action == Action::"McpCall", resource) when { context.args == {"repo": "r"} };`, false},
+		{`permit (principal, action == Action::"McpCall", resource) when { context.args.repo.owner == "o" };`, false},
+		{`permit (principal, action == Action::"McpCall", resource) when { context.tool == "search" };`, false},
+		{`permit (principal, action == Action::"McpCall", resource) when { context has method };`, false},
 		{`permit (principal, action == Action::"McpCall", resource) when { context == {"server": "s"} };`, false},
 		{`permit (principal, action == Action::"McpCall", resource) when { principal == Workload::"workload" };`, false},
 		{`permit (principal, action == Action::"McpCall", resource) when { resource.owner == "me" };`, false},
@@ -227,6 +237,26 @@ func TestStrictMCPConditionsMustBeSupplied(t *testing.T) {
 		case !tc.ok && !strings.HasPrefix(err.Error(), "policy policy0 at strict.cedar:1:1: "):
 			t.Errorf("%s: error must name the policy and its position: %v", tc.policy, err)
 		}
+	}
+}
+
+// The policy shape Walk generates for a repo-pinned, retrieval-only
+// code-indexer MCP endpoint (#113; docs/design/CEDAR.md) loads in a strict
+// file next to kernel-enforced rules.
+func TestPinnedRetrievalCapabilityPolicyLoads(t *testing.T) {
+	const cond = `resource in MCP::Server::"ci.example.com" &&
+  resource in [MCP::Tool::"search", MCP::Tool::"bundle"] &&
+  context has args && context.args has repo && context.args.repo == "github.com/o/r" &&
+  context has argNames && ["repo", "query", "limit"].containsAll(context.argNames)`
+	text := `@leash_semantics("cedar")
+@id("walk-code-indexer-retrieval")
+permit (principal, action == Action::"McpCall", resource) when { ` + cond + ` };
+@id("walk-code-indexer-only")
+forbid (principal, action == Action::"McpCall", resource) unless { ` + cond + ` };
+permit (principal, action == Action::"NetworkConnect", resource in Host::"ci.example.com");
+permit (principal, action in Action::"FileOpen", resource in Dir::"/workspace/");`
+	if err := compileStrictText(t, text); err != nil {
+		t.Fatal(err)
 	}
 }
 

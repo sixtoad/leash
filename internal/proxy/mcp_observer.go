@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/strongdm/leash/internal/engine"
 	"github.com/strongdm/leash/internal/lsm"
 	"github.com/strongdm/leash/internal/telemetry/otel"
 )
@@ -47,7 +49,7 @@ type mcpObserver struct {
 
 	sessionMu  sync.RWMutex
 	sessions   map[string]*sessionInfo
-	forceParse bool
+	forceParse atomic.Bool // MCP policies are active: decide every request body
 
 	observedMu    sync.RWMutex
 	recentServers []string
@@ -69,6 +71,14 @@ type mcpRequestContext struct {
 	responseError   string
 	telemetryHandle *otel.RequestHandle
 	sessionPresent  bool
+
+	// calls are the body's tools/call requests (#113); malformed says why
+	// the body could not be decided, set only while MCP policies are
+	// active. policies and argNames record the decision for the audit log.
+	calls     []engine.MCPCall
+	malformed string
+	policies  []string
+	argNames  []string
 
 	started time.Time
 	sampled bool
@@ -124,7 +134,7 @@ func (o *mcpObserver) setForceParse(enabled bool) {
 	if o == nil {
 		return
 	}
-	o.forceParse = enabled
+	o.forceParse.Store(enabled)
 }
 
 func (o *mcpObserver) inspectHTTPRequest(req *http.Request, server string) (*mcpRequestContext, error) {
@@ -137,23 +147,59 @@ func (o *mcpObserver) inspectHTTPRequest(req *http.Request, server string) (*mcp
 		return nil, nil
 	}
 
-	bodyCopy, restoredBody, truncated, err := readBodyWithLimit(req.Body, o.cfg.SniffLimit)
+	// While MCP policies are active the whole body must be decided (#113):
+	// read ahead further, and a body that cannot be read or parsed
+	// unambiguously yields a malformed context, which enforcement denies.
+	governed := o.forceParse.Load()
+	limit := o.cfg.SniffLimit
+	if governed && limit < governedMCPBodyLimit {
+		limit = governedMCPBodyLimit
+	}
+	malformedCtx := func(why string) *mcpRequestContext {
+		return &mcpRequestContext{
+			event:     "mcp.call",
+			method:    "tools/call",
+			server:    server,
+			proto:     strings.TrimSpace(req.Header.Get("MCP-Protocol-Version")),
+			started:   time.Now(),
+			transport: "json",
+			malformed: why,
+		}
+	}
+
+	bodyCopy, restoredBody, truncated, err := readBodyWithLimit(req.Body, limit)
 	if err != nil {
+		if governed {
+			return malformedCtx("request body could not be read"), nil
+		}
 		return nil, fmt.Errorf("mcp sniff body: %w", err)
 	}
 	req.Body = restoredBody
 	if truncated {
+		if governed {
+			return malformedCtx(fmt.Sprintf("JSON request body larger than %d bytes cannot be checked", limit)), nil
+		}
 		return nil, nil
 	}
 
-	envelope, err := decodeJSONRPCEnvelope(bodyCopy)
-	if err != nil {
+	parsed := parseMCPBody(bodyCopy)
+	if parsed.malformed != "" {
+		if governed {
+			return malformedCtx(parsed.malformed), nil
+		}
+		return nil, nil
+	}
+	envelope := parsed.envelope
+	if envelope == nil || (len(parsed.calls) == 0 && strings.TrimSpace(envelope.JSONRPC) != "2.0") {
 		return nil, nil
 	}
 
 	eventName, ok := methodToEvent(envelope.Method)
-	if !ok {
+	if !ok && len(parsed.calls) == 0 {
 		return nil, nil
+	}
+	if !ok {
+		eventName = "mcp.call"
 	}
 
 	ctx := &mcpRequestContext{
@@ -164,6 +210,7 @@ func (o *mcpObserver) inspectHTTPRequest(req *http.Request, server string) (*mcp
 		proto:     strings.TrimSpace(req.Header.Get("MCP-Protocol-Version")),
 		started:   time.Now(),
 		transport: "json",
+		calls:     parsed.calls,
 	}
 
 	if isNotification(envelope) {
@@ -171,6 +218,11 @@ func (o *mcpObserver) inspectHTTPRequest(req *http.Request, server string) (*mcp
 	}
 	if envelope.Method == "tools/call" {
 		ctx.tool = envelope.ToolName
+	} else if len(parsed.calls) > 0 {
+		// A batch: report the first call.
+		ctx.method = "tools/call"
+		ctx.event = "mcp.call"
+		ctx.tool = parsed.calls[0].Tool
 	}
 
 	ctx.sampled = true
@@ -306,6 +358,18 @@ func (o *mcpObserver) logHTTPRequest(ctx *mcpRequestContext, status int, outcome
 
 	if ctx.tool != "" {
 		o.rememberTool(ctx.tool)
+	}
+
+	if len(ctx.policies) > 0 {
+		sb.WriteString(` policies="`)
+		sb.WriteString(escapeQuotes(strings.Join(ctx.policies, ",")))
+		sb.WriteString(`"`)
+	}
+	if len(ctx.argNames) > 0 {
+		// Argument names only: values may carry source text or secrets.
+		sb.WriteString(` arg_names="`)
+		sb.WriteString(escapeQuotes(truncateString(strings.Join(ctx.argNames, ","), 512)))
+		sb.WriteString(`"`)
 	}
 
 	if ctx.id != "" && o.cfg.Mode != MCPModeOff {

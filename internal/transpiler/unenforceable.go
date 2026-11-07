@@ -28,9 +28,9 @@ import (
 //     forbid's resources) is rejected too; any other forbid keeps being
 //     enforced without its condition (stricter), with a note.
 //   - Strict McpCall policies (userspace only, evaluated by cedar.Authorize).
-//     The MCP adapters supply only context.server and no principal or
-//     entity attributes, so a policy reading anything else could never apply
-//     as written: rejected. Kernel actions are checked by CompileKernel's
+//     The MCP adapters supply context.server, context.args and
+//     context.argNames (#113) and no principal or entity attributes, so a
+//     policy reading anything else could never apply as written: rejected. Kernel actions are checked by CompileKernel's
 //     subset, plugin actions are evaluated with the context the plugin sends
 //     and are not restricted here.
 
@@ -321,14 +321,29 @@ func hasKernelAction(p CedarPolicy) bool {
 // enforced by the MCP adapters, or "" when it can. Those adapters (the HTTP
 // proxy's tools/call check and the authz socket's built-in McpCall query)
 // send the workload as principal, MCP::Tool/MCP::Server entities without
-// attributes or tags, and a context holding only `server`.
+// attributes or tags, and a context holding `server` and, when the call's
+// arguments are known, the record `args` and the set `argNames`
+// (engine.MCPCall).
 func mcpUnenforceable(pa *xast.Policy) string {
 	for _, c := range pa.Conditions {
 		if why := mcpUnavailable(c.Body); why != "" {
-			return fmt.Sprintf("%s on McpCall cannot be enforced as written: `%s` uses %s, which the MCP adapters do not supply (they send only context.server), so the policy could never apply as written. Remove that test, or test `context.server` or `resource in MCP::Server::\"...\"` instead.", effectName(pa), conditionText(c), why)
+			return fmt.Sprintf("%s on McpCall cannot be enforced as written: `%s` uses %s, which the MCP adapters do not supply (they send context.server, context.args (a record of the call's arguments) and context.argNames), so the policy could never apply as written. Test `context.server`, `resource in MCP::Server::\"...\"`, a field of `context.args` (`context.args has repo && context.args.repo == \"...\"`) or `context.argNames` instead.", effectName(pa), conditionText(c), why)
 		}
 	}
 	return ""
+}
+
+// mcpContextKeys are the McpCall context keys the adapters supply.
+var mcpContextKeys = map[string]bool{
+	engine.MCPContextServer:   true,
+	engine.MCPContextArgs:     true,
+	engine.MCPContextArgNames: true,
+}
+
+// isContextArgs reports whether n is `context.args`.
+func isContextArgs(n xast.IsNode) bool {
+	a, ok := n.(xast.NodeTypeAccess)
+	return ok && isVar(a.Arg, "context") && string(a.Value) == engine.MCPContextArgs
 }
 
 func mcpUnavailable(body xast.IsNode) string {
@@ -339,21 +354,29 @@ func mcpUnavailable(body xast.IsNode) string {
 		}
 		switch v := n.(type) {
 		case xast.NodeTypeAccess:
+			if isContextArgs(v.Arg) {
+				return false // a field of context.args
+			}
 			if isVar(v.Arg, "context") {
-				if string(v.Value) == "server" {
-					return false
+				switch {
+				case string(v.Value) == engine.MCPContextArgs:
+					// The record itself: only its fields are meaningful.
+					why = "context.args as a value (it is a record: test its fields, e.g. `context.args.repo`)"
+				case !mcpContextKeys[string(v.Value)]:
+					why = fmt.Sprintf("context.%s", string(v.Value))
 				}
-				why = fmt.Sprintf("context.%s", string(v.Value))
 				return false
 			}
 			why = fmt.Sprintf("the attribute .%s", string(v.Value))
 			return false
 		case xast.NodeTypeHas:
+			if isContextArgs(v.Arg) {
+				return false
+			}
 			if isVar(v.Arg, "context") {
-				if string(v.Value) == "server" {
-					return false
+				if !mcpContextKeys[string(v.Value)] {
+					why = fmt.Sprintf("context has %s", string(v.Value))
 				}
-				why = fmt.Sprintf("context has %s", string(v.Value))
 				return false
 			}
 			why = fmt.Sprintf("the attribute %s", string(v.Value))

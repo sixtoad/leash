@@ -22,10 +22,11 @@ import (
 	"github.com/strongdm/leash/internal/lsm"
 )
 
-// PolicyChecker interface for connect policy enforcement
+// PolicyChecker is the decision engine as the proxy uses it: the connect
+// check, and the MCP tools/call check with the call's arguments (#113).
 type PolicyChecker interface {
 	CheckConnect(hostname string, ip string, port uint16) bool
-	CheckMCPCall(server string, tool string) bool
+	DecideMCPCall(call engine.MCPCall) engine.Decision
 	HasMCPPolicies() bool
 }
 
@@ -505,23 +506,45 @@ func (p *MITMProxy) enforceMCPCall(conn net.Conn, ctx *mcpRequestContext, server
 	if pc == nil || ctx == nil {
 		return false
 	}
-	if !strings.EqualFold(ctx.method, "tools/call") {
-		return false
-	}
 	if serverHost == "" {
 		serverHost = logHost
 	}
-	if !pc.CheckMCPCall(serverHost, ctx.tool) {
+	denied := false
+	if ctx.malformed != "" {
+		// Only set while MCP policies were active when the body was read.
+		denied = pc.HasMCPPolicies()
+	} else {
+		for i := range ctx.calls {
+			call := ctx.calls[i]
+			call.Server = serverHost
+			d := pc.DecideMCPCall(call)
+			ctx.policies = d.PolicyIDs
+			ctx.argNames = call.ArgNames
+			if !d.Allow {
+				denied = true
+				ctx.tool = call.Tool
+				break
+			}
+		}
+	}
+	if denied {
 		status := http.StatusForbidden
 		ctx.server = serverHost
 		ctx.responseOutcome = "denied"
 		ctx.responseError = "policy_denied"
 		description := "MCP tools/call denied by policy"
+		if ctx.malformed != "" {
+			ctx.responseError = "malformed_request"
+			description = "MCP request denied: " + ctx.malformed
+		}
 		if serverHost != "" {
 			description += fmt.Sprintf(" (server=%s)", escapeQuotes(serverHost))
 		}
 		if ctx.tool != "" {
 			description += fmt.Sprintf(" (tool=%s)", escapeQuotes(ctx.tool))
+		}
+		if len(ctx.policies) > 0 {
+			description += fmt.Sprintf(" (policies=%s)", escapeQuotes(strings.Join(ctx.policies, ",")))
 		}
 		description = strings.ReplaceAll(description, "\"", "'")
 		idField := "null"

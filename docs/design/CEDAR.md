@@ -330,6 +330,57 @@ permit (
 
 In the legacy dialect MCP permits were no-ops (MCP was allowed by default); in strict Cedar they are the only way to allow a call.
 
+### Pin an MCP endpoint to one repository (retrieval only)
+
+`McpCall` decisions see the call's arguments (#113, capability
+`mcp-call-args`):
+
+| Context key | Type | Holds |
+|---|---|---|
+| `context.server` | String | the server (lowercased host) |
+| `context.args` | Record | the top-level arguments whose value is a string (up to 4 KiB), a boolean or an integer; nested values, floats, `null` and longer strings are left out |
+| `context.argNames` | Set of String | the name of every top-level argument, including those `args` leaves out |
+
+`args` and `argNames` are absent when the arguments cannot be represented
+(more than 64 of them, or a name over 128 bytes). Reading an absent key is
+an evaluation error and the policy then does not apply, so guard every
+read with `has`. This is the shape Walk generates for its code-indexer
+endpoint: only the listed retrieval tools, only on that server, only with
+`repo` equal to the pinned repository and no argument outside the list.
+The forbid keeps a broader `permit` elsewhere (another layer, a default)
+from widening it; written with `unless`, it also applies to calls whose
+arguments it cannot read.
+
+```cedar
+@id("walk-code-indexer-retrieval")
+permit (principal, action == Action::"McpCall", resource)
+when {
+  resource in MCP::Server::"ci-retrieval.internal" &&
+  resource in [MCP::Tool::"search", MCP::Tool::"bundle", MCP::Tool::"graph"] &&
+  context has args && context.args has repo &&
+  context.args.repo == "github.com/acme/app" &&
+  context has argNames && ["repo", "query", "limit"].containsAll(context.argNames)
+};
+
+@id("walk-code-indexer-only")
+forbid (principal, action == Action::"McpCall", resource)
+unless {
+  resource in MCP::Server::"ci-retrieval.internal" &&
+  resource in [MCP::Tool::"search", MCP::Tool::"bundle", MCP::Tool::"graph"] &&
+  context has args && context.args has repo &&
+  context.args.repo == "github.com/acme/app" &&
+  context has argNames && ["repo", "query", "limit"].containsAll(context.argNames)
+};
+```
+
+Pair it with a `NetworkConnect` permit for that host only. While MCP
+policies are active the proxy decides every `tools/call` of a JSON-RPC
+batch and denies a JSON request it cannot decide unambiguously (invalid
+JSON, a duplicated key, a body over 64 MiB). The proxy sees HTTP(S) on
+ports 80 and 443; a stdio MCP server is a child process of the agent and is
+governed by exec, file and network policy, not per call. See
+`docs/design/AUTHZ-SERVICE.md` §3.5.
+
 ## Example Policy File
 
 A small end-to-end policy might look like:
