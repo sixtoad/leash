@@ -58,7 +58,7 @@ func applyOne(spec Spec) error {
 	defer stop()
 	defer unix.Close(userns)
 
-	tree, err := unix.OpenTree(unix.AT_FDCWD, spec.Target, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
+	tree, err := unix.OpenTree(unix.AT_FDCWD, spec.Target, cloneTreeFlags)
 	if err != nil {
 		return fmt.Errorf("clone bind mount (kernel/filesystem may not support idmapped mounts): %w", err)
 	}
@@ -72,6 +72,14 @@ func applyOne(spec Spec) error {
 	}
 	return nil
 }
+
+// cloneTreeFlags clone the target with its submounts (AT_RECURSIVE). The
+// idmapped clone is mounted over the target, so a non-recursive clone would
+// hide every mount below it: an ordinary --volume nested in an idmapped
+// volume (a read-only mask over the workspace's .git, say) would silently
+// disappear from the workload's view. MOUNT_ATTR_IDMAP is set on the top
+// mount only; the submounts keep their own ownership and flags.
+const cloneTreeFlags = unix.OPEN_TREE_CLONE | unix.OPEN_TREE_CLOEXEC | unix.AT_RECURSIVE
 
 func mappedUserNamespace(spec Spec) (int, func(), error) {
 	r, w, err := os.Pipe()

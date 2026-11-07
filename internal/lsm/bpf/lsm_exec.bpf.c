@@ -33,6 +33,10 @@ typedef int bool;
 
 char LICENSE[] SEC("license") = "GPL";
 
+#include "audit_drops.h"
+// audit_drops slots for this object (internal/lsm/audit_drops.go).
+#define AUDIT_SLOT_EXEC 0
+
 #define MAX_PATH_LEN 256
 #define MAX_ENTRIES 8192
 // BPF verifier-friendly constant bound for policy rules (max 64 to reduce instruction count)
@@ -70,7 +74,7 @@ struct exec_policy_rule {
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
+    __uint(max_entries, AUDIT_RINGBUF_DEFAULT_BYTES);
 } exec_events SEC(".maps");
 
 // Map to store the target cgroup ID for filtering (root of subtree to monitor)
@@ -323,7 +327,9 @@ int BPF_PROG(lsm_exec, struct linux_binprm *bprm)
     // Reserve ringbuf space
     event = bpf_ringbuf_reserve(&exec_events, sizeof(*event), 0);
     if (!event) {
-        // Still need to enforce policy even if we can't log
+        // Still need to enforce policy even if we can't log; the lost record
+        // is counted, and lossless audit denies instead.
+        if (audit_record_dropped(AUDIT_SLOT_EXEC)) policy_result = 0;
         return policy_result ? 0 : -13; // -EACCES = 13
     }
 

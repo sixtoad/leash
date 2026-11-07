@@ -10,6 +10,7 @@ import (
 
 	"github.com/strongdm/leash/internal/enforcement"
 	"github.com/strongdm/leash/internal/entrypoint"
+	"github.com/strongdm/leash/internal/lsm"
 )
 
 func TestEffectiveEnforcement(t *testing.T) {
@@ -112,6 +113,11 @@ func TestWriteEnforcementReadyMarkerJSON(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("marker is not JSON: %v (%q)", err, data)
 	}
+	// An active Layer 1 also states the audit posture (#241).
+	if got.Audit == nil || got.Audit.RingBufferBytes != lsm.DefaultAuditRingBufferBytes || got.Audit.Lossless {
+		t.Fatalf("marker audit = %+v, want the default posture", got.Audit)
+	}
+	got.Audit = nil
 	if got != want {
 		t.Fatalf("marker = %+v, want %+v", got, want)
 	}
@@ -124,5 +130,44 @@ func TestWriteEnforcementReadyMarkerJSON(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("expected only the marker in %s, found %d entries", dir, len(entries))
+	}
+}
+
+// Audit records the kernel could not write are added to the published marker
+// as they are counted, including the enforcer daemon's (#241).
+func TestAuditDropsUpdateMarker(t *testing.T) {
+	dir := t.TempDir()
+	defer func() {
+		auditMarker.mu.Lock()
+		auditMarker.dir, auditMarker.status, auditMarker.remoteDropped = "", nil, 0
+		auditMarker.mu.Unlock()
+	}()
+	writeEnforcementReadyMarker(dir, enforcement.Describe(true, true))
+	read := func() enforcement.Status {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(dir, entrypoint.EnforcementReadyFileName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var st enforcement.Status
+		if err := json.Unmarshal(data, &st); err != nil || st.Audit == nil {
+			t.Fatalf("marker %q: %v", data, err)
+		}
+		return st
+	}
+	base := read().Audit.Dropped
+
+	noteRemoteAuditLine(`time=t event=file.open pid=1 path="count=9" decision=allowed`)
+	noteRemoteAuditLine("time=t event=audit.dropped kind=file.open count=5 kind_total=5 total=5 lossless=false")
+	if got := read().Audit.Dropped - base; got != 5 {
+		t.Fatalf("marker dropped grew by %d, want 5", got)
+	}
+	noteRemoteAuditLine("time=t event=audit.dropped kind=net.send count=2 kind_total=2 total=7 lossless=false")
+	st := read()
+	if got := st.Audit.Dropped - base; got != 7 {
+		t.Fatalf("marker dropped grew by %d, want 7", got)
+	}
+	if st.Enforcement != enforcement.LevelLSM {
+		t.Fatalf("rewriting the marker changed the level: %+v", st)
 	}
 }

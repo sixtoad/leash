@@ -559,7 +559,8 @@ func (s *Server) attach(p peer, req Request, c *clientConn) (*session, error) {
 		return nil, fmt.Errorf("start session worker: %v", err)
 	}
 	se.worker = w
-	fwd := Request{V: ProtocolVersion, Op: OpAttach, Cgroup: target, CgroupID: id, Policy: req.Policy, Hosts: req.Hosts}
+	fwd := Request{V: ProtocolVersion, Op: OpAttach, Cgroup: target, CgroupID: id, Policy: req.Policy, Hosts: req.Hosts,
+		AuditRingBufferKB: req.AuditRingBufferKB, AuditLossless: req.AuditLossless}
 	if err := writeJSONLine(w, fwd); err != nil {
 		w.Kill()
 		_ = w.Wait()

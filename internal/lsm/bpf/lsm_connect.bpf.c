@@ -34,6 +34,11 @@ typedef int bool;
 
 char LICENSE[] SEC("license") = "GPL";
 
+#include "audit_drops.h"
+// audit_drops slots for this object (internal/lsm/audit_drops.go).
+#define AUDIT_SLOT_CONNECT 0
+#define AUDIT_SLOT_SOCKET 1
+
 #define MAX_HOSTNAME_LEN 128
 #define MAX_ENTRIES 8192
 // BPF verifier-friendly constant bound for policy rules (max 256 with loop-based implementation)
@@ -135,7 +140,7 @@ _Static_assert(sizeof(struct leash_sockaddr_in6) == 24, "sockaddr_in6 prefix lay
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
+    __uint(max_entries, AUDIT_RINGBUF_DEFAULT_BYTES);
 } connect_events SEC(".maps");
 
 // Map to store the target cgroup ID for filtering (root of subtree to monitor)
@@ -452,7 +457,9 @@ static __always_inline int process_network_event(struct socket *sock, const stru
     // Reserve ringbuf space for event logging
     event = bpf_ringbuf_reserve(&connect_events, sizeof(*event), 0);
     if (!event) {
-        // Still need to enforce policy even if we can't log
+        // Still need to enforce policy even if we can't log; the lost record
+        // is counted, and lossless audit denies instead.
+        if (audit_record_dropped(AUDIT_SLOT_CONNECT)) policy_result = 0;
         return policy_result ? 0 : -13; // -EACCES = 13
     }
 
@@ -611,6 +618,8 @@ int BPF_PROG(lsm_socket_create, int family, int type, int protocol, int kern)
         event->sock_type = (u16)((type & LEASH_SOCK_TYPE_MASK) | 0x100);
         event->result = allow ? 0 : -1;
         bpf_ringbuf_submit(event, 0);
+    } else if (audit_record_dropped(AUDIT_SLOT_SOCKET)) {
+        allow = 0;
     }
 
     // -EPERM, the error a missing CAP_NET_RAW gives, so tools report it as

@@ -627,7 +627,7 @@ func TestRunnerDeclaredDirectoryMutations(t *testing.T) {
 		t.Skip("set LEASH_E2E_NONROOT_IMAGE and LEASH_E2E_MANAGER_IMAGE for the directory mutation regression")
 	}
 	fixtureDir := t.TempDir()
-	fixtureImage := fmt.Sprintf("leash-e2e-dir-fixture:%d", time.Now().UnixNano())
+	fixtureImage := fmt.Sprintf("localhost/leash-e2e-dir-fixture:%d", time.Now().UnixNano())
 	fixtureDockerfile := fmt.Sprintf(`FROM %s
 USER root
 RUN rm -rf /home/agent/.undeclared /home/agent/.future /home/agent/.npm-renamed /home/agent/escaped && \

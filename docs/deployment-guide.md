@@ -185,6 +185,46 @@ Outside the GitHub Actions pipeline:
 | Shared volume (public) | `/leash` (mode 0755, bind-mounted into both containers) |
 | Manager-private volume | `/leash-private` (mode 0700, manager container only) |
 | Event log | `LEASH_LOG=/log/events.log` (configurable) |
+| Audit ring buffer size | `LEASH_AUDIT_RINGBUF_KB` / leashd `--audit-ringbuf-kb` (KiB per eBPF object, power of two, 64..262144; default 1024) |
+| Lossless audit | `LEASH_AUDIT_LOSSLESS=1` / leashd `--audit-lossless` (default off) |
+
+### Audit completeness
+
+Every eBPF LSM program decides first and records second: the decision never
+depends on the audit record. Each object (file, exec, connect) hands its
+records to leashd through a kernel ring buffer. When the ring is full -- a
+burst faster than leashd drains it, typically on a heavily loaded host -- the
+record cannot be written. The kernel counts every such record per kind, and
+leashd turns the count into a record in the event log:
+
+```
+time=... event=audit.dropped kind=file.open count=12 kind_total=12 total=12 lossless=false
+```
+
+It also logs a `leash: audit: ...` line, an `audit.dropped` policy event, and
+rewrites the enforcement-ready marker (`<LEASH_DIR>/enforcement.ready`) so its
+`audit` object carries the running total:
+
+```json
+{"enforcement":"lsm",...,"audit":{"ringBufferBytes":1048576,"lossless":false,"dropped":12}}
+```
+
+`dropped: 0` means the event log is complete. A nonzero count means some
+operations were decided by policy without a record; raise
+`LEASH_AUDIT_RINGBUF_KB` (each object's ring is that size, so the kernel
+memory cost is three times it).
+
+Where an unrecorded operation is worse than a refused one, set
+`LEASH_AUDIT_LOSSLESS=1`: an operation whose record cannot be written is then
+denied (`EACCES`, `EPERM` for socket creation) instead. It is a run-time
+posture, not a policy construct: the policy says what is allowed, the posture
+says what happens when the audit pipe is full. The `leash` CLI forwards both
+variables to leashd (native leashd inherits the environment; the container
+runtime passes them with `-e`); rootless runs send them to the enforcer daemon,
+and an older daemon that cannot confirm lossless audit is refused.
+
+`leash doctor` is a pre-run readiness check and does not report audit loss,
+which only exists for a running session: read the marker or the event log.
 
 For the trust-boundary details around the public/private split, see [`design/SECURITY-MODEL.md`](design/SECURITY-MODEL.md).
 

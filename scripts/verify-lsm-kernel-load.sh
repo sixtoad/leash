@@ -33,7 +33,7 @@ case "${1:-}" in
 esac
 
 ROOT="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
-IMAGE="${LEASH_KERNEL_LOAD_IMAGE:-debian:bookworm-slim}"
+IMAGE="${LEASH_KERNEL_LOAD_IMAGE:-docker.io/library/debian:bookworm-slim}"
 CONTAINER="leash-lsm-kernel-load-$$"
 WORKDIR="$(mktemp -d /tmp/leash-lsm-kernel-load.XXXXXX)"
 
@@ -107,6 +107,12 @@ docker run --rm --name "$CONTAINER" \
 
 # A renamed or skipped test must not pass the gate vacuously.
 if grep -q -- '^--- PASS: TestKernelLoadAllModulesWithExecRule' "$WORKDIR/output"; then
+  # Audit records the kernel could not write (ring buffer full under host
+  # load) are tolerated only when every one was counted and reported (#241);
+  # say so, since those records' content was not checked on this run.
+  if grep -q -- 'AUDIT-LOSS:' "$WORKDIR/output"; then
+    printf '%s\n' "verify-lsm-kernel-load: passed, but some audit records were dropped (counted and reported); their content was not checked on this run" >&2
+  fi
   exit 0
 fi
 

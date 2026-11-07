@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -94,7 +95,11 @@ func TestRootlessPodmanUsesUsableDaemon(t *testing.T) {
 	if r.enforcerSocket != enforcerd.DefaultSocketPath {
 		t.Fatalf("enforcerSocket = %q", r.enforcerSocket)
 	}
-	args := strings.Join(r.enforcerDaemonArgs(), " ")
+	daemonArgs, err := r.enforcerDaemonArgs("/sys/fs/cgroup/w")
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Join(daemonArgs, " ")
 	for _, want := range []string{"-v /run/leash:/run/leash-enforcer", "--group-add keep-groups", "-e LEASH_ENFORCER_SOCKET=/run/leash-enforcer/enforcerd.sock"} {
 		if !strings.Contains(args, want) {
 			t.Errorf("leash container args lack %q: %s", want, args)
@@ -122,17 +127,118 @@ func TestRootfulAndUndetectableEnginesSkipTheDaemon(t *testing.T) {
 	}
 }
 
-// Rootless Docker has no enforcer daemon support yet (#207), so it is always
-// refused.
-func TestRootlessDockerIsRefused(t *testing.T) {
-	withDaemon(t, enforcerd.Report{})
-	rt := infoRuntime{name: "docker", info: `["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]`}
-	err := rootlessRunner(rt).preflightRootless(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "rootless docker") || !strings.Contains(err.Error(), "issues/207") || !strings.Contains(err.Error(), "fail-closed") {
-		t.Fatalf("rootless docker: %v", err)
+var rootlessDockerInfo = `["name=seccomp,profile=builtin","name=rootless","name=cgroupns"]`
+
+// Rootless Docker without a usable daemon is refused with the install hint
+// (#207), never run with only the proxy.
+func TestRootlessDockerWithoutDaemonIsRefused(t *testing.T) {
+	withDaemon(t, enforcerd.Report{Error: "dial unix /run/leash/enforcerd.sock: connect: no such file or directory", Remedy: enforcerd.RemedyFor(errors.New("no such file or directory"))})
+	r := rootlessRunner(infoRuntime{name: "docker", info: rootlessDockerInfo})
+	err := r.preflightRootless(context.Background())
+	if err == nil {
+		t.Fatal("rootless docker without a usable daemon must be refused")
 	}
-	if strings.Contains(err.Error(), "allow-proxy-only") {
-		t.Fatalf("rootless docker refusal must not offer a proxy-only way out: %v", err)
+	for _, want := range []string{"rootless docker", "fail-closed", "sudo leash daemon install", "leash daemon status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal lacks %q:\n%s", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "allow-proxy-only") || strings.Contains(err.Error(), "issues/207") {
+		t.Fatalf("rootless docker refusal: %v", err)
+	}
+	if r.enforcerSocket != "" || r.enforcerViaBroker {
+		t.Fatal("no daemon may be configured for a refused run")
+	}
+}
+
+// DOCKER_HOST=unix:///run/user/<uid>/docker.sock (what rootless Docker's
+// setup tool recommends) is this host's engine; tcp:// and ssh:// are not.
+func TestRootlessDockerHostUnixSocketIsLocal(t *testing.T) {
+	calls := withDaemon(t, enforcerd.Report{Error: "connect: no such file or directory"})
+	t.Setenv("DOCKER_HOST", "unix:///run/user/1000/docker.sock")
+	if err := rootlessRunner(infoRuntime{name: "docker", info: rootlessDockerInfo}).preflightRootless(context.Background()); err == nil || *calls != 1 {
+		t.Fatalf("a local unix DOCKER_HOST must get the rootless preflight: err=%v calls=%d", err, *calls)
+	}
+	for _, remote := range []string{"tcp://10.0.0.1:2376", "ssh://me@host"} {
+		t.Setenv("DOCKER_HOST", remote)
+		if err := rootlessRunner(infoRuntime{name: "docker", info: rootlessDockerInfo}).preflightRootless(context.Background()); err != nil {
+			t.Fatalf("%s: %v", remote, err)
+		}
+	}
+	if *calls != 1 {
+		t.Fatalf("remote engines must not consult the local daemon (calls=%d)", *calls)
+	}
+}
+
+// Rootless Docker with a usable daemon goes through the client-side broker:
+// the leash container gets a private broker directory and no group or daemon
+// socket.
+func TestRootlessDockerUsesTheBroker(t *testing.T) {
+	withDaemon(t, enforcerd.Report{Reachable: true, Usable: true, Status: &enforcerd.Status{Version: "v1", BPFLSM: "active"}})
+	var got enforcerd.BrokerConfig
+	orig := startEnforcerBroker
+	startEnforcerBroker = func(cfg enforcerd.BrokerConfig) (*enforcerd.Broker, error) {
+		got = cfg
+		return nil, nil
+	}
+	t.Cleanup(func() { startEnforcerBroker = orig })
+
+	r := rootlessRunner(infoRuntime{name: "docker", info: rootlessDockerInfo})
+	if err := r.preflightRootless(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if r.enforcerSocket != enforcerd.DefaultSocketPath || !r.enforcerViaBroker {
+		t.Fatalf("enforcerSocket = %q, viaBroker = %v", r.enforcerSocket, r.enforcerViaBroker)
+	}
+	daemonArgs, err := r.enforcerDaemonArgs("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/user.slice/docker-abc.scope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(r.closeEnforcerBroker)
+	args := strings.Join(daemonArgs, " ")
+	if r.enforcerBrokerDir == "" || !strings.HasPrefix(r.enforcerBrokerDir, "/tmp/leash-enforcer-") {
+		t.Fatalf("broker dir = %q", r.enforcerBrokerDir)
+	}
+	for _, want := range []string{"-v " + r.enforcerBrokerDir + ":/run/leash-enforcer", "-e LEASH_ENFORCER_BROKER=/run/leash-enforcer/broker.sock"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("leash container args lack %q: %s", want, args)
+		}
+	}
+	for _, bad := range []string{"keep-groups", "LEASH_ENFORCER_SOCKET", "/run/leash:"} {
+		if strings.Contains(args, bad) {
+			t.Errorf("leash container args must not carry %q: %s", bad, args)
+		}
+	}
+	if got.DaemonSocket != enforcerd.DefaultSocketPath || got.Dir != r.enforcerBrokerDir || !strings.HasSuffix(got.Workload, "docker-abc.scope") {
+		t.Fatalf("broker config = %+v", got)
+	}
+	dir := r.enforcerBrokerDir
+	r.closeEnforcerBroker()
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("broker dir %s not removed: %v", dir, err)
+	}
+}
+
+// The broker directory goes in the run's temporary work dir (removed by the
+// container watcher even when leash is killed) when the socket path fits.
+func TestEnforcerBrokerParent(t *testing.T) {
+	wd, err := os.MkdirTemp("/tmp", "leash.x.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(wd) })
+	r := rootlessRunner(infoRuntime{name: "docker"})
+	r.cfg.workDir, r.cfg.workDirIsTemp = wd, true
+	if got := r.enforcerBrokerParent(); got != wd {
+		t.Fatalf("parent = %q, want the temp work dir %q", got, wd)
+	}
+	r.cfg.workDirIsTemp = false
+	if got := r.enforcerBrokerParent(); got != "/tmp" {
+		t.Fatalf("a user-chosen work dir must not be used: %q", got)
+	}
+	r.cfg.workDir, r.cfg.workDirIsTemp = "/tmp/"+strings.Repeat("x", 90), true
+	if got := r.enforcerBrokerParent(); got != "/tmp" {
+		t.Fatalf("a long work dir must fall back to /tmp: %q", got)
 	}
 }
 

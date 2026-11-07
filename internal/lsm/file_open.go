@@ -254,6 +254,7 @@ func (l *OpenLsm) bpfConfig() BPFConfig {
 		// with it if either fails verification.
 		OptionalStageNames: []string{linkTailCallProgramName},
 		EventMapName:       "events",
+		AuditLogger:        l.logger,
 		AllowedCgroupsMap:  "allowed_cgroups",
 		TargetCgroupMap:    "target_cgroup",
 		StartMessage:       "Successfully started monitoring file opens",

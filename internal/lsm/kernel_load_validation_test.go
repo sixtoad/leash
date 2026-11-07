@@ -758,23 +758,48 @@ collect:
 		`event=file.create .*path="`+regexp.QuoteMeta(longPathRoot+"/s/leash-fifo")+`" decision=allowed`,
 		`event=file.symlink .*path="`+regexp.QuoteMeta(longPathRoot+"/e/leash-symlink")+`" decision=denied`,
 		`event=file.symlink .*path="`+regexp.QuoteMeta(longPaths.mountM+"/leash-symlink")+`" decision=allowed`)
+	// Wait for the event loops to drain. A record can only be missing for
+	// two reasons: the kernel could not reserve it (the ring buffer was full,
+	// which audit_drops counts and an audit.dropped record reports, #241) or
+	// it was never emitted (a bug). Only the first is tolerated, and only
+	// when every missing record is accounted for by a counted drop that was
+	// also reported; the enforcement decisions above are asserted regardless.
 	var events []byte
-	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(250 * time.Millisecond) {
+	var missing []string
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(250 * time.Millisecond) {
 		events, _ = os.ReadFile(eventLog)
-		missing := 0
+		missing = missing[:0]
 		for _, pattern := range required {
 			if !regexp.MustCompile(pattern).Match(events) {
-				missing++
+				missing = append(missing, pattern)
 			}
 		}
-		if missing == 0 {
+		if len(missing) == 0 || time.Now().After(deadline) {
 			break
 		}
 	}
-	for _, pattern := range required {
-		if !regexp.MustCompile(pattern).Match(events) {
-			t.Errorf("FAIL audit: no record matching %s", pattern)
+	collections := map[string]*ebpf.Collection{
+		"lsm_open": openLsm.collection(), "lsm_exec": execLsm.ebpfCollection, "lsm_connect": connectLsm.ebpfCollection,
+	}
+	var dropped uint64
+	for name, coll := range collections {
+		n := auditDropsIn(t, coll)
+		t.Logf("audit: %s dropped %d records (ring buffer full)", name, n)
+		dropped += n
+	}
+	switch {
+	case len(missing) == 0:
+	case dropped == 0:
+		for _, pattern := range missing {
+			t.Errorf("FAIL audit: no record matching %s, and no audit record was dropped: it was never emitted", pattern)
 		}
+	case uint64(len(missing)) > dropped:
+		t.Errorf("FAIL audit: %d expected records missing but only %d dropped: %v", len(missing), dropped, missing)
+	default:
+		if !waitForLogLine(eventLog, `event=audit\.dropped `, 10*time.Second) {
+			t.Errorf("FAIL audit: %d records dropped but no audit.dropped record reported them", dropped)
+		}
+		t.Logf("AUDIT-LOSS: %d expected records missing, accounted for by %d counted and reported drops: %v", len(missing), dropped, missing)
 	}
 	for _, line := range strings.Split(string(events), "\n") {
 		if strings.Contains(line, "event=net.send") && strings.Contains(line, "hostname=") {
@@ -783,5 +808,122 @@ collect:
 		if strings.Contains(line, "event=net.send") || (strings.Contains(line, longPathRoot+"/") && !strings.Contains(line, "proc.exec")) {
 			t.Logf("audit: %s", line)
 		}
+	}
+
+	// Last, because it floods the log: overflow the open ring buffer and
+	// prove the loss is counted and reported, that the decision still stands,
+	// and that lossless audit denies instead (#241).
+	verifyAuditOverflow(t, openLsm, int(cgroupDir.Fd()), trueBin, eventLog)
+}
+
+func (l *OpenLsm) collection() *ebpf.Collection {
+	l.policyUpdateMutex.Lock()
+	defer l.policyUpdateMutex.Unlock()
+	return l.ebpfCollection
+}
+
+// auditDropsIn sums every audit_drops slot of a loaded object.
+func auditDropsIn(t *testing.T, coll *ebpf.Collection) uint64 {
+	t.Helper()
+	if coll == nil {
+		t.Fatalf("audit drops: object not loaded")
+	}
+	m := coll.Maps[auditDropsMapName]
+	if m == nil {
+		t.Fatalf("audit drops: object has no %s map", auditDropsMapName)
+	}
+	var total uint64
+	for slot := uint32(0); slot < m.MaxEntries(); slot++ {
+		var perCPU []uint64
+		if err := m.Lookup(&slot, &perCPU); err != nil {
+			t.Fatalf("audit drops: read slot %d: %v", slot, err)
+		}
+		for _, v := range perCPU {
+			total += v
+		}
+	}
+	return total
+}
+
+func waitForLogLine(path, pattern string, timeout time.Duration) bool {
+	re := regexp.MustCompile(pattern)
+	for deadline := time.Now().Add(timeout); ; time.Sleep(100 * time.Millisecond) {
+		if data, _ := os.ReadFile(path); re.Match(data) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+	}
+}
+
+// verifyAuditOverflow stalls the open module's event handler (it holds the
+// handler's lock), so its reader fills the handoff queue and then the kernel
+// ring buffer, and opens far more files than both hold.
+func verifyAuditOverflow(t *testing.T, openLsm *OpenLsm, cgroupFD int, trueBin, eventLog string) {
+	t.Helper()
+	coll := openLsm.collection()
+	before := auditDropsIn(t, coll)
+
+	openLsm.logMutex.Lock()
+	stalled := true
+	release := func() {
+		if stalled {
+			stalled = false
+			openLsm.logMutex.Unlock()
+		}
+	}
+	defer release()
+
+	// One open_event is just under 300 bytes: the default ring holds about
+	// 3500, the reader's queue 4096 more.
+	opens := 4096 + DefaultAuditRingBufferBytes/256 + 4000
+	script := fmt.Sprintf(`i=0; while [ $i -lt %d ]; do : < /etc/debian_version; i=$((i+1)); done`, opens)
+	if out, err := boxShell(cgroupFD, script); err != nil {
+		t.Fatalf("FAIL audit overflow: %d permitted opens: %v (%s)", opens, err, out)
+	}
+	filled := auditDropsIn(t, coll)
+	if filled <= before {
+		t.Fatalf("FAIL audit overflow: %d opens with the event handler stalled dropped no record (drops %d -> %d)", opens, before, filled)
+	}
+	t.Logf("PASS audit overflow: %d opens with the handler stalled; %d records dropped and counted", opens, filled-before)
+
+	run := func() error {
+		cmd := exec.Command(trueBin)
+		cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: cgroupFD}
+		return cmd.Run()
+	}
+	// The decision does not depend on the record: a permitted exec still runs.
+	if err := run(); err != nil {
+		t.Errorf("FAIL audit overflow: permitted exec of %s with a full ring: %v", trueBin, err)
+	}
+
+	// Lossless audit: an operation whose record cannot be written is denied.
+	config := coll.Maps[auditConfigMapName]
+	if config == nil {
+		t.Fatalf("FAIL audit overflow: object has no %s map", auditConfigMapName)
+	}
+	key, on, off := uint32(0), auditConfigLossless, uint32(0)
+	if err := config.Put(&key, &on); err != nil {
+		t.Fatalf("enable lossless audit: %v", err)
+	}
+	err := run()
+	if perr := config.Put(&key, &off); perr != nil {
+		t.Fatalf("disable lossless audit: %v", perr)
+	}
+	if !errors.Is(err, syscall.EACCES) {
+		t.Errorf("FAIL lossless audit: exec of %s with a full ring: want EACCES, got %v", trueBin, err)
+	} else {
+		t.Logf("PASS lossless audit: exec with a full ring denied (%v)", err)
+	}
+	if err := run(); err != nil {
+		t.Errorf("FAIL audit overflow: permitted exec after lossless was turned off: %v", err)
+	}
+
+	release()
+	if !waitForLogLine(eventLog, `event=audit\.dropped kind=file\.open count=[1-9]`, 30*time.Second) {
+		t.Errorf("FAIL audit overflow: %d dropped records were not reported by an audit.dropped record", auditDropsIn(t, coll)-before)
+	} else {
+		t.Logf("PASS audit overflow: drops reported as audit.dropped")
 	}
 }

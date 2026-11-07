@@ -733,6 +733,15 @@ server and the client.
   most 64 keys whose values are strings, integers and booleans (an McpCall's
   `context.args`, §3.5). Nested records, records in sets, sets in records,
   and `null` are rejected.
+- Connections: a client may keep one connection for its whole run and send
+  requests on it at any pace; the server never times out an idle
+  connection (§7.6). A kept connection can still die under the client, most
+  often because leashd restarted. A client must therefore reconnect and retry
+  the request **once** when a reused connection fails before any byte of the
+  reply arrives (`EPIPE`/`ECONNRESET` on write, `EOF`/`ECONNRESET` on read).
+  Requests are idempotent questions, so the retry is safe. A failure on a
+  freshly dialed connection, or after part of a reply, is not retried; it is
+  a deny (§7.3). `pkg/authz` does this.
 - Versioning: `v` must be `1`. A different version gets a deny with
   `unsupported_version` and the server's `v`. Unknown fields are ignored, so
   additions stay compatible. A breaking change bumps `v`, and the server can
@@ -780,7 +789,7 @@ for the kernel leaves the previous engine and kernel tables in place.
 | Context | 64 keys; strings up to 4 KiB; sets up to 256 elements, one level deep |
 | Rate | 200 requests/s per plugin, burst 400. Over the limit: deny with `rate_limited`; the connection stays open. |
 | Connections | 16 concurrent per plugin. Extra connections are refused. |
-| Idle timeout | 2 minutes |
+| Idle timeout | None. A connection lives as long as the plugin (or leashd): it closes only when the plugin closes it, on a protocol error (an oversized line), or when leashd shuts down. Every peer is a plugin leash spawned itself, so leash makes no assumption about how long a plugin stays quiet. |
 
 ### 7.7 Audit
 
@@ -815,6 +824,10 @@ d, err := c.Check(ctx, authz.Request{
 })
 if d.Allowed() { ... }               // false on any error
 ```
+
+The client keeps one connection and serializes requests on it. If that
+connection was closed by the server before it answered (a leashd restart),
+`Check` retries once on a fresh connection (§7.2).
 
 ## 8. How the use cases map
 

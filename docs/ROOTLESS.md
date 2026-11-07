@@ -1,7 +1,8 @@
-# Rootless podman: the leash enforcer daemon
+# Rootless podman and Docker: the leash enforcer daemon
 
-Rootless podman is the safer way to run containers: no root daemon, and a
-container breakout lands in an unprivileged user namespace. Leash's kernel
+Rootless podman and rootless Docker are the safer way to run containers: no
+root daemon, and a container breakout lands in an unprivileged user
+namespace. Leash's kernel
 layer (Layer 1, the eBPF LSM programs that enforce file, exec, directory
 mutation and network-connect policy) cannot load from there: the leash
 container is root only inside a user namespace, and loading a
@@ -25,6 +26,7 @@ sudo leash daemon install        # once per host; adds $SUDO_USER to the "leash"
 # log out and back in (or: newgrp leash) so your session has the group
 leash daemon status              # exit 0 when rootless runs can use it
 leash --runtime podman -- your-agent ...
+leash --runtime docker -- your-agent ...   # rootless Docker (dockerd-rootless-setuptool.sh)
 ```
 
 `leash daemon install` is idempotent and can be re-run to upgrade. It:
@@ -47,10 +49,14 @@ socket, the user and the group. The audit log in `/var/log/leash-enforcerd`
 is kept unless you pass `--purge`.
 
 Requirements: Linux with systemd, cgroup v2 with systemd user delegation
-(the default for rootless podman on current distributions), podman with crun
-(for `--group-add keep-groups`), and a kernel with `bpf` among its active LSMs.
+(the default for rootless podman and rootless Docker on current
+distributions), and a kernel with `bpf` among its active LSMs. Rootless podman
+also needs crun (for `--group-add keep-groups`). Rootless Docker needs its
+systemd cgroup driver (the default on cgroup v2 with systemd), so that its
+containers' cgroups live in your delegated subtree; `docker info --format
+'{{.CgroupDriver}}'` should print `systemd`.
 
-Two host setup steps that are easy to miss:
+Two rootless podman setup steps that are easy to miss:
 
 - **Use crun, not runc.** Ubuntu's podman packages default to runc, which
   fails `--group-add keep-groups` (only crun supports it), so the leash
@@ -72,7 +78,8 @@ Two host setup steps that are easy to miss:
 ## What a rootless run does
 
 1. The runner detects a rootless engine (`podman info` reports
-   `Host.Security.Rootless`). It asks the daemon for its status over
+   `Host.Security.Rootless`; `docker info` lists the `rootless` security
+   option). It asks the daemon for its status over
    `/run/leash/enforcerd.sock`. If the daemon is unreachable, refuses the
    caller, or reports that BPF LSM programs do not run, the run stops with the
    reason and the fix:
@@ -84,10 +91,25 @@ Two host setup steps that are easy to miss:
    Check it with:         leash daemon status
    ```
 
-2. The leash container gets the socket's directory mounted at
-   `/run/leash-enforcer`, `--group-add keep-groups` (rootless podman otherwise
-   drops the caller's `leash` group membership), and `LEASH_ENFORCER_SOCKET`.
-   The workload container gets none of these.
+2. leashd, in the leash container, needs a connection to the daemon. The
+   workload container never gets one.
+   - **Rootless podman:** the leash container gets the socket's directory
+     mounted at `/run/leash-enforcer`, `--group-add keep-groups` (rootless
+     podman otherwise drops the caller's `leash` group membership), and
+     `LEASH_ENFORCER_SOCKET`. leashd dials the socket.
+   - **Rootless Docker:** Docker cannot keep the caller's supplementary groups
+     in a container, so leashd could not open the `root:leash 0660` socket.
+     The leash client opens the connection instead. It creates a private
+     directory (`leash-enforcer-*`, mode 0700, in the run's temporary work
+     dir so it goes away with the run even if leash is killed; else in
+     `/tmp`) with a single-use broker
+     socket (mode 0600), mounts only that directory into the leash container
+     at `/run/leash-enforcer`, and sets `LEASH_ENFORCER_BROKER`. When leashd
+     connects to the broker, the client checks the peer (below), dials the
+     daemon itself and passes the connected socket to leashd (`SCM_RIGHTS`),
+     then stops listening and removes the socket. leashd speaks the normal
+     protocol on that connection. The daemon authenticates the client: a host
+     process of your user, in your login session, with your `leash` group.
 3. Before the bootstrap, leashd sends the daemon the workload's cgroup and the
    active policy as strict Cedar (`Compilation.StrictText`). It resolves the
    policy's hostname connect rules in the workload's network namespace and sends
@@ -114,9 +136,15 @@ The L7 proxy (Layer 2) and the netfilter rules in the pod's network namespace
 work as in a rootful run. The leash container is `--privileged` inside the
 rootless user namespace, which owns the pod's network namespace.
 
+Where the cgroups are: rootless podman puts a container in
+`user@<uid>.service/user.slice/libpod-<id>.scope` (with a `container`
+child), rootless Docker in `user@<uid>.service/user.slice/docker-<id>.scope`.
+Both are inside your delegated subtree, owned by you (or, for a keep-id podman
+container, by one of your subordinate uids).
+
 ## What is enforced
 
-| Layer | Rootful (Docker/podman) | Rootless podman + daemon |
+| Layer | Rootful (Docker/podman) | Rootless podman or Docker + daemon |
 |---|---|---|
 | file open (read / write), directory mutations, hard links | eBPF LSM | same programs, same tables |
 | exec | eBPF LSM | same |
@@ -128,7 +156,10 @@ rootless user namespace, which owns the pod's network namespace.
 Verified on a real kernel with an identical policy: the same denials, rootful
 and through the daemon (forbidden read, write outside the permitted tree,
 mkdir and unlink outside it, forbidden exec, TCP and UDP to non-permitted
-addresses, HTTPS allowed and denied by the proxy).
+addresses, HTTPS allowed and denied by the proxy). Rootless Docker (Docker CE
+with its rootless extras and the systemd cgroup driver, Ubuntu 24.04, kernel
+6.8) gives the same results as rootless podman on the same host, including
+denied file creation and symlink creation outside the permitted tree.
 
 ## Security model
 
@@ -154,6 +185,19 @@ is something the caller could already do to its own processes.
   socket. On top of that, a connection from any process whose cgroup is
   inside a governed cgroup is refused at connect and on every request. That
   covers a process that connected earlier and later moved into the workload.
+- **Rootless Docker's broker changes none of this.** The connection the daemon
+  authenticates is the leash client's own: `SO_PEERCRED` is fixed when the
+  client connects, so the daemon sees the client's uid (your account, with
+  the `leash` group) and pid (in your login session, outside every governed
+  cgroup), resolves and checks them exactly as above, and re-checks that pid's
+  cgroup on every request. The target cgroup is validated against your
+  account as for podman. The broker itself only serves a peer with the
+  client's uid whose cgroup is outside the workload's cgroup (the daemon's
+  rule, applied before any connection exists), it lives in a 0700 directory
+  of yours mounted only into the leash container, and it hands over exactly
+  one connection, then removes its socket. A workload that somehow reaches
+  the broker path (for example through a bind mount of `/tmp`) is refused by
+  the cgroup check, and after leashd attached there is nothing left to reach.
 
 **Which cgroups it accepts.** The target must be strictly inside the caller's
 delegated systemd subtree,
@@ -207,6 +251,13 @@ enforcement lost`. The runner then sees the leash container stop and kills the
 workload container. A daemon-enforced workload never keeps running without its
 kernel enforcement.
 
+With rootless Docker the daemon re-checks the leash client's pid on every
+request, so the connection is only usable while the client runs. A leash
+client that is killed (`kill -9`) takes the run down: its watcher removes both
+containers, which removes the workload's cgroup and ends the session, and a
+later request from leashd on the connection is refused, which leashd also
+treats as `kernel enforcement lost`.
+
 **Residual risks.**
 - `SO_PEERCRED` reports the pid at connect time. A caller could pass its
   connected socket to another of its own processes, but such a process is the
@@ -220,9 +271,11 @@ kernel enforcement.
   enforcing, including `userns = "keep-id"` and fuse-overlayfs storage); the
   socket needs no policy module. The agent container's project and config
   mounts need a label decision: see [SELINUX.md](SELINUX.md).
-- Rootless Docker is not supported yet
-  ([#207](https://github.com/sixtoad/leash/issues/207)). Its containers cannot
-  keep the caller's `leash` group, so a rootless Docker run is refused.
+- Rootless Docker: the leash container holds a daemon connection that was
+  authenticated as the leash client. That is the same trust the podman path
+  gives the leash container (which holds the `leash` group itself): leashd is
+  your process, outside the workload, and the connection can only act on
+  cgroups your account owns.
 
 ## Machine-readable surface
 

@@ -60,7 +60,7 @@ func TestIntegration(t *testing.T) {
 				t.Fatalf("unsupported variant %q: %v", variant, err)
 			}
 
-			imageName := fmt.Sprintf("leash-test-%s", variant)
+			imageName := fmt.Sprintf("localhost/leash-test-%s", variant)
 			ensureImage(t, imageName, func(ctx context.Context) error {
 				return buildVariantImage(ctx, variant)
 			})
@@ -674,7 +674,7 @@ func buildVariantImage(ctx context.Context, variant string) error {
 		"build",
 		"--target", fmt.Sprintf("leash-test-%s", variant),
 		"-f", "Dockerfile.leash",
-		"-t", fmt.Sprintf("leash-test-%s", variant),
+		"-t", fmt.Sprintf("localhost/leash-test-%s", variant),
 		".",
 	})
 }
@@ -720,7 +720,7 @@ func startVariantEnvironment(t *testing.T, cfg variantConfig, lite bool) *varian
 	runDockerOrFatal(t, ctx, []string{
 		"run", "-d", "--name", targetName,
 		"-v", fmt.Sprintf("%s:/leash", leashDir),
-		fmt.Sprintf("leash-test-%s", cfg.name),
+		fmt.Sprintf("localhost/leash-test-%s", cfg.name),
 		"sleep", "3600",
 	})
 	ensureContainerRunning(t, ctx, targetName)

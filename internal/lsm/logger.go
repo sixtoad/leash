@@ -5,7 +5,17 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
+
+// logSyncDelay bounds how long a written audit line may sit in the page cache
+// before it is fsynced. Syncing on every line (the old behaviour) put a disk
+// flush on the eBPF event loop's critical path: on a loaded host each record
+// cost milliseconds, the reader fell behind, and the kernel ring buffer
+// overflowed and dropped records (issue #241). Readers of the log never need
+// the sync -- a written line is visible immediately -- it only bounds what a
+// power loss can take.
+const logSyncDelay = 200 * time.Millisecond
 
 // LogBroadcaster is an interface for broadcasting log entries
 type LogBroadcaster interface {
@@ -18,6 +28,7 @@ type SharedLogger struct {
 	file        *os.File
 	mutex       sync.Mutex
 	broadcaster LogBroadcaster
+	syncPending bool // a deferred fsync is scheduled
 }
 
 func NewSharedLogger(path string) (*SharedLogger, error) {
@@ -73,15 +84,36 @@ func (l *SharedLogger) Write(entry string) error {
 		l.broadcaster.BroadcastLog(broadcastEntry)
 	}
 
-	if l.file != nil {
-		return l.file.Sync()
+	if l.file != nil && !l.syncPending {
+		l.syncPending = true
+		time.AfterFunc(logSyncDelay, l.syncDeferred)
 	}
 	return nil
 }
 
+// syncDeferred flushes the file outside the mutex, so writers are never held
+// behind a disk flush.
+func (l *SharedLogger) syncDeferred() {
+	l.mutex.Lock()
+	f := l.file
+	l.syncPending = false
+	l.mutex.Unlock()
+	if f != nil {
+		_ = f.Sync()
+	}
+}
+
 func (l *SharedLogger) Close() error {
-	if l == nil || l.file == nil {
+	if l == nil {
 		return nil
 	}
-	return l.file.Close()
+	l.mutex.Lock()
+	f := l.file
+	l.file = nil
+	l.mutex.Unlock()
+	if f == nil {
+		return nil
+	}
+	_ = f.Sync()
+	return f.Close()
 }

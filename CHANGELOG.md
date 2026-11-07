@@ -6,7 +6,45 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 
 ## [Unreleased]
 
+### Fixed
+- **Plugin authz connections no longer die after 2 minutes of silence.**
+  leashd closed any authz socket connection idle for 2 minutes, so a plugin
+  that kept one connection for its run got `broken pipe` on its next
+  question. Walk's walk-git-service reported that as "read denied by
+  policy" and failed a live run (denies right after 8m24s and 3m18s idle
+  gaps). The idle timeout is gone: a connection lives as long as the plugin
+  or leashd and closes only when the plugin closes it, on a protocol error,
+  or at shutdown (which still closes every connection). The connection cap,
+  rate limit and line limits are unchanged. The `pkg/authz` client now
+  retries a question once on a fresh connection when its kept connection
+  was closed by the server before replying (e.g. a leashd restart), and
+  docs/design/AUTHZ-SERVICE.md §7.2 asks other clients to do the same.
+- **eBPF audit records are no longer lost silently** (#241). A record the
+  kernel could not write because the event ring buffer was full used to
+  vanish (the decision was still enforced). Each loss is now counted in the
+  kernel and reported as an `audit.dropped` event, a leashd log line and an
+  `audit` object in the enforcement-ready marker. The event log no longer
+  fsyncs every line on the event loop (it syncs within 200 ms), which was
+  what let the reader fall behind on a loaded host, and the default ring
+  buffer grew from 256 KiB to 1 MiB per object.
+
 ### Added
+- **Rootless Docker gets full eBPF LSM enforcement through the enforcer
+  daemon** (#207). Rootless Docker runs were refused because Docker cannot
+  keep the caller's `leash` group in a container, so leashd could not open the
+  daemon's `root:leash 0660` socket. The leash client now opens the daemon
+  connection itself and hands it to leashd over a single-use broker socket
+  (`SCM_RIGHTS`) in a private directory mounted only into the leash container
+  (`LEASH_ENFORCER_BROKER`). The daemon authenticates the client with its
+  unchanged checks (`SO_PEERCRED` uid and pid, `leash` group, peer outside
+  every governed cgroup, target inside the caller's delegated subtree); the
+  broker refuses peers inside the workload's cgroup and serves one
+  connection. Without a usable daemon a rootless Docker run is still refused
+  before anything starts, now with the `sudo leash daemon install` hint. The
+  `rootless-daemon` capability now covers rootless Docker; the capability
+  list is unchanged. Rootless podman is unchanged. A `DOCKER_HOST` naming a
+  local unix socket (what `dockerd-rootless-setuptool.sh` recommends) is now
+  treated as this host's engine rather than a remote one.
 - **Configurable target `/dev/shm` size**: `--shm-size` / `LEASH_SHM_SIZE` /
   `[leash.resources] shm_size`, validated, read back from the engine and
   reported with the other resource limits; refused by the native runtime
@@ -18,6 +56,10 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
   list (the Walk code-indexer capability; shape in `docs/design/CEDAR.md`).
   The authz socket accepts flat records in the context for the same query.
   Advertised as the `mcp-call-args` capability.
+- **`LEASH_AUDIT_RINGBUF_KB` / `--audit-ringbuf-kb`** sizes the audit ring
+  buffers, and **`LEASH_AUDIT_LOSSLESS=1` / `--audit-lossless`** denies an
+  operation whose audit record cannot be written (docs/deployment-guide.md,
+  "Audit completeness").
 
 ### Changed
 - **MCP enforcement is fail-closed on ambiguous requests** (#113). While MCP

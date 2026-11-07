@@ -45,7 +45,7 @@ func (l *enforcementLost) get() error {
 var enforcementWatchInterval = 500 * time.Millisecond
 
 // watchContainerEnforcement stops the workload if the leash container exits
-// while it runs. In a daemon-enforced (rootless podman) run leashd exits when
+// while it runs. In a daemon-enforced (rootless) run leashd exits when
 // the daemon reports the session lost; in a rootful run leashd itself attached
 // the LSM, so its exit leaves the workload unenforced either way. The returned
 // channel is closed once the watch goroutine has returned.

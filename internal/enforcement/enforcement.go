@@ -58,6 +58,23 @@ type Status struct {
 	// The level is "lsm" either way: the same programs, compiled from the
 	// same policy.
 	Layer1Via string `json:"layer1Via,omitempty"`
+	// Audit is the eBPF audit pipeline's posture and losses (issue #241).
+	// leashd rewrites the marker when Dropped changes, so a reader sees
+	// whether the audit trail of the run is complete.
+	Audit *AuditStatus `json:"audit,omitempty"`
+}
+
+// AuditStatus describes the kernel audit pipeline of a run.
+type AuditStatus struct {
+	// RingBufferBytes is the size of each eBPF object's event ring buffer.
+	RingBufferBytes uint32 `json:"ringBufferBytes"`
+	// Lossless is the opt-in posture that denies an operation whose audit
+	// record cannot be written instead of deciding it without a record.
+	Lossless bool `json:"lossless"`
+	// Dropped counts audit records the kernel could not write because the
+	// ring buffer was full. Nonzero means the event log is incomplete (the
+	// operations were still decided by policy, or denied under Lossless).
+	Dropped uint64 `json:"dropped"`
 }
 
 // Layer1ViaEnforcerDaemon is Status.Layer1Via for a rootless run enforced by
