@@ -224,10 +224,14 @@ type launcher interface {
 // launcher (the default, so runners constructed directly in tests work without
 // wiring). This mirrors r.rt().
 func (r *runner) launcher() launcher {
+	var backend launcher = containerLauncher{r: r}
 	if r.usingNativeRuntime() {
-		return nativeLauncher{r: r}
+		backend = nativeLauncher{r: r}
 	}
-	return containerLauncher{r: r}
+	if r.lifecycleTelemetry != nil {
+		return telemetryLauncher{launcher: backend, telemetry: r.lifecycleTelemetry}
+	}
+	return backend
 }
 
 // usingNativeRuntime reports whether the container-free native backend is

@@ -1,5 +1,11 @@
 # Launcher abstraction — the seam above `Runtime`
 
+The optional run-telemetry decorator now times `PullImages`, `Provision`,
+`StartEnforcement`, `WaitReady` and `Remove` at this seam without changing the
+backend calls or their results. Audit export happens after removal stops the
+producer and before runner directory cleanup. See [run telemetry](run-telemetry.md)
+for the private FIFO protocol and opt-in host settings.
+
 > **Status — 2026-07-04:** Design-era doc. The `launcher` interface shipped as
 > described (container + native adapters, composition-root selection). Shipped
 > beyond this: the native launcher now wires netns **egress** / Layer 2, the
