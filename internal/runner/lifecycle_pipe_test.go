@@ -2,7 +2,6 @@ package runner
 
 import (
 	"bytes"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -25,30 +24,53 @@ func lifecycleCapturePipe(t *testing.T) (string, func() string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader := os.NewFile(uintptr(fd), path)
 	keep, err := os.OpenFile(path, os.O_WRONLY|unix.O_NONBLOCK, 0)
 	if err != nil {
-		_ = reader.Close()
+		_ = unix.Close(fd)
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	done := make(chan struct{})
+	done := make(chan error, 1)
+	stop := make(chan struct{})
 	go func() {
-		_, _ = io.Copy(&buf, reader)
-		close(done)
+		// Read the nonblocking descriptor directly: Darwin's kqueue can miss
+		// FIFO EOF after the last writer closes. Keep checking read(2) so EOF
+		// still proves that every producer has closed, including empty pipes.
+		var chunk [32 << 10]byte
+		for {
+			n, err := unix.Read(fd, chunk[:])
+			if n > 0 {
+				buf.Write(chunk[:n])
+			}
+			if err != unix.EAGAIN && err != unix.EINTR {
+				if err != nil || n == 0 {
+					done <- err
+					return
+				}
+			}
+			select {
+			case <-stop:
+				done <- nil
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
 	}()
 	var once sync.Once
 	finish := func() string {
 		once.Do(func() {
 			_ = keep.Close()
 			select {
-			case <-done:
+			case err := <-done:
+				if err != nil {
+					t.Errorf("capture lifecycle pipe: %v", err)
+				}
 			case <-time.After(2 * time.Second):
-				_ = reader.Close()
+				close(stop)
 				<-done
 				t.Error("optional FIFO producer did not retire")
 			}
-			_ = reader.Close()
+			_ = unix.Close(fd)
 		})
 		return buf.String()
 	}
