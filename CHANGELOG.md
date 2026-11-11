@@ -6,6 +6,16 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 
 ## [Unreleased]
 
+### Added
+- **Optional run observability for Walk/Warren** (#252): opted-in launchers
+  emit versioned startup/cleanup timings and redact and export bounded audit
+  records before temporary run state is removed. Telemetry write failures do
+  not change enforcement gates, required audit initialization, workload stdout
+  or exit status. The host opts in with `LEASH_TELEMETRY_RUN_ID`; the default
+  export cap is 256 MiB. A bounded batch worker and one-second final drain keep
+  optional output from blocking teardown. A dedicated private FIFO and terminal
+  delivery marker isolate telemetry from ordinary stderr, including warnings. See `docs/run-telemetry.md` for the wire contract.
+
 ## [native-v0.6.0] — 2026-11-07
 
 Minor release on top of `native-v0.5.0` (PRs #242–#250, #247). It adds two

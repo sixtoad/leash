@@ -640,3 +640,16 @@ entry helper performs the operation; the target need not provide `getent`.
 The selected snapshot is reported on the runner diagnostic stream as
 `event=runner.network-hosts status=pinned snapshot=<JSON>`. Callers must require
 the capability before passing this additive flag; contract bounds are unchanged.
+
+### Optional run telemetry
+
+The trusted launcher environment variable `LEASH_TELEMETRY_RUN_ID` opts into
+`warren.run-telemetry/v1` NDJSON through the private FIFO named by
+`LEASH_TELEMETRY_PIPE`, independently of interactive/machine mode. There is no
+stderr fallback. A terminal `leash_export` record reports delivery completeness.
+Startup phases and bounded, redacted audit
+export are advisory; required enforcement and audit initialization still fail
+closed, and optional telemetry failures never alter workload output or status.
+See [run telemetry](run-telemetry.md) for fields, caps, redaction inputs and the
+pre-cleanup export lifecycle. This additive environment-only protocol does not
+change the runtime capability contract or require new sandbox egress.

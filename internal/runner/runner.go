@@ -202,8 +202,10 @@ type config struct {
 }
 
 type runner struct {
-	opts options
-	cfg  config
+	opts                 options
+	cfg                  config
+	lifecycleTelemetry   *lifecycleTelemetry
+	lifecycleInitialized bool
 
 	runtime Runtime
 
@@ -394,6 +396,13 @@ func execute(cmdName string, args []string) error {
 		sessionID:     sessionID,
 		workspaceHash: workspaceHash,
 	}
+
+	r.initLifecycleTelemetry()
+	defer func() {
+		if r.lifecycleTelemetry != nil {
+			r.lifecycleTelemetry.finishAudit()
+		}
+	}()
 
 	// Each backend declares the host binaries it drives (container: the runtime
 	// CLI; native: systemd-run/systemctl).
@@ -1815,6 +1824,7 @@ func (r *runner) rt() Runtime {
 }
 
 func (r *runner) startContainers(ctx context.Context) error {
+	r.initLifecycleTelemetry()
 	// A policy that cannot load must stop the run before anything is
 	// provisioned, under every runtime and posture (issue #162). The staged
 	// copy is checked again after syncPolicyFile.
@@ -3690,6 +3700,7 @@ func (r *runner) finishLifecycle(ctx context.Context, exitCode int, runErr error
 		// LSM attached after leash exits (#143).
 		r.teardownInjectedPlugins()
 		r.stopLeashd()
+		r.exportLifecycleAudit()
 		// Kept on purpose: neither the watcher nor a later reaper removes them.
 		if !r.usingNativeRuntime() {
 			r.markContainersKept()
@@ -3722,6 +3733,7 @@ func (r *runner) finishLifecycle(ctx context.Context, exitCode int, runErr error
 
 func (r *runner) stopContainers(ctx context.Context) error {
 	cleanupErr := r.launcher().Remove(ctx)
+	r.exportLifecycleAudit()
 	r.closeEnforcerBroker()
 
 	if r.cfg.shareDir != "" && !r.cfg.shareDirFromEnv {
