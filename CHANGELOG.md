@@ -7,6 +7,14 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 ## [Unreleased]
 
 ### Added
+- **Injected service sockets are bound read-only into containers**
+  (`inject-service-readonly-bind`, sixto/walk#281): the container backend
+  mounts each `--inject-service` socket directory with `:ro`. The workload
+  still connects, but can no longer unlink or rename the socket and bind its
+  own listener in its place (forged replies), even as root in the container.
+  A regression test pins that a native caller's `FileOpenReadWrite` forbid on
+  the socket directory plus exact ancestor forbids compiles to a mutation
+  table denying every replacement path.
 - **Optional run observability for Walk/Warren** (#252): opted-in launchers
   emit versioned startup/cleanup timings and redact and export bounded audit
   records before temporary run state is removed. Telemetry write failures do

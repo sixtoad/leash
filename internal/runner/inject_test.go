@@ -202,7 +202,7 @@ func TestSpawnInjectServicesContainerDockerArgs(t *testing.T) {
 	defer r.teardownInjectedPlugins()
 
 	want := []string{
-		"-v", dir + ":" + dir,
+		"-v", dir + ":" + dir + ":ro",
 		"-e", "HELPER_ADDR=unix:path=" + sock,
 	}
 	if !reflect.DeepEqual(r.injectedDockerArgs, want) {

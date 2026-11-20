@@ -171,6 +171,13 @@ const (
 	// over the read-ahead limit). An older leash rejects such a policy at
 	// load, so a caller generating one should check this capability first.
 	CapabilityMCPCallArgs = "mcp-call-args"
+	// CapabilityInjectServiceReadOnlyBind means the container backend binds
+	// each --inject-service socket directory into the workload read-only: the
+	// workload connects to the socket but cannot unlink, rename or replace it,
+	// or create entries beside it (sixto/walk#281). The native backend leaves
+	// the directory to the caller's policy (a FileOpenReadWrite forbid on it
+	// denies every mutation through the eBPF LSM's mutation table).
+	CapabilityInjectServiceReadOnlyBind = "inject-service-readonly-bind"
 )
 
 // Enforced policy path limits, in bytes of the resolved path (a directory
@@ -219,6 +226,7 @@ var capabilities = []string{
 	CapabilityPinNetworkHost,
 	CapabilityContainerShmSize,
 	CapabilityMCPCallArgs,
+	CapabilityInjectServiceReadOnlyBind,
 }
 
 // Capabilities returns the surface names this build advertises. The slice is a

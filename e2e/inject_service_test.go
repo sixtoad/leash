@@ -96,6 +96,23 @@ func TestInjectServiceContainer(t *testing.T) {
 		t.Fatalf("expected injected socket %s to be a socket inside target container; exit=%d\nstdout=%s\nstderr=%s", socket, exit, stdout.String(), stderr.String())
 	}
 
+	// 2b. The socket dir is bound read-only (sixto/walk#281): the workload (root in
+	//     the container) cannot rename or unlink the socket, bind or create anything
+	//     beside it, or chmod it, so it cannot take the plugin's place.
+	for _, attack := range []string{
+		"mv " + socket + " " + socket + ".x",
+		"rm -f " + socket,
+		"touch " + socketDir + "/forged",
+		"chmod 000 " + socket,
+	} {
+		if exit := dockerExecExitCode(t, targetName, "sh", "-c", attack); exit == 0 {
+			t.Fatalf("workload could run %q in the injected socket dir; it must be read-only", attack)
+		}
+	}
+	if exit := dockerExecExitCode(t, targetName, "sh", "-c", "test -S "+socket); exit != 0 {
+		t.Fatalf("injected socket %s vanished after the replacement attempts; exit=%d", socket, exit)
+	}
+
 	// 3. Config delivery: the plugin recorded the opaque config leash handed it. The
 	//    marker file must equal the sentinel we passed via config=, proving leash
 	//    delivered the payload verbatim end to end.
@@ -116,7 +133,7 @@ func buildInjectStub(t *testing.T) string {
 	t.Helper()
 	out := filepath.Join(t.TempDir(), "injectstub")
 	cmd := exec.Command("go", "build", "-o", out, "./testdata/injectstub")
-	cmd.Env = append(os.Environ(), "GOFLAGS=-vet=off")
+	cmd.Env = append(os.Environ(), "GOFLAGS=-vet=off -buildvcs=false")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
