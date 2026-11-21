@@ -13,8 +13,9 @@ import (
 // replace the socket — unlink or rename it, bind a new socket or create any
 // other entry beside it, rename or remove the directory, or rename an
 // ancestor away and rebuild the path — while the rest of a writable /tmp
-// stays writable. Connecting to the socket is not a mutation and is not
-// decided here.
+// stays writable. A FilePrefix forbid on a run-local name family (e.g.
+// /tmp/walk-svc-) extends that to every concurrent run's paths. Connecting to
+// the socket is not a mutation and is not decided here.
 func TestKernelWriteForbidSealsAServiceSocketDirectory(t *testing.T) {
 	t.Parallel()
 	const policy = `@leash_semantics("cedar")
@@ -25,6 +26,8 @@ forbid (principal, action == Action::"FileOpenReadWrite", resource)
 when { resource in [ Dir::"/tmp/walk-svc-r1/", Dir::"/home/u/tmp/walk-git-r1/" ] };
 forbid (principal, action == Action::"FileOpenReadWrite", resource)
 when { resource in [ File::"/tmp", File::"/home", File::"/home/u", File::"/home/u/tmp" ] };
+forbid (principal, action == Action::"FileOpenReadWrite", resource)
+when { resource in [ FilePrefix::"/tmp/walk-svc-", FilePrefix::"/tmp/walk-ci/" ] };
 `
 	eng, ir, _, err := compileStrict(t, policy)
 	if err != nil {
@@ -48,7 +51,12 @@ when { resource in [ File::"/tmp", File::"/home", File::"/home/u", File::"/home/
 		{"/home/u/tmp", false}, // a user-owned TMPDIR: renaming it would free the path
 		{"/home/u", false},
 		{"/home", false},
-		{"/tmp/walk-svc-r1x", true}, // a sibling with the same prefix stays writable
+		{"/tmp/walk-svc-r2/svc.sock", false}, // another run's socket: a name-family prefix
+		{"/tmp/walk-svc-r2", false},
+		{"/tmp/walk-svc-skill-r2/host-config.json", false},
+		{"/tmp/walk-ci/abc/s", false},
+		{"/tmp/walk-git-stage-r1", true}, // a box-writable name outside the families
+		{"/tmp/walk-cix", true},
 		{"/tmp/other.sock", true},
 		{"/home/u/tmp/scratch", true},
 	} {
