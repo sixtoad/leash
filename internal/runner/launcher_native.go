@@ -419,7 +419,7 @@ func (r *runner) spawnInjectService(ctx context.Context, svc injectService) erro
 // spawnInjectServicesContainer spawns every --inject-service plugin ONCE for the
 // container backend (before the launch retry loop, so a port-conflict retry does
 // not respawn them) and builds r.injectedDockerArgs: for each plugin, bind its
-// socket's dir into the workload container at the identical path and set the
+// socket's dir read-only into the workload container at the identical path and set the
 // workload env var to the in-container socket address. Fail-closed: any spawn
 // failure aborts before the workload container is launched.
 func (r *runner) spawnInjectServicesContainer(ctx context.Context) error {
@@ -431,10 +431,16 @@ func (r *runner) spawnInjectServicesContainer(ctx context.Context) error {
 			return err
 		}
 		// Bind the socket's dir to the identical path in the container so the
-		// in-container socket path == the host path the plugin bound.
+		// in-container socket path == the host path the plugin bound. The bind
+		// is read-only: connecting to a Unix socket needs write permission on
+		// the socket inode, not a writable mount, so the workload still
+		// connects, but no workload process (root in the container included)
+		// can unlink or rename the socket, bind a replacement in the
+		// directory or chmod it, so it cannot serve forged replies in the
+		// plugin's place (sixto/walk#281).
 		dir := filepath.Dir(svc.socket)
 		r.injectedDockerArgs = append(r.injectedDockerArgs,
-			"-v", dir+":"+dir,
+			"-v", dir+":"+dir+":ro",
 			"-e", svc.env+"=unix:path="+svc.socket,
 		)
 	}

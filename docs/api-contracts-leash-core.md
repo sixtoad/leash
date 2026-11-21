@@ -186,7 +186,7 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
   "contractVersion": 3,             // current CLI surface
   "minCompatibleContract": 0,       // oldest caller contract still served
   "capabilities": [                 // surface elements a provisioner can drive
-    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "rootless-daemon", "raw-socket-gate", "cedar-strict-default", "manager-inspect", "pin-network-host", "container-shm-size", "mcp-call-args"
+    "policy", "inject-service", "runtime", "user", "require-lsm", "machine-output", "version-json", "resolver-contract-json", "idmap-volume", "policy-path-limits", "container-resource-limits", "authz-socket", "rootless-daemon", "raw-socket-gate", "cedar-strict-default", "manager-inspect", "pin-network-host", "container-shm-size", "mcp-call-args", "inject-service-readonly-bind"
   ],
   "policyLimits": {                 // enforced policy path lengths, in bytes
     "filePathBytes": 255,           // file.open rules: every byte matched; longer rules rejected at load
@@ -201,6 +201,8 @@ Not an endpoint: this is the document an installed binary emits on stdout, for p
 Field names are camelCase and additive-only: renaming or removing one is a contract break, adding one is not.
 
 `authz-socket` means `--inject-service` accepts `authz=<Ns>[+<Ns>...]` and `id=<id>`, and leashd serves that plugin a private Cedar authorization socket (path in the plugin's `LEASH_AUTHZ_SOCKET`) speaking protocol v1. The wire format, limits and fail-closed rules are in [design/AUTHZ-SERVICE.md](design/AUTHZ-SERVICE.md); the Go client is `github.com/strongdm/leash/pkg/authz`.
+
+`inject-service-readonly-bind` means the container backend binds each `--inject-service` socket directory into the workload **read-only** at the identical path. Connecting to a Unix socket needs write permission on the socket inode, not a writable mount, so the workload still connects; no workload process (root in the container included) can unlink, rename or `chmod` the socket, bind a replacement or create any entry in the directory. The native backend shares the host filesystem: a caller that must keep the workload from replacing a native socket forbids `FileOpenReadWrite` on the socket directory (and an exact `File::` forbid on each ancestor) in its policy; the eBPF LSM's mutation table then denies unlink, rename, bind, create, mkdir and rmdir there (pinned by `internal/lsm/socket_dir_seal_test.go`).
 
 Value domains a caller must accept rather than reject:
 
