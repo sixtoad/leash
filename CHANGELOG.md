@@ -6,6 +6,13 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
 
 ## [Unreleased]
 
+## [native-v0.8.0] — 2026-11-26
+
+Minor release on top of `native-v0.7.0` (#257). It adds one capability,
+`inject-service-readonly-bind`, advertised by the CLI and the manager image;
+`contractVersion` and `minCompatibleContract` are unchanged, so existing callers
+are unaffected. Walk uses it when present and does not require it.
+
 ### Added
 - **Injected service sockets are bound read-only into containers**
   (`inject-service-readonly-bind`, sixto/walk#281): the container backend
@@ -15,6 +22,13 @@ All notable changes to the `sixtoad/leash` fork, released as `native-vX.Y.Z`
   A regression test pins that a native caller's `FileOpenReadWrite` forbid on
   the socket directory plus exact ancestor forbids compiles to a mutation
   table denying every replacement path.
+
+## [native-v0.7.0] — 2026-11-11
+
+Minor release on top of `native-v0.6.0` (#252, #253). Its notes were not cut
+into their own section at release time; they are recorded here.
+
+### Added
 - **Optional run observability for Walk/Warren** (#252): opted-in launchers
   emit versioned startup/cleanup timings and redact and export bounded audit
   records before temporary run state is removed. Telemetry write failures do
